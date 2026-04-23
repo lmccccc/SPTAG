@@ -118,6 +118,28 @@ Run the SPTAGTest (or Test.exe) in the Release folder to verify all the tests ha
 The detailed usage can be found in [Get started](docs/GettingStart.md). There is also an end-to-end tutorial for building vector search online service using Python Wrapper in [Python Tutorial](docs/Tutorial.ipynb).
 The detailed parameters tunning can be found in [Parameters](docs/Parameters.md).
 
+### **Multi-Tenant Serving (optional)**
+
+SPTAG ships a `TenantIndexManager` that serves many independent SPANN indices from
+one process with a bounded-memory LRU cache, a shared Linux AIO pool, and a
+dirty-flag checkpoint so read-only tenants evict in ~2 ms instead of ~50 ms.
+
+Minimal example (see [`docs/examples/multi_tenant_quickstart.py`](docs/examples/multi_tenant_quickstart.py) for the full script):
+
+```python
+from sptag import SPTAG
+
+mgr = SPTAG.CreateTenantIndexManager(dim=128, algo_type="SPANN", value_type="Float")
+mgr.BuildFromNumpy(vectors, tenant_ids)       # vectors: (N, 128); tenant_ids: (N,)
+mgr.SaveAll("/path/to/index")
+
+mgr.LoadAll("/path/to/index")
+mgr.SetHeadIndexCacheLimit(64 * 1024 * 1024)  # 64 MB budget
+result = mgr.Search(query_vector, tenant_id=0, k=10)
+```
+
+Change notes for upstream review: [`docs/MULTITENANT_CHANGES.md`](docs/MULTITENANT_CHANGES.md).
+
 ## **References**
 Please cite SPTAG in your publications if it helps your research:
 ```
