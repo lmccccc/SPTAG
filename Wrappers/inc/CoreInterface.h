@@ -273,9 +273,9 @@ private:
     // Concurrent cache management
     void InitCache();
     bool EnsureTenantCached(int p_tenantId);
-    void TouchLRU(int p_tenantId);
-    void EvictIfNeeded();
 
+    // Lazy-load a tenant's HeadIndex; performs inline LRU+byte-budget eviction
+    // (see EnsureTenantLoaded in CoreInterface.cpp) when m_headIndexCacheLimitBytes > 0.
     bool EnsureTenantLoaded(int p_tenantId);
 
     // Unload a tenant while holding exclusive lock (called by eviction)

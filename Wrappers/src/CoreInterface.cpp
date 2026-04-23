@@ -1308,16 +1308,6 @@ bool TenantIndexManager::UnloadTenantLocked(int p_tenantId)
     return true;
 }
 
-void TenantIndexManager::TouchLRU(int p_tenantId)
-{
-    // No-op: S3-FIFO handles promotion internally via freq counter
-}
-
-void TenantIndexManager::EvictIfNeeded()
-{
-    // No-op: HeadIndexCache handles eviction internally
-}
-
 bool TenantIndexManager::EnsureTenantCached(int p_tenantId)
 {
     return EnsureTenantLoaded(p_tenantId);

@@ -172,7 +172,22 @@ budget 75 % of total head size:
 7. `AnnService/inc/Core/Common/Dataset.h` — small destructor safety patch.
 8. `Wrappers/inc/PythonCore.i` — SWIG bindings for the new class.
 
-## 7. What Is Deliberately **Not** In This Branch
+## 7. Known Limitations
+
+- **Cache byte budget is heuristic.** `m_headIndexCacheLimitBytes` is compared
+  against `vectorCount * 128` (fallback 1 MiB), not the actual on-disk or
+  in-memory HeadIndex size. This is enough to bound residency coarsely on
+  homogeneous tenants, but uneven tenants can over- or under-fill by a modest
+  factor. Replacing the estimate with a real byte count is straightforward
+  follow-up work; the eviction loop itself does not need to change.
+- **Eviction is inline inside `EnsureTenantLoaded`.** There is no separate
+  `EvictIfNeeded` entry point — the byte-budget sweep runs under the exclusive
+  lock whenever a new tenant is loaded. Readers expecting a periodic background
+  evictor should know it is purely reactive.
+- Headers `HeadIndexCache.h` / `ChunkedHeadIndexCache.h` are compiled but not
+  on the query path (already noted in §2).
+
+## 8. What Is Deliberately **Not** In This Branch
 
 - No tag / ACL filtering, no posting signatures, no head-bundle routing. All of
   that lives in later commits (`06ae744` onward) and is not part of this
