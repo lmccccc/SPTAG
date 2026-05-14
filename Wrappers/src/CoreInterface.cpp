@@ -1874,7 +1874,15 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
 
         if (indexType == TenantIndexType::SPANN)
         {
-            if (!tenantLocalTags.empty()) {
+            // When SPTAG_DISABLE_NODE_AWARE=1, skip the per-pivot routing plan so
+            // the build goes through the standard single-index SPANN path
+            // (VectorIndex::ApproximateRNG) where the hybrid posting distance hook
+            // (SPTAG_HYBRID_WEIGHT) takes effect.
+            bool disableNodeAware = false;
+            if (const char* env = std::getenv("SPTAG_DISABLE_NODE_AWARE")) {
+                disableNodeAware = (std::atoi(env) != 0);
+            }
+            if (!tenantLocalTags.empty() && !disableNodeAware) {
                 PivotEstimatorComputation pivotComputation;
                 const PivotEstimatorCandidate* pivotCandidate = nullptr;
                 if (BuildPivotEstimatorComputation(tenantLocalTags.data(),

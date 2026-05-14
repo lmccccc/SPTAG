@@ -1370,6 +1370,176 @@ void VectorIndex::ApproximateRNG(std::shared_ptr<VectorSet> &fullVectors, std::u
                                  int candidateNum, Edge *selections, int replicaCount, int numThreads, int numTrees,
                                  int leafSize, float RNGFactor, int numGPUs)
 {
+    // ---- Optional: hybrid (Gower-style) distance for posting selection -----
+    // When enabled, candidates per base vector are reordered by:
+    //   D_hybrid(v, h) = (1 - w) * d_geo(v,h) / d_max(v)
+    //                  + (w / A) * Σ_a [v.attr[a] != h.attr[a]]
+    // where d_max(v) is the largest d_geo in v's candidate list (local norm).
+    // RNG check still uses raw geometric distance (graph structure unchanged).
+    //
+    //   env SPTAG_HYBRID_WEIGHT      : w ∈ [0,1], default 0 (disabled).
+    //   env SPTAG_HYBRID_ATTRS_FILE  : text file, N rows × A space-separated
+    //                                  non-negative ints (categorical values,
+    //                                  0-indexed). N must equal fullVectors->Count().
+    //   env SPTAG_HYBRID_CARDS       : comma-separated cardinalities,
+    //                                  e.g. "4,16,256" (only used for validation
+    //                                  and logging; distance treats values as
+    //                                  opaque categorical).
+    double hybridWeight = 0.0;
+    if (const char *e = std::getenv("SPTAG_HYBRID_WEIGHT"))
+        hybridWeight = std::max(0.0, std::min(1.0, std::atof(e)));
+    int hybridNumAttrs = 0;
+    std::vector<int> perVecAttr;        // size: N * A
+    std::vector<int> hybridCards;
+    if (hybridWeight > 0.0)
+    {
+        const char *cardsStr = std::getenv("SPTAG_HYBRID_CARDS");
+        const char *attrsFile = std::getenv("SPTAG_HYBRID_ATTRS_FILE");
+        if (cardsStr == nullptr || attrsFile == nullptr)
+        {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                         "SPTAG_HYBRID_WEIGHT>0 requires SPTAG_HYBRID_CARDS and SPTAG_HYBRID_ATTRS_FILE; "
+                         "disabling hybrid distance.\n");
+            hybridWeight = 0.0;
+        }
+        else
+        {
+            std::string s(cardsStr);
+            size_t pos = 0;
+            while (pos < s.size())
+            {
+                size_t comma = s.find(',', pos);
+                std::string tok = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                if (!tok.empty()) hybridCards.push_back(std::max(1, std::atoi(tok.c_str())));
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+            hybridNumAttrs = static_cast<int>(hybridCards.size());
+            if (hybridNumAttrs == 0)
+            {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                             "SPTAG_HYBRID_CARDS parse error: '%s'; disabling hybrid distance.\n", cardsStr);
+                hybridWeight = 0.0;
+            }
+            else
+            {
+                int N = fullVectors->Count();
+                perVecAttr.assign(static_cast<size_t>(N) * hybridNumAttrs, 0);
+                std::ifstream fin(attrsFile);
+                if (!fin.good())
+                {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                                 "ApproximateRNG failed to open hybrid attrs file %s; disabling.\n", attrsFile);
+                    hybridWeight = 0.0;
+                }
+                else
+                {
+                    int rows = 0;
+                    bool ok = true;
+                    for (int i = 0; i < N && ok; ++i)
+                    {
+                        for (int a = 0; a < hybridNumAttrs; ++a)
+                        {
+                            int v;
+                            if (!(fin >> v)) { ok = false; break; }
+                            if (v < 0 || v >= hybridCards[a])
+                            {
+                                SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                                             "ApproximateRNG hybrid attr out of range row=%d col=%d v=%d card=%d\n",
+                                             i, a, v, hybridCards[a]);
+                                ok = false;
+                                break;
+                            }
+                            perVecAttr[static_cast<size_t>(i) * hybridNumAttrs + a] = v;
+                        }
+                        if (ok) ++rows;
+                    }
+                    if (!ok || rows != N)
+                    {
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                                     "ApproximateRNG hybrid attrs file has %d valid rows, expected %d; disabling.\n",
+                                     rows, N);
+                        hybridWeight = 0.0;
+                    }
+                    else
+                    {
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                                     "ApproximateRNG hybrid: weight=%.3f, attrs=%d, cards=[",
+                                     hybridWeight, hybridNumAttrs);
+                        for (int a = 0; a < hybridNumAttrs; ++a)
+                            SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "%s%d",
+                                         a == 0 ? "" : ",", hybridCards[a]);
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "]\n");
+                    }
+                }
+            }
+        }
+    }
+    const bool hybridEnabled = hybridWeight > 0.0;
+
+    // ---- Optional: DUAL-replica routing ----
+    // When SPTAG_HYBRID_DUAL is set (e.g. "2,4"), the per-vector replicaCount
+    // budget is split into two phases:
+    //   Phase A (attr): pick attr_n candidates using a strong-attribute weight
+    //   Phase B (geo) : pick geo_n  candidates using a strong-geometry weight
+    // Selections are dedup'd and still pass the same geometric RNG prune.
+    // Per-attribute weights (SPTAG_HYBRID_ATTR_WEIGHTS) let you zero out
+    // attributes that are too sparse to be useful for clustering.
+    int dualAttrCount = 0;
+    int dualGeoCount  = 0;
+    float wAttrStrong = 0.9f;
+    float wGeoStrong  = 0.0f;
+    std::vector<float> attrPerAttrW;
+    if (hybridEnabled)
+    {
+        if (const char *e = std::getenv("SPTAG_HYBRID_DUAL"))
+        {
+            std::string s(e);
+            size_t comma = s.find(',');
+            if (comma != std::string::npos)
+            {
+                dualAttrCount = std::max(0, std::atoi(s.substr(0, comma).c_str()));
+                dualGeoCount  = std::max(0, std::atoi(s.substr(comma + 1).c_str()));
+            }
+        }
+        if (const char *e = std::getenv("SPTAG_HYBRID_W_ATTR_STRONG"))
+            wAttrStrong = std::max(0.0f, std::min(1.0f, (float)std::atof(e)));
+        if (const char *e = std::getenv("SPTAG_HYBRID_W_GEO_STRONG"))
+            wGeoStrong = std::max(0.0f, std::min(1.0f, (float)std::atof(e)));
+        attrPerAttrW.assign(hybridNumAttrs, 1.0f);
+        if (const char *e = std::getenv("SPTAG_HYBRID_ATTR_WEIGHTS"))
+        {
+            std::string s(e); size_t pos = 0; int a = 0;
+            while (pos < s.size() && a < hybridNumAttrs)
+            {
+                size_t c = s.find(',', pos);
+                std::string tok = s.substr(pos, c == std::string::npos ? std::string::npos : c - pos);
+                attrPerAttrW[a++] = std::max(0.0f, (float)std::atof(tok.c_str()));
+                if (c == std::string::npos) break;
+                pos = c + 1;
+            }
+        }
+    }
+    bool dualEnabled = hybridEnabled && (dualAttrCount + dualGeoCount > 0);
+    if (dualEnabled && dualAttrCount + dualGeoCount > replicaCount)
+    {
+        int extra = (dualAttrCount + dualGeoCount) - replicaCount;
+        int rg = std::min(extra, dualGeoCount);
+        dualGeoCount -= rg; extra -= rg;
+        dualAttrCount = std::max(0, dualAttrCount - extra);
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                     "ApproximateRNG hybrid DUAL clamped to replicaCount=%d -> attr=%d geo=%d\n",
+                     replicaCount, dualAttrCount, dualGeoCount);
+    }
+    if (dualEnabled)
+    {
+        float wsum = 0.0f;
+        for (float w : attrPerAttrW) wsum += w;
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                     "ApproximateRNG hybrid DUAL: attr=%d (w_strong=%.2f) geo=%d (w_strong=%.2f) attr_weights_sum=%.2f\n",
+                     dualAttrCount, wAttrStrong, dualGeoCount, wGeoStrong, wsum);
+    }
+
     std::vector<std::thread> threads;
     threads.reserve(numThreads);
 
@@ -1382,6 +1552,10 @@ void VectorIndex::ApproximateRNG(std::shared_ptr<VectorSet> &fullVectors, std::u
             QueryResult resultSet(NULL, candidateNum, false);
 
             size_t rngFailedCount = 0;
+            std::vector<int> candOrder;
+            std::vector<float> candHybrid;
+            candOrder.reserve(candidateNum);
+            candHybrid.reserve(candidateNum);
 
             while (true)
             {
@@ -1428,37 +1602,152 @@ void VectorIndex::ApproximateRNG(std::shared_ptr<VectorSet> &fullVectors, std::u
                 size_t selectionOffset = static_cast<size_t>(fullID) * replicaCount;
 
                 BasicResult *queryResults = resultSet.GetResults();
-                int currReplicaCount = 0;
-                for (int i = 0; i < candidateNum && currReplicaCount < replicaCount; ++i)
-                {
-                    if (queryResults[i].VID == -1)
-                    {
-                        break;
-                    }
 
-                    // RNG Check.
-                    bool rngAccpeted = true;
+                // ---- Build candidate iteration order ----
+                // Default: same as before, by ascending geometric distance
+                // (the order SearchIndex already returned).
+                // Hybrid: rescore by D_hybrid using per-vector d_max for d_geo
+                // normalization; reorder by D_hybrid ascending.
+                candOrder.clear();
+                int validCands = 0;
+                float dMax = 0.0f;
+                for (int i = 0; i < candidateNum; ++i)
+                {
+                    if (queryResults[i].VID == -1) break;
+                    candOrder.push_back(i);
+                    if (queryResults[i].Dist > dMax) dMax = queryResults[i].Dist;
+                    ++validCands;
+                }
+
+                if (hybridEnabled && !dualEnabled && validCands > 1)
+                {
+                    candHybrid.assign(validCands, 0.0f);
+                    const int *vAttr = &perVecAttr[static_cast<size_t>(fullID) * hybridNumAttrs];
+                    const float invDMax = (dMax > 0.0f) ? (1.0f / dMax) : 0.0f;
+                    const float wGeo = static_cast<float>(1.0 - hybridWeight);
+                    const float wAttr = static_cast<float>(hybridWeight) /
+                                        static_cast<float>(hybridNumAttrs);
+                    for (int k = 0; k < validCands; ++k)
+                    {
+                        int i = candOrder[k];
+                        int headVID = queryResults[i].VID;
+                        const int *hAttr = &perVecAttr[static_cast<size_t>(headVID) * hybridNumAttrs];
+                        int diffCount = 0;
+                        for (int a = 0; a < hybridNumAttrs; ++a)
+                            if (vAttr[a] != hAttr[a]) ++diffCount;
+                        float dGeoNorm = queryResults[i].Dist * invDMax;
+                        candHybrid[k] = wGeo * dGeoNorm + wAttr * static_cast<float>(diffCount);
+                    }
+                    // Replace candOrder with permutation 0..validCands-1 sorted by candHybrid ascending.
+                    // (queryResults[candOrder[k]] is the candidate to visit at iteration k.)
+                    for (int k = 0; k < validCands; ++k) candOrder[k] = k;
+                    std::sort(candOrder.begin(), candOrder.end(),
+                              [&](int a, int b) { return candHybrid[a] < candHybrid[b]; });
+                }
+
+                // Dual-mode: compute two per-candidate scores and walk in two phases.
+                std::vector<int> orderAttr, orderGeo;
+                std::vector<float> dAttr, dGeo;
+                if (dualEnabled && validCands > 1)
+                {
+                    dAttr.assign(validCands, 0.0f);
+                    dGeo.assign(validCands,  0.0f);
+                    orderAttr.resize(validCands);
+                    orderGeo.resize(validCands);
+                    const int *vAttr = &perVecAttr[static_cast<size_t>(fullID) * hybridNumAttrs];
+                    const float invDMax = (dMax > 0.0f) ? (1.0f / dMax) : 0.0f;
+                    float totalAttrW = 0.0f;
+                    for (int a = 0; a < hybridNumAttrs; ++a) totalAttrW += attrPerAttrW[a];
+                    if (totalAttrW <= 0.0f) totalAttrW = 1.0f;
+                    for (int k = 0; k < validCands; ++k)
+                    {
+                        int headVID = queryResults[k].VID;
+                        const int *hAttr = &perVecAttr[static_cast<size_t>(headVID) * hybridNumAttrs];
+                        float diffW = 0.0f;
+                        for (int a = 0; a < hybridNumAttrs; ++a)
+                            if (vAttr[a] != hAttr[a]) diffW += attrPerAttrW[a];
+                        float diffNorm = diffW / totalAttrW;
+                        float dGeoNorm = queryResults[k].Dist * invDMax;
+                        dAttr[k] = (1.0f - wAttrStrong) * dGeoNorm + wAttrStrong * diffNorm;
+                        dGeo[k]  = (1.0f - wGeoStrong)  * dGeoNorm + wGeoStrong  * diffNorm;
+                        orderAttr[k] = k;
+                        orderGeo[k]  = k;
+                    }
+                    std::sort(orderAttr.begin(), orderAttr.end(),
+                              [&](int a, int b) { return dAttr[a] < dAttr[b]; });
+                    std::sort(orderGeo.begin(), orderGeo.end(),
+                              [&](int a, int b) { return dGeo[a] < dGeo[b]; });
+                }
+
+                // ---- Walk in chosen order, RNG-check by raw d_geo ----
+                int currReplicaCount = 0;
+                auto tryAcceptCandidate = [&](int i) -> int {
+                    // returns: 1 accepted, 0 rng-failed, -1 dup or invalid
+                    if (i < 0 || queryResults[i].VID == -1) return -1;
+                    // dedupe
+                    for (int j = 0; j < currReplicaCount; ++j)
+                        if (selections[selectionOffset + j].node == queryResults[i].VID)
+                            return -1;
+                    // RNG check (geometric, unchanged).
                     for (int j = 0; j < currReplicaCount; ++j)
                     {
                         float nnDist = ComputeDistance(GetSample(queryResults[i].VID),
                                                        GetSample(selections[selectionOffset + j].node));
-
                         if (RNGFactor * nnDist < queryResults[i].Dist)
-                        {
-                            rngAccpeted = false;
-                            break;
-                        }
+                            return 0;
                     }
-
-                    if (!rngAccpeted)
-                    {
-                        ++rngFailedCount;
-                        continue;
-                    }
-
                     selections[selectionOffset + currReplicaCount].node = queryResults[i].VID;
                     selections[selectionOffset + currReplicaCount].distance = queryResults[i].Dist;
                     ++currReplicaCount;
+                    return 1;
+                };
+
+                if (dualEnabled)
+                {
+                    // Phase A: attribute-heavy order, up to dualAttrCount accepts.
+                    int phaseAccepted = 0;
+                    for (size_t s = 0;
+                         s < orderAttr.size() && phaseAccepted < dualAttrCount && currReplicaCount < replicaCount;
+                         ++s)
+                    {
+                        int k = orderAttr[s];
+                        int r = tryAcceptCandidate(k);
+                        if (r == 1) ++phaseAccepted;
+                        else if (r == 0) ++rngFailedCount;
+                    }
+                    // Phase B: geometry-heavy order, fill the rest up to dualGeoCount or replicaCount.
+                    int phaseBQuota = std::min(replicaCount - currReplicaCount, dualGeoCount);
+                    int phaseBAccepted = 0;
+                    for (size_t s = 0;
+                         s < orderGeo.size() && phaseBAccepted < phaseBQuota && currReplicaCount < replicaCount;
+                         ++s)
+                    {
+                        int k = orderGeo[s];
+                        int r = tryAcceptCandidate(k);
+                        if (r == 1) ++phaseBAccepted;
+                        else if (r == 0) ++rngFailedCount;
+                    }
+                    // Fill any remaining slots from geo order (catch-all).
+                    for (size_t s = 0;
+                         s < orderGeo.size() && currReplicaCount < replicaCount;
+                         ++s)
+                    {
+                        int k = orderGeo[s];
+                        int r = tryAcceptCandidate(k);
+                        if (r == 0) ++rngFailedCount;
+                    }
+                }
+                else
+                {
+                    for (int slot = 0;
+                         slot < validCands && currReplicaCount < replicaCount;
+                         ++slot)
+                    {
+                        int i = hybridEnabled ? candOrder[slot] : slot;
+                        int r = tryAcceptCandidate(i);
+                        if (r == -1 && queryResults[i].VID == -1) break;
+                        if (r == 0) ++rngFailedCount;
+                    }
                 }
 
                 if (reconstructed_vector)
