@@ -2627,6 +2627,21 @@ namespace SPTAG::SPANN {
 
             if (ErrorCode::Success != WriteDownAllPostingToDB(selections, fullVectors)) return false;
 
+            // ===== Centroid re-election (option B): replace each head with the in-posting
+            //       real vector closest to the posting's geometric mean. Gated by env.
+            //       Postings on disk stay keyed by head index, so they are not touched.
+            //       The caller (SPANNIndex::BuildIndexInternal) is expected to rebuild
+            //       the HeadIndex BKT from the updated vectors.bin after this returns. =====
+            {
+                const char* recentroidEnv = std::getenv("SPTAG_RESELECT_CENTROIDS");
+                if (recentroidEnv != nullptr && std::string(recentroidEnv) == "1") {
+                    if (!ReselectHeadCentroids(selections, fullVectors, p_vectorTranslateMap)) {
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "[Recentroid] Failed to re-select head centroids\n");
+                        return false;
+                    }
+                }
+            }
+
             if (m_opt->m_update && !m_opt->m_allowZeroReplica && zeroReplicaSet.size() > 0)
             {
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "SPFresh: initialize thread pools, append: %d, reassign %d\n", m_opt->m_appendThreadNum, m_opt->m_reassignThreadNum);
@@ -2674,8 +2689,131 @@ namespace SPTAG::SPANN {
             return true;
         }
 
-        ErrorCode WriteDownAllPostingToDB(Selection& p_postingSelections, std::shared_ptr<VectorSet> p_fullVectors) {
+        // Replace each head's representative vector with the in-posting member closest
+        // to that posting's mean (geometric centroid). Writes updated HeadIndex/vectors.bin
+        // and HeadIndex/HeadVectorIDs.bin; the BKT tree+graph must be rebuilt by the caller.
+        // Postings on disk remain valid because they are keyed by head index, not VID.
+        bool ReselectHeadCentroids(Selection& p_selections,
+                                   std::shared_ptr<VectorSet> p_fullVectors,
+                                   COMMON::Dataset<std::uint64_t>& p_vectorTranslateMap)
+        {
+            const SizeType N = p_vectorTranslateMap.R();
+            const DimensionType dim = m_opt->m_dim;
+            if (N <= 0 || p_fullVectors == nullptr) {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "[Recentroid] Nothing to do (N=%d)\n", (int)N);
+                return true;
+            }
 
+            std::vector<SizeType> originalHeadVids(N);
+            for (SizeType k = 0; k < N; ++k) {
+                originalHeadVids[k] = static_cast<SizeType>(*(p_vectorTranslateMap[k]));
+            }
+
+            std::vector<SizeType> newHeadVids(N);
+            std::atomic<int> swapped(0);
+            std::atomic<int> emptyPostings(0);
+
+            auto t0 = std::chrono::high_resolution_clock::now();
+
+            const int numThreads = max(1, m_opt->m_iSSDNumberOfThreads);
+            std::vector<std::thread> workers;
+            std::atomic<SizeType> next(0);
+            for (int t = 0; t < numThreads; ++t) {
+                workers.emplace_back([&]() {
+                    std::vector<double> mean(dim, 0.0);
+                    while (true) {
+                        SizeType k = next.fetch_add(1);
+                        if (k >= N) return;
+                        auto lo = std::lower_bound(p_selections.m_selections.begin(),
+                                                   p_selections.m_selections.end(),
+                                                   (int)k, Selection::g_edgeComparer);
+                        auto hi = std::lower_bound(p_selections.m_selections.begin(),
+                                                   p_selections.m_selections.end(),
+                                                   (int)(k + 1), Selection::g_edgeComparer);
+                        size_t n_members = static_cast<size_t>(hi - lo);
+                        if (n_members == 0) {
+                            newHeadVids[k] = originalHeadVids[k];
+                            emptyPostings.fetch_add(1);
+                            continue;
+                        }
+                        std::fill(mean.begin(), mean.end(), 0.0);
+                        for (auto it = lo; it != hi; ++it) {
+                            const ValueType* v = static_cast<const ValueType*>(p_fullVectors->GetVector(it->tonode));
+                            for (DimensionType d = 0; d < dim; ++d) {
+                                mean[d] += static_cast<double>(v[d]);
+                            }
+                        }
+                        const double invN = 1.0 / static_cast<double>(n_members);
+                        for (DimensionType d = 0; d < dim; ++d) mean[d] *= invN;
+
+                        SizeType bestVid = lo->tonode;
+                        double bestDist = std::numeric_limits<double>::max();
+                        for (auto it = lo; it != hi; ++it) {
+                            const ValueType* v = static_cast<const ValueType*>(p_fullVectors->GetVector(it->tonode));
+                            double s = 0.0;
+                            for (DimensionType d = 0; d < dim; ++d) {
+                                double diff = static_cast<double>(v[d]) - mean[d];
+                                s += diff * diff;
+                            }
+                            if (s < bestDist) { bestDist = s; bestVid = it->tonode; }
+                        }
+                        newHeadVids[k] = bestVid;
+                        if (bestVid != originalHeadVids[k]) swapped.fetch_add(1);
+                    }
+                });
+            }
+            for (auto& w : workers) w.join();
+
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double seconds = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count() / 1000.0;
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                         "[Recentroid] swapped %d/%d heads, %d empty postings kept, took %.2fs\n",
+                         swapped.load(), (int)N, emptyPostings.load(), seconds);
+
+            // Write new vectors.bin
+            const std::string vectorFile = m_opt->m_indexDirectory + FolderSep + m_opt->m_headVectorFile;
+            const std::string idFile     = m_opt->m_indexDirectory + FolderSep + m_opt->m_headIDFile;
+
+            std::shared_ptr<Helper::DiskIO> output    = SPTAG::f_createIO();
+            std::shared_ptr<Helper::DiskIO> outputIDs = SPTAG::f_createIO();
+            if (output == nullptr || outputIDs == nullptr
+                || !output->Initialize(vectorFile.c_str(), std::ios::binary | std::ios::out)
+                || !outputIDs->Initialize(idFile.c_str(), std::ios::binary | std::ios::out))
+            {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                             "[Recentroid] Failed to open head files for write: %s / %s\n",
+                             vectorFile.c_str(), idFile.c_str());
+                return false;
+            }
+
+            SizeType count = N;
+            DimensionType dimsHead = dim;
+            DimensionType idDims = 1;
+            if (output->WriteBinary(sizeof(count), reinterpret_cast<char*>(&count)) != sizeof(count) ||
+                output->WriteBinary(sizeof(dimsHead), reinterpret_cast<char*>(&dimsHead)) != sizeof(dimsHead) ||
+                outputIDs->WriteBinary(sizeof(count), reinterpret_cast<char*>(&count)) != sizeof(count) ||
+                outputIDs->WriteBinary(sizeof(idDims), reinterpret_cast<char*>(&idDims)) != sizeof(idDims))
+            {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "[Recentroid] Failed to write head file headers\n");
+                return false;
+            }
+
+            const size_t vecBytes = sizeof(ValueType) * static_cast<size_t>(dim);
+            for (SizeType k = 0; k < N; ++k) {
+                uint64_t vid = static_cast<uint64_t>(newHeadVids[k]);
+                const ValueType* v = static_cast<const ValueType*>(p_fullVectors->GetVector(newHeadVids[k]));
+                if (outputIDs->WriteBinary(sizeof(vid), reinterpret_cast<char*>(&vid)) != sizeof(vid) ||
+                    output->WriteBinary(vecBytes, reinterpret_cast<const char*>(v)) != vecBytes)
+                {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "[Recentroid] Failed to write head k=%d\n", (int)k);
+                    return false;
+                }
+                *(p_vectorTranslateMap[k]) = vid;
+            }
+            return true;
+        }
+
+        ErrorCode WriteDownAllPostingToDB(Selection& p_postingSelections, std::shared_ptr<VectorSet> p_fullVectors) {
             std::vector<std::thread> threads;
             std::atomic_size_t vectorsSent(0);
             ErrorCode ret = ErrorCode::Success;

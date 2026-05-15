@@ -3345,6 +3345,79 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
             }
         }
 
+        // Post-BuildSSD centroid re-election rebuild: if SPTAG_RESELECT_CENTROIDS=1 was set,
+        // ExtraSearcher::BuildIndex has already rewritten HeadIndex/vectors.bin and
+        // HeadVectorIDs.bin with the in-posting medoids. Rebuild the BKT (tree+graph) from the
+        // updated vectors.bin so that query-time head selection benefits from the new positions.
+        {
+            const char* recentroidEnv = std::getenv("SPTAG_RESELECT_CENTROIDS");
+            if (m_options.m_buildSsdIndex && recentroidEnv != nullptr && std::string(recentroidEnv) == "1")
+            {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "[Recentroid] Rebuilding HeadIndex BKT from updated vectors.bin...\n");
+                auto valueType = m_pQuantizer ? SPTAG::VectorValueType::UInt8 : m_options.m_valueType;
+                auto dims = m_pQuantizer ? m_pQuantizer->GetNumSubvectors() : m_options.m_dim;
+                std::shared_ptr<Helper::ReaderOptions> vectorOptions(
+                    new Helper::ReaderOptions(valueType, dims, VectorFileType::DEFAULT));
+                auto vectorReader = Helper::VectorSetReader::CreateInstance(vectorOptions);
+                if (ErrorCode::Success !=
+                    vectorReader->LoadFile(m_options.m_indexDirectory + FolderSep + m_options.m_headVectorFile))
+                {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "[Recentroid] Failed to reload head vectors.\n");
+                    return ErrorCode::Fail;
+                }
+
+                m_index.reset();
+                m_index = SPTAG::VectorIndex::CreateInstance(m_options.m_indexAlgoType, valueType);
+                m_index->SetParameter("DistCalcMethod", SPTAG::Helper::Convert::ConvertToString(m_options.m_distCalcMethod));
+                m_index->SetQuantizer(m_pQuantizer);
+                for (const auto& iter : m_headParameters)
+                {
+                    m_index->SetParameter(iter.first.c_str(), iter.second.c_str());
+                }
+                auto headvectorset = vectorReader->GetVectorSet();
+                if (m_index->BuildIndex(headvectorset, nullptr, false, true, true) != ErrorCode::Success)
+                {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "[Recentroid] Failed to rebuild head index.\n");
+                    return ErrorCode::Fail;
+                }
+                if (!m_options.m_quantizerFilePath.empty())
+                {
+                    m_index->SetQuantizerFileName(
+                        m_options.m_quantizerFilePath.substr(m_options.m_quantizerFilePath.find_last_of("/\\") + 1));
+                }
+                if (m_index->SaveIndex(m_options.m_indexDirectory + FolderSep + m_options.m_headIndexFolder) != ErrorCode::Success)
+                {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "[Recentroid] Failed to save rebuilt head index.\n");
+                    return ErrorCode::Fail;
+                }
+                m_index.reset();
+                if (LoadIndex(m_options.m_indexDirectory + FolderSep + m_options.m_headIndexFolder, m_index) != ErrorCode::Success)
+                {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "[Recentroid] Failed to reload rebuilt head index.\n");
+                    return ErrorCode::Fail;
+                }
+                m_index->SetQuantizer(m_pQuantizer);
+                m_index->SetParameter("NumberOfThreads", std::to_string(m_options.m_iSSDNumberOfThreads));
+                m_index->SetParameter("MaxCheck", std::to_string(m_options.m_maxCheck));
+                m_index->SetParameter("HashTableExponent", std::to_string(m_options.m_hashExp));
+                m_index->UpdateIndex();
+
+                // Reload m_vectorTranslateMap from the updated HeadVectorIDs.bin so it stays
+                // consistent with the new head identities written by ReselectHeadCentroids
+                // (or with the MaxSize markers if excludehead=false, which is also fine).
+                std::shared_ptr<Helper::DiskIO> ptr = SPTAG::f_createIO();
+                if (ptr == nullptr ||
+                    !ptr->Initialize((m_options.m_indexDirectory + FolderSep + m_options.m_headIDFile).c_str(),
+                                     std::ios::binary | std::ios::in))
+                {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "[Recentroid] Failed to reload HeadVectorIDs.bin\n");
+                    return ErrorCode::Fail;
+                }
+                m_vectorTranslateMap.Load(ptr, m_index->m_iDataBlockSize, m_index->m_iDataCapacity);
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "[Recentroid] HeadIndex BKT rebuilt and reloaded.\n");
+            }
+        }
+
         if (!m_extraSearcher->LoadIndex(m_options, m_versionMap, m_vectorTranslateMap, m_index))
         {
             SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Cannot Load SSDIndex!\n");
