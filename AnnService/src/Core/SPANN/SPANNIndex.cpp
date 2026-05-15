@@ -3351,7 +3351,12 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
         // updated vectors.bin so that query-time head selection benefits from the new positions.
         {
             const char* recentroidEnv = std::getenv("SPTAG_RESELECT_CENTROIDS");
-            if (m_options.m_buildSsdIndex && recentroidEnv != nullptr && std::string(recentroidEnv) == "1")
+            bool doRecentroidRebuild = false;
+            if (m_options.m_buildSsdIndex && recentroidEnv != nullptr) {
+                std::string mode(recentroidEnv);
+                doRecentroidRebuild = (mode == "1" || mode == "noop");
+            }
+            if (doRecentroidRebuild)
             {
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "[Recentroid] Rebuilding HeadIndex BKT from updated vectors.bin...\n");
                 auto valueType = m_pQuantizer ? SPTAG::VectorValueType::UInt8 : m_options.m_valueType;

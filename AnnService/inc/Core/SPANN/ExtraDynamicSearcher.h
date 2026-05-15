@@ -2631,13 +2631,18 @@ namespace SPTAG::SPANN {
             //       real vector closest to the posting's geometric mean. Gated by env.
             //       Postings on disk stay keyed by head index, so they are not touched.
             //       The caller (SPANNIndex::BuildIndexInternal) is expected to rebuild
-            //       the HeadIndex BKT from the updated vectors.bin after this returns. =====
+            //       the HeadIndex BKT from the updated vectors.bin after this returns.
+            //       SPTAG_RESELECT_CENTROIDS=noop: rebuild pipeline only, no swap (sanity). =====
             {
                 const char* recentroidEnv = std::getenv("SPTAG_RESELECT_CENTROIDS");
-                if (recentroidEnv != nullptr && std::string(recentroidEnv) == "1") {
-                    if (!ReselectHeadCentroids(selections, fullVectors, p_vectorTranslateMap)) {
-                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "[Recentroid] Failed to re-select head centroids\n");
-                        return false;
+                if (recentroidEnv != nullptr) {
+                    std::string mode(recentroidEnv);
+                    if (mode == "1" || mode == "noop") {
+                        bool noop = (mode == "noop");
+                        if (!ReselectHeadCentroids(selections, fullVectors, p_vectorTranslateMap, noop)) {
+                            SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "[Recentroid] Failed to re-select head centroids\n");
+                            return false;
+                        }
                     }
                 }
             }
@@ -2693,9 +2698,12 @@ namespace SPTAG::SPANN {
         // to that posting's mean (geometric centroid). Writes updated HeadIndex/vectors.bin
         // and HeadIndex/HeadVectorIDs.bin; the BKT tree+graph must be rebuilt by the caller.
         // Postings on disk remain valid because they are keyed by head index, not VID.
+        // p_noop=true: keep original heads but still rewrite the files (sanity test for
+        //              the rebuild pipeline; recall should match baseline).
         bool ReselectHeadCentroids(Selection& p_selections,
                                    std::shared_ptr<VectorSet> p_fullVectors,
-                                   COMMON::Dataset<std::uint64_t>& p_vectorTranslateMap)
+                                   COMMON::Dataset<std::uint64_t>& p_vectorTranslateMap,
+                                   bool p_noop = false)
         {
             const SizeType N = p_vectorTranslateMap.R();
             const DimensionType dim = m_opt->m_dim;
@@ -2713,6 +2721,11 @@ namespace SPTAG::SPANN {
             std::atomic<int> swapped(0);
             std::atomic<int> emptyPostings(0);
 
+            if (p_noop) {
+                for (SizeType k = 0; k < N; ++k) newHeadVids[k] = originalHeadVids[k];
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                             "[Recentroid][NOOP] Pipeline sanity mode: heads unchanged (N=%d)\n", (int)N);
+            } else {
             auto t0 = std::chrono::high_resolution_clock::now();
 
             const int numThreads = max(1, m_opt->m_iSSDNumberOfThreads);
@@ -2769,6 +2782,7 @@ namespace SPTAG::SPANN {
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
                          "[Recentroid] swapped %d/%d heads, %d empty postings kept, took %.2fs\n",
                          swapped.load(), (int)N, emptyPostings.load(), seconds);
+            }  // end !p_noop
 
             // Write new vectors.bin
             const std::string vectorFile = m_opt->m_indexDirectory + FolderSep + m_opt->m_headVectorFile;
