@@ -404,11 +404,12 @@ bool VectorIndex::HeadHierMaskMayIntersect(SizeType p_sampleId, const Cache::Hie
 
 bool VectorIndex::HeadPostingHierMaskMayIntersect(SizeType p_sampleId, const Cache::HierarchicalPostingMask& p_queryMask) const
 {
-    const auto* postingMask = GetHeadNodePostingHierMask(p_sampleId);
-    // Fail-open: legacy / V2 indexes lack the posting-union mask. Keep head
-    // so the caller doesn't drop posting candidates spuriously.
-    if (postingMask == nullptr) return true;
-    return postingMask->MayIntersect(p_queryMask);
+    // V2 fallback: this branch has only the head-node (single) hier mask;
+    // posting-union mask (V3) is not available. Use the single mask, which
+    // is the same behaviour as HeadNodeHierMaskMayIntersect.
+    const auto* hierMask = GetHeadNodeHierMask(p_sampleId);
+    if (hierMask == nullptr) return true;
+    return hierMask->MayIntersect(p_queryMask);
 }
 
 void VectorIndex::ResetThreadLocalPostingScanStats()
