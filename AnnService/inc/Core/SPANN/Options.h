@@ -106,6 +106,9 @@ namespace SPTAG {
             std::string m_ssdInfoFile;
             std::string m_checksumFile;
             std::string m_postingPureCountsFile;
+            std::string m_postingSegmentLengthsFile;
+            std::string m_tailSubindexFile;
+            std::string m_tagSubsetMaskFile;
             bool m_useDirectIO;
             bool m_preReassign;
             float m_preReassignRatio;

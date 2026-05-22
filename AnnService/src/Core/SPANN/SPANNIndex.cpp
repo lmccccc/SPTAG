@@ -2491,6 +2491,54 @@ void Index<T>::SelectHeadDynamically(const std::shared_ptr<COMMON::BKTree> p_tre
 }
 
 template <typename T>
+void Index<T>::SelectHeadsOnSubset(const COMMON::Dataset<T>& data, const std::vector<SizeType>& subset, float ratio, std::vector<int>& outHeads)
+{
+    if (subset.empty()) return;
+    int subSize = (int)subset.size();
+
+    // Save options that we'll temporarily override
+    const auto savedRatio      = m_options.m_ratio;
+    const auto savedSelTh      = m_options.m_selectThreshold;
+    const auto savedSplTh      = m_options.m_splitThreshold;
+    const auto savedSplFa      = m_options.m_splitFactor;
+    const auto savedKmeansK    = m_options.m_iBKTKmeansK;
+    const auto savedSamples    = m_options.m_iSamples;
+
+    m_options.m_ratio          = ratio;
+    m_options.m_selectThreshold = 0;
+    m_options.m_splitThreshold  = 0;
+    m_options.m_splitFactor     = 0;
+    m_options.m_iBKTKmeansK    = savedKmeansK;
+    m_options.m_iSamples       = std::min(savedSamples, subSize);
+    SelectHeadAdjustOptions(subSize);
+
+    // Build BKTree on the subset
+    std::vector<SizeType> mutableSubset(subset.begin(), subset.end());
+    std::shared_ptr<COMMON::BKTree> bkt = std::make_shared<COMMON::BKTree>();
+    bkt->m_iBKTKmeansK   = m_options.m_iBKTKmeansK;
+    bkt->m_iBKTLeafSize  = m_options.m_iBKTLeafSize;
+    bkt->m_iSamples      = std::min(m_options.m_iSamples, subSize);
+    bkt->m_iTreeNumber   = m_options.m_iTreeNumber;
+    bkt->m_fBalanceFactor = m_options.m_fBalanceFactor;
+    bkt->m_pQuantizer    = m_pQuantizer;
+    bkt->BuildTrees<T>(data, m_options.m_distCalcMethod,
+                       m_options.m_iSelectHeadNumberOfThreads,
+                       &mutableSubset, nullptr, true);
+
+    SelectHeadDynamically(bkt, subSize, outHeads);
+    if (outHeads.empty() && !subset.empty())
+        outHeads.push_back((int)subset[0]);
+
+    // Restore options
+    m_options.m_ratio          = savedRatio;
+    m_options.m_selectThreshold = savedSelTh;
+    m_options.m_splitThreshold  = savedSplTh;
+    m_options.m_splitFactor     = savedSplFa;
+    m_options.m_iBKTKmeansK    = savedKmeansK;
+    m_options.m_iSamples       = savedSamples;
+}
+
+template <typename T>
 template <typename InternalDataType>
 bool Index<T>::SelectHeadInternal(std::shared_ptr<Helper::VectorSetReader> &p_reader)
 {
@@ -3371,6 +3419,21 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
                 if (!m_pendingHeadVectorOwners.empty()) {
                     eds->SetHeadVectorOwners(m_pendingHeadVectorOwners);
                 }
+            }
+        }
+
+        // Forward tail-subindex assignments to ExtraDynamicSearcher for tag-aware Phase 4
+        if (!m_pendingTailSubindex.empty() && m_pendingTailSubindexN > 0) {
+            auto* eds = dynamic_cast<ExtraDynamicSearcher<T>*>(m_extraSearcher.get());
+            if (eds) {
+                eds->SetTailSubindex(m_pendingTailSubindex, m_pendingTailSubindexN);
+                eds->SetHeadSelectCallback(
+                    [this](const COMMON::Dataset<T>& data,
+                           const std::vector<SizeType>& subset,
+                           float ratio,
+                           std::vector<int>& out) {
+                        this->SelectHeadsOnSubset(data, subset, ratio, out);
+                    });
             }
         }
 

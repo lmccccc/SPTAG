@@ -87,6 +87,10 @@ namespace SPTAG::SPANN {
             // filtered queries with one read.
             bool ReadBlocks(const std::vector<AddressType*>& p_data, std::vector<Helper::PageBuffer<std::uint8_t>>& p_value, const std::vector<std::uint32_t>& maxBytesPerKey, const std::chrono::microseconds& timeout, std::vector<Helper::AsyncReadRequest>* reqs);
 
+            // Byte-range variant: skip skipBytesPerKey[i] bytes (page-aligned) then read
+            // readBytesPerKey[i] bytes (page-aligned). Data is written to buffer[0..].
+            bool ReadBlocks(const std::vector<AddressType*>& p_data, std::vector<Helper::PageBuffer<std::uint8_t>>& p_value, const std::vector<std::uint32_t>& skipBytesPerKey, const std::vector<std::uint32_t>& readBytesPerKey, const std::chrono::microseconds& timeout, std::vector<Helper::AsyncReadRequest>* reqs);
+
             bool WriteBlocks(AddressType* p_data, int p_size, const std::string& p_value, const std::chrono::microseconds& timeout, std::vector<Helper::AsyncReadRequest>* reqs);
 
             bool IOStatistics();
@@ -761,6 +765,44 @@ namespace SPTAG::SPANN {
                 i++;
             }
             auto result = m_pBlockController.ReadBlocks(blocks, values, caps, timeout, reqs);
+            return result ? ErrorCode::Success : ErrorCode::Fail;
+        }
+
+        // Byte-range variant: skip skipBytesPerKey[i] bytes (page-aligned) per posting, then
+        // read readBytesPerKey[i] bytes (page-aligned). Data is written to buffer[0..].
+        ErrorCode MultiGet(const std::vector<SizeType>& keys,
+            std::vector<Helper::PageBuffer<std::uint8_t>>& values,
+            const std::vector<std::uint32_t>& skipBytesPerKey,
+            const std::vector<std::uint32_t>& readBytesPerKey,
+            const std::chrono::microseconds &timeout,
+            std::vector<Helper::AsyncReadRequest>* reqs) override {
+            std::vector<AddressType*> blocks;
+            std::vector<std::uint32_t> skips, reads;
+            skips.reserve(keys.size());
+            reads.reserve(keys.size());
+            SizeType r;
+            int i = 0;
+            for (SizeType key : keys) {
+                r = m_pBlockMapping.R();
+                if (key < r) {
+                    if (m_pShardedLRUCache && m_pShardedLRUCache->get(key, values[i]))
+                    {
+                        blocks.push_back(nullptr);
+                        skips.push_back(0);
+                        reads.push_back(0);
+                    } else {
+                        AddressType* addr = (AddressType*)(At(key));
+                        blocks.push_back(addr);
+                        skips.push_back(i < (int)skipBytesPerKey.size() ? skipBytesPerKey[i] : 0);
+                        reads.push_back(i < (int)readBytesPerKey.size() ? readBytesPerKey[i] : 0);
+                    }
+                }
+                else {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Fail to read key:%d total key number:%d\n", key, r);
+                }
+                i++;
+            }
+            auto result = m_pBlockController.ReadBlocks(blocks, values, skips, reads, timeout, reqs);
             return result ? ErrorCode::Success : ErrorCode::Fail;
         }
 

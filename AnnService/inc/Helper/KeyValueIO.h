@@ -35,6 +35,16 @@ namespace SPTAG
                 return MultiGet(keys, values, timeout, reqs);
             }
 
+            // Optional byte-range variant: per-key, skip skipBytesPerKey[i] bytes (page-aligned)
+            // then read readBytesPerKey[i] bytes (page-aligned). Data lands at buffer[0].
+            // Default impl falls back to non-truncated MultiGet (safe but reads more).
+            virtual ErrorCode MultiGet(const std::vector<SizeType>& keys, std::vector<SPTAG::Helper::PageBuffer<std::uint8_t>>& values, const std::vector<std::uint32_t>& skipBytesPerKey, const std::vector<std::uint32_t>& readBytesPerKey, const std::chrono::microseconds& timeout, std::vector<Helper::AsyncReadRequest>* reqs)
+            {
+                (void)skipBytesPerKey;
+                (void)readBytesPerKey;
+                return MultiGet(keys, values, timeout, reqs);
+            }
+
             virtual ErrorCode MultiGet(const std::vector<SizeType>& keys, std::vector<std::string>* values, const std::chrono::microseconds& timeout, std::vector<Helper::AsyncReadRequest>* reqs) = 0;
 
             virtual ErrorCode MultiGet(const std::vector<std::string>& keys, std::vector<std::string>* values, const std::chrono::microseconds &timeout, std::vector<Helper::AsyncReadRequest>* reqs) { return ErrorCode::Undefined; }            

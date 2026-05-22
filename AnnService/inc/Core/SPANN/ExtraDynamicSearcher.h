@@ -18,6 +18,7 @@
 #include "ExtraFileController.h"
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <cmath>
 #include <cstring>
@@ -26,6 +27,9 @@
 #include <numeric>
 #include <utility>
 #include <random>
+#include <unordered_set>
+#include <unordered_map>
+#include <fstream>
 
 #ifdef SPDK
 #include "ExtraSPDKController.h"
@@ -197,6 +201,16 @@ namespace SPTAG::SPANN {
         COMMON::PostingSizeRecord m_postingPureCounts;
         bool m_hasPostingPureCounts = false;
 
+        // Segment-length sidecar: m_postingSegmentLengths[h * m_segmentN_sub + s] = # tail records
+        // for head h in subset s. Tail region per head is sorted by subset_id ascending.
+        std::vector<int32_t> m_postingSegmentLengths;
+        int m_segmentN_sub = 0;
+        bool m_hasPostingSegments = false;
+
+        // Tag→subset bitmask: for each tag value, which subsets contain a vector with that tag.
+        std::unordered_map<uint32_t, uint32_t> m_tagToSubsetMask;
+        bool m_hasTagSubsetMask = false;
+
         COMMON::Checksum m_checkSum;
         COMMON::Dataset<ChecksumType> m_checkSums;
 
@@ -228,6 +242,20 @@ namespace SPTAG::SPANN {
 
         void SetPrimaryNodeVectorAssignments(const std::vector<std::vector<SizeType>>& primaryNodeVectorAssignments) {
             m_primaryNodeVectorAssignments = primaryNodeVectorAssignments;
+        }
+
+        // --- Tag-aware unfilter-tail: subindex assignments + head-select callback ---
+        std::vector<int32_t> m_tailSubindex;
+        int m_tailSubindexN = 0;
+        std::function<void(const COMMON::Dataset<ValueType>&, const std::vector<SizeType>&, float, std::vector<int>&)> m_headSelectCb;
+
+        void SetTailSubindex(const std::vector<int32_t>& subIds, int N) {
+            m_tailSubindex = subIds;
+            m_tailSubindexN = N;
+        }
+        void SetHeadSelectCallback(
+            std::function<void(const COMMON::Dataset<ValueType>&, const std::vector<SizeType>&, float, std::vector<int>&)> cb) {
+            m_headSelectCb = std::move(cb);
         }
 
         void SetHeadVectorOwners(const std::unordered_map<SizeType, int>& headVectorOwners) {
@@ -285,6 +313,163 @@ namespace SPTAG::SPANN {
             if (!m_hasPostingPureCounts) return;
             std::string path = m_opt->m_indexDirectory + FolderSep + m_opt->m_postingPureCountsFile;
             m_postingPureCounts.Save(path);
+        }
+
+        // --- Segment-length sidecar ---
+        void LoadOrInitPostingSegmentLengths() {
+            std::string path = m_opt->m_indexDirectory + FolderSep + m_opt->m_postingSegmentLengthsFile;
+            if (fileexists(path.c_str())) {
+                std::ifstream fin(path, std::ios::binary);
+                if (fin) {
+                    int32_t numHeads = 0, nsub = 0;
+                    fin.read(reinterpret_cast<char*>(&numHeads), sizeof(int32_t));
+                    fin.read(reinterpret_cast<char*>(&nsub), sizeof(int32_t));
+                    if (fin && numHeads > 0 && nsub > 0 && nsub <= 32) {
+                        m_postingSegmentLengths.resize((size_t)numHeads * nsub);
+                        fin.read(reinterpret_cast<char*>(m_postingSegmentLengths.data()),
+                                 (std::streamsize)((size_t)numHeads * nsub * sizeof(int32_t)));
+                        if (fin) {
+                            m_segmentN_sub = nsub;
+                            m_hasPostingSegments = true;
+                            SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                                "Loaded posting_segment_lengths sidecar: numHeads=%d N_sub=%d\n",
+                                numHeads, nsub);
+                            return;
+                        }
+                    }
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Warning,
+                        "Failed to parse %s; segment scan disabled.\n", path.c_str());
+                }
+            }
+            m_hasPostingSegments = false;
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                "posting_segment_lengths sidecar not present; segment scan disabled.\n");
+        }
+        void SavePostingSegmentLengths() {
+            if (!m_hasPostingSegments || m_postingSegmentLengths.empty()) return;
+            std::string path = m_opt->m_indexDirectory + FolderSep + m_opt->m_postingSegmentLengthsFile;
+            std::ofstream fout(path, std::ios::binary);
+            if (!fout) {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Warning,
+                    "Cannot write posting_segment_lengths to %s\n", path.c_str());
+                return;
+            }
+            int32_t numHeads = (int32_t)(m_postingSegmentLengths.size() / (size_t)m_segmentN_sub);
+            int32_t nsub = (int32_t)m_segmentN_sub;
+            fout.write(reinterpret_cast<const char*>(&numHeads), sizeof(int32_t));
+            fout.write(reinterpret_cast<const char*>(&nsub), sizeof(int32_t));
+            fout.write(reinterpret_cast<const char*>(m_postingSegmentLengths.data()),
+                       (std::streamsize)(m_postingSegmentLengths.size() * sizeof(int32_t)));
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                "Saved posting_segment_lengths sidecar: numHeads=%d N_sub=%d path=%s\n",
+                numHeads, nsub, path.c_str());
+        }
+        inline int GetSegmentLength(SizeType h, int s) const {
+            if (!m_hasPostingSegments) return 0;
+            return m_postingSegmentLengths[(size_t)h * m_segmentN_sub + s];
+        }
+
+        // --- Tail subindex sidecar ---
+        void LoadOrInitTailSubindex() {
+            std::string path = m_opt->m_indexDirectory + FolderSep + m_opt->m_tailSubindexFile;
+            if (fileexists(path.c_str())) {
+                std::ifstream fin(path, std::ios::binary);
+                if (fin) {
+                    int32_t fullCount = 0, nsub = 0;
+                    fin.read(reinterpret_cast<char*>(&fullCount), sizeof(int32_t));
+                    fin.read(reinterpret_cast<char*>(&nsub), sizeof(int32_t));
+                    if (fin && fullCount > 0 && nsub > 0 && nsub <= 32) {
+                        m_tailSubindex.resize(fullCount);
+                        fin.read(reinterpret_cast<char*>(m_tailSubindex.data()),
+                                 (std::streamsize)((size_t)fullCount * sizeof(int32_t)));
+                        if (fin) {
+                            m_tailSubindexN = nsub;
+                            SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                                "Loaded tail_subindex sidecar: fullCount=%d N_sub=%d\n",
+                                fullCount, nsub);
+                            return;
+                        }
+                    }
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Warning,
+                        "Failed to parse %s; tail subindex not loaded.\n", path.c_str());
+                }
+            }
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                "tail_subindex sidecar not present; tail subindex empty.\n");
+        }
+        void SaveTailSubindex() {
+            if (m_tailSubindex.empty() || m_tailSubindexN <= 0) return;
+            std::string path = m_opt->m_indexDirectory + FolderSep + m_opt->m_tailSubindexFile;
+            std::ofstream fout(path, std::ios::binary);
+            if (!fout) {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Warning,
+                    "Cannot write tail_subindex to %s\n", path.c_str());
+                return;
+            }
+            int32_t fullCount = (int32_t)m_tailSubindex.size();
+            int32_t nsub = (int32_t)m_tailSubindexN;
+            fout.write(reinterpret_cast<const char*>(&fullCount), sizeof(int32_t));
+            fout.write(reinterpret_cast<const char*>(&nsub), sizeof(int32_t));
+            fout.write(reinterpret_cast<const char*>(m_tailSubindex.data()),
+                       (std::streamsize)((size_t)fullCount * sizeof(int32_t)));
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                "Saved tail_subindex sidecar: fullCount=%d N_sub=%d path=%s\n",
+                fullCount, nsub, path.c_str());
+        }
+
+        // --- Tag→subset mask sidecar ---
+        void LoadOrInitTagSubsetMask() {
+            std::string path = m_opt->m_indexDirectory + FolderSep + m_opt->m_tagSubsetMaskFile;
+            if (fileexists(path.c_str())) {
+                std::ifstream fin(path, std::ios::binary);
+                if (fin) {
+                    int32_t count = 0;
+                    fin.read(reinterpret_cast<char*>(&count), sizeof(int32_t));
+                    if (fin && count >= 0) {
+                        m_tagToSubsetMask.clear();
+                        m_tagToSubsetMask.reserve(count);
+                        bool ok = true;
+                        for (int i = 0; i < count; ++i) {
+                            uint32_t tag = 0, mask = 0;
+                            fin.read(reinterpret_cast<char*>(&tag), sizeof(uint32_t));
+                            fin.read(reinterpret_cast<char*>(&mask), sizeof(uint32_t));
+                            if (!fin) { ok = false; break; }
+                            m_tagToSubsetMask[tag] = mask;
+                        }
+                        if (ok) {
+                            m_hasTagSubsetMask = true;
+                            SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                                "Loaded tag_subset_mask sidecar: %d entries path=%s\n",
+                                count, path.c_str());
+                            return;
+                        }
+                    }
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Warning,
+                        "Failed to parse %s; tag subset mask disabled.\n", path.c_str());
+                }
+            }
+            m_hasTagSubsetMask = false;
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                "tag_subset_mask sidecar not present; tag subset mask disabled.\n");
+        }
+        void SaveTagSubsetMask() {
+            if (!m_hasTagSubsetMask || m_tagToSubsetMask.empty()) return;
+            std::string path = m_opt->m_indexDirectory + FolderSep + m_opt->m_tagSubsetMaskFile;
+            std::ofstream fout(path, std::ios::binary);
+            if (!fout) {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Warning,
+                    "Cannot write tag_subset_mask to %s\n", path.c_str());
+                return;
+            }
+            int32_t count = (int32_t)m_tagToSubsetMask.size();
+            fout.write(reinterpret_cast<const char*>(&count), sizeof(int32_t));
+            for (auto& [tag, mask] : m_tagToSubsetMask) {
+                fout.write(reinterpret_cast<const char*>(&tag), sizeof(uint32_t));
+                fout.write(reinterpret_cast<const char*>(&mask), sizeof(uint32_t));
+            }
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                "Saved tag_subset_mask sidecar: %d entries path=%s\n",
+                count, path.c_str());
         }
         // -----------------------------------------------------------------------
 
@@ -1886,6 +2071,9 @@ namespace SPTAG::SPANN {
 	    }
             // Unfilter-tail sidecar: load if present, fall back to pure=total.
             LoadOrInitPostingPureCounts();
+            LoadOrInitPostingSegmentLengths();
+            LoadOrInitTailSubindex();
+            LoadOrInitTagSubsetMask();
             if (m_opt->m_update) {
                 if (m_splitThreadPool == nullptr) {
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "SPFresh: initialize thread pools, append: %d, reassign %d\n", m_opt->m_appendThreadNum, m_opt->m_reassignThreadNum);
@@ -2031,15 +2219,116 @@ namespace SPTAG::SPANN {
                 p_exWorkSpace->m_queryTags != nullptr &&
                 p_exWorkSpace->m_numQueryTags > 0;
             const bool trackPostingStats = hasInlineTagFilter;
-            static const bool s_unfilterTailEnabled = []() {
-                const char* env = std::getenv("SPTAG_UNFILTER_TAIL");
-                return env && env[0] == '1';
+            // Search-side semantics: for tag-aware tail, unfilter CAPS to pure region
+            // (tail edges are tag-specific, not useful for unfiltered queries), while
+            // filtered queries READ the full posting (tail edges add tag-matched recall).
+            // For tag-agnostic tail (legacy): cap always to pure to avoid wasteful I/O.
+            const bool useUnfilterTail = m_hasPostingPureCounts && !hasInlineTagFilter;
+
+            // Pre-compute query subset mask for segment-aware tail scanning
+            uint32_t querySubsetMask = 0;
+            if (hasInlineTagFilter && m_hasPostingSegments && m_hasTagSubsetMask) {
+                for (int qi = 0; qi < p_exWorkSpace->m_numQueryTags; ++qi) {
+                    auto it = m_tagToSubsetMask.find(p_exWorkSpace->m_queryTags[qi]);
+                    if (it != m_tagToSubsetMask.end()) querySubsetMask |= it->second;
+                }
+            }
+            const uint32_t allSubsetBits = (m_segmentN_sub > 0 && m_segmentN_sub < 32)
+                ? ((1u << m_segmentN_sub) - 1) : 0xFFFFFFFFu;
+            const bool useSegmentedTailScan =
+                hasInlineTagFilter && m_hasPostingSegments && m_hasPostingPureCounts &&
+                querySubsetMask != 0 && querySubsetMask != allSubsetBits;
+
+            // Tail-only mode: when SPTAG_TAIL_ONLY_FILTER=1 and query hits exactly one subset,
+            // skip the pure region entirely and only read the matching subset's tail segment.
+            static const bool s_tailOnlyEnabled = []() -> bool {
+                const char* e = std::getenv("SPTAG_TAIL_ONLY_FILTER");
+                return e && e[0] == '1';
             }();
-            const bool useUnfilterTail =
-                s_unfilterTailEnabled && m_hasPostingPureCounts && hasInlineTagFilter;
+            static const bool s_purePlusSegEnabled = []() -> bool {
+                const char* e = std::getenv("SPTAG_PURE_PLUS_SEG_FILTER");
+                return e && e[0] == '1';
+            }();
+            const int querySubsetPopcount = querySubsetMask ? __builtin_popcount(querySubsetMask) : 0;
+            const bool useTailOnly = s_tailOnlyEnabled && hasInlineTagFilter &&
+                m_hasPostingSegments && m_hasPostingPureCounts &&
+                querySubsetMask != 0 && querySubsetPopcount == 1;
+            // Pure+seg-truncated mode: read [0, end_of_target_segment) only.
+            // Pure region scanned normally, tail segments AFTER the target one are dropped.
+            const bool usePurePlusSeg = !useTailOnly && s_purePlusSegEnabled && hasInlineTagFilter &&
+                m_hasPostingSegments && m_hasPostingPureCounts &&
+                querySubsetMask != 0 && querySubsetPopcount == 1;
+
+            // Per-posting skip/read byte arrays for tail-only IO.
+            std::vector<std::uint32_t> tailOnlySkipBytes, tailOnlyReadBytes;
+            // Per-posting metadata for scan loop: buf_inner_offset and seg_len in records.
+            struct TailOnlyMeta { size_t buf_inner_offset; int seg_len; };
+            std::vector<TailOnlyMeta> tailOnlyMeta;
+            if (useTailOnly) {
+                const int subset = __builtin_ctz(querySubsetMask); // lowest set bit = subset index
+                const size_t n = p_exWorkSpace->m_postingIDs.size();
+                tailOnlySkipBytes.resize(n, 0);
+                tailOnlyReadBytes.resize(n, 0);
+                tailOnlyMeta.resize(n, {0, 0});
+                for (size_t i = 0; i < n; ++i) {
+                    SizeType hid = p_exWorkSpace->m_postingIDs[i];
+                    int pureCount = m_postingPureCounts.GetSize(hid);
+                    if (pureCount < 0) pureCount = 0;
+                    size_t pure_bytes = (size_t)pureCount * m_vectorInfoSize;
+                    // Start of the target subset's segment within the tail.
+                    size_t seg_start_bytes = pure_bytes;
+                    for (int s = 0; s < subset; ++s)
+                        seg_start_bytes += (size_t)m_postingSegmentLengths[(size_t)hid * m_segmentN_sub + s] * m_vectorInfoSize;
+                    int seg_len = m_postingSegmentLengths[(size_t)hid * m_segmentN_sub + subset];
+                    if (seg_len < 0) seg_len = 0;
+                    size_t seg_end_bytes = seg_start_bytes + (size_t)seg_len * m_vectorInfoSize;
+                    // Page-align the byte range.
+                    std::uint32_t skip_aligned = (std::uint32_t)((seg_start_bytes / PageSize) * PageSize);
+                    std::uint32_t end_aligned  = (std::uint32_t)(((seg_end_bytes + PageSize - 1) / PageSize) * PageSize);
+                    std::uint32_t read_bytes   = end_aligned - skip_aligned;
+                    // Offset within the returned buffer where the segment data begins.
+                    size_t buf_inner_offset = seg_start_bytes - skip_aligned;
+                    tailOnlySkipBytes[i] = skip_aligned;
+                    tailOnlyReadBytes[i] = read_bytes;
+                    tailOnlyMeta[i] = {buf_inner_offset, seg_len};
+                }
+            }
 
             ErrorCode mgErr;
-            if (useUnfilterTail) {
+            if (useTailOnly) {
+                mgErr = db->MultiGet(p_exWorkSpace->m_postingIDs,
+                                     p_exWorkSpace->m_pageBuffers,
+                                     tailOnlySkipBytes,
+                                     tailOnlyReadBytes,
+                                     remainLimit,
+                                     &(p_exWorkSpace->m_diskRequests));
+            } else if (usePurePlusSeg) {
+                // Read [0, end_of_target_segment) page-aligned. Pure + segments [0..target] arrive;
+                // later segments dropped. Scan loop (useSegmentedTailScan path) already handles
+                // pure + target-segment scanning correctly.
+                const int subset = __builtin_ctz(querySubsetMask);
+                const size_t n = p_exWorkSpace->m_postingIDs.size();
+                std::vector<std::uint32_t> maxBytes(n, 0);
+                for (size_t i = 0; i < n; ++i) {
+                    SizeType hid = p_exWorkSpace->m_postingIDs[i];
+                    int pureCount = m_postingPureCounts.GetSize(hid);
+                    if (pureCount < 0) pureCount = 0;
+                    size_t end_bytes = (size_t)pureCount * m_vectorInfoSize;
+                    for (int s = 0; s <= subset; ++s) {
+                        int sl = m_postingSegmentLengths[(size_t)hid * m_segmentN_sub + s];
+                        if (sl > 0) end_bytes += (size_t)sl * m_vectorInfoSize;
+                    }
+                    // Page-align up; cap at uint32 max.
+                    size_t aligned = ((end_bytes + PageSize - 1) / PageSize) * PageSize;
+                    if (aligned > 0xFFFFFFFFULL) aligned = 0xFFFFFFFFULL;
+                    maxBytes[i] = (std::uint32_t)aligned;
+                }
+                mgErr = db->MultiGet(p_exWorkSpace->m_postingIDs,
+                                     p_exWorkSpace->m_pageBuffers,
+                                     maxBytes,
+                                     remainLimit,
+                                     &(p_exWorkSpace->m_diskRequests));
+            } else if (useUnfilterTail) {
                 // Build per-posting byte cap = pure_count * vectorInfoSize.
                 // Block layer rounds up to ceil(cap / PageSize) blocks.
                 std::vector<std::uint32_t> maxBytes(p_exWorkSpace->m_postingIDs.size(), 0);
@@ -2080,10 +2369,74 @@ namespace SPTAG::SPANN {
                 auto& buffer = (p_exWorkSpace->m_pageBuffers[pi]);
                 char* p_postingListFullData = (char*)(buffer.GetBuffer());
                 int vectorNum = (int)(buffer.GetAvailableSize() / m_vectorInfoSize);
-                int scanLimit = vectorNum;
+
+                // Tail-only path: the buffer contains only the matching subset's segment
+                // (page-aligned). The pure region was not read. Scan directly.
+                if (useTailOnly) {
+                    const TailOnlyMeta& meta = tailOnlyMeta[pi];
+                    const int seg_len = meta.seg_len;
+                    char* seg_start = p_postingListFullData + meta.buf_inner_offset;
+                    listElements += seg_len;
+                    diskIO += ((buffer.GetAvailableSize() + PageSize - 1) >> PageSizeEx);
+                    diskRead += (int)(buffer.GetAvailableSize());
+                    int realNum = seg_len;
+                    bool postingHasExactMatch = false;
+                    auto compStart = std::chrono::high_resolution_clock::now();
+                    for (int i = 0; i < seg_len; i++) {
+                        char* vectorInfo = seg_start + i * m_vectorInfoSize;
+                        int vectorID = *(reinterpret_cast<int*>(vectorInfo));
+                        if (m_versionMap->Deleted(vectorID)) {
+                            realNum--;
+                            listElements--;
+                            continue;
+                        }
+                        bool tagMatch = false;
+                        const uint32_t* vecTags = reinterpret_cast<const uint32_t*>(vectorInfo + sizeof(int) + sizeof(uint8_t));
+                        for (int ti = 0; ti < m_numTagsPerVec && !tagMatch; ti++) {
+                            for (int qi = 0; qi < p_exWorkSpace->m_numQueryTags && !tagMatch; qi++) {
+                                if (vecTags[ti] == p_exWorkSpace->m_queryTags[qi]) tagMatch = true;
+                            }
+                        }
+                        if (trackPostingStats) {
+                            ++p_exWorkSpace->m_postingProbeStats.m_scannedVectors;
+                            if (tagMatch) ++p_exWorkSpace->m_postingProbeStats.m_matchedVectors;
+                        }
+                        if (tagMatch) postingHasExactMatch = true;
+                        if (p_exWorkSpace->m_deduper.CheckAndSet(vectorID)) {
+                            listElements--;
+                            continue;
+                        }
+                        if (!tagMatch) {
+                            listElements--;
+                            continue;
+                        }
+                        auto distance2leaf = p_index->ComputeDistance(queryResults.GetQuantizedTarget(), vectorInfo + m_metaDataSize);
+                        queryResults.AddPoint(vectorID, distance2leaf);
+                    }
+                    if (trackPostingStats && postingHasExactMatch)
+                        ++p_exWorkSpace->m_postingProbeStats.m_matchedPostings;
+                    auto compEnd = std::chrono::high_resolution_clock::now();
+                    if (m_opt->m_update && m_opt->m_asyncMergeInSearch && m_splitThreadPool != nullptr && realNum <= m_mergeThreshold)
+                        MergeAsync(p_index.get(), curPostingID);
+                    compLatency += ((double)std::chrono::duration_cast<std::chrono::microseconds>(compEnd - compStart).count());
+                    // truth tracking not done in tail-only mode (segment-only read)
+                    continue;
+                }
+
+                // Compute pure region boundary
+                int pureCount = vectorNum;
+                if (m_hasPostingPureCounts) {
+                    int p = m_postingPureCounts.GetSize(curPostingID);
+                    if (p > 0 && p <= vectorNum) pureCount = p;
+                }
+                // Determine scan range for first loop
+                int scanEnd = vectorNum;
+                bool doSegmentedTail = false;
                 if (useUnfilterTail) {
-                    int pure = m_postingPureCounts.GetSize(curPostingID);
-                    if (pure > 0 && pure < scanLimit) scanLimit = pure;
+                    scanEnd = pureCount;  // cap to pure for unfilter queries
+                } else if (useSegmentedTailScan) {
+                    scanEnd = pureCount;  // pure region only; tail handled separately
+                    doSegmentedTail = true;
                 }
                 bool postingHasExactMatch = false;
 
@@ -2092,9 +2445,16 @@ namespace SPTAG::SPANN {
                 
                 //SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "DEBUG: postingList %d size:%d m_vectorInfoSize:%d vectorNum:%d\n", pi, (int)(postingList.size()), m_vectorInfoSize, vectorNum);
                 int realNum = vectorNum;
-                listElements += scanLimit;
+                listElements += scanEnd;
+                if (doSegmentedTail) {
+                    for (int s = 0; s < m_segmentN_sub; s++) {
+                        if (querySubsetMask & (1u << s)) {
+                            listElements += m_postingSegmentLengths[(size_t)curPostingID * m_segmentN_sub + s];
+                        }
+                    }
+                }
                 auto compStart = std::chrono::high_resolution_clock::now();
-                for (int i = 0; i < scanLimit; i++) {
+                for (int i = 0; i < scanEnd; i++) {
                     char* vectorInfo = p_postingListFullData + i * m_vectorInfoSize;
                     int vectorID = *(reinterpret_cast<int*>(vectorInfo));
 
@@ -2136,6 +2496,49 @@ namespace SPTAG::SPANN {
                     }
                     auto distance2leaf = p_index->ComputeDistance(queryResults.GetQuantizedTarget(), vectorInfo + m_metaDataSize);
                     queryResults.AddPoint(vectorID, distance2leaf);
+                }
+                // Segmented tail scan: only scan subsets matching the query's tag mask
+                if (doSegmentedTail) {
+                    int cursor = pureCount;
+                    for (int s = 0; s < m_segmentN_sub; s++) {
+                        int seg_len = m_postingSegmentLengths[(size_t)curPostingID * m_segmentN_sub + s];
+                        if (querySubsetMask & (1u << s)) {
+                            int segEnd = cursor + seg_len;
+                            if (segEnd > vectorNum) segEnd = vectorNum;
+                            for (int i = cursor; i < segEnd; i++) {
+                                char* vectorInfo = p_postingListFullData + i * m_vectorInfoSize;
+                                int vectorID = *(reinterpret_cast<int*>(vectorInfo));
+                                if (m_versionMap->Deleted(vectorID)) {
+                                    realNum--;
+                                    listElements--;
+                                    continue;
+                                }
+                                bool tagMatch = false;
+                                const uint32_t* vecTags = reinterpret_cast<const uint32_t*>(vectorInfo + sizeof(int) + sizeof(uint8_t));
+                                for (int ti = 0; ti < m_numTagsPerVec && !tagMatch; ti++) {
+                                    for (int qi = 0; qi < p_exWorkSpace->m_numQueryTags && !tagMatch; qi++) {
+                                        if (vecTags[ti] == p_exWorkSpace->m_queryTags[qi]) tagMatch = true;
+                                    }
+                                }
+                                if (trackPostingStats) {
+                                    ++p_exWorkSpace->m_postingProbeStats.m_scannedVectors;
+                                    if (tagMatch) ++p_exWorkSpace->m_postingProbeStats.m_matchedVectors;
+                                }
+                                if (tagMatch) postingHasExactMatch = true;
+                                if (p_exWorkSpace->m_deduper.CheckAndSet(vectorID)) {
+                                    listElements--;
+                                    continue;
+                                }
+                                if (!tagMatch) {
+                                    listElements--;
+                                    continue;
+                                }
+                                auto distance2leaf = p_index->ComputeDistance(queryResults.GetQuantizedTarget(), vectorInfo + m_metaDataSize);
+                                queryResults.AddPoint(vectorID, distance2leaf);
+                            }
+                        }
+                        cursor += seg_len;
+                    }
                 }
                 if (trackPostingStats && postingHasExactMatch) {
                     ++p_exWorkSpace->m_postingProbeStats.m_matchedPostings;
@@ -2847,71 +3250,347 @@ namespace SPTAG::SPANN {
                     int tailRelaxLimit = relaxLimit + m_tailBufferSizeLimit;  // extra budget for unfilter-tail records
                     SizeType numHeadsLocal = p_headIndex->GetNumSamples();
 
-                    // Build a per-head set of vector-IDs already present in pure region,
-                    // for fast dup check. Memory: ~ sum(pure_count) * 8 bytes ≈ 400 MB worst case.
-                    // To keep it cheap, we instead do binary-search lookup on the sorted
-                    // `selections.m_selections` (sorted by node first).
-                    auto worker = [&]() {
-                        COMMON::QueryResultSet<ValueType> nearbyHeads(nullptr, k_replica);
-                        std::vector<Edge> local_appends;
-                        local_appends.reserve(4096);
-                        std::vector<int> local_inc;  // (head_id pairs flat: h0, h1, ...) per-head inc accumulator
-                        std::vector<uint32_t> local_head_incs(numHeadsLocal, 0);
-                        const std::vector<Edge>& selsRef = selections.m_selections;
-                        size_t v;
-                        while (true) {
-                            v = vec_cursor.fetch_add(1);
-                            if (v >= (size_t)fullCount) break;
-                            // Skip if v is itself a head (it's already its own posting member)
-                            // — those entries have no "base posting" and don't need a tail.
-                            if (headVectorIDS.count((SizeType)v)) continue;
+                    // Precompute per-head pure-region starts in selections.m_selections.
+                    // Phase 1-3 left m_selections sorted by (node, distance, tonode), with
+                    // contiguous runs per head; tail edges will be appended at the END,
+                    // outside the pure prefix. We snapshot starts here and use them as
+                    // immutable indices in workers, eliminating both the lower_bound cost
+                    // and the race against concurrent push_back.
+                    std::vector<size_t> pure_start_per_head(numHeadsLocal, 0);
+                    {
+                        size_t cur = 0;
+                        for (SizeType h = 0; h < numHeadsLocal; ++h) {
+                            // Locate first edge with .node == h using one global lower_bound
+                            // pass, done single-threaded here BEFORE any append.
+                            auto it = std::lower_bound(
+                                selections.m_selections.begin(),
+                                selections.m_selections.end(),
+                                (int)h, Selection::g_edgeComparer);
+                            pure_start_per_head[h] = (size_t)(it - selections.m_selections.begin());
+                            cur += (size_t)pure_count_per_head[h];
+                            (void)cur;
+                        }
+                    }
 
-                            const ValueType* vec_data = (const ValueType*)fullVectors->GetVector((SizeType)v);
-                            if (vec_data == nullptr) continue;
-                            nearbyHeads.SetTarget(vec_data, p_headIndex->m_pQuantizer);
-                            nearbyHeads.Reset();
-                            p_headIndex->SearchIndex(nearbyHeads);
-                            BasicResult* res = nearbyHeads.GetResults();
-                            for (int r = 0; r < k_replica; ++r) {
-                                SizeType h = res[r].VID;
-                                if (h < 0 || h >= numHeadsLocal) continue;
-                                // Dup check: scan pure region of head h's posting
-                                size_t lo = std::lower_bound(selsRef.begin(), selsRef.end(), (int)h,
-                                                              Selection::g_edgeComparer) - selsRef.begin();
-                                size_t pure_end = lo + (size_t)pure_count_per_head[h];
-                                bool dup = false;
-                                for (size_t k = lo; k < pure_end && k < selsRef.size(); ++k) {
-                                    if (selsRef[k].node != h) break;
-                                    if (selsRef[k].tonode == (SizeType)v) { dup = true; break; }
-                                }
-                                if (dup) { ++tail_skipped_dup; continue; }
-                                Edge e; e.node = h; e.tonode = (SizeType)v; e.distance = std::numeric_limits<float>::max();
-                                local_appends.push_back(e);
-                                ++local_head_incs[h];
+                    // Reserve enough capacity so that all tail push_backs fit without
+                    // triggering reallocation. Worst case: K_replica edges per non-head
+                    // vector. This makes the readers' index-based access safe against
+                    // concurrent push_back (no iterator invalidation since the underlying
+                    // array never moves).
+                    selections.m_selections.reserve(
+                        selections.m_selections.size() +
+                        (size_t)fullCount * (size_t)k_replica);
+
+                    // Per-head per-subset tail counter for fair cap allocation.
+                    const int N_sub_for_cap = m_tailSubindexN > 0 ? m_tailSubindexN : 1;
+                    std::vector<std::atomic<int>> postingTailSegLen(
+                        (size_t)numHeadsLocal * (size_t)N_sub_for_cap);
+                    for (auto& a : postingTailSegLen) a.store(0);
+
+                    // Per-subset cap. Default: divide existing tail buffer budget evenly.
+                    // m_tailBufferSizeLimit is already in record count units.
+                    // Env override: SPTAG_TAIL_SEGMENT_CAP=<int>
+                    int perSubsetTailCap;
+                    {
+                        const char* env_cap = std::getenv("SPTAG_TAIL_SEGMENT_CAP");
+                        if (env_cap && std::atoi(env_cap) > 0) {
+                            perSubsetTailCap = std::atoi(env_cap);
+                        } else {
+                            perSubsetTailCap = std::max(1, m_tailBufferSizeLimit / N_sub_for_cap);
+                        }
+                    }
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                        "Phase 4: per-subset tail cap = %d records (N_sub=%d, total tail buffer=%d)\n",
+                        perSubsetTailCap, N_sub_for_cap, m_tailBufferSizeLimit);
+
+                    // === Tag-aware mode: build per-subindex centroid data ===
+                    const bool useTagAwareTail =
+                        !m_tailSubindex.empty() && m_tailSubindexN > 0 && m_headSelectCb;
+                    const int N_sub = m_tailSubindexN;
+
+                    // Per-subindex centroid vectors (populated if useTagAwareTail)
+                    std::vector<std::vector<SizeType>>          centroid_vids;    // [S][i] = VID
+                    std::vector<std::vector<SizeType>>          centroid_mheads;  // [S][i] = mapped global head
+                    std::vector<std::vector<const ValueType*>>  centroid_vecs;    // [S][i] = data ptr
+
+                    if (useTagAwareTail) {
+                        // Build per-subindex subset lists
+                        std::vector<std::vector<SizeType>> subsetByS(N_sub);
+                        for (int v = 0; v < fullCount; ++v) {
+                            int S = (v < (int)m_tailSubindex.size()) ? m_tailSubindex[v] : -1;
+                            if (S >= 0 && S < N_sub) subsetByS[S].push_back((SizeType)v);
+                        }
+
+                        // Wrap fullVectors as a Dataset for the BKTree callback.
+                        // shareOwnership=true: Dataset does NOT own or copy the memory.
+                        SizeType fCount = fullVectors->Count();
+                        COMMON::Dataset<ValueType> fullDataset(
+                            fCount, m_opt->m_dim,
+                            fCount, fCount + 1,
+                            (ValueType*)fullVectors->GetData(), /*shareOwnership=*/true);
+
+                        centroid_vids.resize(N_sub);
+                        centroid_mheads.resize(N_sub);
+                        centroid_vecs.resize(N_sub);
+
+                        for (int S = 0; S < N_sub; ++S) {
+                            if (subsetByS[S].empty()) continue;
+                            std::vector<int> raw_centroids;
+                            m_headSelectCb(fullDataset, subsetByS[S],
+                                           (float)m_opt->m_ratio, raw_centroids);
+
+                            int nc = (int)raw_centroids.size();
+                            centroid_vids[S].resize(nc);
+                            centroid_mheads[S].assign(nc, (SizeType)-1);
+                            centroid_vecs[S].assign(nc, nullptr);
+
+                            // Map each centroid to its nearest global head (parallelised)
+                            #pragma omp parallel for schedule(dynamic, 16)
+                            for (int ci = 0; ci < nc; ++ci) {
+                                SizeType cvid = (SizeType)raw_centroids[ci];
+                                centroid_vids[S][ci] = cvid;
+                                const ValueType* cvec =
+                                    (const ValueType*)fullVectors->GetVector(cvid);
+                                centroid_vecs[S][ci] = cvec;
+                                if (!cvec) continue;
+                                COMMON::QueryResultSet<ValueType> headQ(cvec, 1);
+                                headQ.Reset();
+                                p_headIndex->SearchIndex(headQ);
+                                BasicResult* r = headQ.GetResults();
+                                centroid_mheads[S][ci] = (r[0].VID >= 0) ? r[0].VID : (SizeType)-1;
                             }
-                            if (local_appends.size() >= 4096) {
+
+                            SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                                "Phase 4 subindex S=%d: subset=%zu centroids=%d\n",
+                                S, subsetByS[S].size(), nc);
+                        }
+                    }
+
+                    // === Worker: tag-aware or tag-agnostic ===
+                    std::function<void()> worker;
+
+                    if (useTagAwareTail) {
+                        worker = [&]() {
+                            std::vector<Edge> local_appends;
+                            local_appends.reserve(4096);
+                            const std::vector<Edge>& selsRef = selections.m_selections;
+                            size_t v;
+                            while (true) {
+                                v = vec_cursor.fetch_add(1);
+                                if (v >= (size_t)fullCount) break;
+                                if (headVectorIDS.count((SizeType)v)) continue;
+                                int S = (v < m_tailSubindex.size())
+                                            ? m_tailSubindex[v] : -1;
+                                if (S < 0 || S >= N_sub) continue;
+
+                                const ValueType* vvec =
+                                    (const ValueType*)fullVectors->GetVector((SizeType)v);
+                                if (!vvec) continue;
+
+                                const auto& cvids  = centroid_vids[S];
+                                const auto& cvecs  = centroid_vecs[S];
+                                const auto& mheads = centroid_mheads[S];
+                                int nc = (int)cvids.size();
+                                if (nc == 0) continue;
+
+                                // Brute-force distance to all centroids in this subindex
+                                std::vector<std::pair<float, int>> distIdx;
+                                distIdx.reserve(nc);
+                                for (int ci = 0; ci < nc; ++ci) {
+                                    if (cvids[ci] == (SizeType)v) continue;
+                                    if (!cvecs[ci]) continue;
+                                    float d = (float)p_headIndex->ComputeDistance(
+                                                  (const void*)vvec, (const void*)cvecs[ci]);
+                                    distIdx.emplace_back(d, ci);
+                                }
+
+                                int topK = std::min(k_replica * 2, (int)distIdx.size());
+                                if (topK <= 0) continue;
+                                std::nth_element(distIdx.begin(),
+                                                 distIdx.begin() + topK,
+                                                 distIdx.end());
+                                distIdx.resize(topK);
+                                std::sort(distIdx.begin(), distIdx.end());
+
+                                std::unordered_set<SizeType> chosen;
+                                for (auto& [d, ci] : distIdx) {
+                                    if ((int)chosen.size() >= k_replica) break;
+                                    SizeType h_c = mheads[ci];
+                                    if (h_c < 0 || h_c >= numHeadsLocal) continue;
+                                    if (chosen.count(h_c)) continue;
+                                    // Dedup vs pure region snapshot
+                                    size_t lo = pure_start_per_head[h_c];
+                                    size_t pure_end = lo + (size_t)pure_count_per_head[h_c];
+                                    bool dup = false;
+                                    for (size_t ki = lo; ki < pure_end; ++ki) {
+                                        if (selsRef[ki].node != h_c) break;
+                                        if (selsRef[ki].tonode == (SizeType)v) {
+                                            dup = true; break;
+                                        }
+                                    }
+                                    if (dup) { ++tail_skipped_dup; continue; }
+                                    // Optimistic per-subset cap check (no lock, authoritative at flush)
+                                    {
+                                        int curSegLen = postingTailSegLen[(size_t)h_c * N_sub_for_cap + S]
+                                                            .load(std::memory_order_relaxed);
+                                        if (curSegLen >= perSubsetTailCap) { ++tail_skipped_cap; continue; }
+                                    }
+                                    chosen.insert(h_c);
+                                    Edge e;
+                                    e.node = h_c; e.tonode = (SizeType)v;
+                                    // Encode subset_id in distance so tail sorts by subset
+                                    e.distance = (float)(1e30 + S);
+                                    local_appends.push_back(e);
+                                }
+
+                                if (local_appends.size() >= 4096) {
+                                    std::lock_guard<std::mutex> lk(append_mtx);
+                                    for (auto& e : local_appends) {
+                                        int s_e = (e.tonode < (SizeType)m_tailSubindex.size())
+                                                      ? m_tailSubindex[e.tonode] : 0;
+                                        if (s_e < 0 || s_e >= N_sub_for_cap) s_e = 0;
+                                        int cur_sub = postingTailSegLen[(size_t)e.node * N_sub_for_cap + s_e]
+                                                          .fetch_add(1, std::memory_order_relaxed);
+                                        if (cur_sub >= perSubsetTailCap) {
+                                            postingTailSegLen[(size_t)e.node * N_sub_for_cap + s_e]
+                                                .fetch_sub(1, std::memory_order_relaxed);
+                                            ++tail_skipped_cap; continue;
+                                        }
+                                        if (postingListSize[e.node].load() >= tailRelaxLimit) {
+                                            postingTailSegLen[(size_t)e.node * N_sub_for_cap + s_e]
+                                                .fetch_sub(1, std::memory_order_relaxed);
+                                            ++tail_skipped_cap; continue;
+                                        }
+                                        selections.m_selections.push_back(e);
+                                        ++postingListSize[e.node];
+                                        ++tail_added;
+                                    }
+                                    local_appends.clear();
+                                }
+                            }
+                            if (!local_appends.empty()) {
                                 std::lock_guard<std::mutex> lk(append_mtx);
                                 for (auto& e : local_appends) {
-                                    int cur = postingListSize[e.node].load();
-                                    if (cur >= tailRelaxLimit) { ++tail_skipped_cap; continue; }
+                                    int s_e = (e.tonode < (SizeType)m_tailSubindex.size())
+                                                  ? m_tailSubindex[e.tonode] : 0;
+                                    if (s_e < 0 || s_e >= N_sub_for_cap) s_e = 0;
+                                    int cur_sub = postingTailSegLen[(size_t)e.node * N_sub_for_cap + s_e]
+                                                      .fetch_add(1, std::memory_order_relaxed);
+                                    if (cur_sub >= perSubsetTailCap) {
+                                        postingTailSegLen[(size_t)e.node * N_sub_for_cap + s_e]
+                                            .fetch_sub(1, std::memory_order_relaxed);
+                                        ++tail_skipped_cap; continue;
+                                    }
+                                    if (postingListSize[e.node].load() >= tailRelaxLimit) {
+                                        postingTailSegLen[(size_t)e.node * N_sub_for_cap + s_e]
+                                            .fetch_sub(1, std::memory_order_relaxed);
+                                        ++tail_skipped_cap; continue;
+                                    }
                                     selections.m_selections.push_back(e);
                                     ++postingListSize[e.node];
                                     ++tail_added;
                                 }
-                                local_appends.clear();
                             }
-                        }
-                        if (!local_appends.empty()) {
-                            std::lock_guard<std::mutex> lk(append_mtx);
-                            for (auto& e : local_appends) {
-                                int cur = postingListSize[e.node].load();
-                                if (cur >= tailRelaxLimit) { ++tail_skipped_cap; continue; }
-                                selections.m_selections.push_back(e);
-                                ++postingListSize[e.node];
-                                ++tail_added;
+                        };
+                    } else {
+                        // Tag-agnostic fallback: K nearest global heads per base vector
+                        worker = [&]() {
+                            COMMON::QueryResultSet<ValueType> nearbyHeads(nullptr, k_replica);
+                            std::vector<Edge> local_appends;
+                            local_appends.reserve(4096);
+                            const std::vector<Edge>& selsRef = selections.m_selections;
+                            size_t v;
+                            while (true) {
+                                v = vec_cursor.fetch_add(1);
+                                if (v >= (size_t)fullCount) break;
+                                // Skip if v is itself a head (it's already its own posting member)
+                                // — those entries have no "base posting" and don't need a tail.
+                                if (headVectorIDS.count((SizeType)v)) continue;
+
+                                const ValueType* vec_data = (const ValueType*)fullVectors->GetVector((SizeType)v);
+                                if (vec_data == nullptr) continue;
+                                nearbyHeads.SetTarget(vec_data, p_headIndex->m_pQuantizer);
+                                nearbyHeads.Reset();
+                                p_headIndex->SearchIndex(nearbyHeads);
+                                BasicResult* res = nearbyHeads.GetResults();
+                                for (int r = 0; r < k_replica; ++r) {
+                                    SizeType h = res[r].VID;
+                                    if (h < 0 || h >= numHeadsLocal) continue;
+                                    // Dup check against the immutable pure region snapshot.
+                                    size_t lo = pure_start_per_head[h];
+                                    size_t pure_end = lo + (size_t)pure_count_per_head[h];
+                                    bool dup = false;
+                                    for (size_t ki = lo; ki < pure_end; ++ki) {
+                                        // selsRef[ki].node may be != h ONLY for the tail of the
+                                        // last head in the legacy resize-padded array; defensively
+                                        // guard with the break.
+                                        if (selsRef[ki].node != h) break;
+                                        if (selsRef[ki].tonode == (SizeType)v) { dup = true; break; }
+                                    }
+                                    if (dup) { ++tail_skipped_dup; continue; }
+                                    {
+                                        int Sv = (v < m_tailSubindex.size()) ? m_tailSubindex[v] : 0;
+                                        if (Sv < 0 || Sv >= N_sub_for_cap) Sv = 0;
+                                        // Optimistic per-subset cap check (no lock, authoritative at flush)
+                                        int curSegLenV = postingTailSegLen[(size_t)h * N_sub_for_cap + Sv]
+                                                             .load(std::memory_order_relaxed);
+                                        if (curSegLenV >= perSubsetTailCap) { ++tail_skipped_cap; continue; }
+                                        Edge e; e.node = h; e.tonode = (SizeType)v;
+                                        // Encode subset_id in distance so tail sorts by subset
+                                        e.distance = (float)(1e30 + Sv);
+                                        local_appends.push_back(e);
+                                    }
+                                }
+                                if (local_appends.size() >= 4096) {
+                                    std::lock_guard<std::mutex> lk(append_mtx);
+                                    for (auto& e : local_appends) {
+                                        int s_e = (e.tonode < (SizeType)m_tailSubindex.size())
+                                                      ? m_tailSubindex[e.tonode] : 0;
+                                        if (s_e < 0 || s_e >= N_sub_for_cap) s_e = 0;
+                                        int cur_sub = postingTailSegLen[(size_t)e.node * N_sub_for_cap + s_e]
+                                                          .fetch_add(1, std::memory_order_relaxed);
+                                        if (cur_sub >= perSubsetTailCap) {
+                                            postingTailSegLen[(size_t)e.node * N_sub_for_cap + s_e]
+                                                .fetch_sub(1, std::memory_order_relaxed);
+                                            ++tail_skipped_cap; continue;
+                                        }
+                                        if (postingListSize[e.node].load() >= tailRelaxLimit) {
+                                            postingTailSegLen[(size_t)e.node * N_sub_for_cap + s_e]
+                                                .fetch_sub(1, std::memory_order_relaxed);
+                                            ++tail_skipped_cap; continue;
+                                        }
+                                        selections.m_selections.push_back(e);
+                                        ++postingListSize[e.node];
+                                        ++tail_added;
+                                    }
+                                    local_appends.clear();
+                                }
                             }
-                        }
-                    };
+                            if (!local_appends.empty()) {
+                                std::lock_guard<std::mutex> lk(append_mtx);
+                                for (auto& e : local_appends) {
+                                    int s_e = (e.tonode < (SizeType)m_tailSubindex.size())
+                                                  ? m_tailSubindex[e.tonode] : 0;
+                                    if (s_e < 0 || s_e >= N_sub_for_cap) s_e = 0;
+                                    int cur_sub = postingTailSegLen[(size_t)e.node * N_sub_for_cap + s_e]
+                                                      .fetch_add(1, std::memory_order_relaxed);
+                                    if (cur_sub >= perSubsetTailCap) {
+                                        postingTailSegLen[(size_t)e.node * N_sub_for_cap + s_e]
+                                            .fetch_sub(1, std::memory_order_relaxed);
+                                        ++tail_skipped_cap; continue;
+                                    }
+                                    if (postingListSize[e.node].load() >= tailRelaxLimit) {
+                                        postingTailSegLen[(size_t)e.node * N_sub_for_cap + s_e]
+                                            .fetch_sub(1, std::memory_order_relaxed);
+                                        ++tail_skipped_cap; continue;
+                                    }
+                                    selections.m_selections.push_back(e);
+                                    ++postingListSize[e.node];
+                                    ++tail_added;
+                                }
+                            }
+                        };
+                    }
 
                     std::vector<std::thread> phase4_threads;
                     for (int t = 0; t < n_threads; ++t) phase4_threads.emplace_back(worker);
@@ -2921,8 +3600,27 @@ namespace SPTAG::SPANN {
                                  "Phase 4 done: tail_added=%zu tail_skipped_dup=%zu tail_skipped_cap=%zu\n",
                                  tail_added.load(), tail_skipped_dup.load(), tail_skipped_cap.load());
 
-                    // Re-sort: tail edges have dist=FLT_MAX so they end up at the END
-                    // of each head's posting region.
+                    // Histogram of per-subset segment lengths for diagnostic
+                    {
+                        std::vector<int64_t> segLenHist((size_t)perSubsetTailCap + 2, 0);
+                        for (auto& a : postingTailSegLen) {
+                            int val = a.load();
+                            if (val < (int)segLenHist.size()) segLenHist[val]++;
+                            else segLenHist.back()++;
+                        }
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                            "Phase 4 per-subset segment-length histogram (first 10 buckets):\n");
+                        for (int i = 0; i < 10 && i < (int)segLenHist.size(); ++i) {
+                            SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                                "  segLen=%d: count=%lld\n", i, (long long)segLenHist[i]);
+                        }
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                            "  segLen>=cap(%d): count=%lld\n",
+                            perSubsetTailCap, (long long)segLenHist.back());
+                    }
+
+                    // Re-sort: tail edges have dist encoded as 1e30+subset_id, so they
+                    // end up at the END of each head's posting region, sorted by subset.
                     VectorIndex::SortSelections(&selections.m_selections);
 
                     // Initialize pure_counts sidecar (will be persisted at save).
@@ -2932,6 +3630,47 @@ namespace SPTAG::SPANN {
                         m_postingPureCounts.UpdateSize((SizeType)h, pure_count_per_head[h]);
                     }
                     m_hasPostingPureCounts = true;
+
+                    // Compute per-head per-subset segment lengths from sorted tail edges.
+                    if (!m_tailSubindex.empty() && m_tailSubindexN > 0) {
+                        SizeType numH = (SizeType)postingListSize.size();
+                        m_postingSegmentLengths.assign((size_t)numH * m_tailSubindexN, 0);
+                        m_segmentN_sub = m_tailSubindexN;
+                        for (auto& e : selections.m_selections) {
+                            if (e.distance < 1e29f) continue;  // pure edge
+                            SizeType h = e.node;
+                            if (h < 0 || h >= numH) continue;
+                            SizeType vv = e.tonode;
+                            int S = (vv < (SizeType)m_tailSubindex.size()) ? m_tailSubindex[vv] : 0;
+                            if (S < 0 || S >= m_tailSubindexN) S = 0;
+                            m_postingSegmentLengths[(size_t)h * m_tailSubindexN + S]++;
+                        }
+                        m_hasPostingSegments = true;
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                            "Computed posting segment lengths: numHeads=%d N_sub=%d\n",
+                            (int)numH, m_tailSubindexN);
+                    }
+
+                    // Build tag→subset bitmask from vector tag assignments.
+                    if (!m_tailSubindex.empty() && m_tailSubindexN > 0 && m_numTagsPerVec > 0 && !m_vectorTags.empty()) {
+                        std::unordered_map<uint32_t, uint32_t> tagMask;
+                        tagMask.reserve(1 << 16);
+                        for (int v = 0; v < fullCount; ++v) {
+                            if (v >= (int)m_tailSubindex.size()) continue;
+                            int S = m_tailSubindex[v];
+                            if (S < 0 || S >= m_tailSubindexN) continue;
+                            uint32_t bit = (1u << S);
+                            for (int t = 0; t < m_numTagsPerVec; ++t) {
+                                uint32_t tag = m_vectorTags[(size_t)v * m_numTagsPerVec + t];
+                                if (tag != 0) tagMask[tag] |= bit;
+                            }
+                        }
+                        m_tagToSubsetMask = std::move(tagMask);
+                        m_hasTagSubsetMask = !m_tagToSubsetMask.empty();
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                            "Built tag_subset_mask: %zu distinct tags\n",
+                            m_tagToSubsetMask.size());
+                    }
                 }
             }
             // ====================================================================
@@ -2991,6 +3730,9 @@ namespace SPTAG::SPANN {
             m_postingSizes.Save(m_opt->m_indexDirectory + FolderSep + m_opt->m_ssdInfoFile);
             m_checkSums.Save(m_opt->m_indexDirectory + FolderSep + m_opt->m_checksumFile);
             SavePostingPureCounts();
+            SavePostingSegmentLengths();
+            SaveTailSubindex();
+            SaveTagSubsetMask();
 
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "SPFresh: save versionMap\n");
             m_versionMap->Save(m_opt->m_indexDirectory + FolderSep + m_opt->m_deleteIDFile);
@@ -3265,6 +4007,12 @@ namespace SPTAG::SPANN {
                 if ((ret = m_postingPureCounts.Save(p_pureCountsPath)) != ErrorCode::Success)
                     return ret;
             }
+
+            if (m_hasPostingSegments) {
+                SavePostingSegmentLengths();
+            }
+            SaveTailSubindex();
+            SaveTagSubsetMask();
 
             if ((ret = db->Checkpoint(prefix)) != ErrorCode::Success)
                 return ret;

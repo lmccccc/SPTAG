@@ -531,6 +531,137 @@ bool FileIO::BlockController::ReadBlocks(const std::vector<AddressType *> &p_dat
     return true;
 }
 
+// Byte-range variant: for each posting i, skip the first skipBytesPerKey[i] bytes (page-aligned)
+// and read only readBytesPerKey[i] bytes (page-aligned). Data is written to the page buffer
+// starting at offset 0, so the caller can index it directly. Both skip and read must be
+// multiples of PageSize (4096). 0 skip = read from start.
+//
+// Key invariant: we emit exactly numPages requests per posting (same as the other batch
+// variants), so the flat request array never overflows. Skipped physical pages simply
+// advance dataIdx without consuming a request slot.
+bool FileIO::BlockController::ReadBlocks(
+    const std::vector<AddressType *> &p_data,
+    std::vector<Helper::PageBuffer<std::uint8_t>> &p_values,
+    const std::vector<std::uint32_t> &skipBytesPerKey,
+    const std::vector<std::uint32_t> &readBytesPerKey,
+    const std::chrono::microseconds &timeout,
+    std::vector<Helper::AsyncReadRequest> *reqs)
+{
+    m_batchReadTimes++;
+    std::uint32_t reqcount = 0;
+    std::uint32_t emptycount = 0;
+
+    for (size_t i = 0; i < p_data.size(); i++)
+    {
+        AddressType *p_data_i = p_data[i];
+        int numPages = (p_values[i].GetPageSize() >> PageSizeEx);
+
+        if (p_data_i == nullptr || (uintptr_t)p_data_i == 0xffffffffffffffff)
+        {
+            if (p_data_i != nullptr) p_values[i].SetAvailableSize(0);
+            for (int r = 0; r < numPages; r++)
+            {
+                Helper::AsyncReadRequest &curr = reqs->at(reqcount);
+                curr.m_readSize = 0;
+                reqcount++;
+                emptycount++;
+            }
+            continue;
+        }
+
+        std::size_t postingSize = (std::size_t)p_data_i[0];
+        std::uint32_t skip = (i < skipBytesPerKey.size()) ? skipBytesPerKey[i] : 0;
+        std::uint32_t readLen = (i < readBytesPerKey.size()) ? readBytesPerKey[i] : 0;
+
+        // Cap posting size to skip + readLen (both page-aligned).
+        if (readLen > 0)
+        {
+            std::size_t cap = (std::size_t)skip + (std::size_t)readLen;
+            if (cap < postingSize) postingSize = cap;
+        }
+
+        // Available bytes placed in the buffer starting at offset 0.
+        std::size_t availBytes = (postingSize > (std::size_t)skip) ? (postingSize - (std::size_t)skip) : 0;
+        p_values[i].SetAvailableSize(availBytes);
+
+        // Advance dataIdx past skipped pages WITHOUT emitting request slots.
+        // This keeps the per-posting request count == numPages.
+        AddressType dataIdx = 1;
+        {
+            AddressType skipOffset = 0;
+            while (skipOffset < (AddressType)skip && skipOffset < (AddressType)postingSize)
+            {
+                skipOffset += PageSize;
+                dataIdx++;
+            }
+        }
+
+        // Emit actual read requests into buffer slots 0, 1, ...
+        // The request at slot bufPage of posting i has its m_buffer pre-set to
+        // p_values[i].GetBuffer() + bufPage*PageSize, which is exactly where we want
+        // the data to land (starting at buffer[0] = first read page).
+        int bufPage = 0;
+        AddressType currOffset = (AddressType)skip;  // tracks position within posting
+        while (currOffset < (AddressType)postingSize)
+        {
+            if (bufPage >= numPages)
+            {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Error,
+                    "FileIO::BlockController::ReadBlocks(skip): bufPage (%d) >= numPages (%d)\n",
+                    bufPage, numPages);
+                break;
+            }
+            if (reqcount >= reqs->size())
+            {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                             "FileIO::BlockController::ReadBlocks(skip): req (%u) >= req array size (%u)\n",
+                             reqcount, (std::uint32_t)reqs->size());
+                return false;
+            }
+            Helper::AsyncReadRequest &curr = reqs->at(reqcount);
+            curr.m_readSize = (postingSize - currOffset) < PageSize
+                              ? (std::size_t)(postingSize - currOffset) : (std::size_t)PageSize;
+            curr.m_offset = p_data_i[dataIdx] * PageSize;
+            // m_buffer already points to p_values[i].GetBuffer() + bufPage*PageSize — correct.
+            currOffset += PageSize;
+            dataIdx++;
+            bufPage++;
+            reqcount++;
+        }
+
+        // Emit trailing empty request slots to fill out this posting's numPages block.
+        while (bufPage < numPages)
+        {
+            if (reqcount >= reqs->size())
+            {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                             "FileIO::BlockController::ReadBlocks(skip): req (%u) >= req array size (%u)\n",
+                             reqcount, (std::uint32_t)reqs->size());
+                return false;
+            }
+            Helper::AsyncReadRequest &curr = reqs->at(reqcount);
+            curr.m_readSize = 0;
+            bufPage++;
+            reqcount++;
+            emptycount++;
+        }
+    }
+
+    std::uint32_t totalReads = m_fileHandle->BatchReadFile(reqs->data(), reqcount, timeout, m_batchSize);
+    read_submit_vec += reqcount - emptycount;
+    read_complete_vec += totalReads;
+
+    if (totalReads < reqcount - emptycount)
+    {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Warning, "FileIO::BlockController::ReadBlocks(skip): %u < %u\n",
+                     totalReads, reqcount - emptycount);
+        m_batchReadTimeouts++;
+        return false;
+    }
+    return true;
+}
+
 bool FileIO::BlockController::WriteBlocks(AddressType *p_data, int p_size, const std::string &p_value,
                                           const std::chrono::microseconds &timeout,
                                           std::vector<Helper::AsyncReadRequest> *reqs)

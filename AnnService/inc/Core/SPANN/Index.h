@@ -99,6 +99,10 @@ namespace SPTAG
             std::vector<std::vector<SizeType>> m_pendingNodeHeadSelections;
             std::unordered_map<SizeType, int> m_pendingHeadVectorOwners;
 
+            // Tail-subindex members for tag-aware unfilter-tail routing
+            std::vector<int32_t> m_pendingTailSubindex;
+            int m_pendingTailSubindexN = 0;
+
  
 
         public:
@@ -134,6 +138,16 @@ namespace SPTAG
             {
                 m_pendingPrimaryNodeVectorAssignments = primaryNodeVectorAssignments;
             }
+
+            // Tag-aware unfilter-tail: store per-vector subindex assignments
+            void SetTailSubindex(const std::vector<int32_t>& subIds, int N) {
+                m_pendingTailSubindex = subIds;
+                m_pendingTailSubindexN = N;
+            }
+
+            // Build BKTree on a subset of vectors and run SelectHeadDynamically.
+            // Called via callback from ExtraDynamicSearcher during Phase 4 setup.
+            void SelectHeadsOnSubset(const COMMON::Dataset<T>& data, const std::vector<SizeType>& subset, float ratio, std::vector<int>& outHeads);
 
             // Shared-DB hook: when set BEFORE BuildIndex / LoadIndex, the
             // ExtraDynamicSearcher will reuse this KeyValueIO instead of opening

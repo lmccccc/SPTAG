@@ -1524,6 +1524,15 @@ void AnnIndex::SetPrimaryNodeVectorAssignments(const std::vector<std::vector<int
     spannIdx->SetPrimaryNodeVectorAssignments(convertedAssignments);
 }
 
+void AnnIndex::SetTailSubindex(const std::vector<int32_t>& subIds, int N)
+{
+    if (!m_index) return;
+    auto* spannIdx = dynamic_cast<SPTAG::SPANN::Index<float>*>(m_index.get());
+    if (spannIdx) {
+        spannIdx->SetTailSubindex(subIds, N);
+    }
+}
+
 bool AnnIndex::SetSharedDB(std::shared_ptr<SPTAG::Helper::KeyValueIO> p_db)
 {
     if (m_index == nullptr)
@@ -2061,6 +2070,59 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                 }
             }
 
+            // --- SPTAG_TAIL_SUBINDEX_N: tag-aware unfilter-tail routing ---
+            // Independent of the skipPivot gate above. Uses Huffman partitioning to
+            // split base vectors into N subindexes. Activated only when env var is set.
+            // NOTE: store result in locals; m_index is null here (created by SetBuildParam
+            // below), so we apply the subindex after m_index is initialized.
+            std::vector<int32_t> pendingSubIdPerVec;
+            int pendingSubN = 0;
+            {
+                const char* envN = std::getenv("SPTAG_TAIL_SUBINDEX_N");
+                int targetN = envN ? std::atoi(envN) : 0;
+                if (targetN > 0 && !tenantLocalTags.empty()) {
+                    PivotEstimatorComputation pc;
+                    if (BuildPivotEstimatorComputation(tenantLocalTags.data(),
+                                                       static_cast<int>(tenantVecCount),
+                                                       m_buildNumTagsPerVec,
+                                                       0, 0.99, 10.0, 1.0,
+                                                       std::string(), pc)) {
+                        // Pick candidate with nodeCount closest to targetN
+                        // (prefer >= targetN to avoid under-partitioning)
+                        const PivotEstimatorCandidate* picked = nullptr;
+                        int bestDiff = INT_MAX;
+                        for (const auto& cand : pc.candidates) {
+                            int diff = std::abs(cand.nodeCount - targetN);
+                            bool better = (diff < bestDiff) ||
+                                (diff == bestDiff && cand.nodeCount >= targetN &&
+                                 (!picked || picked->nodeCount < targetN));
+                            if (better) {
+                                picked = &cand;
+                                bestDiff = diff;
+                            }
+                        }
+                        if (picked) {
+                            std::vector<std::vector<int>> nodeVectors;
+                            BuildPrimaryNodeVectorAssignmentsForCandidate(
+                                *picked, tenantLocalTags.data(),
+                                static_cast<int>(tenantVecCount),
+                                m_buildNumTagsPerVec, nodeVectors);
+                            pendingSubIdPerVec.assign(tenantVecCount, -1);
+                            for (int nid = 0; nid < (int)nodeVectors.size(); ++nid) {
+                                for (int vid : nodeVectors[nid]) {
+                                    if (vid >= 0 && vid < tenantVecCount)
+                                        pendingSubIdPerVec[vid] = nid;
+                                }
+                            }
+                            pendingSubN = (int)nodeVectors.size();
+                            fprintf(stderr,
+                                    "[INFO] Tenant %d: tail-subindex N=%d (target=%d)\n",
+                                    tenantId, pendingSubN, targetN);
+                        }
+                    }
+                }
+            }
+
             auto planIt = m_tenantPlannedNodeVectors.find(tenantId);
             auto primaryPlanIt = m_tenantPlannedPrimaryNodeVectors.find(tenantId);
             bool hasNodeAwarePlan = (planIt != m_tenantPlannedNodeVectors.end() && !planIt->second.empty());
@@ -2143,6 +2205,10 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             if (!tenantLocalTags.empty()) {
                 tenantIndex->SetBuildParam("NumTagsPerVec", std::to_string(m_buildNumTagsPerVec).c_str(), "BuildSSDIndex");
                 tenantIndex->SetVectorTags(tenantLocalTags.data(), tenantVecCount, m_buildNumTagsPerVec);
+            }
+            // Apply tail subindex now that m_index is initialized (SetBuildParam above created it)
+            if (!pendingSubIdPerVec.empty() && pendingSubN > 0) {
+                tenantIndex->SetTailSubindex(pendingSubIdPerVec, pendingSubN);
             }
             if (hasNodeAwarePlan) {
                 tenantIndex->SetNodeVectorAssignments(planIt->second);

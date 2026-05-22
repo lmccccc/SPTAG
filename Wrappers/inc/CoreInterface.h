@@ -110,6 +110,9 @@ public:
     // Set build-time primary node ownership for SPANN head construction
     void SetPrimaryNodeVectorAssignments(const std::vector<std::vector<int>>& primaryNodeVectorAssignments);
 
+    // Set per-vector subindex assignments for tag-aware unfilter-tail routing
+    void SetTailSubindex(const std::vector<int32_t>& subIds, int N);
+
     // Wrap an already-built/loaded VectorIndex (used internally and by
     // TenantIndexManager when injecting a shared RocksDB during load).
     AnnIndex(const std::shared_ptr<SPTAG::VectorIndex>& p_index);
