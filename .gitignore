@@ -58,6 +58,7 @@ dkms.conf
 /Wrappers/inc/*.py
 /Wrappers/inc/*.java
 /.vs
+/.venv
 /obj
 /x64
 /build
