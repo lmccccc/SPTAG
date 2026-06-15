@@ -1002,8 +1002,6 @@ template <typename T> ErrorCode Index<T>::LoadIndexDataFromMemory(const std::vec
         return ErrorCode::Fail;
 
     m_index->SetParameter("NumberOfThreads", std::to_string(m_options.m_iSSDNumberOfThreads));
-    // m_index->SetParameter("MaxCheck", std::to_string(m_options.m_maxCheck));
-    // m_index->SetParameter("HashTableExponent", std::to_string(m_options.m_hashExp));
     m_index->UpdateIndex();
     m_index->SetReady(true);
 
@@ -1911,8 +1909,6 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         for (int i = 0; i < p_query.GetResultNum(); ++i)
         {
             SizeType result = p_query.GetResult(i)->VID;
-            // if (result > m_pMetadata->Count()) SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "vid return is beyond the
-            // metadata set:(%d > (%d, %d))\n", result, GetNumSamples(), m_pMetadata->Count());
             p_query.SetMetadata(i, (result < 0) ? ByteArray::c_empty : m_pMetadata->GetMetadataCopy(result));
         }
     }
@@ -2187,11 +2183,8 @@ ErrorCode Index<T>::SearchDiskIndexIterative(QueryResult &p_headQuery, QueryResu
     if (extraWorkspace->m_loadPosting)
     {
         COMMON::QueryResultSet<T> *p__headQueryResults = (COMMON::QueryResultSet<T> *)&p_headQuery;
-        // std::shared_ptr<ExtraWorkSpace> workSpace = m_workSpacePool->Rent();
-        // workSpace->m_deduper.clear();
         extraWorkspace->m_postingIDs.clear();
 
-        // float limitDist = p_queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio;
         const int postingOffset = m_options.m_postingOffset;
 
         for (int i = 0; i < p__headQueryResults->GetResultNum(); ++i)

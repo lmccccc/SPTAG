@@ -1476,28 +1476,36 @@ void AnnIndex::SetVectorTags(const uint32_t* tags, int numVecs, int numTagsPerVe
     }
 }
 
+namespace
+{
+    std::vector<std::vector<SPTAG::SizeType>> ConvertNodeVectorAssignments(
+        const std::vector<std::vector<int>>& nodeVectorAssignments)
+    {
+        std::vector<std::vector<SPTAG::SizeType>> convertedAssignments;
+        convertedAssignments.reserve(nodeVectorAssignments.size());
+        for (const auto& nodeVectors : nodeVectorAssignments)
+        {
+            std::vector<SPTAG::SizeType> convertedNode;
+            convertedNode.reserve(nodeVectors.size());
+            for (int vectorId : nodeVectors)
+            {
+                if (vectorId >= 0) {
+                    convertedNode.push_back(static_cast<SPTAG::SizeType>(vectorId));
+                }
+            }
+            convertedAssignments.emplace_back(std::move(convertedNode));
+        }
+        return convertedAssignments;
+    }
+}
+
 void AnnIndex::SetNodeVectorAssignments(const std::vector<std::vector<int>>& nodeVectorAssignments)
 {
     if (!m_index) return;
     auto* spannIdx = dynamic_cast<SPTAG::SPANN::Index<float>*>(m_index.get());
     if (!spannIdx) return;
 
-    std::vector<std::vector<SPTAG::SizeType>> convertedAssignments;
-    convertedAssignments.reserve(nodeVectorAssignments.size());
-    for (const auto& nodeVectors : nodeVectorAssignments)
-    {
-        std::vector<SPTAG::SizeType> convertedNode;
-        convertedNode.reserve(nodeVectors.size());
-        for (int vectorId : nodeVectors)
-        {
-            if (vectorId >= 0) {
-                convertedNode.push_back(static_cast<SPTAG::SizeType>(vectorId));
-            }
-        }
-        convertedAssignments.emplace_back(std::move(convertedNode));
-    }
-
-    spannIdx->SetNodeVectorAssignments(convertedAssignments);
+    spannIdx->SetNodeVectorAssignments(ConvertNodeVectorAssignments(nodeVectorAssignments));
 }
 
 void AnnIndex::SetPrimaryNodeVectorAssignments(const std::vector<std::vector<int>>& primaryNodeVectorAssignments)
@@ -1506,22 +1514,7 @@ void AnnIndex::SetPrimaryNodeVectorAssignments(const std::vector<std::vector<int
     auto* spannIdx = dynamic_cast<SPTAG::SPANN::Index<float>*>(m_index.get());
     if (!spannIdx) return;
 
-    std::vector<std::vector<SPTAG::SizeType>> convertedAssignments;
-    convertedAssignments.reserve(primaryNodeVectorAssignments.size());
-    for (const auto& nodeVectors : primaryNodeVectorAssignments)
-    {
-        std::vector<SPTAG::SizeType> convertedNode;
-        convertedNode.reserve(nodeVectors.size());
-        for (int vectorId : nodeVectors)
-        {
-            if (vectorId >= 0) {
-                convertedNode.push_back(static_cast<SPTAG::SizeType>(vectorId));
-            }
-        }
-        convertedAssignments.emplace_back(std::move(convertedNode));
-    }
-
-    spannIdx->SetPrimaryNodeVectorAssignments(convertedAssignments);
+    spannIdx->SetPrimaryNodeVectorAssignments(ConvertNodeVectorAssignments(primaryNodeVectorAssignments));
 }
 
 bool AnnIndex::SetSharedDB(std::shared_ptr<SPTAG::Helper::KeyValueIO> p_db)

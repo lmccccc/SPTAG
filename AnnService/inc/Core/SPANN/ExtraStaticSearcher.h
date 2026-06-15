@@ -448,19 +448,6 @@ namespace SPTAG
 #ifdef BATCH_READ // async batch read
                     request.m_callback = [this](bool success)
                     {
-                        //char* buffer = request.m_buffer;
-                        //ListInfo* listInfo = (ListInfo*)(request.m_payload);
-
-                        // decompress posting list
-                        /*
-                        char* p_postingListFullData = buffer + listInfo->pageOffset;
-                        if (m_enableDataCompression)
-                        {
-                            DecompressPosting();
-                        }
-
-                        ProcessPosting();
-                        */
                     };
 #else // async read
                     request.m_callback = [&p_exWorkSpace, &request](bool success)
@@ -482,16 +469,6 @@ namespace SPTAG
                         SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "File %s read bytes, expected: %zu, acutal: %llu.\n", m_extraFullGraphFile.c_str(), totalBytes, numRead);
                         return ErrorCode::DiskIOFail;
                     }
-                    // decompress posting list
-                    /*
-                    char* p_postingListFullData = buffer + listInfo->pageOffset;
-                    if (m_enableDataCompression)
-                    {
-                        DecompressPosting();
-                    }
-
-                    ProcessPosting();
-                    */
 #endif
                 }
 
@@ -513,16 +490,6 @@ namespace SPTAG
                     --unprocessed;
                     char* buffer = request->m_buffer;
                     ListInfo* listInfo = static_cast<ListInfo*>(request->m_payload);
-                    // decompress posting list
-                    /*
-                    char* p_postingListFullData = buffer + listInfo->pageOffset;
-                    if (m_enableDataCompression)
-                    {
-                        DecompressPosting();
-                    }
-
-                    ProcessPosting();
-                    */
                 }
 #endif
 #endif

@@ -426,21 +426,6 @@ namespace SPTAG::SPANN {
                 if (m_versionMap->Deleted(vid) || m_versionMap->GetVersion(vid) != version) continue;
                 
                 if (brokenID.find(vid) == brokenID.end() && IsAssumptionBroken(p_index, headID, reinterpret_cast<ValueType*>(vectorId + m_metaDataSize), vid)) {
-                    /*
-                    float_t headDist = p_index->ComputeDistance(headCandidates.GetTarget(), p_index->GetSample(SplitHead));
-                    float_t newHeadDist_1 = p_index->ComputeDistance(headCandidates.GetTarget(), p_index->GetSample(newHeads[0]));
-                    float_t newHeadDist_2 = p_index->ComputeDistance(headCandidates.GetTarget(), p_index->GetSample(newHeads[1]));
-
-                    float_t splitDist = p_index->ComputeDistance(p_index->GetSample(SplitHead), p_index->GetSample(headID));
-
-                    float_t headToNewHeadDist_1 = p_index->ComputeDistance(p_index->GetSample(headID), p_index->GetSample(newHeads[0]));
-                    float_t headToNewHeadDist_2 = p_index->ComputeDistance(p_index->GetSample(headID), p_index->GetSample(newHeads[1]));
-
-                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "broken vid to head distance: %f, to split head distance: %f\n", dist, headDist);
-                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "broken vid to new head 1 distance: %f, to new head 2 distance: %f\n", newHeadDist_1, newHeadDist_2);
-                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "head to spilit head distance: %f\n", splitDist);
-                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "head to new head 1 distance: %f, to new head 2 distance: %f\n", headToNewHeadDist_1, headToNewHeadDist_2);
-                    */
                     assumptionBrokenNum++;
                     brokenID.insert(vid);
                 }
@@ -450,15 +435,6 @@ namespace SPTAG::SPANN {
                 std::sort(distanceSet.begin(), distanceSet.end());
                 minDist = distanceSet[1];
                 maxDist = distanceSet.back();
-                // SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "distance: min: %f, max: %f, avg: %f, 50th: %f\n", minDist, maxDist, avgDist/postVectorNum, distanceSet[distanceSet.size() * 0.5]);
-                // SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "assumption broken num: %d\n", assumptionBrokenNum);
-                float_t splitDist = p_index->ComputeDistance(p_index->GetSample(SplitHead), p_index->GetSample(headID));
-
-                float_t headToNewHeadDist_1 = p_index->ComputeDistance(p_index->GetSample(headID), p_index->GetSample(newHeads[0]));
-                float_t headToNewHeadDist_2 = p_index->ComputeDistance(p_index->GetSample(headID), p_index->GetSample(newHeads[1]));
-
-                // SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "head to spilt head distance: %f/%d/%.2f\n", splitDist, topK, ratio);
-                // SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "head to new head 1 distance: %f, to new head 2 distance: %f\n", headToNewHeadDist_1, headToNewHeadDist_2);
             }
 
             return assumptionBrokenNum;
@@ -520,7 +496,6 @@ namespace SPTAG::SPANN {
         {
             std::set<int> brokenID;
             brokenID.clear();
-            // SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Split Quantify: %d, head1:%d, head2:%d\n", split_order, newHeads[0], newHeads[1]);
             int assumptionBrokenNum = QuantifySplitCaseA(p_index, newHeads, postingLists, SplitHead, split_order, brokenID);
             QuantifySplitCaseB(p_exWorkSpace, p_index, headID, newHeads, SplitHead, split_order, assumptionBrokenNum, brokenID);
         }
@@ -1339,18 +1314,10 @@ namespace SPTAG::SPANN {
 
         inline void SplitAsync(VectorIndex* p_index, SizeType headID, std::function<void()> p_callback = nullptr)
         {
-            // SPTAGLIB_LOG(Helper::LogLevel::LL_Info,"Into SplitAsync, current headID: %d, size: %d\n", headID, m_postingSizes.GetSize(headID));
-            // tbb::concurrent_hash_map<SizeType, SizeType>::const_accessor headIDAccessor;
-            // if (m_splitList.find(headIDAccessor, headID)) {
-            //     return;
-            // }
-            // tbb::concurrent_hash_map<SizeType, SizeType>::value_type workPair(headID, headID);
-            // m_splitList.insert(workPair);
             {
                 std::lock_guard<std::mutex> tmplock(m_runningLock);
 
                 if (m_splitList.find(headID) != m_splitList.end()) {
-                    // SPTAGLIB_LOG(Helper::LogLevel::LL_Info,"Already in queue\n");
                     return;
                 }
                 m_splitList.insert(headID);
@@ -1358,7 +1325,6 @@ namespace SPTAG::SPANN {
 
             auto* curJob = new SplitAsyncJob(p_index, this, headID, m_opt->m_disableReassign, p_callback);
             m_splitThreadPool->add(curJob);
-            // SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Add to thread pool\n");
         }
 
         inline void MergeAsync(VectorIndex* p_index, SizeType headID, std::function<void()> p_callback = nullptr)
