@@ -2,6 +2,7 @@
 import argparse
 import json
 import math
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -9,8 +10,9 @@ from pathlib import Path
 import numpy as np
 
 
-DEFAULT_SCENARIO_FILE = "/home/v-mochengli/test/tenant_tag_scenario_1m.json"
-DEFAULT_OUTPUT_ROOT = Path("/home/v-mochengli/test")
+_BENCH_ROOT = Path(os.environ.get("SPTAG_BENCH_ROOT", str(Path.home() / "sptag_bench")))
+DEFAULT_SCENARIO_FILE = str(_BENCH_ROOT / "tenant_tag_scenario_1m.json")
+DEFAULT_OUTPUT_ROOT = _BENCH_ROOT
 LEVEL_NAMES = ("org", "dept", "team", "project")
 
 

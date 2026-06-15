@@ -3,11 +3,11 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$PROJECT_ROOT/build"
-PY310_PYTHON="/home/v-mochengli/anaconda3/envs/py310/bin/python"
+PY310_PYTHON="${SPTAG_PYTHON:-$(command -v python3 || command -v python)}"
 BUILD_JOBS="${BUILD_JOBS:-$(nproc)}"
 
-if [[ ! -x "$PY310_PYTHON" ]]; then
-    echo "[ERROR] py310 python not found: $PY310_PYTHON"
+if [[ -z "$PY310_PYTHON" || ! -x "$PY310_PYTHON" ]]; then
+    echo "[ERROR] python not found; set SPTAG_PYTHON to a valid interpreter"
     exit 1
 fi
 

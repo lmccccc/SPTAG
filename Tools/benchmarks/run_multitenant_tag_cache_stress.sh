@@ -5,10 +5,11 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/../.." && pwd)
 bench_script="$script_dir/multitenant_tag_cache_stress.py"
 
-scenario_file=${SPTAG_STRESS_SCENARIO_FILE:-/home/v-mochengli/test/tenant_tag_scenario_1m.json}
-query_file=${SPTAG_STRESS_QUERY_FILE:-/home/v-mochengli/dataset/sift/sift_query.fvecs}
+bench_root=${SPTAG_BENCH_ROOT:-$HOME/sptag_bench}
+scenario_file=${SPTAG_STRESS_SCENARIO_FILE:-$bench_root/tenant_tag_scenario_1m.json}
+query_file=${SPTAG_STRESS_QUERY_FILE:-$bench_root/sift/sift_query.fvecs}
 output_root=${SPTAG_STRESS_OUTPUT_ROOT:-/tmp}
-python_bin=${SPTAG_STRESS_PYTHON:-/home/v-mochengli/anaconda3/envs/py310/bin/python}
+python_bin=${SPTAG_STRESS_PYTHON:-python3}
 ld_preload=${SPTAG_STRESS_LD_PRELOAD:-/lib/x86_64-linux-gnu/libjemalloc.so.2}
 
 num_queries=${SPTAG_STRESS_NUM_QUERIES:-1000}

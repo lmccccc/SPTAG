@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 
@@ -42,19 +43,20 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Generate markdown and PPT artifacts for fixed-nprobe recall/QPS comparison."
     )
+    _bench_root = os.environ.get("SPTAG_BENCH_ROOT", str(Path.home() / "sptag_bench"))
     parser.add_argument(
         "--summary-json",
-        default="/home/v-mochengli/test/tenant0_fixed_nprobe_compare_20260417_summary.json",
+        default=os.path.join(_bench_root, "tenant0_fixed_nprobe_compare_summary.json"),
         help="Path to the fixed-nprobe summary JSON.",
     )
     parser.add_argument(
         "--report-md",
-        default="/home/v-mochengli/test/tenant0_fixed_nprobe_compare_20260417_report.md",
+        default=os.path.join(_bench_root, "tenant0_fixed_nprobe_compare_report.md"),
         help="Output markdown report path.",
     )
     parser.add_argument(
         "--report-ppt",
-        default="/home/v-mochengli/test/tenant0_fixed_nprobe_compare_20260417_report.pptx",
+        default=os.path.join(_bench_root, "tenant0_fixed_nprobe_compare_report.pptx"),
         help="Output PPT path.",
     )
     return parser.parse_args()

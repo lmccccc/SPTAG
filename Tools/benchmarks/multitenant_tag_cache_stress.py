@@ -15,8 +15,9 @@ import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_SCENARIO_FILE = "/home/v-mochengli/test/tenant_tag_scenario_1m.json"
-DEFAULT_QUERY_FILE = "/home/v-mochengli/dataset/sift/sift_query.fvecs"
+_BENCH_ROOT = Path(os.environ.get("SPTAG_BENCH_ROOT", str(Path.home() / "sptag_bench")))
+DEFAULT_SCENARIO_FILE = str(_BENCH_ROOT / "tenant_tag_scenario_1m.json")
+DEFAULT_QUERY_FILE = os.environ.get("SPTAG_BENCH_QUERY_FILE", str(_BENCH_ROOT / "sift" / "sift_query.fvecs"))
 DEFAULT_OUTPUT_ROOT = Path("/tmp")
 MB = 1024 * 1024
 LEVEL_NAMES = ("org", "dept", "team", "project")
