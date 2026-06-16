@@ -388,6 +388,12 @@ private:
     // Posting storage backend
     std::string m_storageBackend = "FILEIO";
 
+    // Distance metric for the build, configured through the standard
+    // SetBuildParam("DistCalcMethod", <value>, <section>) call (defaults to L2,
+    // the SIFT/BIGANN convention). The tag-pure / sparse fast paths read the
+    // built index's actual metric so they always stay consistent.
+    std::string m_distCalcMethod = "L2";
+
     // --- Shared RocksDB (multi-tenant) ---
     // When m_useSharedDB is true and m_storageBackend == "ROCKSDBIO", every
     // SPANN tenant is wired to a single shared RocksDB via a per-tenant

@@ -540,17 +540,24 @@ struct TagPurePosting {
 
     // Decode all chunks (already fetched from KV) and flat-scan against q.
     // chunkValues[i] must be the raw value blob for chunkKeys[i], holding
-    // chunkCounts[i] records of (int32 vid + float[dim] normVec).
-    // Distance: 1.0 - cos(q_normalized, v) → matches SPTAG cosine.
+    // chunkCounts[i] records of (int32 vid + float[dim] raw vec).
+    // Metric follows the built index: squared L2, or cosine (1 - cos) when
+    // p_useCosine is set.
     void SearchTopK(const float* q,
                     const std::vector<std::string>& chunkValues,
                     int topK,
-                    std::vector<std::pair<float, int>>& out) const {
-        float qn2 = 0.0f;
-        for (int i = 0; i < dim; ++i) qn2 += q[i] * q[i];
-        float qInv = (qn2 > 1e-30f) ? 1.0f / std::sqrt(qn2) : 0.0f;
-        std::vector<float> qn(dim);
-        for (int i = 0; i < dim; ++i) qn[i] = q[i] * qInv;
+                    std::vector<std::pair<float, int>>& out,
+                    bool p_useCosine = false) const {
+        std::vector<float> qn;
+        const float* qref = q;
+        if (p_useCosine) {
+            float qn2 = 0.0f;
+            for (int i = 0; i < dim; ++i) qn2 += q[i] * q[i];
+            float qInv = (qn2 > 1e-30f) ? 1.0f / std::sqrt(qn2) : 0.0f;
+            qn.resize(dim);
+            for (int i = 0; i < dim; ++i) qn[i] = q[i] * qInv;
+            qref = qn.data();
+        }
 
         const size_t recSize = sizeof(int32_t) + (size_t)dim * sizeof(float);
         out.clear();
@@ -564,9 +571,17 @@ struct TagPurePosting {
                 int32_t vid;
                 std::memcpy(&vid, rec, sizeof(int32_t));
                 const float* v = reinterpret_cast<const float*>(rec + sizeof(int32_t));
-                float ip = 0.0f;
-                for (int i = 0; i < dim; ++i) ip += qn[i] * v[i];
-                out.emplace_back(1.0f - ip, (int)vid);
+                float dist;
+                if (p_useCosine) {
+                    float vn2 = 0.0f, ip = 0.0f;
+                    for (int i = 0; i < dim; ++i) { vn2 += v[i] * v[i]; ip += qref[i] * v[i]; }
+                    float vInv = (vn2 > 1e-30f) ? 1.0f / std::sqrt(vn2) : 0.0f;
+                    dist = 1.0f - ip * vInv;
+                } else {
+                    dist = 0.0f;
+                    for (int i = 0; i < dim; ++i) { float diff = qref[i] - v[i]; dist += diff * diff; }
+                }
+                out.emplace_back(dist, (int)vid);
             }
         }
         int k = std::min(topK, (int)out.size());

@@ -2220,7 +2220,7 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             RemovePathRecursive(spannWorkDir);
             EnsureDir(spannWorkDir);
             tenantIndex->SetBuildParam("IndexDirectory", spannWorkDir.c_str(), "Base");
-            tenantIndex->SetBuildParam("DistCalcMethod", "Cosine", "Base");
+            tenantIndex->SetBuildParam("DistCalcMethod", m_distCalcMethod.c_str(), "Base");
             tenantIndex->SetBuildParam("isExecute", "true", "SelectHead");
             tenantIndex->SetBuildParam("isExecute", "true", "BuildHead");
             tenantIndex->SetBuildParam("isExecute", "true", "BuildSSDIndex");
@@ -2329,7 +2329,7 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
         {
             // Medium tenant: build in-memory BKT index
             tenantIndex = std::make_shared<AnnIndex>("BKT", valueTypeStr.c_str(), m_dimension);
-            tenantIndex->SetBuildParam("DistCalcMethod", "Cosine", "Index");
+            tenantIndex->SetBuildParam("DistCalcMethod", m_distCalcMethod.c_str(), "Index");
             buildOk = tenantIndex->Build(tenantVectors, tenantVecCount, p_normalized);
             fprintf(stderr, "[INFO] Tenant %d: BKT build (%d vectors)\n", tenantId, tenantVecCount);
         }
@@ -2337,7 +2337,7 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
         {
             // Small tenant: build trivial BKT index (effectively brute force at this scale)
             tenantIndex = std::make_shared<AnnIndex>("BKT", valueTypeStr.c_str(), m_dimension);
-            tenantIndex->SetBuildParam("DistCalcMethod", "Cosine", "Index");
+            tenantIndex->SetBuildParam("DistCalcMethod", m_distCalcMethod.c_str(), "Index");
             buildOk = tenantIndex->Build(tenantVectors, tenantVecCount, p_normalized);
             fprintf(stderr, "[INFO] Tenant %d: BruteForce build (%d vectors)\n", tenantId, tenantVecCount);
         }
@@ -2826,6 +2826,7 @@ bool TenantIndexManager::SaveAll(const char* p_baseDir)
     fprintf(manifestFile, "algorithm %s\n", m_algoType == SPTAG::IndexAlgoType::SPANN ? "SPANN" : 
             (m_algoType == SPTAG::IndexAlgoType::BKT ? "BKT" : "KDT"));
     fprintf(manifestFile, "unified_storage 1\n");
+    fprintf(manifestFile, "dist_calc_method %s\n", m_distCalcMethod.c_str());
     fprintf(manifestFile, "total_postings %d\n", m_totalPostingCount);
     
     for (const auto& kv : m_tenantVectorCounts)
@@ -2917,6 +2918,11 @@ bool TenantIndexManager::LoadAll(const char* p_baseDir)
             {
                 unifiedStorage = (val != 0);
             }
+        }
+        else if (key == "dist_calc_method")
+        {
+            std::string m;
+            if (iss >> m) m_distCalcMethod = m;
         }
         else if (key == "total_postings")
         {
@@ -3191,6 +3197,14 @@ bool TenantIndexManager::LoadUnifiedStorage(const char* p_baseDir)
 
 void TenantIndexManager::SetBuildParam(const char* p_name, const char* p_value, const char* p_section)
 {
+    // Capture the build-time distance metric so BuildFromData (which creates the
+    // per-tenant indices internally) and the tag/ACL fast paths use the
+    // caller-configured value instead of a hardcoded one.
+    if (p_name != nullptr && p_value != nullptr
+        && SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_name, "DistCalcMethod"))
+    {
+        m_distCalcMethod = p_value;
+    }
     for (auto& tenantEntry : m_tenantIndices)
     {
         tenantEntry.second->SetBuildParam(p_name, p_value, p_section);
@@ -4147,15 +4161,13 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                 auto& vids = kv.second;
                 if (vids.empty()) continue;
 
-                // L2-normalize each vector once for cosine-as-1-IP at query.
+                // Store raw vectors; exact squared-L2 distance is computed at
+                // query time (matches the L2 main index).
                 normBuf.assign((size_t)vids.size() * (size_t)m_dimension, 0.0f);
                 for (size_t k = 0; k < vids.size(); ++k) {
                     const float* src = vidVecData.data() + (size_t)vids[k] * (size_t)m_dimension;
-                    float n2 = 0.0f;
-                    for (int i = 0; i < m_dimension; ++i) n2 += src[i] * src[i];
-                    float inv = (n2 > 1e-30f) ? 1.0f / std::sqrt(n2) : 0.0f;
                     float* dst = normBuf.data() + k * (size_t)m_dimension;
-                    for (int i = 0; i < m_dimension; ++i) dst[i] = src[i] * inv;
+                    for (int i = 0; i < m_dimension; ++i) dst[i] = src[i];
                 }
 
                 auto pure = std::make_shared<SPTAG::Cache::TagPurePosting>();
@@ -4405,13 +4417,16 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
                                           &ws.m_diskRequests);
                 if (err == SPTAG::ErrorCode::Success) {
                     std::vector<std::pair<float, int>> topK;
-                    // Tag-pure stores float vectors; convert the (possibly
-                    // non-Float) query to float so scoring is value-type-agnostic.
+                    // Tag-pure stores raw float vectors; convert the (possibly
+                    // non-Float) query to float and score with the built index's
+                    // metric so the fast path matches the main path.
+                    const bool useCosine =
+                        SPTAG::Helper::StrUtils::StrEqualIgnoreCase(m_distCalcMethod.c_str(), "Cosine");
                     std::vector<float> queryFloat(m_dimension);
                     CopyVectorToFloat(queryFloat.data(), p_queryVector.Data(),
                                       m_valueType, m_dimension);
                     pure.SearchTopK(queryFloat.data(),
-                                    values, p_resultNum, topK);
+                                    values, p_resultNum, topK, useCosine);
                     auto result = std::make_shared<QueryResult>(
                         p_queryVector.Data(), p_resultNum, false);
                     for (int i = 0; i < p_resultNum; ++i) {
@@ -4757,11 +4772,23 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchSharedSPANN(
             memcpy(&vid, ptr, sizeof(vid));
             const float* vec = reinterpret_cast<const float*>(ptr + metaDataSize);
 
-            // Cosine distance (SPTAG uses negative inner product for cosine on normalized vectors)
+            // Distance per the built index's metric (squared L2, or cosine =
+            // negative inner product on normalized vectors).
             float dist = 0;
-            for (int d = 0; d < m_dimension; d++)
+            if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(m_distCalcMethod.c_str(), "Cosine"))
             {
-                dist -= queryVec[d] * vec[d];
+                for (int d = 0; d < m_dimension; d++)
+                {
+                    dist -= queryVec[d] * vec[d];
+                }
+            }
+            else
+            {
+                for (int d = 0; d < m_dimension; d++)
+                {
+                    float diff = queryVec[d] - vec[d];
+                    dist += diff * diff;
+                }
             }
 
             if ((int)topK.size() < p_resultNum)
