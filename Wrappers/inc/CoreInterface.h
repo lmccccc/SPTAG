@@ -394,6 +394,15 @@ private:
     // built index's actual metric so they always stay consistent.
     std::string m_distCalcMethod = "L2";
 
+    // SPANN posting replication factor, configured through the standard
+    // SetBuildParam("ReplicaCount", <n>, <section>) call (SPANN default 8).
+    // Lower values (e.g. 4) roughly halve the on-disk posting size — useful for
+    // very large (1B) builds where storage is the binding constraint.
+    // Caller-set build params, applied by BuildFromData after its own internal
+    // defaults so the caller can override any of them (StartFileSizeGB,
+    // MaxFileSizeGB, ReplicaCount, ...): (section, name, value).
+    std::vector<std::tuple<std::string, std::string, std::string>> m_pendingBuildParams;
+
     // --- Shared RocksDB (multi-tenant) ---
     // When m_useSharedDB is true and m_storageBackend == "ROCKSDBIO", every
     // SPANN tenant is wired to a single shared RocksDB via a per-tenant

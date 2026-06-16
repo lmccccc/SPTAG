@@ -2144,6 +2144,14 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
         TenantIndexType indexType = ChooseIndexType(tenantVecCount);
         m_tenantIndexTypes[tenantId] = indexType;
 
+        // Apply caller-set build params LAST (after the wrapper's internal
+        // defaults), so SetBuildParam("StartFileSizeGB"/"MaxFileSizeGB"/
+        // "ReplicaCount"/...) overrides the defaults instead of being ignored.
+        auto applyPendingBuildParams = [this](const std::shared_ptr<AnnIndex>& idx) {
+            for (const auto& p : m_pendingBuildParams)
+                idx->SetBuildParam(std::get<1>(p).c_str(), std::get<2>(p).c_str(), std::get<0>(p).c_str());
+        };
+
         if (indexType == TenantIndexType::SPANN)
         {
             const char* skipPivotEnv = std::getenv("SPTAG_DISABLE_PIVOT_ESTIMATOR");
@@ -2255,10 +2263,10 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             tenantIndex->SetBuildParam("DataCapacity", std::to_string(dataCapacity).c_str(), "Base");
             tenantIndex->SetBuildParam("DataBlockSize", std::to_string(std::min(dataCapacity, 1024 * 1024)).c_str(), "Base");
 
-            // Scale SSD file size: each posting can hold ~PostingVectorLimit vectors.
-            // Each vector in posting: dim*sizeof(valueType) + metadata overhead.
-            // Use the ACTUAL value-type size (not hardcoded float) so uint8/int8
-            // builds don't over-allocate the posting pool by 4x.
+            // Scale SSD file size from the ACTUAL per-vector byte size (value-type
+            // aware, not a hardcoded float assumption). This is only a DEFAULT —
+            // the caller can override StartFileSizeGB/MaxFileSizeGB/ReplicaCount
+            // through the standard SetBuildParam mechanism (applied below).
             const int64_t vecBytes = static_cast<int64_t>(SPTAG::GetValueTypeSize(m_valueType)) * m_dimension + 64;
             int64_t estimatedBytes = postingAssignmentCount * vecBytes * 10LL;
                 int startFileSizeGB = std::max(1, (int)(estimatedBytes / (1024LL * 1024LL * 1024LL)) + 1);
@@ -2321,6 +2329,7 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                 if (!InjectSharedDB(tenantIndex, tenantId)) return false;
             }
 
+            applyPendingBuildParams(tenantIndex);
             buildOk = tenantIndex->Build(tenantVectors, tenantVecCount, p_normalized);
             m_tenantSpannWorkDirs[tenantId] = spannWorkDir;
             fprintf(stderr, "[INFO] Tenant %d: SPANN build (%d vectors)\n", tenantId, tenantVecCount);
@@ -2330,6 +2339,7 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             // Medium tenant: build in-memory BKT index
             tenantIndex = std::make_shared<AnnIndex>("BKT", valueTypeStr.c_str(), m_dimension);
             tenantIndex->SetBuildParam("DistCalcMethod", m_distCalcMethod.c_str(), "Index");
+            applyPendingBuildParams(tenantIndex);
             buildOk = tenantIndex->Build(tenantVectors, tenantVecCount, p_normalized);
             fprintf(stderr, "[INFO] Tenant %d: BKT build (%d vectors)\n", tenantId, tenantVecCount);
         }
@@ -2338,6 +2348,7 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             // Small tenant: build trivial BKT index (effectively brute force at this scale)
             tenantIndex = std::make_shared<AnnIndex>("BKT", valueTypeStr.c_str(), m_dimension);
             tenantIndex->SetBuildParam("DistCalcMethod", m_distCalcMethod.c_str(), "Index");
+            applyPendingBuildParams(tenantIndex);
             buildOk = tenantIndex->Build(tenantVectors, tenantVecCount, p_normalized);
             fprintf(stderr, "[INFO] Tenant %d: BruteForce build (%d vectors)\n", tenantId, tenantVecCount);
         }
@@ -3204,6 +3215,14 @@ void TenantIndexManager::SetBuildParam(const char* p_name, const char* p_value, 
         && SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_name, "DistCalcMethod"))
     {
         m_distCalcMethod = p_value;
+    }
+    // Remember caller-set build params so BuildFromData (which creates the
+    // per-tenant indices internally) can apply them, letting the caller override
+    // the wrapper's internal defaults (StartFileSizeGB/MaxFileSizeGB/ReplicaCount/
+    // ...) through the standard parameter mechanism instead of editing the code.
+    if (p_name != nullptr && p_value != nullptr && p_section != nullptr)
+    {
+        m_pendingBuildParams.emplace_back(p_section, p_name, p_value);
     }
     for (auto& tenantEntry : m_tenantIndices)
     {
