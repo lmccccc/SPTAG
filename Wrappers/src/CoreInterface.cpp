@@ -2059,12 +2059,12 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
     m_tenantTagToNodes.clear();
     m_tenantHeadNodeToNode.clear();
 
-    std::map<int, std::vector<std::pair<const uint8_t*, size_t>>> tenantVectorRanges;
-    std::map<int, std::vector<std::string>> tenantMetadataLines;
-
+    // Per-tenant vector assignment. We only keep the global vector indices per
+    // tenant (the minimal mapping); vectors are gathered on demand per tenant
+    // from p_vectors during the build loop, so we never hold a second full copy
+    // of all tenants' vectors (or per-vector pointer/metadata structures) at once.
     const char* metaPtr = reinterpret_cast<const char*>(p_metadata.Data());
     const char* metaEnd = metaPtr + p_metadata.Length();
-    const uint8_t* vectorPtr = p_vectors.Data();
 
     SizeType globalIdx = 0;
     while (metaPtr < metaEnd && globalIdx < p_vectorNum)
@@ -2082,11 +2082,7 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
 
         std::string metaLine(metaPtr, lineEnd - metaPtr);
         int tenantId = RegisterTenantId(metaLine.c_str());
-
-        tenantVectorRanges[tenantId].push_back({vectorPtr, m_inputVectorSize});
-        tenantMetadataLines[tenantId].push_back(metaLine);
         m_tenantGlobalIndices[tenantId].push_back(globalIdx);
-        vectorPtr += m_inputVectorSize;
         metaPtr = (lineEnd < metaEnd) ? (lineEnd + 1) : lineEnd;
         globalIdx++;
     }
@@ -2094,68 +2090,52 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
     std::string algoTypeStr = SPTAG::Helper::Convert::ConvertToString(m_algoType);
     std::string valueTypeStr = SPTAG::Helper::Convert::ConvertToString(m_valueType);
 
-    for (auto& tenantEntry : tenantVectorRanges)
+    // Build tenants one at a time: gather this tenant's vectors, build, save,
+    // and (for multi-tenant) unload before moving on — bounded peak memory.
+    for (auto& tenantEntry : m_tenantGlobalIndices)
     {
         int tenantId = tenantEntry.first;
-        std::vector<std::pair<const uint8_t*, size_t>>& vectorRanges = tenantEntry.second;
-        if (vectorRanges.empty())
+        const std::vector<int>& gids = tenantEntry.second;
+        if (gids.empty())
         {
             continue;
         }
 
-        size_t totalVectorSize = vectorRanges.size() * m_inputVectorSize;
+        SizeType tenantVecCount = static_cast<SizeType>(gids.size());
+        size_t totalVectorSize = static_cast<size_t>(tenantVecCount) * m_inputVectorSize;
         ByteArray tenantVectors;
-        // Zero-copy fast path: when this tenant's vectors are exactly the whole
-        // contiguous input blob (the common single-tenant case), reuse p_vectors
-        // directly instead of allocating + memcpy'ing a second full copy. This
-        // removes one full N*D*S host-memory copy (peak ~3x -> ~2x).
-        if (vectorRanges.size() == (size_t)p_vectorNum
-            && totalVectorSize == p_vectors.Length()
-            && vectorRanges.front().first == p_vectors.Data())
+        // Zero-copy fast path: a single tenant owning all N vectors gets the
+        // identity assignment [0..N); reuse the input blob directly (no copy).
+        if (gids.size() == (size_t)p_vectorNum)
         {
             tenantVectors = ByteArray(const_cast<std::uint8_t*>(p_vectors.Data()), totalVectorSize, false);
         }
         else
         {
+            // Multi-tenant: gather only THIS tenant's vectors from the original
+            // input (one tenant resident at a time, re-read per tenant).
             uint8_t* tenantVectorBuffer = new uint8_t[totalVectorSize];
             uint8_t* out = tenantVectorBuffer;
-            for (const auto& vec : vectorRanges)
+            for (int gid : gids)
             {
-                memcpy(out, vec.first, vec.second);
-                out += vec.second;
+                memcpy(out, p_vectors.Data() + static_cast<size_t>(gid) * m_inputVectorSize, m_inputVectorSize);
+                out += m_inputVectorSize;
             }
             tenantVectors = ByteArray(tenantVectorBuffer, totalVectorSize, true);
         }
 
-        std::string metaStr;
-        for (size_t i = 0; i < tenantMetadataLines[tenantId].size(); ++i)
-        {
-            if (i > 0) metaStr.push_back('\n');
-            metaStr += tenantMetadataLines[tenantId][i];
-        }
-        metaStr.push_back('\n');
-
-        uint8_t* metaBuffer = new uint8_t[metaStr.size()];
-        memcpy(metaBuffer, metaStr.data(), metaStr.size());
-        ByteArray tenantMetadata(metaBuffer, metaStr.size(), true);
-
         auto tenantIndex = std::make_shared<AnnIndex>(algoTypeStr.c_str(), valueTypeStr.c_str(), m_dimension);
         bool buildOk = false;
-        SizeType tenantVecCount = static_cast<SizeType>(vectorRanges.size());
         std::vector<uint32_t> tenantLocalTags;
 
         if (m_buildNumTagsPerVec > 0 && m_buildTags.Data() != nullptr) {
             const uint32_t* globalTags = reinterpret_cast<const uint32_t*>(m_buildTags.Data());
-            auto gidIt = m_tenantGlobalIndices.find(tenantId);
-            if (gidIt != m_tenantGlobalIndices.end()) {
-                const auto& gids = gidIt->second;
-                tenantLocalTags.resize(static_cast<size_t>(tenantVecCount) * static_cast<size_t>(m_buildNumTagsPerVec));
-                for (int i = 0; i < tenantVecCount && i < static_cast<int>(gids.size()); ++i) {
-                    int gid = gids[i];
-                    for (int t = 0; t < m_buildNumTagsPerVec; ++t) {
-                        tenantLocalTags[static_cast<size_t>(i) * static_cast<size_t>(m_buildNumTagsPerVec) + static_cast<size_t>(t)] =
-                            globalTags[static_cast<size_t>(gid) * static_cast<size_t>(m_buildNumTagsPerVec) + static_cast<size_t>(t)];
-                    }
+            tenantLocalTags.resize(static_cast<size_t>(tenantVecCount) * static_cast<size_t>(m_buildNumTagsPerVec));
+            for (int i = 0; i < tenantVecCount && i < static_cast<int>(gids.size()); ++i) {
+                int gid = gids[i];
+                for (int t = 0; t < m_buildNumTagsPerVec; ++t) {
+                    tenantLocalTags[static_cast<size_t>(i) * static_cast<size_t>(m_buildNumTagsPerVec) + static_cast<size_t>(t)] =
+                        globalTags[static_cast<size_t>(gid) * static_cast<size_t>(m_buildNumTagsPerVec) + static_cast<size_t>(t)];
                 }
             }
         }
@@ -2367,7 +2347,7 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             return false;
         }
 
-        m_tenantVectorCounts[tenantId] = static_cast<int>(vectorRanges.size());
+        m_tenantVectorCounts[tenantId] = static_cast<int>(tenantVecCount);
 
         // For SPANN: save the index to its work dir right away, then release the
         // AnnIndex object.  This closes the SSD file descriptor and frees the
@@ -2377,7 +2357,7 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             std::string workDir = m_tenantSpannWorkDirs[tenantId];
             tenantIndex->Save(workDir.c_str());
             fprintf(stderr, "[INFO] Tenant %d: built & released (%d vectors, dir=%s)\n",
-                tenantId, (int)vectorRanges.size(), workDir.c_str());
+                tenantId, (int)tenantVecCount, workDir.c_str());
             tenantIndex.reset();
             continue;
         }
