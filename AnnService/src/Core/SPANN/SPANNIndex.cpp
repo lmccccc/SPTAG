@@ -3491,7 +3491,12 @@ ErrorCode Index<T>::BuildIndex(const void *p_data, SizeType p_vectorNum, Dimensi
         return ErrorCode::EmptyData;
 
     std::shared_ptr<VectorSet> vectorSet;
-    if (p_shareOwnership)
+    // Cosine build normalizes the vectors in place (below). If we will normalize,
+    // we must own a private copy so we don't mutate the caller's buffer. Only
+    // share (zero-copy) when the caller granted ownership AND no in-place
+    // normalization will happen (non-Cosine metric or already-normalized input).
+    const bool willNormalizeInPlace = (m_options.m_distCalcMethod == DistCalcMethod::Cosine && !p_normalized);
+    if (p_shareOwnership && !willNormalizeInPlace)
     {
         vectorSet.reset(
             new BasicVectorSet(ByteArray((std::uint8_t *)p_data, sizeof(T) * p_vectorNum * p_dimension, false),

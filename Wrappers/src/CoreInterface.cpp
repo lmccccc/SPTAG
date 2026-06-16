@@ -1353,7 +1353,8 @@ bool AnnIndex::Build(ByteArray p_data, SizeType p_num, bool p_normalized)
         return false;
     }
     return (SPTAG::ErrorCode::Success == m_index->BuildIndex(p_data.Data(), (SPTAG::SizeType)p_num,
-                                                             (SPTAG::DimensionType)m_dimension, p_normalized));
+                                                             (SPTAG::DimensionType)m_dimension, p_normalized,
+                                                             /*p_shareOwnership*/ true));
 }
 
 bool AnnIndex::BuildWithMetaData(ByteArray p_data, ByteArray p_meta, SizeType p_num, bool p_withMetaIndex,
@@ -2103,14 +2104,28 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
         }
 
         size_t totalVectorSize = vectorRanges.size() * m_inputVectorSize;
-        uint8_t* tenantVectorBuffer = new uint8_t[totalVectorSize];
-        uint8_t* out = tenantVectorBuffer;
-        for (const auto& vec : vectorRanges)
+        ByteArray tenantVectors;
+        // Zero-copy fast path: when this tenant's vectors are exactly the whole
+        // contiguous input blob (the common single-tenant case), reuse p_vectors
+        // directly instead of allocating + memcpy'ing a second full copy. This
+        // removes one full N*D*S host-memory copy (peak ~3x -> ~2x).
+        if (vectorRanges.size() == (size_t)p_vectorNum
+            && totalVectorSize == p_vectors.Length()
+            && vectorRanges.front().first == p_vectors.Data())
         {
-            memcpy(out, vec.first, vec.second);
-            out += vec.second;
+            tenantVectors = ByteArray(const_cast<std::uint8_t*>(p_vectors.Data()), totalVectorSize, false);
         }
-        ByteArray tenantVectors(tenantVectorBuffer, totalVectorSize, true);
+        else
+        {
+            uint8_t* tenantVectorBuffer = new uint8_t[totalVectorSize];
+            uint8_t* out = tenantVectorBuffer;
+            for (const auto& vec : vectorRanges)
+            {
+                memcpy(out, vec.first, vec.second);
+                out += vec.second;
+            }
+            tenantVectors = ByteArray(tenantVectorBuffer, totalVectorSize, true);
+        }
 
         std::string metaStr;
         for (size_t i = 0; i < tenantMetadataLines[tenantId].size(); ++i)
