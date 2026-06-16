@@ -151,6 +151,83 @@ int TagLevel(uint32_t tag)
     return static_cast<int>(tag / 1000U);
 }
 
+// Convert one dim-length vector from its native SPTAG value type into float.
+// Used by the tag-pure path, whose stored vectors and query scoring are float,
+// so it can serve non-Float (e.g. UInt8) indices too.
+inline void CopyVectorToFloat(float* dst, const void* src,
+                              SPTAG::VectorValueType vt, int dim)
+{
+    switch (vt) {
+    case SPTAG::VectorValueType::UInt8: {
+        const uint8_t* s = reinterpret_cast<const uint8_t*>(src);
+        for (int i = 0; i < dim; ++i) dst[i] = static_cast<float>(s[i]);
+        break;
+    }
+    case SPTAG::VectorValueType::Int8: {
+        const int8_t* s = reinterpret_cast<const int8_t*>(src);
+        for (int i = 0; i < dim; ++i) dst[i] = static_cast<float>(s[i]);
+        break;
+    }
+    case SPTAG::VectorValueType::Int16: {
+        const int16_t* s = reinterpret_cast<const int16_t*>(src);
+        for (int i = 0; i < dim; ++i) dst[i] = static_cast<float>(s[i]);
+        break;
+    }
+    case SPTAG::VectorValueType::Float:
+    default:
+        std::memcpy(dst, src, sizeof(float) * static_cast<size_t>(dim));
+        break;
+    }
+}
+
+// The SPANN-specific accessors GetDiskIndex / GetGlobalVID / GetOptions live on
+// the templated SPTAG::SPANN::Index<T>, not the VectorIndex base. These helpers
+// dispatch on the runtime value type so the tag/ACL machinery works for any
+// value type (Float/UInt8/Int8/Int16), not just Float.
+template <typename Fn>
+auto DispatchSpann(SPTAG::VectorIndex* idx, SPTAG::VectorValueType vt, Fn&& fn)
+    -> decltype(fn(static_cast<SPTAG::SPANN::Index<float>*>(nullptr)))
+{
+    switch (vt) {
+    case SPTAG::VectorValueType::UInt8:
+        return fn(dynamic_cast<SPTAG::SPANN::Index<std::uint8_t>*>(idx));
+    case SPTAG::VectorValueType::Int8:
+        return fn(dynamic_cast<SPTAG::SPANN::Index<std::int8_t>*>(idx));
+    case SPTAG::VectorValueType::Int16:
+        return fn(dynamic_cast<SPTAG::SPANN::Index<std::int16_t>*>(idx));
+    case SPTAG::VectorValueType::Float:
+    default:
+        return fn(dynamic_cast<SPTAG::SPANN::Index<float>*>(idx));
+    }
+}
+
+std::shared_ptr<SPTAG::SPANN::IExtraSearcher>
+SpannGetDiskIndex(SPTAG::VectorIndex* idx, SPTAG::VectorValueType vt)
+{
+    return DispatchSpann(idx, vt, [](auto* p) -> std::shared_ptr<SPTAG::SPANN::IExtraSearcher> {
+        return p ? p->GetDiskIndex() : nullptr;
+    });
+}
+
+SPTAG::SizeType SpannGetGlobalVID(SPTAG::VectorIndex* idx, SPTAG::VectorValueType vt, SPTAG::SizeType vid)
+{
+    return DispatchSpann(idx, vt, [vid](auto* p) -> SPTAG::SizeType {
+        return p ? p->GetGlobalVID(vid) : SPTAG::MaxSize;
+    });
+}
+
+SPTAG::SPANN::Options* SpannGetOptions(SPTAG::VectorIndex* idx, SPTAG::VectorValueType vt)
+{
+    return DispatchSpann(idx, vt, [](auto* p) -> SPTAG::SPANN::Options* {
+        return p ? p->GetOptions() : nullptr;
+    });
+}
+
+bool SpannIsValid(SPTAG::VectorIndex* idx, SPTAG::VectorValueType vt)
+{
+    return DispatchSpann(idx, vt, [](auto* p) -> bool { return p != nullptr; });
+}
+
 float EstimateQueryVectorSelectivity(
     int tenantSize,
     const std::unordered_map<uint32_t, TenantIndexManager::TagRoutingStats>* tagStats,
@@ -316,9 +393,12 @@ std::string HeadNodeMetaPath(const std::string& workDir)
 
 std::shared_ptr<SPTAG::VectorIndex> GetMemoryIndexForInternal(const std::shared_ptr<SPTAG::VectorIndex>& internalIndex)
 {
-    auto* spannInternalIdx = dynamic_cast<SPTAG::SPANN::Index<float>*>(internalIndex.get());
-    if (spannInternalIdx == nullptr) return nullptr;
-    return spannInternalIdx->GetMemoryIndex();
+    SPTAG::VectorIndex* idx = internalIndex.get();
+    if (auto* p = dynamic_cast<SPTAG::SPANN::Index<float>*>(idx)) return p->GetMemoryIndex();
+    if (auto* p = dynamic_cast<SPTAG::SPANN::Index<std::uint8_t>*>(idx)) return p->GetMemoryIndex();
+    if (auto* p = dynamic_cast<SPTAG::SPANN::Index<std::int8_t>*>(idx)) return p->GetMemoryIndex();
+    if (auto* p = dynamic_cast<SPTAG::SPANN::Index<std::int16_t>*>(idx)) return p->GetMemoryIndex();
+    return nullptr;
 }
 
 bool SaveHeadNodeMetaFile(const std::string& workDir, const std::shared_ptr<SPTAG::VectorIndex>& headIndex)
@@ -394,8 +474,22 @@ bool LoadPostingSignaturesIntoHeadIndex(const std::string& workDir,
     if (internalIndex == nullptr) return false;
 
     auto headIndex = GetMemoryIndexForInternal(internalIndex);
-    auto* spannInternalIdx = dynamic_cast<SPTAG::SPANN::Index<float>*>(internalIndex.get());
-    if (headIndex == nullptr || spannInternalIdx == nullptr) return false;
+    if (headIndex == nullptr) return false;
+
+    // Resolve a value-type-agnostic GetGlobalVID accessor once (the SPANN index
+    // may be Float/UInt8/Int8/Int16).
+    SPTAG::VectorIndex* rawIdx = internalIndex.get();
+    std::function<SizeType(SizeType)> getGlobalVID;
+    if (auto* p = dynamic_cast<SPTAG::SPANN::Index<float>*>(rawIdx))
+        getGlobalVID = [p](SizeType h) { return p->GetGlobalVID(h); };
+    else if (auto* p = dynamic_cast<SPTAG::SPANN::Index<std::uint8_t>*>(rawIdx))
+        getGlobalVID = [p](SizeType h) { return p->GetGlobalVID(h); };
+    else if (auto* p = dynamic_cast<SPTAG::SPANN::Index<std::int8_t>*>(rawIdx))
+        getGlobalVID = [p](SizeType h) { return p->GetGlobalVID(h); };
+    else if (auto* p = dynamic_cast<SPTAG::SPANN::Index<std::int16_t>*>(rawIdx))
+        getGlobalVID = [p](SizeType h) { return p->GetGlobalVID(h); };
+    else
+        return false;
 
     SPTAG::Cache::TenantBitmaskPS sigs;
     std::string sigPath = workDir + "/signatures_bitmask.bin";
@@ -407,7 +501,7 @@ bool LoadPostingSignaturesIntoHeadIndex(const std::string& workDir,
     }
 
     for (SizeType hid = 0; hid < numHeadSamples; ++hid) {
-        SizeType globalVID = spannInternalIdx->GetGlobalVID(hid);
+        SizeType globalVID = getGlobalVID(hid);
         headIndex->SetHeadNodeGlobalVID(hid, globalVID);
         if (hid < sigs.num_postings) {
             headIndex->SetHeadNodePS(hid, sigs.ps[hid]);
@@ -979,11 +1073,13 @@ void BuildHeadNodeToNodeIndexForCandidate(const PivotEstimatorCandidate& candida
                                           int numVectors,
                                           int numTagsPerVec,
                                           const std::shared_ptr<SPTAG::VectorIndex>& memoryIndex,
-                                          SPTAG::SPANN::Index<float>* spannInternalIdx,
+                                          SPTAG::VectorIndex* spannInternalIdx,
+                                          SPTAG::VectorValueType valueType,
                                           std::vector<int>& headNodeToNode)
 {
     headNodeToNode.clear();
-    if (tags == nullptr || numVectors <= 0 || numTagsPerVec <= 0 || memoryIndex == nullptr || spannInternalIdx == nullptr) {
+    if (tags == nullptr || numVectors <= 0 || numTagsPerVec <= 0 || memoryIndex == nullptr
+        || spannInternalIdx == nullptr || !SpannIsValid(spannInternalIdx, valueType)) {
         return;
     }
 
@@ -994,7 +1090,7 @@ void BuildHeadNodeToNodeIndexForCandidate(const PivotEstimatorCandidate& candida
     headNodeToNode.assign(numHeadSamples, -1);
     for (SizeType hid = 0; hid < numHeadSamples; ++hid)
     {
-        SizeType globalVID = spannInternalIdx->GetGlobalVID(hid);
+        SizeType globalVID = SpannGetGlobalVID(spannInternalIdx, valueType, hid);
         if (globalVID == SPTAG::MaxSize || globalVID >= static_cast<SizeType>(numVectors)) {
             continue;
         }
@@ -1469,10 +1565,25 @@ bool AnnIndex::ReadyToServe() const
 void AnnIndex::SetVectorTags(const uint32_t* tags, int numVecs, int numTagsPerVec)
 {
     if (!m_index) return;
-    // Cast to SPANN Index<float> to access SetVectorTags
-    auto* spannIdx = dynamic_cast<SPTAG::SPANN::Index<float>*>(m_index.get());
-    if (spannIdx) {
-        spannIdx->SetVectorTags(tags, numVecs, numTagsPerVec);
+    // Embed per-vector tags into SPANN postings, for any value type.
+    switch (m_inputValueType) {
+    case SPTAG::VectorValueType::UInt8:
+        if (auto* p = dynamic_cast<SPTAG::SPANN::Index<std::uint8_t>*>(m_index.get()))
+            p->SetVectorTags(tags, numVecs, numTagsPerVec);
+        break;
+    case SPTAG::VectorValueType::Int8:
+        if (auto* p = dynamic_cast<SPTAG::SPANN::Index<std::int8_t>*>(m_index.get()))
+            p->SetVectorTags(tags, numVecs, numTagsPerVec);
+        break;
+    case SPTAG::VectorValueType::Int16:
+        if (auto* p = dynamic_cast<SPTAG::SPANN::Index<std::int16_t>*>(m_index.get()))
+            p->SetVectorTags(tags, numVecs, numTagsPerVec);
+        break;
+    case SPTAG::VectorValueType::Float:
+    default:
+        if (auto* p = dynamic_cast<SPTAG::SPANN::Index<float>*>(m_index.get()))
+            p->SetVectorTags(tags, numVecs, numTagsPerVec);
+        break;
     }
 }
 
@@ -1502,19 +1613,43 @@ namespace
 void AnnIndex::SetNodeVectorAssignments(const std::vector<std::vector<int>>& nodeVectorAssignments)
 {
     if (!m_index) return;
-    auto* spannIdx = dynamic_cast<SPTAG::SPANN::Index<float>*>(m_index.get());
-    if (!spannIdx) return;
-
-    spannIdx->SetNodeVectorAssignments(ConvertNodeVectorAssignments(nodeVectorAssignments));
+    auto converted = ConvertNodeVectorAssignments(nodeVectorAssignments);
+    switch (m_inputValueType) {
+    case SPTAG::VectorValueType::UInt8:
+        if (auto* p = dynamic_cast<SPTAG::SPANN::Index<std::uint8_t>*>(m_index.get())) p->SetNodeVectorAssignments(converted);
+        break;
+    case SPTAG::VectorValueType::Int8:
+        if (auto* p = dynamic_cast<SPTAG::SPANN::Index<std::int8_t>*>(m_index.get())) p->SetNodeVectorAssignments(converted);
+        break;
+    case SPTAG::VectorValueType::Int16:
+        if (auto* p = dynamic_cast<SPTAG::SPANN::Index<std::int16_t>*>(m_index.get())) p->SetNodeVectorAssignments(converted);
+        break;
+    case SPTAG::VectorValueType::Float:
+    default:
+        if (auto* p = dynamic_cast<SPTAG::SPANN::Index<float>*>(m_index.get())) p->SetNodeVectorAssignments(converted);
+        break;
+    }
 }
 
 void AnnIndex::SetPrimaryNodeVectorAssignments(const std::vector<std::vector<int>>& primaryNodeVectorAssignments)
 {
     if (!m_index) return;
-    auto* spannIdx = dynamic_cast<SPTAG::SPANN::Index<float>*>(m_index.get());
-    if (!spannIdx) return;
-
-    spannIdx->SetPrimaryNodeVectorAssignments(ConvertNodeVectorAssignments(primaryNodeVectorAssignments));
+    auto converted = ConvertNodeVectorAssignments(primaryNodeVectorAssignments);
+    switch (m_inputValueType) {
+    case SPTAG::VectorValueType::UInt8:
+        if (auto* p = dynamic_cast<SPTAG::SPANN::Index<std::uint8_t>*>(m_index.get())) p->SetPrimaryNodeVectorAssignments(converted);
+        break;
+    case SPTAG::VectorValueType::Int8:
+        if (auto* p = dynamic_cast<SPTAG::SPANN::Index<std::int8_t>*>(m_index.get())) p->SetPrimaryNodeVectorAssignments(converted);
+        break;
+    case SPTAG::VectorValueType::Int16:
+        if (auto* p = dynamic_cast<SPTAG::SPANN::Index<std::int16_t>*>(m_index.get())) p->SetPrimaryNodeVectorAssignments(converted);
+        break;
+    case SPTAG::VectorValueType::Float:
+    default:
+        if (auto* p = dynamic_cast<SPTAG::SPANN::Index<float>*>(m_index.get())) p->SetPrimaryNodeVectorAssignments(converted);
+        break;
+    }
 }
 
 bool AnnIndex::SetSharedDB(std::shared_ptr<SPTAG::Helper::KeyValueIO> p_db)
@@ -1719,7 +1854,15 @@ TenantIndexManager::TenantIndexManager(DimensionType p_dimension, const char* p_
     // Initialize shared AIO pool: 4 contexts, 1024 events each
     // Must be large enough for concurrent MultiBatchSearch across multiple tenants
     // Each tenant's BatchSearch submits nprobe(64) × batch_threads IO requests
+    //
+    // When built with -DURING, the shared libaio pool is intentionally NOT
+    // initialized so each FileIO instance falls into the io_uring branch in
+    // AsyncFileIO::InitializeFileIo (it sets up per-instance io_uring queues
+    // for batched reads plus libaio contexts for single reads). Initializing
+    // the shared pool would force the libaio path and leave m_uring empty.
+#ifndef URING
     SPTAG::Helper::SharedAIOPool::Instance().Initialize(4, 1024);
+#endif
 }
 
 TenantIndexManager::~TenantIndexManager()
@@ -2070,7 +2213,15 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                 }
             }
 
-            std::string spannWorkDir = "/tmp/sptag_spann_tenant_" + std::to_string(tenantId);
+            // Work directory root is configurable so large builds can use a big
+            // disk instead of /tmp (root fs may be small). SPTAG_SPANN_WORKDIR
+            // overrides the parent directory; per-tenant subdir is appended.
+            std::string workRoot = "/tmp";
+            {
+                const char* wdEnv = std::getenv("SPTAG_SPANN_WORKDIR");
+                if (wdEnv != nullptr && wdEnv[0] != '\0') workRoot = wdEnv;
+            }
+            std::string spannWorkDir = workRoot + "/sptag_spann_tenant_" + std::to_string(tenantId);
             RemovePathRecursive(spannWorkDir);
             EnsureDir(spannWorkDir);
             tenantIndex->SetBuildParam("IndexDirectory", spannWorkDir.c_str(), "Base");
@@ -2081,6 +2232,25 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             tenantIndex->SetBuildParam("BuildSsdIndex", "true", "BuildSSDIndex");
             tenantIndex->SetBuildParam("Storage", m_storageBackend.c_str(), "BuildSSDIndex");
 
+            // Optional build parallelism override. The head-graph refinement
+            // (BuildHead) and SSD posting build dominate wall time on many-core
+            // hosts. SPTAG_BUILD_THREADS raises threads for those two stages.
+            // NOTE: SelectHead is intentionally left at its default — raising its
+            // thread count pathologically slows the head-selection BKT k-means.
+            {
+                const char* btEnv = std::getenv("SPTAG_BUILD_THREADS");
+                if (btEnv != nullptr && btEnv[0] != '\0') {
+                    int bt = std::atoi(btEnv);
+                    if (bt > 0) {
+                        std::string btStr = std::to_string(bt);
+                        tenantIndex->SetBuildParam("NumberOfThreads", btStr.c_str(), "BuildHead");
+                        tenantIndex->SetBuildParam("NumberOfThreads", btStr.c_str(), "BuildSSDIndex");
+                        fprintf(stderr, "[INFO] Tenant %d: SPTAG_BUILD_THREADS=%d applied to BuildHead/BuildSSDIndex\n",
+                                tenantId, bt);
+                    }
+                }
+            }
+
             // Scale DataCapacity and SSD file size to tenant size
             // Block pool uses 4KB pages; each vector with replication needs multiple blocks
             // Use the routed posting assignment count instead of raw tenant size,
@@ -2090,10 +2260,12 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             tenantIndex->SetBuildParam("DataCapacity", std::to_string(dataCapacity).c_str(), "Base");
             tenantIndex->SetBuildParam("DataBlockSize", std::to_string(std::min(dataCapacity, 1024 * 1024)).c_str(), "Base");
 
-            // Scale SSD file size: each posting can hold ~PostingVectorLimit(118) vectors
-            // Each vector in posting: dim*sizeof(float) + metadata overhead ~= dim*4+64 bytes
-            // With ReplicaCount=8, total data ~ assignments * replica * vec_bytes / page_size blocks.
-            int64_t estimatedBytes = postingAssignmentCount * static_cast<int64_t>(m_dimension * 4 + 64) * 10LL;
+            // Scale SSD file size: each posting can hold ~PostingVectorLimit vectors.
+            // Each vector in posting: dim*sizeof(valueType) + metadata overhead.
+            // Use the ACTUAL value-type size (not hardcoded float) so uint8/int8
+            // builds don't over-allocate the posting pool by 4x.
+            const int64_t vecBytes = static_cast<int64_t>(SPTAG::GetValueTypeSize(m_valueType)) * m_dimension + 64;
+            int64_t estimatedBytes = postingAssignmentCount * vecBytes * 10LL;
                 int startFileSizeGB = std::max(1, (int)(estimatedBytes / (1024LL * 1024LL * 1024LL)) + 1);
                 if (hasNodeAwarePlan) {
                 startFileSizeGB = std::max(startFileSizeGB, 4);
@@ -2881,13 +3053,12 @@ void TenantIndexManager::LoadTenantTagPureIndices()
             auto it = m_tenantIndices.find(tenantId);
             if (it != m_tenantIndices.end()) {
                 auto internalIdx = it->second->GetInternalIndex();
-                auto* spannIdx = dynamic_cast<SPTAG::SPANN::Index<float>*>(internalIdx.get());
-                if (spannIdx != nullptr) {
-                    if (auto* opts = spannIdx->GetOptions()) {
+                if (SpannIsValid(internalIdx.get(), m_valueType)) {
+                    if (auto* opts = SpannGetOptions(internalIdx.get(), m_valueType)) {
                         postingPageLimit = std::max(1, opts->m_postingPageLimit);
                         bufferLength = std::max(0, opts->m_bufferLength);
                     }
-                    auto extra = spannIdx->GetDiskIndex();
+                    auto extra = SpannGetDiskIndex(internalIdx.get(), m_valueType);
                     if (extra) kvDb = extra->GetKVStore();
                 }
             }
@@ -3562,9 +3733,9 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
 
     // Tag-pure path: collect first-occurrence vector data per VID so we can
     // materialize per-tag dense lists for very-sparse tags after the loop.
-    // Only enabled for Float value type (m_inputVectorSize == dim * 4).
-    const bool kTagPureEligible = (m_valueType == SPTAG::VectorValueType::Float)
-        && (m_inputVectorSize == (size_t)m_dimension * sizeof(float));
+    // Stored as float (normalized at materialization) regardless of the index
+    // value type, so non-Float (e.g. UInt8) indices are converted on capture.
+    const bool kTagPureEligible = true;
     std::vector<uint8_t> vidSeen;            // 0/1 per VID
     std::vector<float>   vidVecData;         // p_numVectors * dim, row-major
     if (kTagPureEligible) {
@@ -3613,8 +3784,8 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
             // First-occurrence capture of vector payload for tag-pure path.
             if (kTagPureEligible && !vidSeen[vid]) {
                 const uint8_t* src = raw.data() + offset + META_SIZE;
-                std::memcpy(vidVecData.data() + (size_t)vid * (size_t)m_dimension,
-                            src, m_inputVectorSize);
+                CopyVectorToFloat(vidVecData.data() + (size_t)vid * (size_t)m_dimension,
+                                  src, m_valueType, m_dimension);
                 vidSeen[vid] = 1;
             }
         }
@@ -3761,12 +3932,12 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
     if (idxPtr) {
         auto internalIdx = idxPtr->GetInternalIndex();
         auto memoryIndex = GetMemoryIndexForInternal(internalIdx);
-        auto* spannInternalIdx = dynamic_cast<SPTAG::SPANN::Index<float>*>(internalIdx.get());
-        if (memoryIndex != nullptr && spannInternalIdx != nullptr) {
+        const bool spannValid = SpannIsValid(internalIdx.get(), m_valueType);
+        if (memoryIndex != nullptr && spannValid) {
             const SizeType numHeadSamples = memoryIndex->GetNumSamples();
             memoryIndex->InitializeHeadNodeMeta(numHeadSamples);
             for (SizeType hid = 0; hid < numHeadSamples; ++hid) {
-                SizeType globalVID = spannInternalIdx->GetGlobalVID(hid);
+                SizeType globalVID = SpannGetGlobalVID(internalIdx.get(), m_valueType, hid);
                 memoryIndex->SetHeadNodeGlobalVID(hid, globalVID);
                 if (hid < sigs->num_postings) {
                     memoryIndex->SetHeadNodePS(hid, sigs->ps[hid]);
@@ -3794,8 +3965,8 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                     && !vidSeen[globalVID]) {
                     const void* hv = memoryIndex->GetSample(hid);
                     if (hv != nullptr) {
-                        std::memcpy(vidVecData.data() + (size_t)globalVID * (size_t)m_dimension,
-                                    hv, m_inputVectorSize);
+                        CopyVectorToFloat(vidVecData.data() + (size_t)globalVID * (size_t)m_dimension,
+                                          hv, m_valueType, m_dimension);
                         vidSeen[globalVID] = 1;
                     }
                 }
@@ -3831,7 +4002,8 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                                                      p_numVectors,
                                                      p_numTagsPerVec,
                                                      memoryIndex,
-                                                     spannInternalIdx,
+                                                     internalIdx.get(),
+                                                     m_valueType,
                                                      headNodeToNode);
                 m_tenantHeadNodeToNode[p_tenantId] = headNodeToNode;
 
@@ -3881,13 +4053,12 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
             auto it = m_tenantIndices.find(p_tenantId);
             if (it != m_tenantIndices.end()) {
                 auto internalIdx2 = it->second->GetInternalIndex();
-                auto* spann2 = dynamic_cast<SPTAG::SPANN::Index<float>*>(internalIdx2.get());
-                if (spann2 != nullptr) {
-                    if (auto* opts = spann2->GetOptions()) {
+                if (SpannIsValid(internalIdx2.get(), m_valueType)) {
+                    if (auto* opts = SpannGetOptions(internalIdx2.get(), m_valueType)) {
                         postingPageLimit = std::max(1, opts->m_postingPageLimit);
                         bufferLength = std::max(0, opts->m_bufferLength);
                     }
-                    auto extra = spann2->GetDiskIndex();
+                    auto extra = SpannGetDiskIndex(internalIdx2.get(), m_valueType);
                     if (extra) kvDb = extra->GetKVStore();
                 }
             }
@@ -4034,8 +4205,7 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                     auto it = m_tenantIndices.find(p_tenantId);
                     if (it != m_tenantIndices.end()) {
                         auto internalIdx = it->second->GetInternalIndex();
-                        auto* spannIdx = dynamic_cast<SPTAG::SPANN::Index<float>*>(internalIdx.get());
-                        if (spannIdx) extra = spannIdx->GetDiskIndex();
+                        extra = SpannGetDiskIndex(internalIdx.get(), m_valueType);
                     }
                 }
                 if (extra) {
@@ -4201,8 +4371,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
     // the chunks from the shared KV store (FileIO ShardedLRUCache / RocksDB
     // block cache handles caching), decode (VID + normVec) entries and
     // flat-scan for top-K. Bypasses BKT/SSD and gives R=1.0 by construction.
-    if (!s_disableTagPurePath && !forceDenseTagSearch && p_numTags == 1
-        && m_valueType == SPTAG::VectorValueType::Float) {
+    if (!s_disableTagPurePath && !forceDenseTagSearch && p_numTags == 1) {
         auto pureIt = m_tenantTagPurePostings.find(p_tenantId);
         auto kvIt = m_tenantTagPureKV.find(p_tenantId);
         if (pureIt != m_tenantTagPurePostings.end() && kvIt != m_tenantTagPureKV.end()
@@ -4241,7 +4410,12 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
                                           &ws.m_diskRequests);
                 if (err == SPTAG::ErrorCode::Success) {
                     std::vector<std::pair<float, int>> topK;
-                    pure.SearchTopK(reinterpret_cast<const float*>(p_queryVector.Data()),
+                    // Tag-pure stores float vectors; convert the (possibly
+                    // non-Float) query to float so scoring is value-type-agnostic.
+                    std::vector<float> queryFloat(m_dimension);
+                    CopyVectorToFloat(queryFloat.data(), p_queryVector.Data(),
+                                      m_valueType, m_dimension);
+                    pure.SearchTopK(queryFloat.data(),
                                     values, p_resultNum, topK);
                     auto result = std::make_shared<QueryResult>(
                         p_queryVector.Data(), p_resultNum, false);
@@ -4484,8 +4658,9 @@ bool TenantIndexManager::InitSharedFileIO()
     sharedOpts.m_datasetCapacity = std::max(m_totalPostingCount * 8, 4096);
     sharedOpts.m_datasetRowsInBlock = std::min(sharedOpts.m_datasetCapacity, 1024 * 1024);
 
-    // Estimate file size from total posting count
-    int64_t totalEstBytes = (int64_t)m_totalPostingCount * (int64_t)(m_dimension * 4 + 64) * 10;
+    // Estimate file size from total posting count (value-type-aware).
+    const int64_t sharedVecBytes = (int64_t)SPTAG::GetValueTypeSize(m_valueType) * m_dimension + 64;
+    int64_t totalEstBytes = (int64_t)m_totalPostingCount * sharedVecBytes * 10;
     int startGB = std::max(1, (int)(totalEstBytes / (1024LL * 1024LL * 1024LL)) + 1);
     sharedOpts.m_startFileSize = startGB;
     sharedOpts.m_maxFileSize = std::max(startGB * 3, 10);
