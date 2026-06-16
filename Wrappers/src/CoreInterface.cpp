@@ -2218,13 +2218,17 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
 
             // Work directory root is configurable so large builds can use a big
             // disk instead of /tmp (root fs may be small). SPTAG_SPANN_WORKDIR
-            // overrides the parent directory; per-tenant subdir is appended.
+            // overrides the parent directory; the per-tenant subdir is named
+            // "tenant_<id>" to match the final unified-storage layout. Setting
+            // SPTAG_SPANN_WORKDIR to the SaveAll output dir therefore builds the
+            // index in place — SaveUnifiedStorage detects srcDir == dstDir and
+            // skips the copy, avoiding a second full (~TB for 1B) posting copy.
             std::string workRoot = "/tmp";
             {
                 const char* wdEnv = std::getenv("SPTAG_SPANN_WORKDIR");
                 if (wdEnv != nullptr && wdEnv[0] != '\0') workRoot = wdEnv;
             }
-            std::string spannWorkDir = workRoot + "/sptag_spann_tenant_" + std::to_string(tenantId);
+            std::string spannWorkDir = workRoot + "/tenant_" + std::to_string(tenantId);
             RemovePathRecursive(spannWorkDir);
             EnsureDir(spannWorkDir);
             tenantIndex->SetBuildParam("IndexDirectory", spannWorkDir.c_str(), "Base");
