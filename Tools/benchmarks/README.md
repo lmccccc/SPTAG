@@ -96,8 +96,11 @@ remain an optional sparse-filter experiment.
 
 `UnfilterPureDistanceScanPercent` can benchmark computation reduction on this
 distance-ordered layout. Values below `100` retain the nearest pure prefix and
-the complete tail suffix. The runtime rejects this setting on attribute-ordered
-snapshots and when bounded-tail page controls are active.
+the tail suffix. By default the complete tail is retained. For a combined
+compute/I/O sweep, enable `UnfilterPurePages` and set
+`UnfilterExtraTailPages=N`; the reader scans the selected pure prefix plus only
+the tail records available within the pure pages and at most `N` additional
+pages. Attribute-ordered snapshots remain unsupported.
 
 `build_spann_attr_sift1m_tagged_4node_static_fullfloat_tail_unbounded.ini`
 is the matching SIFT1M no-order control; it explicitly sets this parameter to

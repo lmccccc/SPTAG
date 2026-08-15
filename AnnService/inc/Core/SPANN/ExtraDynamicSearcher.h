@@ -34,6 +34,7 @@
 #include <future>
 #include <numeric>
 #include <utility>
+#include <utility>
 #include <random>
 #include <fstream>
 #include <sstream>
@@ -368,6 +369,13 @@ namespace SPTAG::SPANN {
         // One nearest-head owner per vector. Optional sparse-filter sidecar.
         PrimaryHeadCSR m_primaryHeadCSR;
 
+        int ACLTagCols() const
+        {
+            return m_opt != nullptr && m_opt->m_staticACLTagCols > 0
+                ? (std::min)(m_opt->m_staticACLTagCols, m_numTagsPerVec)
+                : m_numTagsPerVec;
+        }
+
     public:
         void SetVectorTags(const uint32_t* tags, int numVecs, int numTagsPerVec) override {
             m_numTagsPerVec = numTagsPerVec;
@@ -381,6 +389,11 @@ namespace SPTAG::SPANN {
 
         void SetPrimaryNodeVectorAssignments(const std::vector<std::vector<SizeType>>& primaryNodeVectorAssignments) override {
             m_primaryNodeVectorAssignments = primaryNodeVectorAssignments;
+        }
+
+        void SetPrimaryNodeVectorAssignments(std::vector<std::vector<SizeType>>&& primaryNodeVectorAssignments) override {
+            m_primaryNodeVectorAssignments =
+                std::move(primaryNodeVectorAssignments);
         }
 
         void SetHeadVectorOwners(const std::unordered_map<SizeType, int>& headVectorOwners) override {
@@ -3344,6 +3357,9 @@ namespace SPTAG::SPANN {
                 m_tagBytesPerVec > 0 &&
                 p_exWorkSpace->m_dnf != nullptr &&
                 !p_exWorkSpace->m_dnf->Empty();
+            const bool hasPredicateFilter = hasInlineTagFilter || hasDNF;
+            const bool ablateTail =
+                m_opt->m_ablateTail && m_hasPostingPureCounts;
             {
                 static const bool s_dnfDbg = (std::getenv("SPTAG_DNF_DEBUG") != nullptr);
                 if (s_dnfDbg) {
@@ -3360,7 +3376,10 @@ namespace SPTAG::SPANN {
             // U_extra (unfilter-only) heads are infrastructure for unfiltered
             // recall only. Filtered queries drop role==1 heads unless the native
             // FilterKeepUExtra A/B option is enabled.
-            if (hasInlineTagFilter && HasHeadRoles() && !m_opt->m_filterKeepUExtra) {
+            if (hasPredicateFilter &&
+                (!p_exWorkSpace->m_useGlobalTailWithPostFilter || ablateTail) &&
+                HasHeadRoles() &&
+                !m_opt->m_filterKeepUExtra) {
                 auto& ids = p_exWorkSpace->m_postingIDs;
                 ids.erase(std::remove_if(ids.begin(), ids.end(),
                     [&](int pid) { return IsUnfilterOnlyHead(pid); }), ids.end());
@@ -3369,7 +3388,11 @@ namespace SPTAG::SPANN {
             // pure-count sidecar exists: filtered queries must never scan the
             // unfilter-only tail. EnableUnfilterTail=false force-disables it.
             const bool useUnfilterTail =
-                m_opt->m_enableUnfilterTail && m_hasPostingPureCounts && hasInlineTagFilter;
+                m_opt->m_enableUnfilterTail &&
+                m_hasPostingPureCounts &&
+                hasPredicateFilter &&
+                !p_exWorkSpace->m_useGlobalTailWithPostFilter;
+            const bool usePurePrefix = useUnfilterTail || ablateTail;
 
             // Page-selective IO (env SPTAG_PAGE_SELECT=1): for filtered queries,
             // read only the posting pages whose per-page signature may contain a
@@ -3380,7 +3403,11 @@ namespace SPTAG::SPANN {
                 const char* env = std::getenv("SPTAG_PAGE_SELECT");
                 return env && env[0] == '1';
             }();
-            bool usePageSelect = s_pageSelect && hasInlineTagFilter && m_numTagsPerVec > 0;
+            bool usePageSelect =
+                s_pageSelect &&
+                hasInlineTagFilter &&
+                m_numTagsPerVec > 0 &&
+                !p_exWorkSpace->m_useGlobalTailWithPostFilter;
             if (usePageSelect && !EnsurePagePS(p_exWorkSpace)) usePageSelect = false;
             const std::uint32_t searchPostingByteCap =
                 (m_opt->m_searchPostingPageLimit > 0)
@@ -3419,7 +3446,8 @@ namespace SPTAG::SPANN {
                     const auto& pages = m_pagePS[hid];
                     int numPages = (int)pages.size();
                     int pStart = 0, pEnd = numPages;
-                    if (m_hasPostingPureCounts) {
+                    if (m_hasPostingPureCounts &&
+                        !p_exWorkSpace->m_useGlobalTailWithPostFilter) {
                         int pure = m_postingPureCounts.GetSize(hid);
                         if (pure > 0)
                             pEnd = (int)((std::min)((size_t)numPages,
@@ -3444,7 +3472,7 @@ namespace SPTAG::SPANN {
                                      pageSel,
                                      remainLimit,
                                      &(p_exWorkSpace->m_diskRequests));
-            } else if (useUnfilterTail) {
+            } else if (usePurePrefix) {
                 // Build per-posting byte cap = pure_count * vectorInfoSize.
                 // Block layer rounds up to ceil(cap / PageSize) blocks.
                 std::vector<std::uint32_t> maxBytes(p_exWorkSpace->m_postingIDs.size(), 0);
@@ -3485,7 +3513,7 @@ namespace SPTAG::SPANN {
             if (mgErr != ErrorCode::Success ||
                 (!usePageSelect &&
                  !ValidatePostings(p_exWorkSpace->m_postingIDs, p_exWorkSpace->m_pageBuffers,
-                                   useUnfilterTail || searchPostingByteCap > 0)))
+                                   usePurePrefix || searchPostingByteCap > 0)))
             {
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "[SearchIndex] read postings fail!\n");
                 return ErrorCode::DiskIOFail;
@@ -3504,7 +3532,7 @@ namespace SPTAG::SPANN {
                 int vectorNum = (int)(buffer.GetAvailableSize() / m_vectorInfoSize);
                 int scanStart = 0;
                 int scanLimit = vectorNum;
-                if (useUnfilterTail) {
+                if (usePurePrefix) {
                     if (IsUnfilterOnlyHead((int)curPostingID)) {
                         // Tail-only (U_extra) head: never scanned by filtered queries.
                         scanLimit = 0;
@@ -3626,7 +3654,7 @@ namespace SPTAG::SPANN {
                     } else if (hasInlineTagFilter) {
                         tagMatch = false;
                         const uint32_t* vecTags = reinterpret_cast<const uint32_t*>(vectorInfo + sizeof(int) + sizeof(uint8_t));
-                        for (int ti = 0; ti < m_numTagsPerVec && !tagMatch; ti++) {
+                        for (int ti = 0; ti < ACLTagCols() && !tagMatch; ti++) {
                             for (int qi = 0; qi < p_exWorkSpace->m_numQueryTags && !tagMatch; qi++) {
                                 if (vecTags[ti] == p_exWorkSpace->m_queryTags[qi]) tagMatch = true;
                             }
@@ -3640,7 +3668,9 @@ namespace SPTAG::SPANN {
 
                     if (tagMatch) {
                         postingHasExactMatch = true;
-                        if (hasDNF) dnfMatched.insert((SizeType)vectorID);
+                        if (hasPredicateFilter) {
+                            dnfMatched.insert((SizeType)vectorID);
+                        }
                     }
 
                     if(p_exWorkSpace->m_deduper.CheckAndSet(vectorID)) {
@@ -3802,10 +3832,30 @@ namespace SPTAG::SPANN {
                     BasicResult* r = queryResults.GetResult(i);
                     if (r == nullptr || r->VID < 0) continue;
                     bool matches;
-                    if (m_tagBytesPerVec > 0 && r->VID >= 0 &&
+                    if (dnfMatched.find((SizeType)r->VID) != dnfMatched.end()) {
+                        matches = true;
+                    } else if (m_tagBytesPerVec > 0 && r->VID >= 0 &&
                         (size_t)r->VID * m_numTagsPerVec < m_vectorTags.size()) {
-                        matches = p_exWorkSpace->m_dnf->Matches(
-                            &m_vectorTags[(size_t)r->VID * m_numTagsPerVec], m_numTagsPerVec);
+                        const uint32_t* resultTags =
+                            &m_vectorTags[(size_t)r->VID * m_numTagsPerVec];
+                        if (hasDNF) {
+                            matches = p_exWorkSpace->m_dnf->Matches(
+                                resultTags, m_numTagsPerVec);
+                        } else {
+                            matches = false;
+                            for (int ti = 0;
+                                 ti < ACLTagCols() && !matches;
+                                 ++ti) {
+                                for (int qi = 0;
+                                     qi < p_exWorkSpace->m_numQueryTags &&
+                                     !matches;
+                                     ++qi) {
+                                    matches =
+                                        resultTags[ti] ==
+                                        p_exWorkSpace->m_queryTags[qi];
+                                }
+                            }
+                        }
                     } else {
                         matches = (dnfMatched.find((SizeType)r->VID) != dnfMatched.end());
                     }
@@ -4045,47 +4095,52 @@ namespace SPTAG::SPANN {
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Build SSD Index.\n");
 
             std::vector<std::vector<SizeType>> plannedNodeVectors;
-            std::vector<std::vector<int>> vectorMemberships;
-            bool useNodeAwareBuild = !m_plannedNodeVectorAssignments.empty();
+            std::vector<int> vectorOwner;
+            const bool usePrimaryAssignments =
+                !m_primaryNodeVectorAssignments.empty();
+            if (usePrimaryAssignments) {
+                plannedNodeVectors =
+                    std::move(m_primaryNodeVectorAssignments);
+                std::vector<std::vector<SizeType>>().swap(
+                    m_plannedNodeVectorAssignments);
+            } else {
+                plannedNodeVectors =
+                    std::move(m_plannedNodeVectorAssignments);
+            }
+            bool useNodeAwareBuild = !plannedNodeVectors.empty();
             size_t plannedAssignmentCount = static_cast<size_t>(fullCount);
-            // Prefer primary assignments (each vector owned by exactly one node) for
-            // posting placement so each vector contributes a unique posting footprint.
-            // Multi-membership planned assignments are kept only for head-routing/ACL.
-            const std::vector<std::vector<SizeType>>& postingPlacementSource =
-                !m_primaryNodeVectorAssignments.empty()
-                    ? m_primaryNodeVectorAssignments
-                    : m_plannedNodeVectorAssignments;
             if (useNodeAwareBuild)
             {
-                plannedNodeVectors.resize(postingPlacementSource.size());
-                vectorMemberships.assign(fullCount, std::vector<int>());
+                vectorOwner.assign(fullCount, -1);
                 plannedAssignmentCount = 0;
 
-                std::vector<uint8_t> claimedVector(fullCount, 0);
-                for (size_t nodeId = 0; nodeId < postingPlacementSource.size(); ++nodeId)
+                for (size_t nodeId = 0; nodeId < plannedNodeVectors.size(); ++nodeId)
                 {
-                    for (SizeType vectorId : postingPlacementSource[nodeId])
+                    auto& nodeVectors = plannedNodeVectors[nodeId];
+                    size_t output = 0;
+                    for (SizeType vectorId : nodeVectors)
                     {
                         if (vectorId < 0 || vectorId >= fullCount) {
                             continue;
                         }
-                        if (claimedVector[static_cast<size_t>(vectorId)]) {
+                        if (vectorOwner[static_cast<size_t>(vectorId)] >= 0) {
                             continue;
                         }
-                        claimedVector[static_cast<size_t>(vectorId)] = 1;
 
-                        plannedNodeVectors[nodeId].push_back(vectorId);
-                        vectorMemberships[vectorId].push_back(static_cast<int>(nodeId));
+                        vectorOwner[static_cast<size_t>(vectorId)] =
+                            static_cast<int>(nodeId);
+                        nodeVectors[output++] = vectorId;
                         ++plannedAssignmentCount;
                     }
+                    nodeVectors.resize(output);
                 }
 
                 useNodeAwareBuild = plannedAssignmentCount > 0;
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
                              "Node-aware build: posting placement source=%s, unique assignments=%zu across %zu nodes\n",
-                             (!m_primaryNodeVectorAssignments.empty() ? "primary" : "planned"),
+                             (usePrimaryAssignments ? "primary" : "planned"),
                              plannedAssignmentCount,
-                             postingPlacementSource.size());
+                             plannedNodeVectors.size());
             }
 
             Selection selections((useNodeAwareBuild ? plannedAssignmentCount : static_cast<size_t>(fullCount)) * m_opt->m_replicaCount, m_opt->m_tmpdir);
@@ -4114,20 +4169,6 @@ namespace SPTAG::SPANN {
                         fullVectors->Normalize(m_opt->m_iSSDNumberOfThreads);
                     }
 
-                    std::vector<int> primaryOwner(fullCount, -1);
-                    if (!m_primaryNodeVectorAssignments.empty())
-                    {
-                        for (size_t nodeId = 0; nodeId < m_primaryNodeVectorAssignments.size(); ++nodeId)
-                        {
-                            for (SizeType vectorId : m_primaryNodeVectorAssignments[nodeId])
-                            {
-                                if (vectorId >= 0 && vectorId < fullCount) {
-                                    primaryOwner[vectorId] = static_cast<int>(nodeId);
-                                }
-                            }
-                        }
-                    }
-
                     std::vector<int> headToNode(p_headIndex->GetNumSamples(), -1);
                     for (const auto& pair : headVectorIDS)
                     {
@@ -4139,16 +4180,19 @@ namespace SPTAG::SPANN {
                         auto ownerIt = m_headVectorOwners.find(pair.first);
                         if (ownerIt != m_headVectorOwners.end()) {
                             assignedNode = ownerIt->second;
-                        } else if (pair.first >= 0 && pair.first < static_cast<SizeType>(primaryOwner.size()) && primaryOwner[pair.first] >= 0) {
-                            assignedNode = primaryOwner[pair.first];
-                        } else if (!vectorMemberships[pair.first].empty()) {
-                            assignedNode = vectorMemberships[pair.first].front();
+                        } else if (pair.first >= 0
+                                   && pair.first < static_cast<SizeType>(vectorOwner.size())
+                                   && vectorOwner[static_cast<size_t>(pair.first)] >= 0)
+                        {
+                            assignedNode =
+                                vectorOwner[static_cast<size_t>(pair.first)];
                         }
                         if (assignedNode < 0) {
                             assignedNode = 0;
                         }
                         headToNode[pair.second] = assignedNode;
                     }
+                    std::vector<int>().swap(vectorOwner);
 
                     std::vector<std::vector<uint8_t>> allowedHeadMasks(plannedNodeVectors.size(), std::vector<uint8_t>(p_headIndex->GetNumSamples(), 0));
                     std::vector<size_t> nodeHeadCounts(plannedNodeVectors.size(), 0);
@@ -4479,13 +4523,6 @@ namespace SPTAG::SPANN {
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Posting size limit: %d\n", m_postingSizeLimit);
             {
                 int maxReplicaSlots = m_opt->m_replicaCount;
-                if (useNodeAwareBuild)
-                {
-                    for (const auto& memberships : vectorMemberships)
-                    {
-                        maxReplicaSlots = max(maxReplicaSlots, static_cast<int>(memberships.size()) * m_opt->m_replicaCount);
-                    }
-                }
                 std::vector<int> replicaCountDist(maxReplicaSlots + 1, 0);
                 for (int i = 0; i < replicaCount.size(); ++i)
                 {
@@ -4562,13 +4599,6 @@ namespace SPTAG::SPANN {
             }
             {
                 int maxReplicaSlots = m_opt->m_replicaCount;
-                if (useNodeAwareBuild)
-                {
-                    for (const auto& memberships : vectorMemberships)
-                    {
-                        maxReplicaSlots = max(maxReplicaSlots, static_cast<int>(memberships.size()) * m_opt->m_replicaCount);
-                    }
-                }
                 std::vector<int> replicaCountDist(maxReplicaSlots + 1, 0);
                 for (int i = 0; i < replicaCount.size(); ++i)
                 {
@@ -7646,7 +7676,18 @@ namespace SPTAG::SPANN {
             }
             const bool hasInlineTagFilter =
                 m_tagBytesPerVec > 0 && p_exWorkSpace->m_queryTags != nullptr && p_exWorkSpace->m_numQueryTags > 0;
-            if (hasInlineTagFilter && HasHeadRoles() && !m_opt->m_filterKeepUExtra) {
+            const bool hasDNF =
+                m_tagBytesPerVec > 0 &&
+                p_exWorkSpace->m_dnf != nullptr &&
+                !p_exWorkSpace->m_dnf->Empty();
+            const bool hasPredicateFilter = hasInlineTagFilter || hasDNF;
+            std::unordered_set<SizeType> dnfMatched;
+            const bool ablateTail =
+                m_opt->m_ablateTail && m_hasPostingPureCounts;
+            if (hasPredicateFilter &&
+                (!p_exWorkSpace->m_useGlobalTailWithPostFilter || ablateTail) &&
+                HasHeadRoles() &&
+                !m_opt->m_filterKeepUExtra) {
                 auto& ids = p_exWorkSpace->m_postingIDs;
                 ids.erase(std::remove_if(ids.begin(), ids.end(),
                     [&](int pid) { return IsUnfilterOnlyHead(pid); }), ids.end());
@@ -7670,7 +7711,10 @@ namespace SPTAG::SPANN {
             // Filter: read+scan only the pure prefix (skip tail pages). Unfilter
             // reads the full posting unless the tail-ablation diagnostic is on.
             const bool useUnfilterTail =
-                m_opt->m_enableUnfilterTail && m_hasPostingPureCounts && hasInlineTagFilter;
+                m_opt->m_enableUnfilterTail &&
+                m_hasPostingPureCounts &&
+                hasPredicateFilter &&
+                !p_exWorkSpace->m_useGlobalTailWithPostFilter;
             const bool capScanToPure =
                 useUnfilterTail ||
                 (m_opt->m_ablateTail && m_hasPostingPureCounts && !hasInlineTagFilter);
@@ -7863,13 +7907,21 @@ namespace SPTAG::SPANN {
                             continue;
                         }
                         if (trackStatsOPQ) ++p_exWorkSpace->m_postingProbeStats.m_scannedVectors;
-                        if (hasInlineTagFilter) {
+                        const uint32_t* vt = reinterpret_cast<const uint32_t*>(
+                            e + sizeof(int) + sizeof(uint8_t));
+                        if (hasDNF) {
+                            if (!p_exWorkSpace->m_dnf->Matches(
+                                    vt, m_numTagsPerVec)) {
+                                continue;
+                            }
+                            dnfMatched.insert(static_cast<SizeType>(vid));
+                        } else if (hasInlineTagFilter) {
                             bool tagMatch = false;
-                            const uint32_t* vt = reinterpret_cast<const uint32_t*>(e + sizeof(int) + sizeof(uint8_t));
-                            for (int ti = 0; ti < m_numTagsPerVec && !tagMatch; ti++)
+                            for (int ti = 0; ti < ACLTagCols() && !tagMatch; ti++)
                                 for (int qi = 0; qi < p_exWorkSpace->m_numQueryTags && !tagMatch; qi++)
                                     if (vt[ti] == p_exWorkSpace->m_queryTags[qi]) tagMatch = true;
                             if (!tagMatch) continue;
+                            dnfMatched.insert(static_cast<SizeType>(vid));
                         }
                         if (trackStatsOPQ) ++p_exWorkSpace->m_postingProbeStats.m_matchedVectors;
                         if (p_exWorkSpace->m_deduper.CheckAndSet(vid)) continue;
@@ -7938,13 +7990,21 @@ namespace SPTAG::SPANN {
                         continue;
                     }
                     if (trackStatsOPQ) ++p_exWorkSpace->m_postingProbeStats.m_scannedVectors;
-                    if (hasInlineTagFilter) {
+                    const uint32_t* vt = reinterpret_cast<const uint32_t*>(
+                        e + sizeof(int) + sizeof(uint8_t));
+                    if (hasDNF) {
+                        if (!p_exWorkSpace->m_dnf->Matches(
+                                vt, m_numTagsPerVec)) {
+                            continue;
+                        }
+                        dnfMatched.insert(static_cast<SizeType>(vid));
+                    } else if (hasInlineTagFilter) {
                         bool tagMatch = false;
-                        const uint32_t* vt = reinterpret_cast<const uint32_t*>(e + sizeof(int) + sizeof(uint8_t));
-                        for (int ti = 0; ti < m_numTagsPerVec && !tagMatch; ti++)
+                        for (int ti = 0; ti < ACLTagCols() && !tagMatch; ti++)
                             for (int qi = 0; qi < p_exWorkSpace->m_numQueryTags && !tagMatch; qi++)
                                 if (vt[ti] == p_exWorkSpace->m_queryTags[qi]) tagMatch = true;
                         if (!tagMatch) continue;
+                        dnfMatched.insert(static_cast<SizeType>(vid));
                     }
                     if (trackStatsOPQ) ++p_exWorkSpace->m_postingProbeStats.m_matchedVectors;
                     if (p_exWorkSpace->m_deduper.CheckAndSet(vid)) continue;
@@ -8063,6 +8123,54 @@ namespace SPTAG::SPANN {
             if (logPhaseTime) {
                 rerankMs = std::chrono::duration<double, std::milli>(
                     std::chrono::high_resolution_clock::now() - rerankStart).count();
+            }
+
+            if (hasDNF) {
+                bool anyDropped = false;
+                for (int i = 0; i < queryResults.GetResultNum(); ++i) {
+                    BasicResult* result = queryResults.GetResult(i);
+                    if (result == nullptr || result->VID < 0) continue;
+                    bool matches = false;
+                    if (dnfMatched.count(
+                            static_cast<SizeType>(result->VID)) > 0) {
+                        matches = true;
+                    } else if (m_tagBytesPerVec > 0 &&
+                        static_cast<size_t>(result->VID) *
+                                static_cast<size_t>(m_numTagsPerVec) <
+                            m_vectorTags.size()) {
+                        const uint32_t* resultTags =
+                            &m_vectorTags[
+                                static_cast<size_t>(result->VID) *
+                                static_cast<size_t>(m_numTagsPerVec)];
+                        if (hasDNF) {
+                            matches = p_exWorkSpace->m_dnf->Matches(
+                                resultTags, m_numTagsPerVec);
+                        } else {
+                            for (int ti = 0;
+                                 ti < ACLTagCols() && !matches;
+                                 ++ti) {
+                                for (int qi = 0;
+                                     qi < p_exWorkSpace->m_numQueryTags &&
+                                     !matches;
+                                     ++qi) {
+                                    matches =
+                                        resultTags[ti] ==
+                                        p_exWorkSpace->m_queryTags[qi];
+                                }
+                            }
+                        }
+                    } else {
+                        matches =
+                            dnfMatched.count(
+                                static_cast<SizeType>(result->VID)) > 0;
+                    }
+                    if (!matches) {
+                        result->VID = -1;
+                        result->Dist = MaxDist;
+                        anyDropped = true;
+                    }
+                }
+                if (anyDropped) queryResults.SortResult();
             }
 
             static const bool s_rbqDbg = []() { const char* e = std::getenv("SPTAG_RBQ_DBG"); return e && e[0] == '1'; }();

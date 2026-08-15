@@ -1348,11 +1348,15 @@ BOOST_AUTO_TEST_CASE(StaticBundleMetadataRootBuildAndReload)
     const SizeType fullPostingScans = query.GetScanned();
 
     typedSpann->GetOptions()->m_unfilterPureDistanceScanPercent = 50;
+    typedSpann->GetOptions()->m_unfilterPurePages = true;
+    typedSpann->GetOptions()->m_unfilterExtraTailPages = 1;
     COMMON::QueryResultSet<float> distancePrefixQuery(data, 10);
     BOOST_REQUIRE(index->SearchIndex(distancePrefixQuery) == ErrorCode::Success);
     BOOST_CHECK_GE(distancePrefixQuery.GetResult(0)->VID, 0);
     BOOST_CHECK_LE(distancePrefixQuery.GetScanned(), fullPostingScans);
     typedSpann->GetOptions()->m_unfilterPureDistanceScanPercent = 100;
+    typedSpann->GetOptions()->m_unfilterPurePages = false;
+    typedSpann->GetOptions()->m_unfilterExtraTailPages = 0;
 
     {
         VectorIndex::ThreadLocalSearchContext filterContext;
@@ -1513,6 +1517,31 @@ BOOST_AUTO_TEST_CASE(StaticBundleMetadataRootBuildAndReload)
     COMMON::QueryResultSet<float> rejectedAttributePrefixQuery(data, 10);
     BOOST_CHECK(
         reloaded->SearchIndex(rejectedAttributePrefixQuery) == ErrorCode::Fail);
+    reloaded.reset();
+
+    auto incompatibleAssignments = nodeAssignments;
+    BOOST_REQUIRE_EQUAL(incompatibleAssignments.size(), 2);
+    BOOST_REQUIRE(!incompatibleAssignments[0].empty());
+    BOOST_REQUIRE(!incompatibleAssignments[1].empty());
+    std::swap(
+        incompatibleAssignments[0].front(),
+        incompatibleAssignments[1].front());
+    auto incompatibleResume =
+        VectorIndex::CreateInstance(IndexAlgoType::SPANN, VectorValueType::Float);
+    BOOST_REQUIRE(incompatibleResume != nullptr);
+    configure(incompatibleResume);
+    auto* incompatibleSpann =
+        dynamic_cast<SPANN::ISPANNIndex*>(incompatibleResume.get());
+    BOOST_REQUIRE(incompatibleSpann != nullptr);
+    incompatibleSpann->SetVectorTags(tags.data(), baseCount, tagCount);
+    incompatibleSpann->SetNodeVectorAssignments(incompatibleAssignments);
+    incompatibleSpann->SetPrimaryNodeVectorAssignments(
+        incompatibleAssignments);
+    BOOST_CHECK(
+        incompatibleResume->BuildIndex(
+            vectors, nullptr, true, false, false) == ErrorCode::Fail);
+    BOOST_CHECK(
+        !std::filesystem::exists(indexDirectory + "/head_select_state.bin"));
     std::filesystem::remove_all(indexDirectory);
 }
 
@@ -1580,6 +1609,18 @@ BOOST_AUTO_TEST_CASE(StaticDistanceOrderSerialization)
     int offset = 3;
     BOOST_CHECK(range.NormalizeScanOffset(offset));
     BOOST_CHECK_EQUAL(offset, 5);
+
+    range.LimitToReadableRecords(7);
+    BOOST_CHECK_EQUAL(range.m_scanBegin, 0);
+    BOOST_CHECK_EQUAL(range.m_scanEnd, 3);
+    BOOST_CHECK_EQUAL(range.m_secondScanBegin, 5);
+    BOOST_CHECK_EQUAL(range.m_secondScanEnd, 7);
+    BOOST_CHECK_EQUAL(range.ScanCount(), 5);
+    offset = 3;
+    BOOST_CHECK(range.NormalizeScanOffset(offset));
+    BOOST_CHECK_EQUAL(offset, 5);
+    offset = 7;
+    BOOST_CHECK(!range.NormalizeScanOffset(offset));
 }
 
 BOOST_AUTO_TEST_CASE(TaggedPureTailUpdate)

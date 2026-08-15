@@ -248,6 +248,13 @@ namespace SPTAG
                 m_staticPrimaryNodeVectorAssignments = p_assignments;
             }
 
+            void SetPrimaryNodeVectorAssignments(
+                std::vector<std::vector<SizeType>>&& p_assignments) override
+            {
+                m_staticPrimaryNodeVectorAssignments =
+                    std::move(p_assignments);
+            }
+
             void SetHeadVectorOwners(
                 const std::unordered_map<SizeType, int>& p_owners) override
             {
@@ -1829,11 +1836,12 @@ namespace SPTAG
 
                 p_versionMap.Initialize(fullCount, p_headIndex->m_iDataBlockSize, p_headIndex->m_iDataCapacity);
 
-                const std::vector<std::vector<SizeType>>& placementSource =
-                    !m_staticPrimaryNodeVectorAssignments.empty()
-                        ? m_staticPrimaryNodeVectorAssignments
-                        : m_staticNodeVectorAssignments;
-                bool useNodeAwareBuild = !placementSource.empty();
+                const bool usePrimaryAssignments =
+                    !m_staticPrimaryNodeVectorAssignments.empty();
+                bool useNodeAwareBuild =
+                    usePrimaryAssignments
+                        ? !m_staticPrimaryNodeVectorAssignments.empty()
+                        : !m_staticNodeVectorAssignments.empty();
                 std::vector<std::vector<SizeType>> plannedNodeVectors;
                 std::vector<int> vectorOwner(static_cast<size_t>(fullCount), -1);
                 size_t plannedAssignmentCount = static_cast<size_t>(fullCount);
@@ -1844,20 +1852,29 @@ namespace SPTAG
                             "Node-aware static placement requires Batches=1 and unquantized heads.\n");
                         return false;
                     }
-                    plannedNodeVectors.resize(placementSource.size());
-                    std::vector<uint8_t> claimed(static_cast<size_t>(fullCount), 0);
+                    if (usePrimaryAssignments) {
+                        plannedNodeVectors =
+                            std::move(m_staticPrimaryNodeVectorAssignments);
+                        std::vector<std::vector<SizeType>>().swap(
+                            m_staticNodeVectorAssignments);
+                    } else {
+                        plannedNodeVectors =
+                            std::move(m_staticNodeVectorAssignments);
+                    }
                     plannedAssignmentCount = 0;
-                    for (size_t nodeId = 0; nodeId < placementSource.size(); ++nodeId) {
-                        for (SizeType vectorId : placementSource[nodeId]) {
+                    for (size_t nodeId = 0; nodeId < plannedNodeVectors.size(); ++nodeId) {
+                        auto& nodeVectors = plannedNodeVectors[nodeId];
+                        size_t output = 0;
+                        for (SizeType vectorId : nodeVectors) {
                             if (vectorId < 0 || vectorId >= fullCount ||
-                                claimed[static_cast<size_t>(vectorId)] != 0) {
+                                vectorOwner[static_cast<size_t>(vectorId)] >= 0) {
                                 continue;
                             }
-                            claimed[static_cast<size_t>(vectorId)] = 1;
                             vectorOwner[static_cast<size_t>(vectorId)] = static_cast<int>(nodeId);
-                            plannedNodeVectors[nodeId].push_back(vectorId);
+                            nodeVectors[output++] = vectorId;
                             ++plannedAssignmentCount;
                         }
+                        nodeVectors.resize(output);
                     }
                     if (plannedAssignmentCount != static_cast<size_t>(fullCount)) {
                         SPTAGLIB_LOG(
@@ -2987,14 +3004,6 @@ namespace SPTAG
                                 "this index contains ordered_page_starts.bin and is attribute-ordered.\n");
                             return true;
                         }
-                        if (m_opt->m_unfilterPurePages ||
-                            m_opt->m_unfilterExtraTailPages > 0) {
-                            SPTAGLIB_LOG(
-                                Helper::LogLevel::LL_Error,
-                                "UnfilterPureDistanceScanPercent retains the complete tail and cannot be "
-                                "combined with UnfilterPurePages or UnfilterExtraTailPages.\n");
-                            return true;
-                        }
                     }
                 }
                 if (p_exWorkSpace == nullptr) return false;
@@ -3023,6 +3032,10 @@ namespace SPTAG
             int StaticScanLimit(const ExtraWorkSpace* p_exWorkSpace, const ListInfo* p_listInfo) const
             {
                 if (p_listInfo == nullptr) return 0;
+                if (p_exWorkSpace != nullptr &&
+                    p_exWorkSpace->m_useGlobalTailWithPostFilter) {
+                    return p_listInfo->listEleCount;
+                }
                 if (!HasStaticMetadataFilter(p_exWorkSpace)) {
                     return p_listInfo->listEleCount;
                 }
@@ -3132,17 +3145,7 @@ namespace SPTAG
                     const int readableRecords = endBytes <= 0
                         ? 0
                         : static_cast<int>(endBytes / m_vectorInfoSize);
-                    range.m_scanEnd = (std::min)(range.m_scanEnd, readableRecords);
-                    if (range.m_secondScanEnd > range.m_secondScanBegin) {
-                        range.m_secondScanBegin =
-                            (std::min)(range.m_secondScanBegin, readableRecords);
-                        range.m_secondScanEnd =
-                            (std::min)(range.m_secondScanEnd, readableRecords);
-                        if (range.m_secondScanEnd <= range.m_secondScanBegin) {
-                            range.m_secondScanBegin = -1;
-                            range.m_secondScanEnd = -1;
-                        }
-                    }
+                    range.LimitToReadableRecords(readableRecords);
                 }
                 size_t attrIndex = 0;
                 std::int32_t queryBit = kOrderedPageStartEmpty;

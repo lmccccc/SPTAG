@@ -25,6 +25,12 @@
 typedef int SizeType;
 typedef int DimensionType;
 
+namespace SPTAG {
+namespace PredicateSubsetPlanner {
+struct Plan;
+}
+}
+
 class AnnIndex
 {
 public:
@@ -114,6 +120,9 @@ public:
 
     // Set build-time primary node ownership for SPANN head construction
     void SetPrimaryNodeVectorAssignments(const std::vector<std::vector<int>>& primaryNodeVectorAssignments);
+#ifndef SWIG
+    void TakePrimaryNodeVectorAssignments(std::vector<std::vector<int>>&& primaryNodeVectorAssignments);
+#endif
 
     // When set, the next Build() borrows the caller's vector buffer instead of
     // copying it into the core (passes p_shareOwnership=true to BuildIndex). The
@@ -248,6 +257,11 @@ public:
     // during the subsequent build.
     void SetBuildParam(const char* p_name, const char* p_value, const char* p_section);
     void SetSearchParam(const char* p_name, const char* p_value, const char* p_section);
+
+    // Enable workload-aware disjoint subset planning for subsequent SPANN
+    // builds. The workload is parsed and planned natively before SelectHead.
+    bool ConfigurePredicateSubsetPlanner(const char* p_workloadFile,
+                                         int p_categoricalColumnCount);
 
     // Set HeadIndex LRU cache size limit (in bytes). 0 = unlimited.
     void SetHeadIndexCacheLimit(uint64_t p_bytesLimit);
@@ -408,6 +422,24 @@ private:
 
     // Head sample -> node assignment for the selected pivot partitioning.
     std::map<int, std::vector<int>> m_tenantHeadNodeToNode;
+
+#ifndef SWIG
+    bool m_predicateSubsetPlannerEnabled = false;
+    std::string m_predicateSubsetWorkloadFile;
+    int m_predicateSubsetCategoricalColumnCount = 0;
+    std::map<int, std::shared_ptr<SPTAG::PredicateSubsetPlanner::Plan>>
+        m_tenantPredicateSubsetPlans;
+    std::map<int, std::unordered_map<std::string, std::vector<int>>>
+        m_tenantPredicateAtomToNodes;
+
+    bool EnsurePredicateSubsetPlan(int p_tenantId,
+                                   const uint32_t* p_tags,
+                                   const uint8_t* p_vectors,
+                                   int p_numVectors,
+                                   int p_numTagsPerVec,
+                                   const char* p_distMethod,
+                                   bool p_buildAssignments);
+#endif
 
     // Unified storage path (base directory for all tenants)
     std::string m_baseStoragePath;

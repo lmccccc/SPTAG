@@ -317,6 +317,20 @@ namespace SPTAG {
                     }
                 }
 
+                void LimitToReadableRecords(int p_readableRecords)
+                {
+                    const int readableRecords = (std::max)(0, p_readableRecords);
+                    m_scanEnd = (std::min)(m_scanEnd, readableRecords);
+                    if (m_secondScanEnd > m_secondScanBegin) {
+                        m_secondScanEnd =
+                            (std::min)(m_secondScanEnd, readableRecords);
+                        if (m_secondScanEnd <= m_secondScanBegin) {
+                            m_secondScanBegin = -1;
+                            m_secondScanEnd = -1;
+                        }
+                    }
+                }
+
                 int ScanCount() const
                 {
                     const int first = (std::max)(0, m_scanEnd - m_scanBegin);
@@ -402,6 +416,10 @@ namespace SPTAG {
             // Optional DNF predicate. When set (non-null, non-empty), the posting
             // scan uses exact DNF evaluation instead of the flat OR/IN m_queryTags.
             const SPTAG::Cache::DNFPredicate* m_dnf = nullptr;
+
+            // Preserve the inline predicate, but include the unfilter-tail
+            // suffix in posting IO and scanning.
+            bool m_useGlobalTailWithPostFilter = false;
 
             std::function<void()> m_callback;
         };
@@ -495,6 +513,11 @@ namespace SPTAG {
             virtual void SetPrimaryNodeVectorAssignments(
                 const std::vector<std::vector<SizeType>>& /*p_assignments*/)
             {
+            }
+            virtual void SetPrimaryNodeVectorAssignments(
+                std::vector<std::vector<SizeType>>&& p_assignments)
+            {
+                SetPrimaryNodeVectorAssignments(p_assignments);
             }
             virtual void SetHeadVectorOwners(
                 const std::unordered_map<SizeType, int>& /*p_owners*/)

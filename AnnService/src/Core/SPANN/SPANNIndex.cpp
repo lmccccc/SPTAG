@@ -72,7 +72,7 @@ static bool LoadUpdateRoutingNodes(const std::string& indexDir, const std::strin
     HeadNodeRoutingIndexFileHeader header {};
     bool ok = fread(&header, sizeof(header), 1, file) == 1 &&
               header.version == kHeadNodeRoutingIndexVersion &&
-              header.pivotLevel >= 0 && header.nodeCount >= 0 &&
+              header.pivotLevel >= -1 && header.nodeCount >= 0 &&
               header.numHeadSamples >= 0 && header.numTagMappings >= 0;
     for (int node = 0; ok && node < header.nodeCount; ++node) {
         std::int32_t count = 0;
@@ -109,11 +109,12 @@ static bool LoadUpdateRoutingNodes(const std::string& indexDir, const std::strin
 // WITHOUT re-running the expensive head-selection BKT k-means. Enabled by
 // SPTAG_PERSIST_SELECTHEAD=1; resumed by additionally setting SPTAG_RESUME_BUILD=1.
 constexpr std::uint32_t kHeadSelectStateMagic = 0x54535348U; // 'HSST'
-constexpr std::int32_t  kHeadSelectStateVersion = 1;
+constexpr std::int32_t  kHeadSelectStateVersion = 2;
 
 struct HeadSelectStateHeader {
     std::uint32_t magic;
     std::int32_t  version;
+    std::uint64_t assignmentFingerprint;
     std::int64_t  nodeHeadSelOuter;
     std::int64_t  nodeUExtraOuter;
     std::int64_t  nodeVecAssignOuter;
@@ -121,6 +122,36 @@ struct HeadSelectStateHeader {
     std::int64_t  headOwnersCount;
     std::int64_t  headRolesCount;
 };
+
+static std::uint64_t AssignmentFingerprint(
+    const std::vector<std::vector<SizeType>>& nodeAssignments,
+    const std::vector<std::vector<SizeType>>& primaryAssignments)
+{
+    std::uint64_t hash = 1469598103934665603ULL;
+    auto mix = [&](std::uint64_t value) {
+        for (int byte = 0; byte < 8; ++byte) {
+            hash ^= static_cast<std::uint8_t>(value >> (byte * 8));
+            hash *= 1099511628211ULL;
+        }
+    };
+    auto mixAssignments =
+        [&](std::uint64_t kind,
+            const std::vector<std::vector<SizeType>>& assignments) {
+            mix(kind);
+            mix(static_cast<std::uint64_t>(assignments.size()));
+            for (std::size_t node = 0; node < assignments.size(); ++node) {
+                mix(static_cast<std::uint64_t>(node));
+                mix(static_cast<std::uint64_t>(assignments[node].size()));
+                for (SizeType vectorId : assignments[node]) {
+                    mix(static_cast<std::uint64_t>(
+                        static_cast<std::uint32_t>(vectorId)));
+                }
+            }
+        };
+    mixAssignments(0x4e4f4445ULL, nodeAssignments);
+    mixAssignments(0x5052494dULL, primaryAssignments);
+    return hash;
+}
 
 static inline bool SpannEnvFlagOn(const char* name) {
     const char* v = std::getenv(name);
@@ -721,6 +752,9 @@ template <typename T> ErrorCode Index<T>::SaveHeadSelectState(const std::string&
     HeadSelectStateHeader header{};
     header.magic = kHeadSelectStateMagic;
     header.version = kHeadSelectStateVersion;
+    header.assignmentFingerprint = AssignmentFingerprint(
+        m_pendingNodeVectorAssignments,
+        m_pendingPrimaryNodeVectorAssignments);
     header.nodeHeadSelOuter = static_cast<std::int64_t>(m_pendingNodeHeadSelections.size());
     header.nodeUExtraOuter = static_cast<std::int64_t>(m_pendingNodeUExtraSelections.size());
     header.nodeVecAssignOuter = static_cast<std::int64_t>(m_pendingNodeVectorAssignments.size());
@@ -770,9 +804,15 @@ template <typename T> ErrorCode Index<T>::LoadHeadSelectState(const std::string&
     }
 
     HeadSelectStateHeader header{};
+    const std::uint64_t expectedAssignmentFingerprint =
+        AssignmentFingerprint(
+            m_pendingNodeVectorAssignments,
+            m_pendingPrimaryNodeVectorAssignments);
     bool ok = fread(&header, sizeof(header), 1, f) == 1 &&
               header.magic == kHeadSelectStateMagic &&
               header.version == kHeadSelectStateVersion &&
+              header.assignmentFingerprint ==
+                  expectedAssignmentFingerprint &&
               header.nodeHeadSelOuter >= 0 && header.nodeUExtraOuter >= 0 &&
               header.nodeVecAssignOuter >= 0 && header.primaryVecAssignOuter >= 0 &&
               header.headOwnersCount >= 0 && header.headRolesCount >= 0;
@@ -1859,8 +1899,8 @@ template <typename T> ErrorCode Index<T>::EnsureStaticTailCrossEdges()
     const std::string dirtyPath =
         headDirectory + FolderSep + Helper::kHeadCrossEdgesDirtyFileName;
     const HeadCrossEdgeBuildOptions options{
-        (std::max)(15, m_options.m_crossExtraEdges),
-        (std::max)(1, m_options.m_crossExtraEdges),
+        (std::max)(32, m_options.m_crossExtraEdges),
+        (std::max)(32, m_options.m_crossExtraEdges),
         (std::max)(1, m_options.m_iSSDNumberOfThreads),
         true};
 
@@ -1984,10 +2024,7 @@ ErrorCode Index<T>::SearchHeadBundleCrossEdgesNative(
 
     auto* entryIndex =
         context.m_nodes[static_cast<size_t>(p_entryNode)].m_index;
-    if (entryIndex == nullptr)
-    {
-        return ErrorCode::Fail;
-    }
+    if (entryIndex == nullptr) return ErrorCode::Fail;
 
     p_queryResults->Reset();
     typename BKT::Index<T>::CrossGraphSearchStats stats;
@@ -1996,10 +2033,7 @@ ErrorCode Index<T>::SearchHeadBundleCrossEdgesNative(
         context,
         std::max(1, m_options.m_maxCheck),
         &stats);
-    if (status != ErrorCode::Success)
-    {
-        return status;
-    }
+    if (status != ErrorCode::Success) return status;
 
     p_scannedOut = stats.m_checked;
     g_bktSeedMs = stats.m_treeSearchMs;
@@ -2359,11 +2393,13 @@ ErrorCode Index<T>::LoadIndexData(const std::vector<std::shared_ptr<Helper::Disk
     // query threads. This avoids reallocating graph rows during a concurrent
     // first search. Missing or invalid sidecars safely fall back to the shared
     // no-cross traversal until they are rebuilt.
-    if (!m_headBundleNodes.empty() &&
+    const bool useHeadBundleRuntime = !m_headBundleNodes.empty() &&
+        (m_metadataOnlyHeadStore || m_headBundleNodes.size() > 1);
+    if (useHeadBundleRuntime &&
         EnsureHeadBundleDenseMaps() != ErrorCode::Success) {
         return ErrorCode::Fail;
     }
-    if (!m_headBundleNodes.empty() &&
+    if (useHeadBundleRuntime &&
         LoadHeadCrossEdges() != ErrorCode::Success) {
         SPTAGLIB_LOG(Helper::LogLevel::LL_Warning,
                      "Head cross edges are unavailable; using no-cross bundle traversal.\n");
@@ -2697,6 +2733,12 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     const std::vector<int>& searchHeadBundleNodes = threadLocalSearchContext != nullptr
         ? threadLocalSearchContext->m_searchHeadBundleNodes
         : kEmptySearchHeadBundleNodes;
+    const bool globalHeadSearchWithPostFilter =
+        threadLocalSearchContext != nullptr &&
+        threadLocalSearchContext->m_globalHeadSearchWithPostFilter;
+    const bool useGlobalTailWithPostFilter =
+        threadLocalSearchContext != nullptr &&
+        threadLocalSearchContext->m_useGlobalTailWithPostFilter;
 
     // ═══ Sparse tag fast path: skip graph search, read postings directly ═══
     if (!directPostingIDs.empty() && m_extraSearcher != nullptr)
@@ -2715,6 +2757,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         workSpace->m_queryTags = queryTags;
         workSpace->m_numQueryTags = numQueryTags;
         workSpace->m_dnf = queryDNF;
+        workSpace->m_useGlobalTailWithPostFilter = false;
         workSpace->m_deduper.clear();
         workSpace->m_postingIDs.clear();
         workSpace->m_postingFilter = nullptr;  // no PS needed, we know exact postings
@@ -2749,13 +2792,6 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         if (!directHeadLocalIDs.empty() && m_index != nullptr)
         {
             const bool hasTagFilter = queryTags != nullptr && numQueryTags > 0;
-            SPTAG::Cache::HierarchicalPostingMask queryHierMask;
-            if (hasTagFilter) {
-                queryHierMask.Clear();
-                for (int i = 0; i < numQueryTags; ++i) {
-                    queryHierMask.Insert(TagLevelFromId(queryTags[i]), queryTags[i]);
-                }
-            }
 
             auto translateHeadVID = [&](SizeType localHid) -> SizeType {
                 if (localHid < 0 || localHid >= m_index->GetNumSamples()) return MaxSize;
@@ -2769,9 +2805,20 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             };
             auto shouldKeepHeadResult = [&](SizeType localHid) -> bool {
                 if (!hasTagFilter) return true;
-                static const std::vector<uint8_t> kNoRouteMask;
-                return m_index->HasHeadNodeMeta() &&
-                    m_index->HeadNodeMatchesQuery(localHid, queryHierMask, kNoRouteMask);
+                if (!m_index->HasHeadNodeMeta()) return false;
+                const auto* ownTags = m_index->GetHeadNodeHierMask(localHid);
+                if (ownTags == nullptr) return false;
+                const int aclTagCols = m_options.m_staticACLTagCols > 0
+                    ? (std::min)(
+                        m_options.m_staticACLTagCols,
+                        SPTAG::Cache::HIER_LEVELS)
+                    : SPTAG::Cache::HIER_LEVELS;
+                for (int level = 0; level < aclTagCols; ++level) {
+                    for (int queryTag = 0; queryTag < numQueryTags; ++queryTag) {
+                        if (ownTags->tag[level] == queryTags[queryTag]) return true;
+                    }
+                }
+                return false;
             };
 
             for (SizeType localHid : directHeadLocalIDs) {
@@ -3153,7 +3200,8 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             }
 
             const bool unfiltered = queryTags == nullptr || numQueryTags == 0;
-            const bool useCrossEdges = canUseHeadBundle && unfiltered &&
+            const bool useCrossEdges = canUseHeadBundle &&
+                (unfiltered || globalHeadSearchWithPostFilter) &&
                 candidateNodes.size() > 1 &&
                 !m_headCrossEdgesDirty.load(std::memory_order_acquire) &&
                 !m_options.m_disableCrossSubgraph &&
@@ -3161,6 +3209,20 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 LoadHeadCrossEdges() == ErrorCode::Success &&
                 m_headInlineCrossEdgeSize > 0 &&
                 m_headInlineCrossEdgeTotal > 0;
+
+            if (globalHeadSearchWithPostFilter &&
+                candidateNodes.size() > 1 &&
+                !useCrossEdges)
+            {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                    "Filtered global head search requires a valid cross-edge "
+                    "sidecar; refusing independent local-graph fallback.\n");
+                if (p_queryResults !=
+                    static_cast<COMMON::QueryResultSet<T>*>(&p_query)) {
+                    delete p_queryResults;
+                }
+                return ErrorCode::Fail;
+            }
 
             if (m_options.m_logPathStats) {
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
@@ -3179,6 +3241,16 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                         scanned);
                     if (ret != ErrorCode::Success)
                     {
+                        if (globalHeadSearchWithPostFilter) {
+                            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                                "Filtered global cross-edge head search failed; "
+                                "refusing independent local-graph fallback.\n");
+                            if (p_queryResults !=
+                                static_cast<COMMON::QueryResultSet<T>*>(&p_query)) {
+                                delete p_queryResults;
+                            }
+                            return ret;
+                        }
                         p_queryResults->Reset();
                         ret = SearchHeadBundlesNative(
                             p_queryResults,
@@ -3320,11 +3392,14 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         }
 
         // Propagate posting-level PS pre-filter (applied in ExtraDynamicSearcher before MultiGet)
-        workSpace->m_postingFilter = postingFilter;
+        workSpace->m_postingFilter =
+            useGlobalTailWithPostFilter ? nullptr : postingFilter;
         // Propagate inline tag filter (for per-vector exact tag check in posting scan)
         workSpace->m_queryTags = queryTags;
         workSpace->m_numQueryTags = numQueryTags;
         workSpace->m_dnf = queryDNF;
+        workSpace->m_useGlobalTailWithPostFilter =
+            useGlobalTailWithPostFilter;
         workSpace->m_deduper.clear();
         workSpace->m_postingIDs.clear();
         workSpace->m_postingProbeStats.Reset();
@@ -3354,14 +3429,8 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             // VID's own tag is NOT guaranteed to match the query even when its
             // posting members do; rejecting them here ensures top-K is sourced
             // only from posting scans (and the rare head-only ghost vectors).
-            static const std::vector<uint8_t> kNoRouteMask;
             if (queryDNF != nullptr && !queryDNF->Empty()) {
-                // Head-only metadata stores categorical own-tags only. A numeric
-                // predicate has no exact head-only representation, so it must not
-                // admit a coarse graph candidate into top-K.
-                if (queryDNF->HasNumericLiteral()) return false;
-                if (m_index == nullptr || !m_index->HasHeadNodeMeta() ||
-                    !m_index->IsHeadNodeHeadOnly(localHid)) {
+                if (m_index == nullptr || !m_index->HasHeadNodeMeta()) {
                     return false;
                 }
                 const auto* ownTags = m_index->GetHeadNodeHierMask(localHid);
@@ -3369,9 +3438,29 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                     queryDNF->Matches(ownTags->tag, SPTAG::Cache::HIER_LEVELS);
             }
             if (!hasTagFilter) return true;
-            return m_index != nullptr &&
-                   m_index->HasHeadNodeMeta() &&
-                   m_index->HeadNodeMatchesQuery(localHid, queryHierMask, kNoRouteMask);
+            if (m_index == nullptr ||
+                !m_index->HasHeadNodeMeta()) {
+                return false;
+            }
+            const auto* ownTags = m_index->GetHeadNodeHierMask(localHid);
+            if (ownTags == nullptr) return false;
+            const int aclTagCols = m_options.m_staticACLTagCols > 0
+                ? (std::min)(
+                    m_options.m_staticACLTagCols,
+                    SPTAG::Cache::HIER_LEVELS)
+                : SPTAG::Cache::HIER_LEVELS;
+            for (int level = 0;
+                 level < aclTagCols;
+                 ++level) {
+                for (int queryTag = 0;
+                     queryTag < numQueryTags;
+                     ++queryTag) {
+                    if (ownTags->tag[level] == queryTags[queryTag]) {
+                        return true;
+                    }
+                }
+            }
+            return false;
         };
 
         float limitDist = p_queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio;
@@ -4695,9 +4784,16 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
                              statePath.c_str(), m_pendingNodeHeadSelections.size(),
                              m_pendingHeadRoles.size());
             } else {
-                SPTAGLIB_LOG(Helper::LogLevel::LL_Warning,
-                             "Resume: failed to load checkpoint %s; re-running SelectHead\n",
-                             statePath.c_str());
+                const bool removed = remove(statePath.c_str()) == 0;
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Error,
+                    "Resume: checkpoint %s is corrupt or does not match the "
+                    "current node assignments; %s. Restart the build so the "
+                    "work directory is rebuilt cleanly.\n",
+                    statePath.c_str(),
+                    removed ? "removed the incompatible checkpoint"
+                            : "failed to remove the incompatible checkpoint");
+                return ErrorCode::Fail;
             }
         } else {
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
@@ -5042,7 +5138,7 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
         }
         if (!m_pendingPrimaryNodeVectorAssignments.empty()) {
             m_extraSearcher->SetPrimaryNodeVectorAssignments(
-                m_pendingPrimaryNodeVectorAssignments);
+                std::move(m_pendingPrimaryNodeVectorAssignments));
         }
         if (auto* staticSearcher =
                 dynamic_cast<ExtraStaticSearcher<T>*>(m_extraSearcher.get())) {
@@ -6629,6 +6725,13 @@ ErrorCode Index<T>::AddIndexWithTags(const void* p_data, SizeType p_vectorNum,
                                 routingPivotLevel, tagToNodes)) {
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
                      "[TaggedUpdate] multi-bundle index is missing a valid tag_node_index.bin routing map.\n");
+        return ErrorCode::Fail;
+    }
+    if (useBundleRuntime && m_headBundleNodes.size() > 1 &&
+        routingPivotLevel < 0) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "[TaggedUpdate] workload-planned multi-bundle indexes are build-time immutable; rebuild the index to add tagged vectors.\n");
         return ErrorCode::Fail;
     }
 

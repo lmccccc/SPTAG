@@ -28,11 +28,14 @@ struct Options
     std::string truthFile;
     std::string truthDir;
     std::string queryTagsFile;
+    std::string baseTagsFile;
     std::string searchIni;
     std::vector<std::string> searchSweepInis;
     std::string valueType = "Float";
     int tagColumn = -1;
     std::vector<int> dnfAndColumns;
+    int dnfOrCount = 0;
+    int baseTagColumns = 0;
     int tenant = 0;
     int topk = 10;
     std::size_t warmup = 200;
@@ -62,7 +65,9 @@ void Usage(const char* p_program)
               << " --index <index-dir> --queries <query.npy>"
               << " (--truth <truth.npy> | --truth-dir <directory>)"
               << " [--query-tags <tags.npy> --tag-column <0..N-1>]"
+              << " [--base-tags-u32 <raw base tags> --base-tag-cols <N>]"
               << " [--dnf-and-cols <col[,col...]>]"
+              << " [--dnf-or-count <2..N>]"
               << " [--search-ini <native-search.ini>]"
               << " [--search-sweep-ini <native-search.ini>]..."
               << " [--value-type Float|UInt8]"
@@ -144,6 +149,13 @@ bool ParseArgs(int p_argc, char** p_argv, Options& p_options)
             p_options.truthDir = value;
         } else if (std::strcmp(arg, "--query-tags") == 0) {
             p_options.queryTagsFile = value;
+        } else if (std::strcmp(arg, "--base-tags-u32") == 0) {
+            p_options.baseTagsFile = value;
+        } else if (std::strcmp(arg, "--base-tag-cols") == 0) {
+            if (!ParseInt(value, p_options.baseTagColumns) ||
+                p_options.baseTagColumns <= 0) {
+                return false;
+            }
         } else if (std::strcmp(arg, "--search-ini") == 0) {
             p_options.searchIni = value;
         } else if (std::strcmp(arg, "--search-sweep-ini") == 0) {
@@ -154,6 +166,11 @@ bool ParseArgs(int p_argc, char** p_argv, Options& p_options)
             if (!ParseInt(value, p_options.tagColumn)) return false;
         } else if (std::strcmp(arg, "--dnf-and-cols") == 0) {
             if (!ParseColumnList(value, p_options.dnfAndColumns)) return false;
+        } else if (std::strcmp(arg, "--dnf-or-count") == 0) {
+            if (!ParseInt(value, p_options.dnfOrCount) ||
+                p_options.dnfOrCount < 2) {
+                return false;
+            }
         } else if (std::strcmp(arg, "--tenant") == 0) {
             if (!ParseInt(value, p_options.tenant)) return false;
         } else if (std::strcmp(arg, "--topk") == 0) {
@@ -173,12 +190,16 @@ bool ParseArgs(int p_argc, char** p_argv, Options& p_options)
     const bool basicOptions = (p_options.valueType == "Float" || p_options.valueType == "UInt8") &&
         !p_options.indexDir.empty() && !p_options.queryFile.empty() &&
         (p_options.allAclLevels ? hasAllLevelTruth : hasSingleTruth);
-    if (!basicOptions || (p_options.tagColumn >= 0 && !p_options.dnfAndColumns.empty())) {
+    if (!basicOptions ||
+        (p_options.tagColumn >= 0 && !p_options.dnfAndColumns.empty()) ||
+        (p_options.dnfOrCount > 0 &&
+         (p_options.tagColumn < 0 || !p_options.dnfAndColumns.empty()))) {
         return false;
     }
     if (p_options.allAclLevels) {
         return !p_options.directSearch && p_options.tagColumn < 0 &&
-            p_options.dnfAndColumns.empty() && !p_options.queryTagsFile.empty();
+            p_options.dnfAndColumns.empty() && p_options.dnfOrCount == 0 &&
+            !p_options.queryTagsFile.empty();
     }
     return ((p_options.tagColumn < 0 && p_options.dnfAndColumns.empty() &&
              p_options.queryTagsFile.empty()) ||
@@ -295,6 +316,24 @@ bool ApplySearchIni(TenantIndexManager& p_manager, const std::string& p_path)
     return true;
 }
 
+bool ReadRawU32(const std::string& p_path, std::vector<std::uint32_t>& p_values)
+{
+    std::ifstream input(p_path, std::ios::binary | std::ios::ate);
+    if (!input) return false;
+    const std::streamoff bytes = input.tellg();
+    if (bytes < 0 ||
+        bytes % static_cast<std::streamoff>(sizeof(std::uint32_t)) != 0) {
+        return false;
+    }
+    p_values.resize(
+        static_cast<std::size_t>(bytes) / sizeof(std::uint32_t));
+    input.seekg(0);
+    input.read(
+        reinterpret_cast<char*>(p_values.data()),
+        static_cast<std::streamsize>(bytes));
+    return static_cast<bool>(input);
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -354,6 +393,21 @@ int main(int argc, char** argv)
         std::cerr << "Measurement offset exceeds available queries\n";
         return 1;
     }
+
+    std::vector<std::uint32_t> baseTags;
+    std::size_t baseTagRows = 0;
+    const std::size_t baseTagCols = options.baseTagColumns > 0
+        ? static_cast<std::size_t>(options.baseTagColumns)
+        : tagCols;
+    if (!options.baseTagsFile.empty()) {
+        if (baseTagCols < tagCols ||
+            !ReadRawU32(options.baseTagsFile, baseTags) ||
+            baseTags.size() % baseTagCols != 0) {
+            std::cerr << "Invalid raw base-tag input\n";
+            return 1;
+        }
+        baseTagRows = baseTags.size() / baseTagCols;
+    }
     const std::size_t availableQueries = queryCount - options.measureOffset;
     const std::size_t measuredQueries = options.maxQueries == 0
         ? availableQueries
@@ -386,34 +440,58 @@ int main(int argc, char** argv)
         const char* level;
         int tagColumn;
         const std::vector<int>* dnfAndColumns;
+        int dnfOrCount;
         const TruthMatrix* truth;
     };
 
     std::vector<Scenario> scenarios;
     if (options.allAclLevels) {
         scenarios = {
-            {"unfilter", -1, nullptr, &truthMatrices[0]},
-            {"org", 0, nullptr, &truthMatrices[1]},
-            {"dept", 1, nullptr, &truthMatrices[2]},
-            {"team", 2, nullptr, &truthMatrices[3]},
-            {"project", 3, nullptr, &truthMatrices[4]},
+            {"unfilter", -1, nullptr, 0, &truthMatrices[0]},
+            {"org", 0, nullptr, 0, &truthMatrices[1]},
+            {"dept", 1, nullptr, 0, &truthMatrices[2]},
+            {"team", 2, nullptr, 0, &truthMatrices[3]},
+            {"project", 3, nullptr, 0, &truthMatrices[4]},
         };
     } else {
         scenarios.push_back(
             {options.tagColumn < 0 ? "unfilter" : "custom",
              options.tagColumn,
              &options.dnfAndColumns,
+             options.dnfOrCount,
              &truthMatrices.front()});
     }
 
     std::vector<std::string> searchPoints = options.searchSweepInis;
     if (searchPoints.empty()) searchPoints.emplace_back();
     const std::size_t warmup = (std::min)(options.warmup, queryCount);
+    bool anyPredicateViolation = false;
     for (const std::string& searchPoint : searchPoints) {
         if (!searchPoint.empty() && !ApplySearchIni(manager, searchPoint)) return 1;
         const std::string& activeSearchIni =
             searchPoint.empty() ? options.searchIni : searchPoint;
         for (const Scenario& scenario : scenarios) {
+            std::vector<std::uint32_t> dnfOrValues;
+            if (scenario.dnfOrCount > 0) {
+                dnfOrValues.reserve(tagCount);
+                for (std::size_t row = 0; row < tagCount; ++row) {
+                    const std::uint32_t value = queryTags[
+                        row * tagCols +
+                        static_cast<std::size_t>(scenario.tagColumn)];
+                    if (std::find(
+                            dnfOrValues.begin(),
+                            dnfOrValues.end(),
+                            value) == dnfOrValues.end()) {
+                        dnfOrValues.push_back(value);
+                    }
+                }
+                std::sort(dnfOrValues.begin(), dnfOrValues.end());
+                if (scenario.dnfOrCount >
+                    static_cast<int>(dnfOrValues.size())) {
+                    std::cerr << "DNF OR count exceeds distinct query-tag values\n";
+                    return 1;
+                }
+            }
             auto search = [&](std::size_t p_queryIndex) {
                 const ByteArray queryBytes = options.valueType == "UInt8"
                     ? ByteArray(
@@ -423,6 +501,44 @@ int main(int argc, char** argv)
                         dimension * sizeof(float), false);
                 if (options.directSearch) {
                     return manager.Search(queryBytes, options.tenant, options.topk);
+                }
+                if (scenario.dnfOrCount > 0) {
+                    const std::uint32_t baseValue = queryTags[
+                        p_queryIndex * tagCols +
+                        static_cast<std::size_t>(scenario.tagColumn)];
+                    const auto baseIt = std::find(
+                        dnfOrValues.begin(), dnfOrValues.end(), baseValue);
+                    if (baseIt == dnfOrValues.end()) {
+                        return std::shared_ptr<QueryResult>();
+                    }
+                    const std::size_t base =
+                        static_cast<std::size_t>(
+                            std::distance(dnfOrValues.begin(), baseIt));
+                    constexpr std::uint32_t kDNF3Magic = 0x444E4633U;
+                    std::vector<std::uint32_t> dnf;
+                    dnf.reserve(
+                        3 + static_cast<std::size_t>(scenario.dnfOrCount) * 5);
+                    dnf.push_back(kDNF3Magic);
+                    dnf.push_back(
+                        static_cast<std::uint32_t>(scenario.dnfOrCount));
+                    for (int clause = 0;
+                         clause < scenario.dnfOrCount;
+                         ++clause) {
+                        dnf.push_back(1);
+                        dnf.push_back(0);
+                        dnf.push_back(
+                            static_cast<std::uint32_t>(scenario.tagColumn));
+                        dnf.push_back(SPTAG::Cache::DNF_EQ);
+                        dnf.push_back(dnfOrValues[
+                            (base + static_cast<std::size_t>(clause)) %
+                            dnfOrValues.size()]);
+                    }
+                    const ByteArray dnfBytes(
+                        reinterpret_cast<std::uint8_t*>(dnf.data()),
+                        dnf.size() * sizeof(std::uint32_t),
+                        false);
+                    return manager.SearchWithACL(
+                        queryBytes, options.tenant, options.topk, dnfBytes, -1);
                 }
                 if (scenario.dnfAndColumns != nullptr && !scenario.dnfAndColumns->empty()) {
                     constexpr std::uint32_t kDNF3Magic = 0x444E4633U;
@@ -517,6 +633,82 @@ int main(int argc, char** argv)
                 options.topk);
             const double recall = static_cast<double>(hits) /
                 static_cast<double>(measuredQueries * static_cast<std::size_t>(options.topk));
+            std::size_t invalidPredicateResults = 0;
+            if (!baseTags.empty() &&
+                (scenario.tagColumn >= 0 ||
+                 (scenario.dnfAndColumns != nullptr &&
+                  !scenario.dnfAndColumns->empty()))) {
+                for (std::size_t i = 0; i < measuredQueries; ++i) {
+                    const std::size_t queryIndex = options.measureOffset + i;
+                    for (int j = 0; j < options.topk; ++j) {
+                        const std::int32_t vid = resultIds[
+                            i * static_cast<std::size_t>(options.topk) +
+                            static_cast<std::size_t>(j)];
+                        if (vid < 0) continue;
+                        bool matches =
+                            static_cast<std::size_t>(vid) < baseTagRows;
+                        if (matches && scenario.dnfOrCount > 0) {
+                            const std::uint32_t baseValue = queryTags[
+                                queryIndex * tagCols +
+                                static_cast<std::size_t>(scenario.tagColumn)];
+                            const auto baseIt = std::find(
+                                dnfOrValues.begin(), dnfOrValues.end(), baseValue);
+                            matches = baseIt != dnfOrValues.end();
+                            const std::size_t base = matches
+                                ? static_cast<std::size_t>(
+                                    std::distance(dnfOrValues.begin(), baseIt))
+                                : 0;
+                            bool anyClause = false;
+                            for (int clause = 0;
+                                 matches && clause < scenario.dnfOrCount;
+                                 ++clause) {
+                                anyClause =
+                                    anyClause ||
+                                    baseTags[
+                                        static_cast<std::size_t>(vid) * baseTagCols +
+                                        static_cast<std::size_t>(scenario.tagColumn)] ==
+                                        dnfOrValues[
+                                            (base + static_cast<std::size_t>(clause)) %
+                                            dnfOrValues.size()];
+                            }
+                            matches = matches && anyClause;
+                        } else if (
+                            matches && scenario.dnfAndColumns != nullptr &&
+                            !scenario.dnfAndColumns->empty()) {
+                            for (int column : *scenario.dnfAndColumns) {
+                                matches =
+                                    matches &&
+                                    baseTags[
+                                        static_cast<std::size_t>(vid) * baseTagCols +
+                                        static_cast<std::size_t>(column)] ==
+                                        queryTags[
+                                            queryIndex * tagCols +
+                                            static_cast<std::size_t>(column)];
+                            }
+                        } else if (matches && scenario.tagColumn >= 0) {
+                            matches =
+                                baseTags[
+                                    static_cast<std::size_t>(vid) * baseTagCols +
+                                    static_cast<std::size_t>(scenario.tagColumn)] ==
+                                queryTags[
+                                    queryIndex * tagCols +
+                                    static_cast<std::size_t>(scenario.tagColumn)];
+                        }
+                        if (!matches) {
+                            if (invalidPredicateResults < 8) {
+                                std::cerr
+                                    << "Predicate violation: level="
+                                    << scenario.level
+                                    << " query=" << queryIndex
+                                    << " vid=" << vid << "\n";
+                            }
+                            ++invalidPredicateResults;
+                        }
+                    }
+                }
+                anyPredicateViolation =
+                    anyPredicateViolation || invalidPredicateResults > 0;
+            }
             const auto perQuery = [measuredQueries](std::uint64_t value) {
                 return static_cast<double>(value) / static_cast<double>(measuredQueries);
             };
@@ -535,6 +727,7 @@ int main(int argc, char** argv)
                       << "\"filter_column\":" << scenario.tagColumn << ","
                       << "\"dnf_and_columns\":"
                       << (scenario.dnfAndColumns == nullptr ? 0 : scenario.dnfAndColumns->size()) << ","
+                      << "\"dnf_or_count\":" << scenario.dnfOrCount << ","
                       << "\"recall\":" << recall << ","
                       << "\"qps\":" << static_cast<double>(measuredQueries) / elapsed << ","
                       << "\"mean_latency_ms\":" << 1000.0 * elapsed / measuredQueries << ","
@@ -562,9 +755,10 @@ int main(int argc, char** argv)
                       << "\"posting_page_reads_per_query\":" << perQuery(postingPageReads) << ","
                       << "\"posting_logical_bytes_per_query\":" << perQuery(postingLogicalBytes) << ","
                       << "\"posting_physical_bytes_per_query\":" << perQuery(postingPhysicalBytes) << ","
+                      << "\"invalid_predicate_results\":" << invalidPredicateResults << ","
                       << "\"failed_queries\":" << failed
                       << "}\n";
         }
     }
-    return 0;
+    return anyPredicateViolation ? 3 : 0;
 }

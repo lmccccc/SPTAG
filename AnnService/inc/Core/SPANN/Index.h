@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <utility>
+#include <utility>
 
 namespace SPTAG
 {
@@ -74,11 +75,13 @@ namespace SPTAG
             virtual std::shared_ptr<VectorIndex> GetMemoryIndex() = 0;
             virtual std::shared_ptr<IExtraSearcher> GetDiskIndex() = 0;
             virtual Options* GetOptions() = 0;
+            virtual const std::vector<HeadBundleNodeInfo>& GetHeadBundleNodes() const = 0;
             virtual SizeType GetGlobalVID(SizeType vid) = 0;
             virtual bool PopulateHeadNodeGlobalVIDsFromBundles() = 0;
             virtual void SetVectorTags(const uint32_t* tags, int numVecs, int numTagsPerVec) = 0;
             virtual void SetNodeVectorAssignments(const std::vector<std::vector<SizeType>>& nodeVectorAssignments) = 0;
             virtual void SetPrimaryNodeVectorAssignments(const std::vector<std::vector<SizeType>>& primaryNodeVectorAssignments) = 0;
+            virtual void SetPrimaryNodeVectorAssignments(std::vector<std::vector<SizeType>>&& primaryNodeVectorAssignments) = 0;
             virtual void SetSharedDB(std::shared_ptr<Helper::KeyValueIO> p_db) = 0;
             virtual bool BuildPrimaryHeadCSRBackfill(const void* vectors, SizeType vectorCount,
                                                      const uint32_t* tags, int numTagsPerVec) = 0;
@@ -183,7 +186,7 @@ namespace SPTAG
             inline std::shared_ptr<VectorIndex> GetMemoryIndex() { return m_index; }
             inline std::shared_ptr<IExtraSearcher> GetDiskIndex() { return m_extraSearcher; }
             inline Options* GetOptions() { return &m_options; }
-            inline const std::vector<HeadBundleNodeInfo>& GetHeadBundleNodes() const { return m_headBundleNodes; }
+            inline const std::vector<HeadBundleNodeInfo>& GetHeadBundleNodes() const override { return m_headBundleNodes; }
             inline bool HasHeadBundleNodes() const { return !m_headBundleNodes.empty(); }
             inline DimensionType GetInlineHeadCrossEdgeSize() const { return m_headInlineCrossEdgeSize; }
             inline size_t GetInlineHeadCrossEdgeTotal() const { return m_headInlineCrossEdgeTotal; }
@@ -225,6 +228,12 @@ namespace SPTAG
             void SetPrimaryNodeVectorAssignments(const std::vector<std::vector<SizeType>>& primaryNodeVectorAssignments)
             {
                 m_pendingPrimaryNodeVectorAssignments = primaryNodeVectorAssignments;
+            }
+
+            void SetPrimaryNodeVectorAssignments(std::vector<std::vector<SizeType>>&& primaryNodeVectorAssignments)
+            {
+                m_pendingPrimaryNodeVectorAssignments =
+                    std::move(primaryNodeVectorAssignments);
             }
 
             bool BuildPrimaryHeadCSRBackfill(const void* vectors, SizeType vectorCount,

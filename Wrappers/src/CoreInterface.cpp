@@ -2,9 +2,11 @@
 // Licensed under the MIT License.
 
 #include "inc/CoreInterface.h"
+#include "inc/PredicateSubsetPlanner.h"
 #include "inc/Helper/StringConvert.h"
 #include "inc/Helper/TenantPrefixedKeyValueIO.h"
 #include "inc/Core/SPANN/Index.h"
+#include "inc/Core/Common/DistanceUtils.h"
 #include "inc/Core/Common/QueryResultSet.h"
 #ifdef ROCKSDB
 #include "inc/Core/SPANN/ExtraRocksDBController.h"
@@ -21,6 +23,8 @@
 #include "inc/Core/SPANN/Index.h"
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <filesystem>
 #include <map>
 #include <vector>
 #include <sstream>
@@ -30,6 +34,7 @@
 #include <unordered_map>
 #include <queue>
 #include <limits>
+#include <type_traits>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <cstdlib>
@@ -382,6 +387,57 @@ float EstimateQueryVectorSelectivity(
     return static_cast<float>(unionSelectivity);
 }
 
+float EstimateDNFVectorSelectivity(
+    int tenantSize,
+    const std::unordered_map<uint32_t, TenantIndexManager::TagRoutingStats>* tagStats,
+    const SPTAG::Cache::DNFPredicate& dnf,
+    bool* hasEstimate)
+{
+    if (hasEstimate != nullptr) *hasEstimate = false;
+    if (tenantSize <= 0 || tagStats == nullptr || dnf.Empty()) {
+        return 1.0f;
+    }
+
+    double productNotSelected = 1.0;
+    bool hasKnownLiteral = false;
+    for (const auto& clause : dnf.clauses) {
+        double clauseSelectivity = 1.0;
+        std::unordered_map<uint32_t, uint32_t> equalityByColumn;
+        for (const auto& literal : clause.lits) {
+            if (literal.kind != 0 || literal.op != SPTAG::Cache::DNF_EQ) {
+                continue;
+            }
+
+            auto existing = equalityByColumn.find(literal.col);
+            if (existing != equalityByColumn.end() &&
+                existing->second != literal.val) {
+                clauseSelectivity = 0.0;
+                break;
+            }
+            equalityByColumn[literal.col] = literal.val;
+
+            auto statIt = tagStats->find(literal.val);
+            if (statIt == tagStats->end()) {
+                continue;
+            }
+            hasKnownLiteral = true;
+            clauseSelectivity *= std::clamp(
+                static_cast<double>(statIt->second.vectorCount) /
+                    static_cast<double>(tenantSize),
+                1e-6,
+                1.0);
+        }
+        productNotSelected *= 1.0 - std::clamp(clauseSelectivity, 0.0, 1.0);
+    }
+
+    if (!hasKnownLiteral) {
+        return 1.0f;
+    }
+    if (hasEstimate != nullptr) *hasEstimate = true;
+    return static_cast<float>(
+        std::clamp(1.0 - productNotSelected, 1e-6, 1.0));
+}
+
 struct PivotEstimatorLevelData {
     std::vector<uint32_t> uniqueTags;
     std::vector<int> counts;
@@ -688,6 +744,7 @@ bool EnsureHeadNodeMetaLoaded(const std::string& workDir, const std::shared_ptr<
 }
 
 constexpr int32_t kHeadNodeRoutingIndexVersion = 1;
+constexpr int32_t kPredicateNodeRoutingIndexVersion = 1;
 
 struct HeadNodeRoutingIndexFileHeader {
     int32_t version;
@@ -695,6 +752,12 @@ struct HeadNodeRoutingIndexFileHeader {
     int32_t nodeCount;
     int32_t numHeadSamples;
     int32_t numTagMappings;
+};
+
+struct PredicateNodeRoutingIndexFileHeader {
+    int32_t version;
+    int32_t nodeCount;
+    int32_t numMappings;
 };
 
 struct PivotEstimatorComputation {
@@ -714,6 +777,60 @@ struct LeafGreedyPlanEntry {
 std::string HeadNodeRoutingIndexPath(const std::string& workDir)
 {
     return workDir + "/HeadIndex/tag_node_index.bin";
+}
+
+std::string PredicateNodeRoutingIndexPath(const std::string& workDir)
+{
+    return workDir + "/HeadIndex/predicate_node_index.bin";
+}
+
+std::string PredicateSubsetPlanPath(const std::string& workDir)
+{
+    return workDir + "/HeadIndex/predicate_subset_plan.bin";
+}
+
+std::string PredicateSubsetAttributesPath(const std::string& workDir)
+{
+    return workDir + "/HeadIndex/predicate_subset_attributes.bin";
+}
+
+template <typename Writer>
+bool WriteRoutingFileAtomically(const std::string& path, Writer&& writer)
+{
+    namespace fs = std::filesystem;
+    const auto nonce =
+        std::chrono::steady_clock::now().time_since_epoch().count();
+    const fs::path finalPath(path);
+    const fs::path tempPath =
+        path + ".tmp." + std::to_string(nonce);
+    FILE* file = fopen(tempPath.string().c_str(), "wb");
+    if (file == nullptr) return false;
+
+    bool ok = writer(file);
+    if (ok && fflush(file) != 0) ok = false;
+    if (fclose(file) != 0) ok = false;
+    if (!ok) {
+        std::error_code removeError;
+        fs::remove(tempPath, removeError);
+        return false;
+    }
+
+    std::error_code renameError;
+    fs::rename(tempPath, finalPath, renameError);
+    if (renameError) {
+#ifdef _WIN32
+        std::error_code removeError;
+        fs::remove(finalPath, removeError);
+        renameError.clear();
+        fs::rename(tempPath, finalPath, renameError);
+#endif
+    }
+    if (renameError) {
+        std::error_code removeError;
+        fs::remove(tempPath, removeError);
+        return false;
+    }
+    return true;
 }
 
 void BuildNodeByPivotTag(const PivotEstimatorCandidate& candidate,
@@ -1297,64 +1414,148 @@ bool TryCollectRoutingNodesForQuery(const std::unordered_map<uint32_t, std::vect
     return !outNodes.empty();
 }
 
-// DNF-aware routing: predicate = OR of clauses, clause = AND of literals.
-//   routedNodes = ⋃_clause ( ⋂_literal tagToNodes[literal.val] )
-// A clause's matching vectors all carry every literal tag, so they live in the
-// intersection of those tags' node-sets (sound because tag→node placement is by
-// a single pivot with no replication: node(pivot) ∈ tagToNodes[t] for every tag
-// t the vector carries, hence in the intersection). The OR across clauses unions
-// the clause node-sets. A literal whose value is absent from tagToNodes makes its
-// clause unsatisfiable, contributing the empty set. Result feeds the same
-// allowedNodeMask / m_searchHeadBundleNodes / routedNodeMask plumbing as the
-// legacy collector, so cross-edge navigation stays inside the routed subgraphs.
 bool TryCollectRoutingNodesForDNF(const std::unordered_map<uint32_t, std::vector<int>>& tagToNodes,
+                                  const std::unordered_map<std::string, std::vector<int>>* predicateToNodes,
                                   const SPTAG::Cache::DNFPredicate& dnf,
                                   std::vector<int>& outNodes)
 {
-    outNodes.clear();
-    if (dnf.clauses.empty()) {
-        return false;
-    }
-
-    std::unordered_set<int> unionNodes;
+    std::vector<std::vector<SPTAG::PredicateSubsetPlanner::Atom>> clauses;
+    clauses.reserve(dnf.clauses.size());
     for (const auto& clause : dnf.clauses)
     {
-        if (clause.lits.empty()) {
-            continue;
-        }
-
-        std::unordered_set<int> clauseNodes;
-        bool first = true;
+        std::vector<SPTAG::PredicateSubsetPlanner::Atom> atoms;
+        atoms.reserve(clause.lits.size());
         for (const auto& lit : clause.lits)
         {
-            auto tagIt = tagToNodes.find(lit.val);
-            if (tagIt == tagToNodes.end() || tagIt->second.empty()) {
-                clauseNodes.clear();  // unsatisfiable literal → empty clause
-                break;
-            }
-
-            if (first) {
-                clauseNodes.insert(tagIt->second.begin(), tagIt->second.end());
-                first = false;
-            } else {
-                std::unordered_set<int> intersected;
-                for (int nodeId : tagIt->second) {
-                    if (clauseNodes.count(nodeId)) intersected.insert(nodeId);
-                }
-                clauseNodes.swap(intersected);
-            }
-
-            if (clauseNodes.empty()) {
-                break;
-            }
+            SPTAG::PredicateSubsetPlanner::Atom atom;
+            atom.column = static_cast<int>(lit.col);
+            atom.value = lit.val;
+            atom.op =
+                static_cast<SPTAG::PredicateSubsetPlanner::Operator>(lit.op);
+            atom.kind = lit.kind;
+            atoms.push_back(atom);
         }
-
-        unionNodes.insert(clauseNodes.begin(), clauseNodes.end());
+        clauses.push_back(std::move(atoms));
     }
+    return SPTAG::PredicateSubsetPlanner::CollectRoutingNodes(
+        tagToNodes, predicateToNodes, clauses, &outNodes, false);
+}
 
-    outNodes.assign(unionNodes.begin(), unionNodes.end());
-    std::sort(outNodes.begin(), outNodes.end());
-    return !outNodes.empty();
+bool SavePredicateNodeRoutingIndexFile(
+    const std::string& workDir,
+    int nodeCount,
+    const std::unordered_map<std::string, std::vector<int>>& predicateToNodes)
+{
+    const std::string path = PredicateNodeRoutingIndexPath(workDir);
+    return WriteRoutingFileAtomically(
+        path,
+        [&](FILE* file) {
+            PredicateNodeRoutingIndexFileHeader header{};
+            header.version = kPredicateNodeRoutingIndexVersion;
+            header.nodeCount = nodeCount;
+            header.numMappings =
+                static_cast<int32_t>(predicateToNodes.size());
+            bool ok = fwrite(&header, sizeof(header), 1, file) == 1;
+
+            std::vector<std::pair<std::string, std::vector<int>>> mappings(
+                predicateToNodes.begin(), predicateToNodes.end());
+            std::sort(
+                mappings.begin(),
+                mappings.end(),
+                [](const auto& left, const auto& right) {
+                    return left.first < right.first;
+                });
+            for (auto& mapping : mappings) {
+                std::sort(mapping.second.begin(), mapping.second.end());
+                mapping.second.erase(
+                    std::unique(mapping.second.begin(), mapping.second.end()),
+                    mapping.second.end());
+                const int32_t keySize =
+                    static_cast<int32_t>(mapping.first.size());
+                const int32_t mappingNodeCount =
+                    static_cast<int32_t>(mapping.second.size());
+                ok = ok && fwrite(&keySize, sizeof(keySize), 1, file) == 1;
+                if (keySize > 0) {
+                    ok = ok &&
+                         fwrite(mapping.first.data(), 1, keySize, file) ==
+                             static_cast<size_t>(keySize);
+                }
+                ok = ok &&
+                     fwrite(&mappingNodeCount,
+                            sizeof(mappingNodeCount),
+                            1,
+                            file) == 1;
+                if (mappingNodeCount > 0) {
+                    ok = ok &&
+                         fwrite(mapping.second.data(),
+                                sizeof(int32_t),
+                                mappingNodeCount,
+                                file) ==
+                             static_cast<size_t>(mappingNodeCount);
+                }
+            }
+            return ok;
+        });
+}
+
+bool LoadPredicateNodeRoutingIndexFile(
+    const std::string& workDir,
+    int expectedNodeCount,
+    std::unordered_map<std::string, std::vector<int>>& predicateToNodes)
+{
+    predicateToNodes.clear();
+    const std::string path = PredicateNodeRoutingIndexPath(workDir);
+    FILE* file = fopen(path.c_str(), "rb");
+    if (file == nullptr) return false;
+
+    PredicateNodeRoutingIndexFileHeader header{};
+    bool ok = fread(&header, sizeof(header), 1, file) == 1;
+    if (!ok ||
+        header.version != kPredicateNodeRoutingIndexVersion ||
+        header.nodeCount != expectedNodeCount ||
+        header.numMappings < 0) {
+        fclose(file);
+        return false;
+    }
+    for (int mappingId = 0; mappingId < header.numMappings; ++mappingId) {
+        int32_t keySize = 0;
+        int32_t mappingNodeCount = 0;
+        ok = fread(&keySize, sizeof(keySize), 1, file) == 1;
+        if (!ok || keySize <= 0 || keySize > 4096) {
+            fclose(file);
+            predicateToNodes.clear();
+            return false;
+        }
+        std::string key(static_cast<size_t>(keySize), '\0');
+        ok = fread(&key[0], 1, keySize, file) ==
+             static_cast<size_t>(keySize);
+        ok = ok &&
+             fread(&mappingNodeCount,
+                   sizeof(mappingNodeCount),
+                   1,
+                   file) == 1;
+        if (!ok || mappingNodeCount < 0 ||
+            mappingNodeCount > expectedNodeCount) {
+            fclose(file);
+            predicateToNodes.clear();
+            return false;
+        }
+        std::vector<int> nodes(static_cast<size_t>(mappingNodeCount));
+        if (mappingNodeCount > 0) {
+            ok = fread(nodes.data(),
+                       sizeof(int32_t),
+                       mappingNodeCount,
+                       file) == static_cast<size_t>(mappingNodeCount);
+        }
+        if (!ok) {
+            fclose(file);
+            predicateToNodes.clear();
+            return false;
+        }
+        predicateToNodes.emplace(std::move(key), std::move(nodes));
+    }
+    fclose(file);
+    return true;
 }
 
 bool SaveHeadNodeRoutingIndexFile(const std::string& workDir,
@@ -1364,46 +1565,76 @@ bool SaveHeadNodeRoutingIndexFile(const std::string& workDir,
                                   const std::vector<int>& headNodeToNode)
 {
     std::string path = HeadNodeRoutingIndexPath(workDir);
-    FILE* f = fopen(path.c_str(), "wb");
-    if (!f) return false;
+    return WriteRoutingFileAtomically(
+        path,
+        [&](FILE* f) {
+            HeadNodeRoutingIndexFileHeader header{};
+            header.version = kHeadNodeRoutingIndexVersion;
+            header.pivotLevel = pivotLevel;
+            header.nodeCount =
+                static_cast<int32_t>(nodePivotTags.size());
+            header.numHeadSamples =
+                static_cast<int32_t>(headNodeToNode.size());
+            header.numTagMappings =
+                static_cast<int32_t>(tagToNodes.size());
 
-    HeadNodeRoutingIndexFileHeader header{};
-    header.version = kHeadNodeRoutingIndexVersion;
-    header.pivotLevel = pivotLevel;
-    header.nodeCount = static_cast<int32_t>(nodePivotTags.size());
-    header.numHeadSamples = static_cast<int32_t>(headNodeToNode.size());
-    header.numTagMappings = static_cast<int32_t>(tagToNodes.size());
+            bool ok = fwrite(&header, sizeof(header), 1, f) == 1;
+            for (const auto& tagsForNode : nodePivotTags)
+            {
+                int32_t tagCount =
+                    static_cast<int32_t>(tagsForNode.size());
+                ok = ok && fwrite(&tagCount, sizeof(tagCount), 1, f) == 1;
+                if (tagCount > 0) {
+                    ok = ok &&
+                         fwrite(tagsForNode.data(),
+                                sizeof(uint32_t),
+                                tagCount,
+                                f) == static_cast<size_t>(tagCount);
+                }
+            }
 
-    bool ok = fwrite(&header, sizeof(header), 1, f) == 1;
-    for (const auto& tagsForNode : nodePivotTags)
-    {
-        int32_t tagCount = static_cast<int32_t>(tagsForNode.size());
-        ok = ok && fwrite(&tagCount, sizeof(tagCount), 1, f) == 1;
-        if (tagCount > 0) {
-            ok = ok && fwrite(tagsForNode.data(), sizeof(uint32_t), tagCount, f) == static_cast<size_t>(tagCount);
-        }
-    }
+            std::vector<std::pair<uint32_t, std::vector<int>>> mappings(
+                tagToNodes.begin(), tagToNodes.end());
+            std::sort(
+                mappings.begin(),
+                mappings.end(),
+                [](const auto& left, const auto& right) {
+                    return left.first < right.first;
+                });
+            for (auto& [tag, nodes] : mappings)
+            {
+                std::sort(nodes.begin(), nodes.end());
+                nodes.erase(
+                    std::unique(nodes.begin(), nodes.end()),
+                    nodes.end());
 
-    std::vector<std::pair<uint32_t, std::vector<int>>> mappings(tagToNodes.begin(), tagToNodes.end());
-    std::sort(mappings.begin(), mappings.end(), [](const auto& left, const auto& right) { return left.first < right.first; });
-    for (auto& [tag, nodes] : mappings)
-    {
-        std::sort(nodes.begin(), nodes.end());
-        nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+                int32_t mappingNodeCount =
+                    static_cast<int32_t>(nodes.size());
+                ok = ok && fwrite(&tag, sizeof(tag), 1, f) == 1;
+                ok = ok &&
+                     fwrite(&mappingNodeCount,
+                            sizeof(mappingNodeCount),
+                            1,
+                            f) == 1;
+                if (mappingNodeCount > 0) {
+                    ok = ok &&
+                         fwrite(nodes.data(),
+                                sizeof(int32_t),
+                                mappingNodeCount,
+                                f) ==
+                             static_cast<size_t>(mappingNodeCount);
+                }
+            }
 
-        int32_t nodeCount = static_cast<int32_t>(nodes.size());
-        ok = ok && fwrite(&tag, sizeof(tag), 1, f) == 1;
-        ok = ok && fwrite(&nodeCount, sizeof(nodeCount), 1, f) == 1;
-        if (nodeCount > 0) {
-            ok = ok && fwrite(nodes.data(), sizeof(int32_t), nodeCount, f) == static_cast<size_t>(nodeCount);
-        }
-    }
-
-    if (!headNodeToNode.empty()) {
-        ok = ok && fwrite(headNodeToNode.data(), sizeof(int32_t), headNodeToNode.size(), f) == headNodeToNode.size();
-    }
-    fclose(f);
-    return ok;
+            if (!headNodeToNode.empty()) {
+                ok = ok &&
+                     fwrite(headNodeToNode.data(),
+                            sizeof(int32_t),
+                            headNodeToNode.size(),
+                            f) == headNodeToNode.size();
+            }
+            return ok;
+        });
 }
 
 bool LoadHeadNodeRoutingIndexFile(const std::string& workDir,
@@ -1480,6 +1711,44 @@ bool LoadHeadNodeRoutingIndexFile(const std::string& workDir,
     }
     fclose(f);
     return ok;
+}
+
+bool BuildHeadNodeToNodeIndexForPredicatePlan(
+    const SPTAG::PredicateSubsetPlanner::Plan& plan,
+    const uint32_t* tags,
+    int numVectors,
+    int numTagsPerVec,
+    const std::shared_ptr<SPTAG::VectorIndex>& memoryIndex,
+    SPTAG::SPANN::ISPANNIndex* spannIndex,
+    std::vector<int>& headNodeToNode)
+{
+    headNodeToNode.clear();
+    if (tags == nullptr || numVectors <= 0 || numTagsPerVec <= 0 ||
+        memoryIndex == nullptr || spannIndex == nullptr ||
+        plan.selectedNodes.empty()) {
+        return false;
+    }
+
+    const SizeType numHeadSamples = memoryIndex->GetNumSamples();
+    headNodeToNode.assign(static_cast<size_t>(numHeadSamples), -1);
+    const bool useMeta = memoryIndex->HasHeadNodeMeta();
+    for (SizeType headId = 0; headId < numHeadSamples; ++headId) {
+        const SizeType globalId =
+            useMeta ? memoryIndex->GetHeadNodeGlobalVID(headId)
+                    : spannIndex->GetGlobalVID(headId);
+        if (globalId == SPTAG::MaxSize ||
+            globalId < 0 ||
+            globalId >= static_cast<SizeType>(numVectors)) {
+            continue;
+        }
+        const uint32_t* row =
+            tags + static_cast<size_t>(globalId) *
+                       static_cast<size_t>(numTagsPerVec);
+        headNodeToNode[static_cast<size_t>(headId)] =
+            SPTAG::PredicateSubsetPlanner::AssignRow(
+                plan, [row](int column) { return row[column]; });
+    }
+    return true;
 }
 
 AnnIndex::AnnIndex(DimensionType p_dimension)
@@ -1849,6 +2118,19 @@ void AnnIndex::SetPrimaryNodeVectorAssignments(const std::vector<std::vector<int
     spannIdx->SetPrimaryNodeVectorAssignments(convertedAssignments);
 }
 
+void AnnIndex::TakePrimaryNodeVectorAssignments(std::vector<std::vector<int>>&& primaryNodeVectorAssignments)
+{
+    if (!m_index) return;
+    auto* spannIdx = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(m_index.get());
+    if (!spannIdx) return;
+
+    static_assert(
+        std::is_same<int, SPTAG::SizeType>::value,
+        "zero-copy primary assignments require int-sized SPTAG vector IDs");
+    spannIdx->SetPrimaryNodeVectorAssignments(
+        std::move(primaryNodeVectorAssignments));
+}
+
 bool AnnIndex::SetSharedDB(std::shared_ptr<SPTAG::Helper::KeyValueIO> p_db)
 {
     if (m_index == nullptr)
@@ -2070,6 +2352,22 @@ TenantIndexManager::TenantIndexManager(DimensionType p_dimension, const char* p_
     SPTAG::Helper::SharedAIOPool::Instance().Initialize(aioContexts, aioEvents);
 }
 
+bool TenantIndexManager::ConfigurePredicateSubsetPlanner(
+    const char* p_workloadFile,
+    int p_categoricalColumnCount)
+{
+    if (p_workloadFile == nullptr || p_workloadFile[0] == '\0' ||
+        p_categoricalColumnCount < 0) {
+        return false;
+    }
+    m_predicateSubsetPlannerEnabled = true;
+    m_predicateSubsetWorkloadFile = p_workloadFile;
+    m_predicateSubsetCategoricalColumnCount = p_categoricalColumnCount;
+    m_tenantPredicateSubsetPlans.clear();
+    m_tenantPredicateAtomToNodes.clear();
+    return true;
+}
+
 TenantIndexManager::~TenantIndexManager()
 {
     if (m_headCache) m_headCache->Clear();
@@ -2090,6 +2388,8 @@ TenantIndexManager::~TenantIndexManager()
     m_tenantPlannedPrimaryNodeVectors.clear();
     m_tenantTagToNodes.clear();
     m_tenantHeadNodeToNode.clear();
+    m_tenantPredicateSubsetPlans.clear();
+    m_tenantPredicateAtomToNodes.clear();
 
     // Shut the shared RocksDB down only after every tenant index (which holds
     // a TenantPrefixedKeyValueIO referencing the shared DB through a
@@ -2099,6 +2399,379 @@ TenantIndexManager::~TenantIndexManager()
         m_sharedDB->ShutDown();
         m_sharedDB.reset();
     }
+}
+
+bool TenantIndexManager::EnsurePredicateSubsetPlan(
+    int p_tenantId,
+    const uint32_t* p_tags,
+    const uint8_t* p_vectors,
+    int p_numVectors,
+    int p_numTagsPerVec,
+    const char* p_distMethod,
+    bool p_buildAssignments)
+{
+    if (p_tags == nullptr ||
+        p_numVectors <= 0 ||
+        p_numTagsPerVec <= 0 ||
+        (m_predicateSubsetPlannerEnabled &&
+         m_predicateSubsetCategoricalColumnCount > p_numTagsPerVec)) {
+        return false;
+    }
+
+    const bool hasAssignments =
+        (m_tenantPlannedNodeVectors.count(p_tenantId) > 0 &&
+         !m_tenantPlannedNodeVectors[p_tenantId].empty()) ||
+        (m_tenantPlannedPrimaryNodeVectors.count(p_tenantId) > 0 &&
+         !m_tenantPlannedPrimaryNodeVectors[p_tenantId].empty());
+    const bool hasRouting =
+        m_tenantTagToNodes.count(p_tenantId) > 0 &&
+        m_tenantPredicateAtomToNodes.count(p_tenantId) > 0;
+    auto planIt = m_tenantPredicateSubsetPlans.find(p_tenantId);
+    if (planIt != m_tenantPredicateSubsetPlans.end() &&
+        (!p_buildAssignments || hasAssignments) &&
+        hasRouting) {
+        return true;
+    }
+
+    std::shared_ptr<SPTAG::PredicateSubsetPlanner::Plan> plan;
+    if (planIt != m_tenantPredicateSubsetPlans.end()) {
+        plan = planIt->second;
+    } else {
+        std::string error;
+        auto workDirIt = m_tenantSpannWorkDirs.find(p_tenantId);
+        if (workDirIt != m_tenantSpannWorkDirs.end()) {
+            const std::string planPath =
+                PredicateSubsetPlanPath(workDirIt->second);
+            struct stat planStat {};
+            if (stat(planPath.c_str(), &planStat) == 0) {
+                plan =
+                    std::make_shared<SPTAG::PredicateSubsetPlanner::Plan>();
+                if (!SPTAG::PredicateSubsetPlanner::LoadPlan(
+                        planPath, plan.get(), &error)) {
+                    fprintf(stderr,
+                            "[ERROR] Tenant %d: predicate subset plan load failed: %s\n",
+                            p_tenantId,
+                            error.c_str());
+                    return false;
+                }
+                if (plan->sourceRows != static_cast<size_t>(p_numVectors) ||
+                    plan->workload.categoricalColumnCount < 0 ||
+                    plan->workload.categoricalColumnCount >
+                        p_numTagsPerVec ||
+                    (m_predicateSubsetPlannerEnabled &&
+                     plan->workload.categoricalColumnCount !=
+                         m_predicateSubsetCategoricalColumnCount)) {
+                    fprintf(stderr,
+                            "[ERROR] Tenant %d: persisted predicate subset plan "
+                            "does not match the tag layout\n",
+                            p_tenantId);
+                    return false;
+                }
+            }
+        }
+
+        if (plan == nullptr) {
+            if (!p_buildAssignments) {
+                fprintf(stderr,
+                        "[ERROR] Tenant %d: cannot rebuild routing without the "
+                        "predicate subset plan that created the physical bundles\n",
+                        p_tenantId);
+                return false;
+            }
+            if (!m_predicateSubsetPlannerEnabled) {
+                return false;
+            }
+            SPTAG::PredicateSubsetPlanner::Workload workload;
+            if (!SPTAG::PredicateSubsetPlanner::LoadWorkload(
+                    m_predicateSubsetWorkloadFile,
+                    m_predicateSubsetCategoricalColumnCount,
+                    &workload,
+                    &error)) {
+                fprintf(stderr,
+                        "[ERROR] Tenant %d: predicate workload load failed: %s\n",
+                        p_tenantId,
+                        error.c_str());
+                return false;
+            }
+
+            plan = std::make_shared<SPTAG::PredicateSubsetPlanner::Plan>();
+            std::vector<SPTAG::PredicateSubsetPlanner::AffinityEdge>
+                affinityEdges;
+            if (p_vectors != nullptr) {
+                SPTAG::DistCalcMethod affinityMetric =
+                    SPTAG::DistCalcMethod::L2;
+                if (p_distMethod != nullptr &&
+                    SPTAG::Helper::StrUtils::StrEqualIgnoreCase(
+                        p_distMethod, "Cosine")) {
+                    affinityMetric = SPTAG::DistCalcMethod::Cosine;
+                } else if (
+                    p_distMethod != nullptr &&
+                    SPTAG::Helper::StrUtils::StrEqualIgnoreCase(
+                        p_distMethod, "InnerProduct")) {
+                    affinityMetric = SPTAG::DistCalcMethod::InnerProduct;
+                }
+                const auto vectorAt = [&](size_t row) {
+                    return p_vectors + row * m_inputVectorSize;
+                };
+                std::function<double(size_t, size_t)> distance;
+                switch (m_valueType) {
+                case SPTAG::VectorValueType::Int8:
+                    distance = [&, affinityMetric](size_t left, size_t right) {
+                        return SPTAG::COMMON::DistanceUtils::ComputeDistance(
+                            reinterpret_cast<const std::int8_t*>(vectorAt(left)),
+                            reinterpret_cast<const std::int8_t*>(vectorAt(right)),
+                            m_dimension,
+                            affinityMetric);
+                    };
+                    break;
+                case SPTAG::VectorValueType::UInt8:
+                    distance = [&, affinityMetric](size_t left, size_t right) {
+                        return SPTAG::COMMON::DistanceUtils::ComputeDistance(
+                            reinterpret_cast<const std::uint8_t*>(vectorAt(left)),
+                            reinterpret_cast<const std::uint8_t*>(vectorAt(right)),
+                            m_dimension,
+                            affinityMetric);
+                    };
+                    break;
+                case SPTAG::VectorValueType::Int16:
+                    distance = [&, affinityMetric](size_t left, size_t right) {
+                        return SPTAG::COMMON::DistanceUtils::ComputeDistance(
+                            reinterpret_cast<const std::int16_t*>(vectorAt(left)),
+                            reinterpret_cast<const std::int16_t*>(vectorAt(right)),
+                            m_dimension,
+                            affinityMetric);
+                    };
+                    break;
+                case SPTAG::VectorValueType::Float:
+                    distance = [&, affinityMetric](size_t left, size_t right) {
+                        return SPTAG::COMMON::DistanceUtils::ComputeDistance(
+                            reinterpret_cast<const float*>(vectorAt(left)),
+                            reinterpret_cast<const float*>(vectorAt(right)),
+                            m_dimension,
+                            affinityMetric);
+                    };
+                    break;
+                default:
+                    fprintf(stderr,
+                            "[ERROR] Tenant %d: unsupported vector type for "
+                            "predicate affinity graph\n",
+                            p_tenantId);
+                    return false;
+                }
+                affinityEdges =
+                    SPTAG::PredicateSubsetPlanner::BuildAffinityEdges(
+                        static_cast<size_t>(p_numVectors), distance);
+            }
+            if (!SPTAG::PredicateSubsetPlanner::BuildPlan(
+                    workload,
+                    static_cast<size_t>(p_numVectors),
+                    p_numTagsPerVec,
+                    [p_tags, p_numTagsPerVec](size_t row, int column) {
+                        return p_tags[
+                            row * static_cast<size_t>(p_numTagsPerVec) +
+                            static_cast<size_t>(column)];
+                    },
+                    affinityEdges,
+                    plan.get(),
+                    &error)) {
+                fprintf(stderr,
+                        "[ERROR] Tenant %d: predicate subset planning failed: %s\n",
+                        p_tenantId,
+                        error.c_str());
+                return false;
+            }
+        }
+        if (plan->selectedNodes.empty() || plan->selectedNodes.size() > 64) {
+            fprintf(stderr,
+                    "[ERROR] Tenant %d: predicate planner selected invalid leaf count %zu\n",
+                    p_tenantId,
+                    plan->selectedNodes.size());
+            return false;
+        }
+        for (const auto& atom : plan->workload.atoms) {
+            if (atom.column < 0 || atom.column >= p_numTagsPerVec) {
+                fprintf(stderr,
+                        "[ERROR] Tenant %d: persisted predicate atom column %d "
+                        "is outside the tag row\n",
+                        p_tenantId,
+                        atom.column);
+                return false;
+            }
+        }
+        m_tenantPredicateSubsetPlans[p_tenantId] = plan;
+    }
+
+    const size_t nodeCount = plan->selectedNodes.size();
+    auto existingNodeCount = m_tenantPivotNodeCounts.find(p_tenantId);
+    if (existingNodeCount != m_tenantPivotNodeCounts.end() &&
+        existingNodeCount->second > 0 &&
+        existingNodeCount->second != static_cast<int>(nodeCount)) {
+        fprintf(stderr,
+                "[ERROR] Tenant %d: predicate plan selects %zu nodes but the "
+                "physical index contains %d nodes\n",
+                p_tenantId,
+                nodeCount,
+                existingNodeCount->second);
+        return false;
+    }
+    std::vector<std::vector<int>> assignments;
+    if (p_buildAssignments) assignments.resize(nodeCount);
+
+    std::unordered_map<uint32_t, uint64_t> tagNodeMasks;
+    std::unordered_map<uint64_t, std::vector<int>> equalityAtoms;
+    std::vector<uint64_t> atomNodeMasks(plan->workload.atoms.size(), 0);
+    for (size_t atomId = 0;
+         atomId < plan->workload.atoms.size();
+         ++atomId) {
+        const auto& atom = plan->workload.atoms[atomId];
+        if (atom.op == SPTAG::PredicateSubsetPlanner::Operator::Equal) {
+            const uint64_t key =
+                (static_cast<uint64_t>(static_cast<uint32_t>(atom.column)) << 32) |
+                static_cast<uint64_t>(atom.value);
+            equalityAtoms[key].push_back(static_cast<int>(atomId));
+        }
+    }
+
+    const size_t rangeCells =
+        nodeCount * static_cast<size_t>(p_numTagsPerVec);
+    std::vector<uint32_t> columnMin(
+        rangeCells, std::numeric_limits<uint32_t>::max());
+    std::vector<uint32_t> columnMax(rangeCells, 0);
+    std::vector<uint8_t> columnSeen(rangeCells, 0);
+
+    for (int vectorId = 0; vectorId < p_numVectors; ++vectorId) {
+        const uint32_t* row =
+            p_tags + static_cast<size_t>(vectorId) *
+                         static_cast<size_t>(p_numTagsPerVec);
+        const int nodeId = SPTAG::PredicateSubsetPlanner::AssignRow(
+            *plan, [row](int column) { return row[column]; });
+        if (nodeId < 0 || nodeId >= static_cast<int>(nodeCount)) {
+            fprintf(stderr,
+                    "[ERROR] Tenant %d: predicate planner left vector %d unassigned\n",
+                    p_tenantId,
+                    vectorId);
+            return false;
+        }
+        const uint64_t nodeBit = uint64_t(1) << static_cast<unsigned int>(nodeId);
+        if (p_buildAssignments) {
+            assignments[static_cast<size_t>(nodeId)].push_back(vectorId);
+        }
+
+        for (int column = 0;
+             column < plan->workload.categoricalColumnCount;
+             ++column) {
+            tagNodeMasks[row[column]] |= nodeBit;
+        }
+        for (int column = 0; column < p_numTagsPerVec; ++column) {
+            const size_t cell =
+                static_cast<size_t>(nodeId) *
+                    static_cast<size_t>(p_numTagsPerVec) +
+                static_cast<size_t>(column);
+            columnSeen[cell] = 1;
+            columnMin[cell] = std::min(columnMin[cell], row[column]);
+            columnMax[cell] = std::max(columnMax[cell], row[column]);
+
+            const uint64_t key =
+                (static_cast<uint64_t>(static_cast<uint32_t>(column)) << 32) |
+                static_cast<uint64_t>(row[column]);
+            auto atomIt = equalityAtoms.find(key);
+            if (atomIt != equalityAtoms.end()) {
+                for (int atomId : atomIt->second) {
+                    atomNodeMasks[static_cast<size_t>(atomId)] |= nodeBit;
+                }
+            }
+        }
+    }
+
+    for (size_t atomId = 0;
+         atomId < plan->workload.atoms.size();
+         ++atomId) {
+        const auto& atom = plan->workload.atoms[atomId];
+        if (atom.op == SPTAG::PredicateSubsetPlanner::Operator::Equal) continue;
+        for (size_t nodeId = 0; nodeId < nodeCount; ++nodeId) {
+            const size_t cell =
+                nodeId * static_cast<size_t>(p_numTagsPerVec) +
+                static_cast<size_t>(atom.column);
+            if (!columnSeen[cell]) continue;
+            bool mayMatch = false;
+            switch (atom.op) {
+            case SPTAG::PredicateSubsetPlanner::Operator::Less:
+                mayMatch = columnMin[cell] < atom.value;
+                break;
+            case SPTAG::PredicateSubsetPlanner::Operator::LessEqual:
+                mayMatch = columnMin[cell] <= atom.value;
+                break;
+            case SPTAG::PredicateSubsetPlanner::Operator::Greater:
+                mayMatch = columnMax[cell] > atom.value;
+                break;
+            case SPTAG::PredicateSubsetPlanner::Operator::GreaterEqual:
+                mayMatch = columnMax[cell] >= atom.value;
+                break;
+            case SPTAG::PredicateSubsetPlanner::Operator::Equal:
+                break;
+            }
+            if (mayMatch) {
+                atomNodeMasks[atomId] |=
+                    uint64_t(1) << static_cast<unsigned int>(nodeId);
+            }
+        }
+    }
+
+    auto& tagToNodes = m_tenantTagToNodes[p_tenantId];
+    tagToNodes.clear();
+    tagToNodes.reserve(tagNodeMasks.size());
+    for (const auto& mapping : tagNodeMasks) {
+        std::vector<int> nodes;
+        for (size_t nodeId = 0; nodeId < nodeCount; ++nodeId) {
+            if ((mapping.second &
+                 (uint64_t(1) << static_cast<unsigned int>(nodeId))) != 0) {
+                nodes.push_back(static_cast<int>(nodeId));
+            }
+        }
+        tagToNodes.emplace(mapping.first, std::move(nodes));
+    }
+
+    auto& predicateToNodes = m_tenantPredicateAtomToNodes[p_tenantId];
+    predicateToNodes.clear();
+    predicateToNodes.reserve(plan->workload.atoms.size());
+    for (size_t atomId = 0;
+         atomId < plan->workload.atoms.size();
+         ++atomId) {
+        if (atomNodeMasks[atomId] == 0) continue;
+        std::vector<int> nodes;
+        for (size_t nodeId = 0; nodeId < nodeCount; ++nodeId) {
+            if ((atomNodeMasks[atomId] &
+                 (uint64_t(1) << static_cast<unsigned int>(nodeId))) != 0) {
+                nodes.push_back(static_cast<int>(nodeId));
+            }
+        }
+        predicateToNodes.emplace(
+            SPTAG::PredicateSubsetPlanner::AtomKey(
+                plan->workload.atoms[atomId]),
+            std::move(nodes));
+    }
+
+    m_tenantPivotLevels[p_tenantId] = -1;
+    m_tenantPivotNodeCounts[p_tenantId] = static_cast<int>(nodeCount);
+    m_tenantNodePivotTags[p_tenantId].assign(
+        nodeCount, std::vector<uint32_t>());
+    if (p_buildAssignments) {
+        m_tenantPlannedNodeVectors.erase(p_tenantId);
+        m_tenantPlannedPrimaryNodeVectors[p_tenantId] =
+            std::move(assignments);
+    }
+
+    fprintf(stderr,
+            "[INFO] Tenant %d: workload planner %s %zu leaves "
+            "(sample=%zu/%d trainCost=%.6f validationCost=%.6f)\n",
+            p_tenantId,
+            plan->loadedFromFile ? "restored" : "selected",
+            nodeCount,
+            plan->sampleRows,
+            p_numVectors,
+            plan->selectedTrainingCost,
+            plan->selectedValidationCost);
+    return true;
 }
 
 bool TenantIndexManager::EnsureSharedDB()
@@ -2255,8 +2928,12 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
     m_tenantPivotLevels.clear();
     m_tenantPivotNodeCounts.clear();
     m_tenantNodePivotTags.clear();
+    m_tenantPlannedNodeVectors.clear();
+    m_tenantPlannedPrimaryNodeVectors.clear();
     m_tenantTagToNodes.clear();
     m_tenantHeadNodeToNode.clear();
+    m_tenantPredicateSubsetPlans.clear();
+    m_tenantPredicateAtomToNodes.clear();
 
     std::map<int, std::vector<std::pair<const uint8_t*, size_t>>> tenantVectorRanges;
     std::map<int, std::vector<std::string>> tenantMetadataLines;
@@ -2395,16 +3072,30 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
 
         if (indexType == TenantIndexType::SPANN)
         {
+            bool workloadPlanned = false;
+            if (m_predicateSubsetPlannerEnabled && !tenantLocalTags.empty()) {
+                if (!EnsurePredicateSubsetPlan(
+                        tenantId,
+                        tenantLocalTags.data(),
+                        tenantVectors.Data(),
+                        static_cast<int>(tenantVecCount),
+                        m_buildNumTagsPerVec,
+                        distMethod.c_str(),
+                        true)) {
+                    return false;
+                }
+                workloadPlanned = true;
+            }
             const char* skipPivotEnv = std::getenv("SPTAG_DISABLE_PIVOT_ESTIMATOR");
             const bool skipPivot = skipPivotEnv != nullptr &&
                 (skipPivotEnv[0] == '1' ||
                  SPTAG::Helper::StrUtils::StrEqualIgnoreCase(skipPivotEnv, "true") ||
                  SPTAG::Helper::StrUtils::StrEqualIgnoreCase(skipPivotEnv, "yes") ||
                  SPTAG::Helper::StrUtils::StrEqualIgnoreCase(skipPivotEnv, "on"));
-            if (skipPivot) {
+            if (!workloadPlanned && skipPivot) {
                 fprintf(stderr, "[INFO] Tenant %d: SPTAG_DISABLE_PIVOT_ESTIMATOR set, skipping node-aware planning\n", tenantId);
             }
-            if (!skipPivot && !tenantLocalTags.empty()) {
+            if (!workloadPlanned && !skipPivot && !tenantLocalTags.empty()) {
                 // Routing/bundle planning must consider only the CATEGORICAL tag
                 // columns. Numeric attributes are inlined as the last
                 // SPTAG_NUMERIC_COLS columns (raw, high-cardinality values); if
@@ -2527,12 +3218,23 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
 
             auto planIt = m_tenantPlannedNodeVectors.find(tenantId);
             auto primaryPlanIt = m_tenantPlannedPrimaryNodeVectors.find(tenantId);
-            bool hasNodeAwarePlan = (planIt != m_tenantPlannedNodeVectors.end() && !planIt->second.empty());
+            const std::vector<std::vector<int>>* postingPlan = nullptr;
+            if (primaryPlanIt != m_tenantPlannedPrimaryNodeVectors.end()
+                && !primaryPlanIt->second.empty())
+            {
+                postingPlan = &primaryPlanIt->second;
+            }
+            else if (planIt != m_tenantPlannedNodeVectors.end()
+                     && !planIt->second.empty())
+            {
+                postingPlan = &planIt->second;
+            }
+            bool hasNodeAwarePlan = postingPlan != nullptr;
 
             int64_t postingAssignmentCount = static_cast<int64_t>(tenantVecCount);
             if (hasNodeAwarePlan) {
                 int64_t plannedAssignmentTotal = 0;
-                for (const auto& nodeAssignments : planIt->second) {
+                for (const auto& nodeAssignments : *postingPlan) {
                     plannedAssignmentTotal += static_cast<int64_t>(nodeAssignments.size());
                 }
 
@@ -2711,6 +3413,10 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             }
             tenantIndex->SetBuildParam("TPTNumber", std::to_string(tptNumber).c_str(), "BuildHead");
             tenantIndex->SetBuildParam("RefineIterations", std::to_string(refineIter).c_str(), "BuildHead");
+            // Attribute-aware execution uses a local graph only for uniquely
+            // routed queries. All broader scopes switch to the global
+            // cross-edge graph, so keep local bundle degree modest.
+            tenantIndex->SetBuildParam("NeighborhoodSize", "20", "BuildHead");
             // Head index (BKT) defaults to the machine width. Explicit native
             // [BuildHead] NumberOfThreads overrides this below.
             {
@@ -2747,11 +3453,14 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                 tenantIndex->SetBuildParam("NumTagsPerVec", std::to_string(m_buildNumTagsPerVec).c_str(), "BuildSSDIndex");
                 tenantIndex->SetVectorTags(tenantLocalTags.data(), tenantVecCount, m_buildNumTagsPerVec);
             }
-            if (hasNodeAwarePlan) {
+            if (planIt != m_tenantPlannedNodeVectors.end()
+                && !planIt->second.empty())
+            {
                 tenantIndex->SetNodeVectorAssignments(planIt->second);
             }
             if (primaryPlanIt != m_tenantPlannedPrimaryNodeVectors.end() && !primaryPlanIt->second.empty()) {
-                tenantIndex->SetPrimaryNodeVectorAssignments(primaryPlanIt->second);
+                tenantIndex->TakePrimaryNodeVectorAssignments(
+                    std::move(primaryPlanIt->second));
             }
 
             // Shared RocksDB: when enabled, inject a tenant-prefixed wrapper
@@ -2767,6 +3476,42 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             tenantIndex->SetShareBuildOwnership(borrowedVectors);
             buildOk = tenantIndex->Build(tenantVectors, tenantVecCount, p_normalized);
             m_tenantSpannWorkDirs[tenantId] = spannWorkDir;
+            auto predicatePlanIt = m_tenantPredicateSubsetPlans.find(tenantId);
+            if (buildOk &&
+                predicatePlanIt != m_tenantPredicateSubsetPlans.end()) {
+                std::string planError;
+                if (!SPTAG::PredicateSubsetPlanner::SavePlan(
+                        PredicateSubsetPlanPath(spannWorkDir),
+                        *predicatePlanIt->second,
+                        &planError)) {
+                    fprintf(stderr,
+                            "[ERROR] Tenant %d: %s\n",
+                            tenantId,
+                            planError.c_str());
+                    buildOk = false;
+                }
+                if (buildOk &&
+                    !SPTAG::PredicateSubsetPlanner::SaveLeafAttributes(
+                        PredicateSubsetAttributesPath(spannWorkDir),
+                        *predicatePlanIt->second,
+                        &planError)) {
+                    fprintf(stderr,
+                            "[ERROR] Tenant %d: %s\n",
+                            tenantId,
+                            planError.c_str());
+                    buildOk = false;
+                }
+                if (buildOk && !predicatePlanIt->second->snapshots.empty() &&
+                    !SPTAG::PredicateSubsetPlanner::WriteManifest(
+                        spannWorkDir + "/HeadIndex/predicate_subset_plan.tsv",
+                        *predicatePlanIt->second,
+                        &planError)) {
+                    fprintf(stderr,
+                            "[WARN] Tenant %d: %s\n",
+                            tenantId,
+                            planError.c_str());
+                }
+            }
             fprintf(stderr, "[INFO] Tenant %d: SPANN build (%d vectors)\n", tenantId, tenantVecCount);
         }
         else if (indexType == TenantIndexType::BKT)
@@ -3314,8 +4059,12 @@ bool TenantIndexManager::LoadAll(const char* p_baseDir)
     m_tenantPivotLevels.clear();
     m_tenantPivotNodeCounts.clear();
     m_tenantNodePivotTags.clear();
+    m_tenantPlannedNodeVectors.clear();
+    m_tenantPlannedPrimaryNodeVectors.clear();
     m_tenantTagToNodes.clear();
     m_tenantHeadNodeToNode.clear();
+    m_tenantPredicateSubsetPlans.clear();
+    m_tenantPredicateAtomToNodes.clear();
 
     // Clear tenant ID mapping
     {
@@ -3924,16 +4673,27 @@ bool TenantIndexManager::EnsureTenantLoaded(int p_tenantId)
 
 bool TenantIndexManager::EnsureTenantPivotIndexLoaded(int p_tenantId)
 {
+    auto wdIt = m_tenantSpannWorkDirs.find(p_tenantId);
+    if (wdIt == m_tenantSpannWorkDirs.end()) return false;
+
     if (m_tenantPivotLevels.count(p_tenantId) &&
         m_tenantPivotNodeCounts.count(p_tenantId) &&
         m_tenantNodePivotTags.count(p_tenantId) &&
         m_tenantTagToNodes.count(p_tenantId) &&
         m_tenantHeadNodeToNode.count(p_tenantId)) {
+        if (!m_tenantPredicateAtomToNodes.count(p_tenantId)) {
+            std::unordered_map<std::string, std::vector<int>> predicateToNodes;
+            m_tenantPredicateAtomToNodes.erase(p_tenantId);
+            if (LoadPredicateNodeRoutingIndexFile(
+                    wdIt->second,
+                    m_tenantPivotNodeCounts[p_tenantId],
+                    predicateToNodes)) {
+                m_tenantPredicateAtomToNodes[p_tenantId] =
+                    std::move(predicateToNodes);
+            }
+        }
         return true;
     }
-
-    auto wdIt = m_tenantSpannWorkDirs.find(p_tenantId);
-    if (wdIt == m_tenantSpannWorkDirs.end()) return false;
 
     int pivotLevel = -1;
     int nodeCount = 0;
@@ -3954,6 +4714,13 @@ bool TenantIndexManager::EnsureTenantPivotIndexLoaded(int p_tenantId)
     m_tenantNodePivotTags[p_tenantId] = std::move(nodePivotTags);
     m_tenantTagToNodes[p_tenantId] = std::move(tagToNodes);
     m_tenantHeadNodeToNode[p_tenantId] = std::move(headNodeToNode);
+    std::unordered_map<std::string, std::vector<int>> predicateToNodes;
+    m_tenantPredicateAtomToNodes.erase(p_tenantId);
+    if (LoadPredicateNodeRoutingIndexFile(
+            wdIt->second, nodeCount, predicateToNodes)) {
+        m_tenantPredicateAtomToNodes[p_tenantId] =
+            std::move(predicateToNodes);
+    }
     return true;
 }
 
@@ -4150,13 +4917,67 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
     auto wdIt = m_tenantSpannWorkDirs.find(p_tenantId);
     if (wdIt == m_tenantSpannWorkDirs.end()) return false;
     std::string workDir = wdIt->second;
+    bool usePredicateSubsetPlan = m_predicateSubsetPlannerEnabled;
+    if (!usePredicateSubsetPlan) {
+        struct stat planStat {};
+        usePredicateSubsetPlan =
+            stat(PredicateSubsetPlanPath(workDir).c_str(), &planStat) == 0;
+    }
+    const bool routingOnly =
+        std::getenv("SPTAG_ROUTING_ONLY") != nullptr;
+    if (!EnsureTenantLoaded(p_tenantId)) return false;
+    if (usePredicateSubsetPlan &&
+        !EnsurePredicateSubsetPlan(
+            p_tenantId,
+            p_tagsPtr,
+            nullptr,
+            p_numVectors,
+            p_numTagsPerVec,
+            nullptr,
+            false)) {
+        return false;
+    }
+    if (usePredicateSubsetPlan) {
+        auto planIt = m_tenantPredicateSubsetPlans.find(p_tenantId);
+        if (planIt == m_tenantPredicateSubsetPlans.end()) return false;
+        std::string planError;
+        if (!SPTAG::PredicateSubsetPlanner::SavePlan(
+                PredicateSubsetPlanPath(workDir),
+                *planIt->second,
+                &planError)) {
+            fprintf(stderr,
+                    "[ERROR] Tenant %d: %s\n",
+                    p_tenantId,
+                    planError.c_str());
+            return false;
+        }
+        if (!SPTAG::PredicateSubsetPlanner::SaveLeafAttributes(
+                PredicateSubsetAttributesPath(workDir),
+                *planIt->second,
+                &planError)) {
+            fprintf(stderr,
+                    "[ERROR] Tenant %d: %s\n",
+                    p_tenantId,
+                    planError.c_str());
+            return false;
+        }
+        if (!planIt->second->snapshots.empty() &&
+            !SPTAG::PredicateSubsetPlanner::WriteManifest(
+                workDir + "/HeadIndex/predicate_subset_plan.tsv",
+                *planIt->second,
+                &planError)) {
+            fprintf(stderr,
+                    "[WARN] Tenant %d: %s\n",
+                    p_tenantId,
+                    planError.c_str());
+        }
+    }
 
     // DirectSparseMaxPostings is a native [BuildSSDIndex] parameter. The
     // sparse-tag sidecar is built after the SPANN store, so retrieve the
     // persisted option from the just-built (or reloaded) index instead of
     // consulting a process environment override.
     int directSparseMaxPostings = 320;
-    if (!EnsureTenantLoaded(p_tenantId)) return false;
     {
         std::shared_lock<std::shared_mutex> rlock(m_tenantIndicesMutex);
         auto it = m_tenantIndices.find(p_tenantId);
@@ -4193,7 +5014,137 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
         bool sigOk     = stat(sigPath.c_str(),     &st) == 0;
         bool sparseOk  = stat(sparsePath.c_str(),  &st) == 0;
         bool tagPureOk = stat(tagPurePath.c_str(), &st) == 0;
-        if (sigOk && sparseOk && tagPureOk) {
+        bool predicateOk = !usePredicateSubsetPlan;
+        bool headRoutingOk = !usePredicateSubsetPlan;
+        if (usePredicateSubsetPlan) {
+            auto planIt = m_tenantPredicateSubsetPlans.find(p_tenantId);
+            auto routingIt = m_tenantPredicateAtomToNodes.find(p_tenantId);
+            std::unordered_map<std::string, std::vector<int>>
+                persistedPredicateRouting;
+            predicateOk =
+                planIt != m_tenantPredicateSubsetPlans.end() &&
+                routingIt != m_tenantPredicateAtomToNodes.end() &&
+                LoadPredicateNodeRoutingIndexFile(
+                    workDir,
+                    static_cast<int>(planIt->second->selectedNodes.size()),
+                    persistedPredicateRouting) &&
+                persistedPredicateRouting == routingIt->second;
+            if (!predicateOk &&
+                planIt != m_tenantPredicateSubsetPlans.end() &&
+                routingIt != m_tenantPredicateAtomToNodes.end())
+            {
+                predicateOk = SavePredicateNodeRoutingIndexFile(
+                    workDir,
+                    static_cast<int>(planIt->second->selectedNodes.size()),
+                    routingIt->second);
+                if (predicateOk) {
+                    fprintf(stderr,
+                            "[INFO] Tenant %d: repaired predicate routing sidecar\n",
+                            p_tenantId);
+                }
+            }
+
+            std::shared_ptr<AnnIndex> idxPtr;
+            {
+                std::shared_lock<std::shared_mutex> rlock(
+                    m_tenantIndicesMutex);
+                auto indexIt = m_tenantIndices.find(p_tenantId);
+                if (indexIt != m_tenantIndices.end()) {
+                    idxPtr = indexIt->second;
+                }
+            }
+            auto internalIndex =
+                idxPtr == nullptr ? nullptr : idxPtr->GetInternalIndex();
+            auto memoryIndex = GetMemoryIndexForInternal(internalIndex);
+            auto* spannIndex =
+                internalIndex == nullptr
+                    ? nullptr
+                    : dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(
+                          internalIndex.get());
+            std::vector<int> expectedHeadNodeToNode;
+            if (planIt != m_tenantPredicateSubsetPlans.end() &&
+                memoryIndex != nullptr &&
+                spannIndex != nullptr &&
+                spannIndex->PopulateHeadNodeGlobalVIDsFromBundles() &&
+                BuildHeadNodeToNodeIndexForPredicatePlan(
+                    *planIt->second,
+                    p_tagsPtr,
+                    p_numVectors,
+                    p_numTagsPerVec,
+                    memoryIndex,
+                    spannIndex,
+                    expectedHeadNodeToNode))
+            {
+                int persistedPivotLevel = -1;
+                int persistedNodeCount = 0;
+                std::vector<std::vector<uint32_t>>
+                    persistedNodePivotTags;
+                std::unordered_map<uint32_t, std::vector<int>>
+                    persistedTagToNodes;
+                std::vector<int> persistedHeadNodeToNode;
+                const auto expectedTagsIt =
+                    m_tenantTagToNodes.find(p_tenantId);
+                const auto expectedNodeTagsIt =
+                    m_tenantNodePivotTags.find(p_tenantId);
+                headRoutingOk =
+                    expectedTagsIt != m_tenantTagToNodes.end() &&
+                    expectedNodeTagsIt !=
+                        m_tenantNodePivotTags.end() &&
+                    LoadHeadNodeRoutingIndexFile(
+                        workDir,
+                        persistedPivotLevel,
+                        persistedNodeCount,
+                        persistedNodePivotTags,
+                        persistedTagToNodes,
+                        persistedHeadNodeToNode) &&
+                    persistedPivotLevel == -1 &&
+                    persistedNodeCount ==
+                        static_cast<int>(
+                            planIt->second->selectedNodes.size()) &&
+                    persistedNodePivotTags ==
+                        expectedNodeTagsIt->second &&
+                    persistedTagToNodes == expectedTagsIt->second &&
+                    persistedHeadNodeToNode ==
+                        expectedHeadNodeToNode;
+                if (!headRoutingOk) {
+                    m_tenantHeadNodeToNode[p_tenantId] =
+                        expectedHeadNodeToNode;
+                    for (SizeType headId = 0;
+                         headId <
+                         static_cast<SizeType>(
+                             expectedHeadNodeToNode.size());
+                         ++headId)
+                    {
+                        memoryIndex->SetHeadNodeBundleNodeId(
+                            headId,
+                            static_cast<int16_t>(
+                                expectedHeadNodeToNode[
+                                    static_cast<size_t>(headId)]));
+                    }
+                    headRoutingOk = SaveHeadNodeRoutingIndexFile(
+                        workDir,
+                        -1,
+                        expectedNodeTagsIt->second,
+                        expectedTagsIt->second,
+                        expectedHeadNodeToNode);
+                    if (headRoutingOk &&
+                        memoryIndex->HasHeadNodeMeta()) {
+                        headRoutingOk =
+                            SaveHeadNodeMetaFile(
+                                workDir, memoryIndex);
+                    }
+                    if (headRoutingOk) {
+                        fprintf(
+                            stderr,
+                            "[INFO] Tenant %d: repaired head routing sidecar\n",
+                            p_tenantId);
+                    }
+                }
+            }
+        }
+        if (!routingOnly &&
+            sigOk && sparseOk && tagPureOk &&
+            predicateOk && headRoutingOk) {
             // Make sure the PS signatures are attached to the head index.
             EnsureTenantLoaded(p_tenantId);
             {
@@ -4244,7 +5195,7 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
     // filtered query fans out to all nodes). Honors SPTAG_PIVOT_FORCE_NODE_COUNT
     // / SPTAG_HIER_LEVEL_WIDTHS so the recomputed pivot partition matches the
     // one used at build time.
-    if (std::getenv("SPTAG_ROUTING_ONLY") != nullptr) {
+    if (routingOnly) {
         EnsureTenantLoaded(p_tenantId);
         std::shared_ptr<AnnIndex> idxPtr;
         {
@@ -4271,6 +5222,47 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
             memoryIndex->InitializeHeadNodeMeta(numHeadSamples);
         }
         spannInternalIdx->PopulateHeadNodeGlobalVIDsFromBundles();
+
+        if (usePredicateSubsetPlan) {
+            auto planIt = m_tenantPredicateSubsetPlans.find(p_tenantId);
+            if (planIt == m_tenantPredicateSubsetPlans.end()) return false;
+            std::vector<int> headNodeToNode;
+            if (!BuildHeadNodeToNodeIndexForPredicatePlan(
+                    *planIt->second,
+                    p_tagsPtr,
+                    p_numVectors,
+                    p_numTagsPerVec,
+                    memoryIndex,
+                    spannInternalIdx,
+                    headNodeToNode)) {
+                return false;
+            }
+            m_tenantHeadNodeToNode[p_tenantId] = headNodeToNode;
+            for (SizeType hid = 0; hid < numHeadSamples; ++hid) {
+                const int16_t nodeId =
+                    hid < static_cast<SizeType>(headNodeToNode.size()) &&
+                            headNodeToNode[static_cast<size_t>(hid)] >= 0
+                        ? static_cast<int16_t>(
+                              headNodeToNode[static_cast<size_t>(hid)])
+                        : static_cast<int16_t>(-1);
+                memoryIndex->SetHeadNodeBundleNodeId(hid, nodeId);
+            }
+            const bool routingOk = SaveHeadNodeRoutingIndexFile(
+                workDir,
+                -1,
+                m_tenantNodePivotTags[p_tenantId],
+                m_tenantTagToNodes[p_tenantId],
+                headNodeToNode);
+            const bool predicateOk = SavePredicateNodeRoutingIndexFile(
+                workDir,
+                m_tenantPivotNodeCounts[p_tenantId],
+                m_tenantPredicateAtomToNodes[p_tenantId]);
+            bool metaOk = true;
+            if (preserveHeadNodeMeta) {
+                metaOk = SaveHeadNodeMetaFile(workDir, memoryIndex);
+            }
+            return routingOk && predicateOk && metaOk;
+        }
 
         // Reproduce the build-time routing-column projection so the recomputed
         // pivot partition (and thus node numbering) matches the physical layout.
@@ -4435,8 +5427,10 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
             // Pivot estimator (tags-only) drives per-bundle tag routing.
             PivotEstimatorComputation pivotComputation;
             const PivotEstimatorCandidate* pivotCandidate = nullptr;
-            if (BuildPivotEstimatorComputation(p_tagsPtr, p_numVectors, p_numTagsPerVec,
-                                               0, 0.99, 10.0, 1.0, std::string(), pivotComputation)) {
+            if (!usePredicateSubsetPlan &&
+                BuildPivotEstimatorComputation(
+                    p_tagsPtr, p_numVectors, p_numTagsPerVec,
+                    0, 0.99, 10.0, 1.0, std::string(), pivotComputation)) {
                 pivotCandidate = FindBestPivotEstimatorCandidate(pivotComputation.candidates);
             }
             if (pivotCandidate != nullptr) {
@@ -4530,14 +5524,52 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                 ++resolved;
                 SPTAG::Cache::HierarchicalOwnTags ownMask;
                 ownMask.Clear();
-                for (int t = 0; t < staticACLTagCols; ++t) {
+                for (int t = 0;
+                     t < (std::min)(p_numTagsPerVec, SPTAG::Cache::HIER_LEVELS);
+                     ++t) {
                     uint32_t tag = p_tagsPtr[(size_t)globalVID * p_numTagsPerVec + t];
                     ownMask.Insert(t, tag);
                 }
                 memoryIndex->SetHeadNodeHierMask(hid, ownMask);
             }
 
-            if (pivotCandidate != nullptr) {
+            if (usePredicateSubsetPlan) {
+                auto planIt = m_tenantPredicateSubsetPlans.find(p_tenantId);
+                if (planIt == m_tenantPredicateSubsetPlans.end()) return false;
+                std::vector<int> headNodeToNode;
+                if (!BuildHeadNodeToNodeIndexForPredicatePlan(
+                        *planIt->second,
+                        p_tagsPtr,
+                        p_numVectors,
+                        p_numTagsPerVec,
+                        memoryIndex,
+                        spannInternalIdx,
+                        headNodeToNode)) {
+                    return false;
+                }
+                m_tenantHeadNodeToNode[p_tenantId] = headNodeToNode;
+                for (SizeType hid = 0; hid < numHeadSamples; ++hid) {
+                    int16_t nid =
+                        hid < static_cast<SizeType>(headNodeToNode.size()) &&
+                                headNodeToNode[static_cast<size_t>(hid)] >= 0
+                            ? static_cast<int16_t>(
+                                  headNodeToNode[static_cast<size_t>(hid)])
+                            : static_cast<int16_t>(-1);
+                    memoryIndex->SetHeadNodeBundleNodeId(hid, nid);
+                }
+                if (!SaveHeadNodeRoutingIndexFile(
+                        workDir,
+                        -1,
+                        m_tenantNodePivotTags[p_tenantId],
+                        m_tenantTagToNodes[p_tenantId],
+                        headNodeToNode) ||
+                    !SavePredicateNodeRoutingIndexFile(
+                        workDir,
+                        m_tenantPivotNodeCounts[p_tenantId],
+                        m_tenantPredicateAtomToNodes[p_tenantId])) {
+                    return false;
+                }
+            } else if (pivotCandidate != nullptr) {
                 std::vector<int> headNodeToNode;
                 BuildHeadNodeToNodeIndexForCandidate(*pivotCandidate, p_tagsPtr, p_numVectors,
                                                      p_numTagsPerVec, memoryIndex, spannInternalIdx,
@@ -4868,7 +5900,8 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
 
     PivotEstimatorComputation pivotComputation;
     const PivotEstimatorCandidate* pivotCandidate = nullptr;
-    if (BuildPivotEstimatorComputation(p_tagsPtr,
+    if (!usePredicateSubsetPlan &&
+        BuildPivotEstimatorComputation(p_tagsPtr,
                                        p_numVectors,
                                        p_numTagsPerVec,
                                        kPivotEstimatorDefaultMaxNodes,
@@ -4880,14 +5913,14 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
         pivotCandidate = FindBestPivotEstimatorCandidate(pivotComputation.candidates);
     }
 
-    if (pivotCandidate != nullptr) {
+    if (!usePredicateSubsetPlan && pivotCandidate != nullptr) {
         m_tenantPivotLevels[p_tenantId] = pivotCandidate->pivotLevel;
         m_tenantPivotNodeCounts[p_tenantId] = pivotCandidate->nodeCount;
         m_tenantNodePivotTags[p_tenantId] = pivotCandidate->nodePivotTags;
         BuildTagToNodeIndexForCandidate(*pivotCandidate,
                                         pivotComputation.levelData,
                                         m_tenantTagToNodes[p_tenantId]);
-    } else {
+    } else if (!usePredicateSubsetPlan) {
         m_tenantPivotLevels.erase(p_tenantId);
         m_tenantPivotNodeCounts.erase(p_tenantId);
         m_tenantNodePivotTags.erase(p_tenantId);
@@ -5017,7 +6050,43 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                 headTagCount++;
             }
 
-            if (pivotCandidate != nullptr) {
+            if (usePredicateSubsetPlan) {
+                auto planIt = m_tenantPredicateSubsetPlans.find(p_tenantId);
+                if (planIt == m_tenantPredicateSubsetPlans.end()) return false;
+                std::vector<int> headNodeToNode;
+                if (!BuildHeadNodeToNodeIndexForPredicatePlan(
+                        *planIt->second,
+                        p_tagsPtr,
+                        p_numVectors,
+                        p_numTagsPerVec,
+                        memoryIndex,
+                        spannInternalIdx,
+                        headNodeToNode)) {
+                    return false;
+                }
+                m_tenantHeadNodeToNode[p_tenantId] = headNodeToNode;
+                for (SizeType hid = 0; hid < numHeadSamples; ++hid) {
+                    int16_t nid =
+                        hid < static_cast<SizeType>(headNodeToNode.size()) &&
+                                headNodeToNode[static_cast<size_t>(hid)] >= 0
+                            ? static_cast<int16_t>(
+                                  headNodeToNode[static_cast<size_t>(hid)])
+                            : static_cast<int16_t>(-1);
+                    memoryIndex->SetHeadNodeBundleNodeId(hid, nid);
+                }
+                if (!SaveHeadNodeRoutingIndexFile(
+                        workDir,
+                        -1,
+                        m_tenantNodePivotTags[p_tenantId],
+                        m_tenantTagToNodes[p_tenantId],
+                        headNodeToNode) ||
+                    !SavePredicateNodeRoutingIndexFile(
+                        workDir,
+                        m_tenantPivotNodeCounts[p_tenantId],
+                        m_tenantPredicateAtomToNodes[p_tenantId])) {
+                    return false;
+                }
+            } else if (pivotCandidate != nullptr) {
                 std::vector<int> headNodeToNode;
                 BuildHeadNodeToNodeIndexForCandidate(*pivotCandidate,
                                                      p_tagsPtr,
@@ -5046,7 +6115,7 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
         }
     }
 
-    if (pivotCandidate != nullptr) {
+    if (!usePredicateSubsetPlan && pivotCandidate != nullptr) {
         fprintf(stderr,
                 "[INFO] Tenant %d: pivot estimator selected level=%d nodes=%d\n",
                 p_tenantId,
@@ -5306,9 +6375,16 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
     // union of literal values drives the coarse masks/selectivity while the
     // exact per-vector DNF eval runs in the posting scan.
     bool dnfMode = (p_numTags < 0);
+    bool dnfUsesColumnEncoding = false;
     SPTAG::Cache::DNFPredicate dnf;
     std::vector<uint32_t> dnfValues;
-    if (dnfMode && queryTagsPtr != nullptr) {
+    if (dnfMode) {
+        if (queryTagsPtr == nullptr ||
+            p_queryTags.Length() == 0 ||
+            p_queryTags.Length() % sizeof(uint32_t) != 0) {
+            fprintf(stderr, "[ERROR] Malformed DNF predicate blob.\n");
+            return nullptr;
+        }
         const uint32_t* w = queryTagsPtr;
         const size_t nWords = p_queryTags.Length() / sizeof(uint32_t);
         size_t pos = 0;
@@ -5322,38 +6398,61 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
         // exact per-vector post-filter and never drive retrieval.
         bool dnf3 = (nWords >= 1 && w[0] == 0x444E4633u);
         bool extended = (nWords >= 1 && w[0] == 0x444E4632u);
+        dnfUsesColumnEncoding = dnf3 || extended;
         if (dnf3 || extended) pos = 1;
-        if (nWords > pos) {
-            uint32_t numClauses = w[pos++];
-            for (uint32_t ci = 0; ci < numClauses && pos < nWords; ++ci) {
-                uint32_t numLits = w[pos++];
-                SPTAG::Cache::DNFClause clause;
-                for (uint32_t li = 0; li < numLits; ++li) {
-                    if (dnf3) {
-                        if (pos + 3 >= nWords) break;
-                        uint32_t kind = w[pos++];
-                        uint32_t col  = w[pos++];
-                        uint8_t  op   = (uint8_t)w[pos++];
-                        uint32_t val  = w[pos++];
-                        clause.lits.push_back({col, val, op, (uint8_t)kind});
-                        if (kind == 0 && op == SPTAG::Cache::DNF_EQ) dnfValues.push_back(val);
-                    } else if (extended) {
-                        if (pos + 2 >= nWords) break;
-                        uint32_t col = w[pos++];
-                        uint8_t  op  = (uint8_t)w[pos++];
-                        uint32_t val = w[pos++];
-                        clause.lits.push_back({col, val, op, (uint8_t)0});
-                        if (op == SPTAG::Cache::DNF_EQ) dnfValues.push_back(val);
-                    } else {
-                        if (pos + 1 >= nWords) break;
-                        uint32_t col = w[pos++];
-                        uint32_t val = w[pos++];
-                        clause.lits.push_back({col, val});
-                        dnfValues.push_back(val);
-                    }
-                }
-                if (!clause.lits.empty()) dnf.clauses.push_back(std::move(clause));
+        bool validDNF = pos < nWords;
+        uint32_t numClauses = validDNF ? w[pos++] : 0;
+        validDNF = validDNF && numClauses > 0;
+        for (uint32_t ci = 0; validDNF && ci < numClauses; ++ci) {
+            if (pos >= nWords) {
+                validDNF = false;
+                break;
             }
+            uint32_t numLits = w[pos++];
+            if (numLits == 0) {
+                validDNF = false;
+                break;
+            }
+            SPTAG::Cache::DNFClause clause;
+            for (uint32_t li = 0; validDNF && li < numLits; ++li) {
+                const size_t literalWords = dnf3 ? 4 : (extended ? 3 : 2);
+                if (nWords - pos < literalWords) {
+                    validDNF = false;
+                    break;
+                }
+                uint32_t kind = 0;
+                uint32_t col;
+                uint32_t op = SPTAG::Cache::DNF_EQ;
+                uint32_t val;
+                if (dnf3) {
+                    kind = w[pos++];
+                    col = w[pos++];
+                    op = w[pos++];
+                    val = w[pos++];
+                } else if (extended) {
+                    col = w[pos++];
+                    op = w[pos++];
+                    val = w[pos++];
+                } else {
+                    col = w[pos++];
+                    val = w[pos++];
+                }
+                if (kind > 1 || op > SPTAG::Cache::DNF_GE) {
+                    validDNF = false;
+                    break;
+                }
+                clause.lits.push_back(
+                    {col, val, static_cast<uint8_t>(op), static_cast<uint8_t>(kind)});
+                if (kind == 0 && op == SPTAG::Cache::DNF_EQ) {
+                    dnfValues.push_back(val);
+                }
+            }
+            if (validDNF) dnf.clauses.push_back(std::move(clause));
+        }
+        if (!validDNF || pos != nWords ||
+            dnf.clauses.size() != static_cast<size_t>(numClauses)) {
+            fprintf(stderr, "[ERROR] Malformed DNF predicate blob.\n");
+            return nullptr;
         }
     }
     // ── Lower pure-OR DNF to the legacy flat-OR path ───────────────────────
@@ -5367,7 +6466,11 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
     // hand off to the legacy path verbatim (dnfMode off, positive p_numTags).
     // The DNF dense path is then reserved for predicates that genuinely need
     // conjunctions, where there is no legacy equivalent.
-    if (dnfMode && !dnf.Empty() && !dnf.HasAndClause() && !dnf.HasNumericLiteral()) {
+    // Only the legacy column-less encoding can be lowered safely. DNF2/DNF3
+    // literals retain their attribute column so equal numeric IDs in different
+    // attributes do not collapse into one flat tag namespace.
+    if (dnfMode && !dnfUsesColumnEncoding && !dnf.Empty() &&
+        !dnf.HasAndClause() && !dnf.HasNumericLiteral()) {
         std::sort(dnfValues.begin(), dnfValues.end());
         dnfValues.erase(std::unique(dnfValues.begin(), dnfValues.end()), dnfValues.end());
         queryTagsPtr = dnfValues.empty() ? nullptr : dnfValues.data();
@@ -5412,6 +6515,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
     bool forceDenseTagSearch = false;
     bool adaptiveFilteredNprobeEnabled = false;
     float filteredSearchNprobeSafety = 1.0f;
+    SPTAG::SPANN::ISPANNIndex* spannIndex = nullptr;
     if (internalIdx != nullptr) {
         const std::string forceDenseParam = internalIdx->GetParameter("ForceDenseTagSearch", "BuildSSDIndex");
         if (!forceDenseParam.empty()) {
@@ -5427,7 +6531,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
             }
         }
 
-        auto* spannIndex = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(internalIdx.get());
+        spannIndex = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(internalIdx.get());
         const auto* searchOptions = spannIndex != nullptr ? spannIndex->GetOptions() : nullptr;
         adaptiveFilteredNprobeEnabled =
             searchOptions != nullptr && searchOptions->m_enableAdaptiveFilteredNprobe;
@@ -5513,6 +6617,12 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
                                           : std::chrono::high_resolution_clock::time_point{};
 
     const auto tagToNodesIt = m_tenantTagToNodes.find(p_tenantId);
+    const auto predicateToNodesIt =
+        m_tenantPredicateAtomToNodes.find(p_tenantId);
+    const auto* predicateToNodes =
+        predicateToNodesIt != m_tenantPredicateAtomToNodes.end()
+            ? &predicateToNodesIt->second
+            : nullptr;
     const auto headNodeToNodeIt = m_tenantHeadNodeToNode.find(p_tenantId);
     const std::vector<int>* headNodeToNode = (headNodeToNodeIt != m_tenantHeadNodeToNode.end())
         ? &headNodeToNodeIt->second
@@ -5531,7 +6641,11 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
         headNodeToNode != nullptr &&
         !headNodeToNode->empty()) {
         if (dnfMode && !dnf.Empty()) {
-            routingCollected = TryCollectRoutingNodesForDNF(tagToNodesIt->second, dnf, routedNodes);
+            routingCollected = TryCollectRoutingNodesForDNF(
+                tagToNodesIt->second,
+                predicateToNodes,
+                dnf,
+                routedNodes);
             static const bool s_routeDbg = (std::getenv("SPTAG_ROUTE_DEBUG") != nullptr);
             if (s_routeDbg) {
                 static std::atomic<int> g_rc{0};
@@ -5570,6 +6684,98 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
                     hasRoutingNodeFilter = true;
                 }
             }
+        }
+    }
+
+    auto vectorCountIt = m_tenantVectorCounts.find(p_tenantId);
+    const int tenantSize =
+        vectorCountIt != m_tenantVectorCounts.end() ? vectorCountIt->second : 0;
+    bool hasSelectivityEstimate = false;
+    float estimatedVectorSelectivity = 1.0f;
+    if (dnfMode && !dnf.Empty()) {
+        estimatedVectorSelectivity = EstimateDNFVectorSelectivity(
+            tenantSize, tagStats, dnf, &hasSelectivityEstimate);
+    } else {
+        estimatedVectorSelectivity = EstimateQueryVectorSelectivity(
+            tenantSize, tagStats, effTagsPtr, effNumTags);
+        if (tagStats != nullptr && effTagsPtr != nullptr) {
+            for (int i = 0; i < effNumTags; ++i) {
+                if (tagStats->find(effTagsPtr[i]) != tagStats->end()) {
+                    hasSelectivityEstimate = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    double routedPopulationFraction = 1.0;
+    if (routingCollected && !routedNodes.empty() && spannIndex != nullptr) {
+        const auto& bundleNodes = spannIndex->GetHeadBundleNodes();
+        std::unordered_set<int> routedNodeSet(
+            routedNodes.begin(), routedNodes.end());
+        std::uint64_t totalAssignments = 0;
+        std::uint64_t routedAssignments = 0;
+        for (const auto& node : bundleNodes) {
+            const std::uint64_t count =
+                node.assignmentCount > 0
+                    ? static_cast<std::uint64_t>(node.assignmentCount)
+                    : 0;
+            totalAssignments += count;
+            if (routedNodeSet.count(node.nodeId) > 0) {
+                routedAssignments += count;
+            }
+        }
+        if (totalAssignments > 0) {
+            routedPopulationFraction =
+                static_cast<double>(routedAssignments) /
+                static_cast<double>(totalAssignments);
+        } else if (!bundleNodes.empty()) {
+            routedPopulationFraction =
+                static_cast<double>(routedNodeSet.size()) /
+                static_cast<double>(bundleNodes.size());
+        }
+    }
+    if (routingCollected && hasSelectivityEstimate) {
+        estimatedVectorSelectivity = static_cast<float>((std::min)(
+            static_cast<double>(estimatedVectorSelectivity),
+            routedPopulationFraction));
+    }
+    estimatedVectorSelectivity =
+        std::clamp(estimatedVectorSelectivity, 1e-6f, 1.0f);
+
+    SPTAG::PredicateSubsetPlanner::QueryExecutionCost executionCost;
+    bool useGlobalTailWithPostFilter = !routingCollected;
+    if (routingCollected) {
+        executionCost =
+            SPTAG::PredicateSubsetPlanner::EvaluateQueryExecutionCost(
+                routedPopulationFraction,
+                routedNodes.size());
+        useGlobalTailWithPostFilter = executionCost.useGlobalTail;
+    }
+    static const bool s_forceGlobalTail = []() {
+        const char* value = std::getenv("SPTAG_FORCE_GLOBAL_TAIL");
+        return value != nullptr && value[0] == '1';
+    }();
+    static const bool s_forcePurePrefix = []() {
+        const char* value = std::getenv("SPTAG_FORCE_PURE_PREFIX");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (s_forceGlobalTail != s_forcePurePrefix) {
+        useGlobalTailWithPostFilter = s_forceGlobalTail;
+    }
+    if (s_gateDebug) {
+        static std::atomic<int> g_costRouteCount{0};
+        if (g_costRouteCount++ < 16) {
+            fprintf(stderr,
+                "[ROUTE-COST] subsets=%zu pop=%.6f sel=%.6f "
+                "subset_ms=%.6f global_tail_ms=%.6f tail=%d known=%d\n",
+                routedNodes.size(),
+                routedPopulationFraction,
+                static_cast<double>(estimatedVectorSelectivity),
+                executionCost.subsetCostMs,
+                executionCost.globalTailCostMs,
+                static_cast<int>(useGlobalTailWithPostFilter),
+                static_cast<int>(hasSelectivityEstimate));
         }
     }
 
@@ -5833,19 +7039,26 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
                     };
                 }
             }
-            // Bundle-node routing (multi-bundle graph search) is separate from the
-            // posting pre-filter above and still useful when manifest has >1 node.
-            if (hasRoutingNodeFilter && headNodeToNode != nullptr) {
+            // A unique subset is searched inside its local head graph. A
+            // predicate spanning multiple subsets uses the full cross-edge
+            // graph and relies on the exact posting predicate as a post-filter:
+            // the induced graph over only the matching subsets is not
+            // guaranteed to be connected.
+            if (headNodeToNode != nullptr &&
+                hasRoutingNodeFilter &&
+                routedNodes.size() == 1) {
                 searchContext.m_searchHeadBundleNodes = routedNodes;
+            } else {
+                searchContext.m_globalHeadSearchWithPostFilter = true;
             }
+            searchContext.m_useGlobalTailWithPostFilter =
+                useGlobalTailWithPostFilter;
             (void)allowedNodeMask;
             (void)headNodeToNode;
 
         if (adaptiveFilteredNprobeEnabled) {
-            auto vcIt2 = m_tenantVectorCounts.find(p_tenantId);
-            int tenantSize2 = (vcIt2 != m_tenantVectorCounts.end()) ? vcIt2->second : 1;
-            float vectorSel = EstimateQueryVectorSelectivity(
-                tenantSize2, tagStats, effTagsPtr, effNumTags);
+            int tenantSize2 = tenantSize > 0 ? tenantSize : 1;
+            float vectorSel = estimatedVectorSelectivity;
             vectorSel = std::clamp(
                 vectorSel / std::max(1.0f, filteredSearchNprobeSafety), 1e-6f, 1.0f);
             searchContext.m_filterSelectivity = vectorSel;

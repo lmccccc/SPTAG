@@ -70,12 +70,13 @@ PIPEPQ_PIVOTS=$(ini PipePQPivotsFile)
 #                      builds create it before Phase 4; this post-build fallback
 #                      supports older/non-STATIC builders.
 #   CrossExtraEdges  : -m, cross-subgraph edges kept per head (augmentheadgraph
-#                      clamps <=0 back to 10). Default 10.
+#                      clamps values below 32 back to 32). Default 32.
 CROSS_EDGES=$(ini CrossEdges);            [ -z "$CROSS_EDGES" ] && CROSS_EDGES=1
-CROSS_EXTRA_EDGES=$(ini CrossExtraEdges); [ -z "$CROSS_EXTRA_EDGES" ] && CROSS_EXTRA_EDGES=10
+CROSS_EXTRA_EDGES=$(ini CrossExtraEdges); [ -z "$CROSS_EXTRA_EDGES" ] && CROSS_EXTRA_EDGES=32
 case "$CROSS_EXTRA_EDGES" in
-  *[!0-9]*|'') CROSS_EXTRA_EDGES=10 ;;
+  *[!0-9]*|'') CROSS_EXTRA_EDGES=32 ;;
 esac
+[ "$CROSS_EXTRA_EDGES" -ge 32 ] || CROSS_EXTRA_EDGES=32
 CROSS_EDGE_SEARCH_TOPK=$CROSS_EXTRA_EDGES
 [ "$CROSS_EDGE_SEARCH_TOPK" -lt 15 ] && CROSS_EDGE_SEARCH_TOPK=15
 CROSS_EDGE_BUILD_THREADS=$(ini_section BuildSSDIndex NumberOfThreads)

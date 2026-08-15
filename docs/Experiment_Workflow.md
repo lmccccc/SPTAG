@@ -118,6 +118,147 @@ Tools/benchmarks/run_spann_attr_build.sh Tools/benchmarks/build_spann_attr_space
 #             + Release/augmentheadgraph -d $IDX/tenant_0/HeadIndex -k 15 -m N -t T -w true
 ```
 
+An optional predicate-workload bootstrap runs before index construction:
+
+```ini
+[PredicateWorkload]
+KeyAttribute=0,1,2,3
+PredicateColumns=0,1,2,3,4
+TrainSetFile=/path/to/predicate_train.tsv
+QueryCount=2048
+```
+
+If `TrainSetFile` already exists, an external workload is retained unchanged;
+generated workloads are reused only when their source and configuration
+metadata and complete data rows match. Otherwise the builder writes the train
+set atomically. One categorical key column is a label key, multiple categorical
+key columns form a hierarchy, and one trailing `NumericCols` key column is a
+range key. `PredicateColumns` is the complete synthetic predicate-column
+whitelist and defaults to all tag columns when omitted. It must include the key
+columns.
+
+With `QueryCount>0`, each output row is one complete DNF query. `KeyAttribute`
+marks the routing/planning key but does not constrain query syntax: any clause
+may include or omit the key, and keyless clauses remain part of the workload for
+global-fallback costing.
+The remaining generation policy is intentionally fixed rather than exposed as
+index tuning:
+
+- 16 representative candidates per attribute and a fixed recorded seed;
+- feasible default clause-count strata from `{1,2}`, with query frequency
+  inversely proportional to clause count (`2:1`) so single-clause queries
+  dominate while both strata contribute the same total clause budget;
+- uniform sampling over all non-empty logical-attribute masks;
+- a full tag scan for datasets up to 1M rows, otherwise one 65,536-row
+  discovery sample and one disjoint 65,536-row evaluation sample.
+
+Categorical predicates use equality, numeric predicates use sampled ranges, and
+DNF clauses may overlap, but every retained clause must contribute at least one
+evaluation-sample row beyond the union of the other clauses. This prevents
+nominal multi-clause shapes from collapsing semantically. Dense predicates are
+retained; the later subset cost planner decides whether optimizing them is
+beneficial. Generated DNF caches use the v5 format with grammar, shape,
+selectivity, and content-hash validation. `QueryCount=0` retains the internal
+atomic-key compatibility mode. Omitting the section preserves the previous
+build path. Unknown keys and malformed values are rejected.
+
+Four-clause DNF remains supported by the generator and external train-set
+format for explicit stress workloads, but is excluded from the default
+synthetic prior.
+
+`QueryCount>0` also enables workload-aware subset planning. After the train set
+is ready and before `SelectHead`, the builder parses all workload rows into
+canonical weighted DNF and precomputes each query's exact sampled bitmap. These
+bitmaps form query hyperedges over mutually exclusive partition cells. A
+deterministic sampled vector-neighbor graph supplies the physical boundary
+penalty using the configured ANN distance metric.
+
+The planner performs global beam search over complete partition states. At each
+leaf count it compares all legal `leaf × atom` splits, retains up to eight
+deduplicated topologies, and permits an intermediate split to increase cost so
+multi-step DNF refinements remain reachable. Training cost combines touched
+population, subset startup/coordination, vector-boundary, and subset-overhead
+terms. A deterministic held-out workload selects both topology and node count.
+The selected partition is then compiled into a decision tree; every vector
+receives exactly one primary leaf.
+
+The coefficients are fixed physical milliseconds measured on the local
+SIFT1M UInt8 static-SPANN path using one search thread, 100 measured queries,
+and three repetitions: 0.40657040 ms of common query-path work,
+0.10746861 ms per full-population equivalent scanned, and 0.02330404 ms per
+additional routed subset. Cross-edge on/off differed by less than one
+microsecond at the median, so the boundary regularizer uses a conservative
+0.001 ms full-cut resolution. Planning uses 4,096 deterministic
+sample rows and declares convergence after eight consecutive leaf counts fail
+to improve the held-out incumbent. It otherwise continues until no legal
+refinement remains or the 64-leaf physical safety limit is reached; neither
+eight nor 64 is used as the selected node count.
+
+Complete `(kind,column,op,value)` atom-to-node mappings are persisted in
+`predicate_node_index.bin` for DNF routing.
+`predicate_subset_attributes.bin` records each selected subset's complete
+root-to-leaf attribute path, including whether every atom is true or false, so
+multi-attribute subset semantics remain inspectable without reconstructing the
+planner.
+`predicate_subset_plan.bin` stores the exact build-time decision tree for
+signature-only and routing-repair runs; `predicate_subset_plan.tsv` records the
+selected beam path and objective components for analysis. Repair refuses to
+infer a replacement tree when the binary plan is missing, because an equal leaf
+count does not imply the same physical partition.
+
+At query time, exact DNF literals retain their attribute columns. If routing
+resolves to exactly one subset, head search is restricted to that subset's
+local graph. If the predicate intersects several subsets, or cannot be safely
+resolved to one subset, head search uses all bundle nodes plus the persisted
+cross-subset edges as one global best-first graph; the original DNF remains the
+authoritative posting post-filter. This avoids assuming that the induced union
+of several local graphs is connected. A filtered global query fails explicitly
+if its cross-edge sidecar is unavailable or dirty rather than silently falling
+back to independent local searches.
+
+Attribute-aware builds use degree 20 for each subset-local head graph and keep
+32 cross-subset edges per head. Local graphs serve only uniquely routed
+predicates; multi-subset, unroutable, and unfiltered queries depend on the
+global graph, so the larger connectivity budget belongs to the cross edges.
+
+For a predicate routed to \(r\) subsets covering population fraction \(p\), the
+runtime also decides whether posting scans should stop at each subset-pure
+prefix or include the global unfilter-tail. The decision reuses build-time
+bundle `assignmentCount` values and accounts for the head over-fetch needed to
+obtain the configured number of predicate-valid postings:
+
+```
+local_pure_cost  = head + posting * p                         (r = 1)
+global_pure_cost = head / p + posting * p + coordination*(r-1)
+global_tail_cost = head + posting
+```
+
+The full-precision SIFT1M calibration uses `head=0.607 ms`,
+`posting=2.141 ms`, and `coordination=0.080 ms`. The common nprobe multiplier
+cancels in the route comparison, so the decision remains nprobe-independent.
+The `head/p` term is required because a multi-subset pure query retains only
+approximately fraction \(p\) of globally selected heads after its safe posting
+signature filter. Omitting this term made `nprobe=96` behave like roughly 24
+postings for an org predicate and reduced Recall@10 from about 0.98 to 0.87.
+In global-tail mode posting and page-signature prefilters are disabled because
+those signatures describe the pure prefix and cannot safely reject matching
+tail records.
+
+Workload-planned multi-bundle
+indexes are currently build-time immutable; tagged inserts must rebuild the
+index so assignments and routing sidecars remain consistent.
+
+For workload-enabled builds, this planner replaces the hierarchy pivot
+estimator and ignores the legacy fixed `PivotForceNodeCount` choice. Without a
+positive `QueryCount`, the existing hierarchy/fixed-pivot build path is
+unchanged.
+
+To generate and inspect the workload without constructing an ANN index:
+
+```bash
+Release/spannbuilder -c Tools/benchmarks/generate_sift1m_predicate_workload.ini
+```
+
 Build phases in the log: `PerTagBKT` head selection → `DualPoolAugment` (U_extra)
 → `Begin Build Head` (BKT + RNG graph over the heads) → `BuildSSDIndex` (slim
 in-posting postings) → in-place `SaveAll`. For the three **unfilter-enhancement

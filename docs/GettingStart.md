@@ -344,12 +344,14 @@ positive values permit at most `N` additional tail pages. Keep the documented
 default (`UnfilterPurePages=false`, `UnfilterExtraTailPages=0`) for normal
 adaptive reads of the complete posting.
 
-For a distance-prefix computation sweep, keep the complete tail and set
+For a distance-prefix computation sweep, set
 `UnfilterPureDistanceScanPercent` to a value in `[1,100]`. The reader scans the
-nearest percentage of the distance-ordered pure prefix plus every tail record;
-`100` is the normal full-posting path. This option is rejected for
-attribute-ordered snapshots and cannot be combined with `UnfilterPurePages` or
-`UnfilterExtraTailPages`.
+nearest percentage of the distance-ordered pure prefix plus every tail record
+by default; `100` is the normal full-posting path. To bound tail I/O at the same
+time, set `UnfilterPurePages=true` and `UnfilterExtraTailPages=N`. The reader
+then scans the selected pure prefix plus tail records that fit in the physical
+pure pages and at most `N` additional pages. Attribute-ordered snapshots remain
+unsupported.
 
 For sift1m dataset, use the default configuration below (buildconfig.ini) and run .\SSDServing.exe buildconfig.ini:
 ```

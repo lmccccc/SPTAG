@@ -25,13 +25,20 @@
 //     [--share-build-ownership]
 
 #include <cstdio>
+#include <cerrno>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
 #include <atomic>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <limits>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 #include <algorithm>
 
@@ -41,6 +48,8 @@
 #include <sys/stat.h>
 
 #include "inc/CoreInterface.h"
+#include "inc/PredicateWorkload.h"
+#include "inc/PredicateWorkloadDNF.h"
 #include "inc/Core/CommonDataStructure.h"
 #include "inc/Core/VectorIndex.h"
 #include "inc/Core/Common/IQuantizer.h"
@@ -72,8 +81,13 @@ struct MappedFile {
         // disk -> ~9x read amplification / thrashing (818 GB read for a 100 GB
         // file in the first SelectHead pass). MADV_RANDOM disables readahead
         // and page-dropping, so the working set accumulates in cache instead.
-        ::madvise(base, length, MADV_RANDOM);
+        Advise(MADV_RANDOM);
         return true;
+    }
+    void Advise(int advice) const {
+        if (base != nullptr && length > 0) {
+            ::madvise(base, length, advice);
+        }
     }
     ~MappedFile() {
         if (base) ::munmap(base, length);
@@ -130,6 +144,159 @@ void IniEnv(const Helper::IniReader* ini, const char* section, const char* key, 
     ::setenv(env, v.c_str(), 1);
     fprintf(stderr, "[spannbuilder][cfg] %s = %s   (from [%s] %s)\n",
             env, v.c_str(), section, key);
+}
+
+bool ParseColumnList(const std::string& value, std::vector<int>* columns, std::string* error) {
+    columns->clear();
+    std::stringstream input(value);
+    std::string token;
+    while (std::getline(input, token, ',')) {
+        const char* begin = token.c_str();
+        while (*begin != '\0' && std::isspace(static_cast<unsigned char>(*begin))) ++begin;
+        if (*begin == '+' || *begin == '-') {
+            if (error != nullptr) {
+                *error = "invalid column list: " + value;
+            }
+            return false;
+        }
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long long parsed = std::strtoull(begin, &end, 10);
+        while (end != nullptr && *end != '\0' &&
+               std::isspace(static_cast<unsigned char>(*end))) {
+            ++end;
+        }
+        if (begin == end || errno != 0 || (end != nullptr && *end != '\0') ||
+            parsed > static_cast<unsigned long long>(std::numeric_limits<int>::max())) {
+            if (error != nullptr) {
+                *error = "invalid column list: " + value;
+            }
+            return false;
+        }
+        columns->push_back(static_cast<int>(parsed));
+    }
+    if (columns->empty()) {
+        if (error != nullptr) {
+            *error = "column list is empty";
+        }
+        return false;
+    }
+    return true;
+}
+
+bool ParseUnsignedSetting(const std::string& value,
+                          std::uint64_t minValue,
+                          std::uint64_t maxValue,
+                          std::uint64_t* parsed,
+                          std::string* error) {
+    const char* begin = value.c_str();
+    while (*begin != '\0' && std::isspace(static_cast<unsigned char>(*begin))) ++begin;
+    if (*begin == '\0' || *begin == '+' || *begin == '-') {
+        if (error != nullptr) *error = "invalid unsigned value: " + value;
+        return false;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long raw = std::strtoull(begin, &end, 10);
+    while (end != nullptr && *end != '\0' &&
+           std::isspace(static_cast<unsigned char>(*end))) {
+        ++end;
+    }
+    if (begin == end || errno != 0 || (end != nullptr && *end != '\0') ||
+        raw < minValue || raw > maxValue) {
+        if (error != nullptr) *error = "value outside allowed range: " + value;
+        return false;
+    }
+    *parsed = static_cast<std::uint64_t>(raw);
+    return true;
+}
+
+bool ParseBooleanSetting(const std::string& value, bool* parsed, std::string* error) {
+    std::size_t begin = 0;
+    while (begin < value.size() &&
+           std::isspace(static_cast<unsigned char>(value[begin]))) {
+        ++begin;
+    }
+    std::size_t end = value.size();
+    while (end > begin &&
+           std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+        --end;
+    }
+    std::string normalized = value.substr(begin, end - begin);
+    std::transform(
+        normalized.begin(), normalized.end(), normalized.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    if (normalized == "1" || normalized == "true" ||
+        normalized == "yes" || normalized == "on") {
+        *parsed = true;
+        return true;
+    }
+    if (normalized == "0" || normalized == "false" ||
+        normalized == "no" || normalized == "off") {
+        *parsed = false;
+        return true;
+    }
+    if (error != nullptr) *error = "invalid boolean value: " + value;
+    return false;
+}
+
+std::string BuildTagSourceId(const std::string& path,
+                             int fileDescriptor,
+                             std::size_t fileSize,
+                             std::size_t tagOffset,
+                             const std::uint32_t* tags,
+                             std::size_t vectorCount,
+                             int numTagsPerVector,
+                             const std::vector<int>& workloadColumns) {
+    namespace fs = std::filesystem;
+
+    std::error_code ec;
+    fs::path canonicalPath = fs::weakly_canonical(path, ec);
+    if (ec) canonicalPath = fs::path(path);
+    ec.clear();
+    const auto modified = fs::last_write_time(path, ec);
+    const std::int64_t modifiedTicks =
+        ec ? 0 : static_cast<std::int64_t>(modified.time_since_epoch().count());
+
+    std::uint64_t hash = 0x6a09e667f3bcc909ULL;
+    auto mix = [&](std::uint64_t value) {
+        hash = PredicateWorkload::Mix64(hash ^ value);
+    };
+    for (unsigned char ch : canonicalPath.string()) mix(ch);
+    mix(static_cast<std::uint64_t>(fileSize));
+    mix(static_cast<std::uint64_t>(tagOffset));
+    mix(static_cast<std::uint64_t>(modifiedTicks));
+    struct stat sourceStat;
+    if (::fstat(fileDescriptor, &sourceStat) == 0) {
+        mix(static_cast<std::uint64_t>(sourceStat.st_dev));
+        mix(static_cast<std::uint64_t>(sourceStat.st_ino));
+        mix(static_cast<std::uint64_t>(sourceStat.st_mtim.tv_sec));
+        mix(static_cast<std::uint64_t>(sourceStat.st_mtim.tv_nsec));
+        mix(static_cast<std::uint64_t>(sourceStat.st_ctim.tv_sec));
+        mix(static_cast<std::uint64_t>(sourceStat.st_ctim.tv_nsec));
+    }
+    mix(static_cast<std::uint64_t>(vectorCount));
+    mix(static_cast<std::uint64_t>(numTagsPerVector));
+    for (int column : workloadColumns) mix(static_cast<std::uint64_t>(column));
+
+    const std::size_t sampleRows = std::min<std::size_t>(vectorCount, 4096);
+    for (std::size_t sample = 0; sample < sampleRows; ++sample) {
+        const std::size_t row = sampleRows <= 1
+            ? 0
+            : static_cast<std::size_t>(
+                  (static_cast<long double>(sample) *
+                   static_cast<long double>(vectorCount - 1)) /
+                  static_cast<long double>(sampleRows - 1));
+        mix(static_cast<std::uint64_t>(row));
+        const std::size_t base = row * static_cast<std::size_t>(numTagsPerVector);
+        for (int column : workloadColumns) {
+            mix(tags[base + static_cast<std::size_t>(column)]);
+        }
+    }
+
+    std::ostringstream output;
+    output << std::hex << std::setfill('0') << std::setw(16) << hash;
+    return output.str();
 }
 
 } // namespace
@@ -554,7 +721,7 @@ int main(int argc, char** argv) {
             "[--posting-quant-bits <b>] [--posting-quant-file <f>] "
             "[--full-vector-file <f>] [--rerank-l <L>] [--quantize-head] [--quant-adc-only] "
             "[--ssd-start-file-gb <GB>] [--ssd-max-file-gb <GB>] [--ssd-growth-file-gb <GB>] "
-            "[--backfill-primary-head-csr]\n");
+            "[--backfill-primary-head-csr] [--predicate-workload-only]\n");
         return 2;
     }
 
@@ -575,6 +742,116 @@ int main(int argc, char** argv) {
         Resolve(argc, argv, "--dist-calc-method", ini, "Base", "DistCalcMethod", "Cosine");
     const bool hasTags = tagPath != nullptr || numTagsPerVec > 0;
 
+    std::string predicateKeyAttribute;
+    std::string predicateTrainSetFile;
+    std::string predicateColumnsText;
+    std::string predicateQueryCountText = "2048";
+    constexpr std::size_t predicateSamplesPerLevel = 16;
+    constexpr std::size_t predicateRangeSampleRows = 65536;
+    std::size_t predicateQueryCount = 2048;
+    std::size_t predicateStatisticsSampleRows = 65536;
+    constexpr std::uint64_t predicateSeed = 20260813;
+    int predicateNumericCols = 0;
+    std::vector<int> predicateKeyColumns;
+    std::vector<int> predicateColumns;
+    std::vector<PredicateWorkload::WeightedCount> predicateClauseCountWeights;
+    std::vector<PredicateWorkload::WeightedCount> predicateClauseAttributeCountWeights;
+    const std::string predicateClauseCountWeightsCanonical =
+        "auto_equal_clause_budget_feasible_1,2";
+    const std::string predicateClauseAttributeCountWeightsCanonical =
+        "auto_uniform_nonempty_attribute_masks";
+    bool predicateWorkloadConfigured = false;
+    bool predicateColumnsSpecified = false;
+    if (ini) {
+        const std::unordered_set<std::string> allowedPredicateWorkloadKeys = {
+            "keyattribute",
+            "trainsetfile",
+            "predicatecolumns",
+            "querycount",
+            "generateonly",
+        };
+        const auto predicateWorkloadParameters =
+            ini->GetParameters("PredicateWorkload");
+        predicateWorkloadConfigured = !predicateWorkloadParameters.empty();
+        for (const auto& parameter : predicateWorkloadParameters) {
+            if (allowedPredicateWorkloadKeys.find(parameter.first) ==
+                allowedPredicateWorkloadKeys.end()) {
+                fprintf(stderr,
+                        "[spannbuilder][predicate-workload] unknown INI key: %s\n",
+                        parameter.first.c_str());
+                return 2;
+            }
+        }
+        predicateKeyAttribute = ini->GetParameter<std::string>(
+            "PredicateWorkload", "KeyAttribute", std::string());
+        predicateTrainSetFile = ini->GetParameter<std::string>(
+            "PredicateWorkload", "TrainSetFile", std::string());
+        predicateColumnsSpecified =
+            ini->DoesParameterExist("PredicateWorkload", "PredicateColumns");
+        predicateColumnsText = ini->GetParameter<std::string>(
+            "PredicateWorkload", "PredicateColumns", std::string());
+        predicateQueryCountText = ini->GetParameter<std::string>(
+            "PredicateWorkload", "QueryCount", std::string("2048"));
+    }
+    const bool predicateWorkloadEnabled = predicateWorkloadConfigured;
+    if (predicateWorkloadEnabled) {
+        if (predicateKeyAttribute.empty() || predicateTrainSetFile.empty()) {
+            fprintf(stderr,
+                    "[spannbuilder][predicate-workload] KeyAttribute and TrainSetFile "
+                    "must be set together\n");
+            return 2;
+        }
+        std::string columnError;
+        if (!ParseColumnList(predicateKeyAttribute, &predicateKeyColumns, &columnError)) {
+            fprintf(stderr, "[spannbuilder][predicate-workload] %s\n", columnError.c_str());
+            return 2;
+        }
+        std::uint64_t parsed = 0;
+        if (!ParseUnsignedSetting(
+                predicateQueryCountText, 0, 10000, &parsed, &columnError)) {
+            fprintf(stderr,
+                    "[spannbuilder][predicate-workload] invalid QueryCount: %s\n",
+                    columnError.c_str());
+            return 2;
+        }
+        predicateQueryCount = static_cast<std::size_t>(parsed);
+        if (predicateColumnsSpecified) {
+            if (!ParseColumnList(
+                    predicateColumnsText,
+                    &predicateColumns,
+                    &columnError)) {
+                fprintf(stderr,
+                        "[spannbuilder][predicate-workload] invalid PredicateColumns: %s\n",
+                        columnError.c_str());
+                return 2;
+            }
+        }
+        if (predicateQueryCount == 0 && predicateColumnsSpecified) {
+            fprintf(stderr,
+                    "[spannbuilder][predicate-workload] PredicateColumns requires "
+                    "QueryCount > 0\n");
+            return 2;
+        }
+    }
+    const bool predicateDNFEnabled =
+        predicateWorkloadEnabled && predicateQueryCount > 0;
+    bool predicateGenerateOnly =
+        ArgFlag(argc, argv, "--predicate-workload-only");
+    if (!predicateGenerateOnly &&
+        ini && ini->DoesParameterExist("PredicateWorkload", "GenerateOnly")) {
+        std::string booleanError;
+        if (!ParseBooleanSetting(
+                ini->GetParameter<std::string>(
+                    "PredicateWorkload", "GenerateOnly", std::string("false")),
+                &predicateGenerateOnly,
+                &booleanError)) {
+            fprintf(stderr,
+                    "[spannbuilder][predicate-workload] invalid GenerateOnly: %s\n",
+                    booleanError.c_str());
+            return 2;
+        }
+    }
+
     const size_t valSize = ValueTypeSize(valueType);
     if (valSize == 0 || dim <= 0 || (hasTags && (tagPath == nullptr || numTagsPerVec <= 0))) {
         fprintf(stderr, "[spannbuilder] invalid value-type/dim/tag configuration\n");
@@ -586,6 +863,93 @@ int main(int argc, char** argv) {
                 "[spannbuilder] ShareBuildOwnership requires Base.Normalized=true for Cosine input; "
                 "the build normalizes unnormalized vectors in place.\n");
         return 2;
+    }
+    if (predicateGenerateOnly && !predicateWorkloadEnabled) {
+        fprintf(stderr,
+                "[spannbuilder][predicate-workload] GenerateOnly requires "
+                "KeyAttribute and TrainSetFile\n");
+        return 2;
+    }
+    if (predicateWorkloadEnabled) {
+        if (!hasTags) {
+            fprintf(stderr,
+                    "[spannbuilder][predicate-workload] workload generation requires tags\n");
+            return 2;
+        }
+        std::uint64_t numericCols = 0;
+        if (ini && ini->DoesParameterExist("MultiTenant", "NumericCols")) {
+            std::string numericError;
+            if (!ParseUnsignedSetting(
+                    ini->GetParameter<std::string>(
+                        "MultiTenant", "NumericCols", std::string("0")),
+                    0, static_cast<std::uint64_t>(numTagsPerVec),
+                    &numericCols, &numericError)) {
+                fprintf(stderr,
+                        "[spannbuilder][predicate-workload] invalid NumericCols: %s\n",
+                        numericError.c_str());
+                return 2;
+            }
+        }
+        predicateNumericCols = static_cast<int>(numericCols);
+        const int categoricalCols = numTagsPerVec - predicateNumericCols;
+        std::unordered_set<int> seenColumns;
+        bool hasCategorical = false;
+        bool hasNumeric = false;
+        for (int column : predicateKeyColumns) {
+            if (column < 0 || column >= numTagsPerVec ||
+                !seenColumns.insert(column).second) {
+                fprintf(stderr,
+                        "[spannbuilder][predicate-workload] key column %d is invalid or "
+                        "duplicated for a %d-column tag row\n",
+                        column, numTagsPerVec);
+                return 2;
+            }
+            hasCategorical = hasCategorical || column < categoricalCols;
+            hasNumeric = hasNumeric || column >= categoricalCols;
+        }
+        if (hasCategorical && hasNumeric) {
+            fprintf(stderr,
+                    "[spannbuilder][predicate-workload] a key attribute cannot mix "
+                    "categorical and numeric columns\n");
+            return 2;
+        }
+        if (hasNumeric && predicateKeyColumns.size() != 1) {
+            fprintf(stderr,
+                    "[spannbuilder][predicate-workload] a range key requires exactly "
+                    "one numeric column\n");
+            return 2;
+        }
+        if (predicateDNFEnabled) {
+            if (predicateColumns.empty()) {
+                predicateColumns.reserve(static_cast<std::size_t>(numTagsPerVec));
+                for (int column = 0; column < numTagsPerVec; ++column) {
+                    predicateColumns.push_back(column);
+                }
+            }
+            std::unordered_set<int> predicateColumnSet;
+            predicateColumnSet.reserve(predicateColumns.size());
+            for (int column : predicateColumns) {
+                if (column < 0 || column >= numTagsPerVec ||
+                    !predicateColumnSet.insert(column).second) {
+                    fprintf(stderr,
+                            "[spannbuilder][predicate-workload] predicate column %d is "
+                            "invalid or duplicated for a %d-column tag row\n",
+                            column, numTagsPerVec);
+                    return 2;
+                }
+            }
+            for (int keyColumn : predicateKeyColumns) {
+                if (predicateColumnSet.find(keyColumn) ==
+                    predicateColumnSet.end()) {
+                    fprintf(stderr,
+                            "[spannbuilder][predicate-workload] PredicateColumns must "
+                            "include key column %d\n",
+                            keyColumn);
+                    return 2;
+                }
+            }
+            std::sort(predicateColumns.begin(), predicateColumns.end());
+        }
     }
 
     MappedFile vecMap, tagMap;
@@ -608,6 +972,9 @@ int main(int argc, char** argv) {
                 tagOffset + tagBytes, tagMap.length);
         return 1;
     }
+    if (predicateDNFEnabled && n > 0 && n <= 1000000) {
+        predicateStatisticsSampleRows = static_cast<std::size_t>(n);
+    }
 
     fprintf(stderr,
         "[spannbuilder] N=%lld dim=%d valueType=%s tagsPerVec=%d tenant=%d backend=%s\n"
@@ -621,9 +988,136 @@ int main(int argc, char** argv) {
     std::uint8_t* vecPtr = reinterpret_cast<std::uint8_t*>(vecMap.base) + vecOffset;
     ByteArray vectors(vecPtr, vecBytes, false);
     ByteArray tags;
+    std::uint8_t* tagPtr = nullptr;
     if (hasTags) {
-        std::uint8_t* tagPtr = reinterpret_cast<std::uint8_t*>(tagMap.base) + tagOffset;
+        tagPtr = reinterpret_cast<std::uint8_t*>(tagMap.base) + tagOffset;
         tags = ByteArray(tagPtr, tagBytes, false);
+    }
+
+    if (predicateWorkloadEnabled) {
+        std::vector<int> workloadColumns =
+            predicateDNFEnabled ? predicateColumns : predicateKeyColumns;
+        std::sort(workloadColumns.begin(), workloadColumns.end());
+        const std::string sourceId = BuildTagSourceId(
+            sTagPath,
+            tagMap.fd,
+            tagMap.length,
+            tagOffset,
+            reinterpret_cast<const std::uint32_t*>(tagPtr),
+            static_cast<std::size_t>(n),
+            numTagsPerVec,
+            workloadColumns);
+        const int categoricalCols = numTagsPerVec - predicateNumericCols;
+        const PredicateWorkload::KeyKind keyKind =
+            predicateKeyColumns[0] >= categoricalCols
+                ? PredicateWorkload::KeyKind::Range
+                : (predicateKeyColumns.size() == 1
+                       ? PredicateWorkload::KeyKind::Label
+                       : PredicateWorkload::KeyKind::Hierarchy);
+
+        std::string error;
+        fprintf(stderr,
+                "[spannbuilder][predicate-workload] checking %s\n",
+                predicateTrainSetFile.c_str());
+        const bool workloadScansAllTags =
+            !predicateDNFEnabled
+            || static_cast<std::uint64_t>(n) <=
+                   static_cast<std::uint64_t>(predicateStatisticsSampleRows);
+        tagMap.Advise(
+            workloadScansAllTags ? MADV_SEQUENTIAL : MADV_RANDOM);
+        bool workloadReady = false;
+        bool reusedExisting = false;
+        std::size_t outputEntries = 0;
+        if (predicateDNFEnabled) {
+            PredicateWorkload::SyntheticDNFOptions options;
+            options.sourceId = sourceId;
+            options.keyColumns = predicateKeyColumns;
+            options.keyKind = keyKind;
+            options.predicateColumns = predicateColumns;
+            options.categoricalColumnCount = categoricalCols;
+            options.samplesPerAttribute = predicateSamplesPerLevel;
+            options.statisticsSampleRows = predicateStatisticsSampleRows;
+            options.queryCount = predicateQueryCount;
+            options.clauseCountWeights = predicateClauseCountWeights;
+            options.clauseAttributeCountWeights =
+                predicateClauseAttributeCountWeights;
+            options.clauseCountWeightsText =
+                predicateClauseCountWeightsCanonical;
+            options.clauseAttributeCountWeightsText =
+                predicateClauseAttributeCountWeightsCanonical;
+            options.seed = predicateSeed;
+
+            PredicateWorkload::DNFTrainSetSummary summary;
+            workloadReady = PredicateWorkload::EnsureSyntheticDNFTrainSet(
+                predicateTrainSetFile,
+                reinterpret_cast<const std::uint32_t*>(tagPtr),
+                static_cast<std::uint64_t>(n),
+                numTagsPerVec,
+                options,
+                &summary,
+                &error);
+            reusedExisting = summary.reusedExisting;
+            outputEntries = summary.uniqueQueries;
+            if (workloadReady && !summary.reusedExisting) {
+                fprintf(stderr,
+                        "[spannbuilder][predicate-workload] generated %zu unique queries "
+                        "from %zu simulated queries (%zu DNF, sampleRows=%zu) -> %s\n",
+                        summary.uniqueQueries,
+                        summary.generatedQueries,
+                        summary.generatedDNFQueries,
+                        summary.statisticsSampleRows,
+                        predicateTrainSetFile.c_str());
+            }
+        } else {
+            PredicateWorkload::SyntheticKeyOptions options;
+            options.keyAttribute = predicateKeyAttribute;
+            options.keyColumns = predicateKeyColumns;
+            options.sourceId = sourceId;
+            options.keyKind = keyKind;
+            options.samplesPerColumn = predicateSamplesPerLevel;
+            options.rangeSampleRows = predicateRangeSampleRows;
+            options.seed = predicateSeed;
+
+            PredicateWorkload::TrainSetSummary summary;
+            workloadReady = PredicateWorkload::EnsureSyntheticKeyTrainSet(
+                predicateTrainSetFile,
+                reinterpret_cast<const std::uint32_t*>(tagPtr),
+                static_cast<std::uint64_t>(n),
+                numTagsPerVec,
+                options,
+                &summary,
+                &error);
+            reusedExisting = summary.reusedExisting;
+            outputEntries = summary.sampledPredicates;
+            if (workloadReady && !summary.reusedExisting) {
+                fprintf(stderr,
+                        "[spannbuilder][predicate-workload] generated %zu key predicates "
+                        "(%s) from %llu vectors -> %s\n",
+                        summary.sampledPredicates,
+                        PredicateWorkload::KeyKindName(options.keyKind),
+                        static_cast<unsigned long long>(summary.vectorCount),
+                        predicateTrainSetFile.c_str());
+            }
+        }
+        tagMap.Advise(MADV_RANDOM);
+        if (!workloadReady) {
+            fprintf(stderr,
+                    "[spannbuilder][predicate-workload] FAILED: %s\n",
+                    error.c_str());
+            return 1;
+        }
+        if (reusedExisting) {
+            fprintf(stderr,
+                    "[spannbuilder][predicate-workload] reusing existing train set: %s\n",
+                    predicateTrainSetFile.c_str());
+        }
+        if (predicateGenerateOnly) {
+            fprintf(stderr,
+                    "[spannbuilder][predicate-workload] GenerateOnly complete "
+                    "(entries=%zu)\n",
+                    outputEntries);
+            return 0;
+        }
     }
 
     // Single-tenant metadata: one integer tenant id per line ("<tenant>\n").
@@ -639,6 +1133,16 @@ int main(int argc, char** argv) {
 
     TenantIndexManager mgr(dim, "SPANN", valueType.c_str());
     if (storageBackend != "FILEIO") mgr.SetStorageBackend(storageBackend.c_str());
+    if (predicateDNFEnabled) {
+        const int categoricalCols = numTagsPerVec - predicateNumericCols;
+        if (!mgr.ConfigurePredicateSubsetPlanner(
+                predicateTrainSetFile.c_str(), categoricalCols)) {
+            fprintf(stderr,
+                    "[spannbuilder][predicate-workload] failed to configure "
+                    "workload-aware subset planning\n");
+            return 2;
+        }
+    }
 
     // Native build sections are staged before BuildFromDataWithTags creates the
     // tenant index. TenantIndexManager applies them after its automatic defaults,

@@ -600,7 +600,8 @@ struct DNFPredicate {
             if (c.lits.empty()) continue;
             bool all = true;
             for (const auto& l : c.lits)
-                if (l.kind == 0 && !page.MayContain(l.val)) { all = false; break; }
+                if (l.kind == 0 && l.op == DNF_EQ &&
+                    !page.MayContain(l.val)) { all = false; break; }
             if (all) return true;
         }
         return false;
@@ -611,7 +612,8 @@ struct DNFPredicate {
             if (c.lits.empty()) continue;
             bool all = true;
             for (const auto& l : c.lits)
-                if (l.kind == 0 && !ps.MayContain(l.val)) { all = false; break; }
+                if (l.kind == 0 && l.op == DNF_EQ &&
+                    !ps.MayContain(l.val)) { all = false; break; }
             if (all) return true;
         }
         return false;
@@ -622,7 +624,8 @@ struct DNFPredicate {
             if (c.lits.empty()) continue;
             bool all = true;
             for (const auto& l : c.lits)
-                if (l.kind == 0 && !h.MayContain((int)l.col, l.val)) { all = false; break; }
+                if (l.kind == 0 && l.op == DNF_EQ &&
+                    !h.MayContain((int)l.col, l.val)) { all = false; break; }
             if (all) return true;
         }
         return false;
@@ -645,7 +648,8 @@ struct DNFPredicate {
             bool all = true;
             for (const auto& l : c.lits) {
                 if (l.kind == 0) {
-                    if (!h.MayContain((int)l.col, l.val)) { all = false; break; }
+                    if (l.op == DNF_EQ &&
+                        !h.MayContain((int)l.col, l.val)) { all = false; break; }
                 } else if (quant != nullptr && qp != nullptr) {
                     int lane = (int)l.col - numBaseCols;
                     if (lane < 0 || lane >= numQuantCols) continue;  // unknown col: fail open

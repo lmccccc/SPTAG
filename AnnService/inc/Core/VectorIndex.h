@@ -323,6 +323,15 @@ public:
             // that supply arbitrary posting IDs retain their existing behavior.
             std::vector<SizeType> m_directHeadLocalIDs;
             std::vector<int> m_searchHeadBundleNodes;
+            // A predicate spanning multiple physical subsets must traverse the
+            // full cross-edge head graph. The selected subsets are a result
+            // filter, not a navigation mask, because their induced graph need
+            // not be connected.
+            bool m_globalHeadSearchWithPostFilter = false;
+            // Cost-selected broad-filter mode: keep the exact predicate but
+            // scan the unfilter-tail suffix instead of truncating each posting
+            // to its subset-pure prefix.
+            bool m_useGlobalTailWithPostFilter = false;
             // Per-level minimum tag value (ascending, disjoint ranges) persisted at
             // build time as tag_level_offsets.bin. Used to map a raw tag value to its
             // hierarchical level (org/dept/team/project) for HierarchicalPostingMask
@@ -342,6 +351,8 @@ public:
                 m_directPostingIDs.clear();
                 m_directHeadLocalIDs.clear();
                 m_searchHeadBundleNodes.clear();
+                m_globalHeadSearchWithPostFilter = false;
+                m_useGlobalTailWithPostFilter = false;
                 m_tagLevelOffsets.clear();
                 m_dnf.Clear();
             }

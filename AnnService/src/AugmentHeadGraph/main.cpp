@@ -178,9 +178,9 @@ public:
         AddRequiredOption(m_headIndexDir, "-d", "--head_index_dir",
                           "Directory containing head_bundle_manifest.bin.");
         AddOptionalOption(m_searchTopK, "-k", "--search_topk",
-                          "Per-subgraph BKT search top (default 15).");
+                          "Per-subgraph BKT search top (default 32).");
         AddOptionalOption(m_extraEdges, "-m", "--extra_edges",
-                          "Cross-subgraph edges to keep per head (default 10).");
+                          "Cross-subgraph edges to keep per head (default 32).");
         AddOptionalOption(m_threads, "-t", "--threads",
                           "Worker threads (default hardware_concurrency).");
         AddOptionalOption(m_overwrite, "-w", "--overwrite",
@@ -190,8 +190,8 @@ public:
     }
 
     std::string m_headIndexDir;
-    int m_searchTopK = 15;
-    int m_extraEdges = 10;
+    int m_searchTopK = 32;
+    int m_extraEdges = 32;
     int m_threads = static_cast<int>(std::thread::hardware_concurrency());
     bool m_overwrite = false;
     std::string m_headIDFile = "SPTAGHeadVectorIDs.bin";
@@ -204,8 +204,8 @@ int main(int argc, char** argv)
     if (!options->Parse(argc - 1, argv + 1)) return 1;
 
     const int threadCount = (std::max)(1, options->m_threads);
-    const int searchTopK = (std::max)(1, options->m_searchTopK);
-    const int extraEdges = (std::max)(1, options->m_extraEdges);
+    const int searchTopK = (std::max)(32, options->m_searchTopK);
+    const int extraEdges = (std::max)(32, options->m_extraEdges);
     SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
                  "augmentheadgraph: dir=%s topk=%d M=%d threads=%d overwrite=%d\n",
                  options->m_headIndexDir.c_str(), searchTopK, extraEdges, threadCount,

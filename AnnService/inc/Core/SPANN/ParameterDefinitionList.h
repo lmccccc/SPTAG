@@ -129,7 +129,7 @@ DefineSSDParameter(m_staticACLTagCols, int, 0, "StaticACLTagCols")
 // Build the bundle cross-edge sidecar before STATIC tail construction. This is
 // separate from the mutable runtime DisableCrossEdges diagnostic switch below.
 DefineSSDParameter(m_buildCrossEdges, bool, false, "CrossEdges")
-DefineSSDParameter(m_crossExtraEdges, int, 10, "CrossExtraEdges")
+DefineSSDParameter(m_crossExtraEdges, int, 32, "CrossExtraEdges")
 
 // GPU Building
 DefineSSDParameter(m_gpuSSDNumTrees, int, 100, "GPUSSDNumTrees")
