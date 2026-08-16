@@ -121,6 +121,10 @@ Tools/benchmarks/run_spann_attr_build.sh Tools/benchmarks/build_spann_attr_space
 An optional predicate-workload bootstrap runs before index construction:
 
 ```ini
+[Tags]
+NumTagsPerVec=5
+AttributeTypes=label,label,label,label,range
+
 [PredicateWorkload]
 KeyAttribute=0,1,2,3
 PredicateColumns=0,1,2,3,4
@@ -132,8 +136,9 @@ If `TrainSetFile` already exists, an external workload is retained unchanged;
 generated workloads are reused only when their source and configuration
 metadata and complete data rows match. Otherwise the builder writes the train
 set atomically. One categorical key column is a label key, multiple categorical
-key columns form a hierarchy, and one trailing `NumericCols` key column is a
-range key. `PredicateColumns` is the complete synthetic predicate-column
+key columns form a hierarchy, and one column declared `range` is a range key.
+Label and range columns may be interleaved. `PredicateColumns` is the complete
+synthetic predicate-column
 whitelist and defaults to all tag columns when omitted. It must include the key
 columns.
 
@@ -182,17 +187,16 @@ terms. A deterministic held-out workload selects both topology and node count.
 The selected partition is then compiled into a decision tree; every vector
 receives exactly one primary leaf.
 
-The coefficients are fixed physical milliseconds measured on the local
-SIFT1M UInt8 static-SPANN path using one search thread, 100 measured queries,
-and three repetitions: 0.40657040 ms of common query-path work,
-0.10746861 ms per full-population equivalent scanned, and 0.02330404 ms per
-additional routed subset. Cross-edge on/off differed by less than one
-microsecond at the median, so the boundary regularizer uses a conservative
-0.001 ms full-cut resolution. Planning uses 4,096 deterministic
-sample rows and declares convergence after eight consecutive leaf counts fail
-to improve the held-out incumbent. It otherwise continues until no legal
+Planner scores are normalized structural work rather than dataset-calibrated
+milliseconds. Query work combines routed population and normalized subset
+fanout; the objective then multiplies this by vector-boundary and leaf-count
+factors. Planning uses deterministic samples and an independent held-out
+workload split, and declares convergence after eight consecutive leaf counts
+fail to improve the held-out incumbent. It otherwise continues until no legal
 refinement remains or the 64-leaf physical safety limit is reached; neither
-eight nor 64 is used as the selected node count.
+eight nor 64 is used as the selected node count. The planner therefore runs
+before index construction and does not depend on measurements or statistics
+from an already-built index.
 
 Complete `(kind,column,op,value)` atom-to-node mappings are persisted in
 `predicate_node_index.bin` for DNF routing.
@@ -215,6 +219,13 @@ authoritative posting post-filter. This avoids assuming that the induced union
 of several local graphs is connected. A filtered global query fails explicitly
 if its cross-edge sidecar is unavailable or dirty rather than silently falling
 back to independent local searches.
+
+Categorical posting signatures also retain physical attribute columns. Their
+lane count is derived from all `label` entries in `AttributeTypes` and persisted
+per index in `head_node_meta.bin` V7; it is no longer limited to five columns.
+Numeric range signatures use a separate physical-column map in
+`numeric_meta.bin`. Older metadata versions remain loadable, but signatures
+must be rebuilt to accelerate columns absent from the legacy layout.
 
 Attribute-aware builds use degree 20 for each subset-local head graph and keep
 32 cross-subset edges per head. Local graphs serve only uniquely routed

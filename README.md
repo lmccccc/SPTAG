@@ -116,7 +116,10 @@ Run the SPTAGTest (or Test.exe) in the Release folder to verify all the tests ha
 
 ### **Usage**
 
-The detailed usage can be found in [Get started](docs/GettingStart.md). There is also an end-to-end tutorial for building vector search online service using Python Wrapper in [Python Tutorial](docs/Tutorial.ipynb).
+The detailed usage can be found in [Get started](docs/GettingStart.md), including
+the current schema-driven SPANN filtering configuration. The reproducible
+attribute-aware build and query workflow is documented in
+[Experiment Workflow](docs/Experiment_Workflow.md). There is also an end-to-end tutorial for building vector search online service using Python Wrapper in [Python Tutorial](docs/Tutorial.ipynb).
 The detailed parameters tunning can be found in [Parameters](docs/Parameters.md).
 
 ## **References**

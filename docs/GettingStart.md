@@ -175,18 +175,23 @@ SearchPostingPageLimit=3
 
 ```
 
-#### **SIFT1B with attributes (raw STATIC STM1)**
+#### **SPANN with filtering attributes (raw STATIC STM1)**
 
-For SIFT1B with four categorical attributes (`org`, `dept`, `team`, and
-`project`) plus one numeric attribute (`price`), use the native sectioned INI
-below. The tracked copy is
+Filtered SPANN uses a fixed-width, row-major `uint32` attribute table. The
+number and order of attributes are arbitrary: every physical column is declared
+as either `label` (categorical equality) or `range` (ordered numeric
+comparison), and the two kinds may be interleaved. Unlike the legacy setup,
+filtering does not require four tags followed by one numeric value.
+
+The SIFT1B example below happens to use four labels (`org`, `dept`, `team`,
+`project`) and one range (`price`). The tracked copy is
 `Tools/benchmarks/build_spann_attr_sift1b_raw_static_tail_capped_distance_order.ini`.
 The INI is the single source of truth for build and search parameters; do not
 override them with `SPTAG_*` environment variables.
 
-The tag file is headerless row-major `uint32`, with five values per vector in
-the order `[org, dept, team, project, price]`. The group-tag file contains the
-`org` value for each vector, one integer per line.
+The attribute file is headerless row-major `uint32`, with five values per
+vector in the order `[org, dept, team, project, price]`. The group-tag file
+contains the routing key (`org`) for each vector, one integer per line.
 
 ```ini
 [Base]
@@ -203,6 +208,7 @@ IndexDirectory=sift1b/sift1b_spann_raw_static_tail_capped_distance_order
 TagFile=sift1b/sift1b_build/sift1b_tags5.u32
 TagOffset=0
 NumTagsPerVec=5
+AttributeTypes=label,label,label,label,range
 Tenant=0
 
 [Build]
@@ -298,7 +304,6 @@ EnableHierPostingFilter=true
 [MultiTenant]
 ACLCols=0,1,2,3
 HierLevelWidths=4,16,64,256
-NumericCols=1
 PerVectorTagsFile=sift1b/sift1b_build/sift1b_group_tags.txt
 PivotForceNodeCount=4
 InPlaceBuild=1
@@ -306,6 +311,56 @@ PersistSelectHead=1
 ResumeBuild=1
 DualPoolAugment=0
 DualPoolExtraRatio=0
+```
+
+`AttributeTypes` must contain exactly `NumTagsPerVec` entries. For example, an
+interleaved six-column schema is:
+
+```ini
+[Tags]
+NumTagsPerVec=6
+AttributeTypes=label,range,label,label,range,label
+```
+
+`NumericCols=N` remains accepted only as a compatibility fallback when
+`AttributeTypes` is absent; it marks the final `N` columns as ranges. New
+configurations should use `AttributeTypes`. `ACLCols` lists physical columns
+used for categorical routing and therefore may contain only `label` columns.
+It may be non-contiguous.
+
+All declared label columns receive categorical posting-signature lanes. The
+lane count is schema-sized rather than capped at five, and the complete
+physical-column map is persisted in `head_node_meta.bin` V7. V3-V6 metadata
+remains loadable, but an old index must rerun `BuildSignatures` to accelerate
+label columns that were not present in its five legacy lanes.
+
+For workload-aware DNF planning, add:
+
+```ini
+[PredicateWorkload]
+KeyAttribute=0,2,3
+PredicateColumns=0,1,2,3,4,5
+TrainSetFile=/path/to/predicate_train.tsv
+QueryCount=2048
+```
+
+Columns are interpreted through `AttributeTypes`: label atoms use equality,
+while range atoms use ordered comparisons. Workload rows are OR-of-AND
+expressions such as `0=7&1>=100|5=42`. The persisted/runtime DNF3 form carries
+`(kind, physical_column, operator, value)` for every literal, so equal values
+in different columns remain distinct. Legacy flat tag queries are columnless
+and should not be used for general multi-attribute predicates.
+
+The subset planner runs before index construction. It uses normalized
+structural costs derived from routed population, fanout, boundary fraction,
+and leaf count, with an independent held-out workload split. It does not use
+dataset-calibrated millisecond constants or measurements from an already-built
+index.
+
+To generate or validate the workload without building the ANN index:
+
+```bash
+Release/spannbuilder -c /path/to/config.ini --predicate-workload-only
 ```
 
 Build it with:
