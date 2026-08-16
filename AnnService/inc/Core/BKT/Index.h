@@ -181,6 +181,8 @@ namespace SPTAG
             // Raw graph access for cross-subgraph orchestration above the BKT layer.
             inline const COMMON::RelativeNeighborhoodGraph& GetGraph() const { return m_pGraph; }
             inline COMMON::RelativeNeighborhoodGraph& GetMutableGraph() { return m_pGraph; }
+            inline COMMON::BKTree& GetMutableTrees() { return m_pTrees; }
+            inline const COMMON::BKTree& GetTrees() const { return m_pTrees; }
             inline DimensionType GetNeighborhoodSize() const { return m_pGraph.m_iNeighborhoodSize; }
             inline bool NeedRefine() const { return m_deletedID.Count() > (size_t)(GetNumSamples() * m_fDeletePercentageForRefine); }
             std::shared_ptr<std::vector<std::uint64_t>> BufferSize() const
@@ -223,6 +225,17 @@ namespace SPTAG
                                                 int p_maxCheck,
                                                 CrossGraphSearchStats* p_stats = nullptr) const;
             ErrorCode SearchIndexWithFilter(QueryResult& p_query, std::function<bool(const ByteArray&)> filterFunc, int maxCheck = 0, bool p_searchDeleted = false) const;
+            ErrorCode SearchIndexWithIDFilter(QueryResult& p_query,
+                                              std::function<bool(SizeType)> p_filterFunc,
+                                              int p_maxCheck = 0,
+                                              int p_treeIndex = -1,
+                                              DimensionType p_edgeCount = -1,
+                                              DimensionType p_checkPos = -1) const;
+            ErrorCode SearchIndexWithGraphLimits(
+                QueryResult& p_query,
+                DimensionType p_edgeCount,
+                DimensionType p_checkPos,
+                int p_treeIndex = -1) const;
             ErrorCode RefineSearchIndex(QueryResult &p_query, bool p_searchDeleted = false) const;
             ErrorCode SearchTree(QueryResult &p_query) const;
             ErrorCode AddIndex(const void* p_data, SizeType p_vectorNum, DimensionType p_dimension, std::shared_ptr<MetadataSet> p_metadataSet, bool p_withMetaIndex = false, bool p_normalized = false);
@@ -276,7 +289,11 @@ namespace SPTAG
                         COMMON::WorkSpace& p_space,
                         std::function<bool(const ByteArray&)> filterFunc,
                         const CrossGraphSearchContext* p_crossContext = nullptr,
-                        CrossGraphSearchStats* p_crossStats = nullptr) const;
+                        CrossGraphSearchStats* p_crossStats = nullptr,
+                        std::function<bool(SizeType)> p_idFilterFunc = nullptr,
+                        int p_treeIndex = -1,
+                        DimensionType p_edgeCount = -1,
+                        DimensionType p_checkPos = -1) const;
         };
     } // namespace BKT
 } // namespace SPTAG

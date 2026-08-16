@@ -580,6 +580,13 @@ break;
             }
 
             inline const std::unordered_map<SizeType, SizeType>& GetSampleMap() const { return m_pSampleCenterMap; }
+            inline SizeType GetTreeStart(int p_treeIndex) const
+            {
+                return p_treeIndex >= 0 &&
+                    p_treeIndex < static_cast<int>(m_pTreeStart.size())
+                    ? m_pTreeStart[static_cast<size_t>(p_treeIndex)]
+                    : static_cast<SizeType>(-1);
+            }
 
             inline void SwapTree(BKTree& newTrees)
             {
@@ -956,9 +963,12 @@ break;
             }
 
             template <typename T>
-            void InitSearchTrees(const Dataset<T>& data, std::function<float(const T*, const T*, DimensionType)> fComputeDistance, COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_space) const
+            void InitSearchTrees(const Dataset<T>& data, std::function<float(const T*, const T*, DimensionType)> fComputeDistance, COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_space, int p_treeIndex = -1) const
             {
-                for (char i = 0; i < m_iTreeNumber; i++) {
+                const int treeBegin = p_treeIndex < 0 ? 0 : p_treeIndex;
+                const int treeEnd = p_treeIndex < 0 ? m_iTreeNumber : p_treeIndex + 1;
+                if (treeBegin < 0 || treeEnd > m_iTreeNumber) return;
+                for (int i = treeBegin; i < treeEnd; i++) {
                     const BKTNode& node = m_pTreeRoots[m_pTreeStart[i]];
                     if (node.childStart < 0) {
                         p_space.m_SPTQueue.insert(NodeDistPair(m_pTreeStart[i], fComputeDistance(p_query.GetQuantizedTarget(), data[node.centerid], data.C())));
@@ -1028,6 +1038,64 @@ break;
                         }
                     }
                 }
+            }
+
+            ErrorCode AdoptRemappedForest(
+                const std::vector<std::pair<
+                    const BKTree*,
+                    const std::vector<SizeType>*>>& p_trees)
+            {
+                std::vector<SizeType> treeStarts;
+                std::vector<BKTNode> treeRoots;
+                for (const auto& source : p_trees) {
+                    if (source.first == nullptr || source.second == nullptr ||
+                        source.first->m_iTreeNumber != 1 ||
+                        source.first->m_pTreeStart.empty()) {
+                        return ErrorCode::Fail;
+                    }
+                    SizeType sourceSize =
+                        static_cast<SizeType>(source.first->m_pTreeRoots.size());
+                    if (sourceSize > 0 &&
+                        source.first->m_pTreeRoots.back().centerid == -1) {
+                        --sourceSize;
+                    }
+                    if (sourceSize <= 0) return ErrorCode::Fail;
+
+                    const SizeType offset =
+                        static_cast<SizeType>(treeRoots.size());
+                    treeStarts.push_back(
+                        offset + source.first->m_pTreeStart.front());
+                    for (SizeType i = 0; i < sourceSize; ++i) {
+                        BKTNode node = source.first->m_pTreeRoots[
+                            static_cast<size_t>(i)];
+                        if (node.centerid < 0) {
+                            return ErrorCode::Fail;
+                        }
+                        if (static_cast<size_t>(node.centerid) >=
+                            source.second->size()) {
+                            if (i != source.first->m_pTreeStart.front() ||
+                                source.second->empty()) {
+                                return ErrorCode::Fail;
+                            }
+                            node.centerid = source.second->front();
+                        } else {
+                            node.centerid = (*source.second)[
+                                static_cast<size_t>(node.centerid)];
+                        }
+                        if (node.childStart >= 0) node.childStart += offset;
+                        if (node.childEnd >= 0) node.childEnd += offset;
+                        treeRoots.push_back(node);
+                    }
+                }
+                if (treeStarts.empty()) return ErrorCode::Fail;
+                treeRoots.emplace_back(-1);
+
+                std::unique_lock<std::shared_timed_mutex> lock(*m_lock);
+                m_pTreeStart.swap(treeStarts);
+                m_pTreeRoots.swap(treeRoots);
+                m_pSampleCenterMap.clear();
+                m_iTreeNumber = static_cast<int>(m_pTreeStart.size());
+                return ErrorCode::Success;
             }
 
             template <typename T>

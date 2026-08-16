@@ -40,7 +40,8 @@ namespace
 
     struct CrossEdgeCandidate
     {
-        Helper::HeadCrossEdgeEntry edge;
+        std::int32_t neighborGlobalVID = -1;
+        float dist = MaxDist;
         std::int32_t reverseTargetOrdinal = -1;
     };
 
@@ -145,8 +146,8 @@ namespace
         return p_globalVID != MaxSize && p_globalVID >= 0;
     }
 
-    bool EntryLess(const Helper::HeadCrossEdgeEntry& p_left,
-                   const Helper::HeadCrossEdgeEntry& p_right)
+    bool EntryLess(const CrossEdgeCandidate& p_left,
+                   const CrossEdgeCandidate& p_right)
     {
         return p_left.dist < p_right.dist ||
             (p_left.dist == p_right.dist &&
@@ -161,7 +162,7 @@ namespace
             p_edges.begin(), p_edges.end(), p_candidate,
             [](const CrossEdgeCandidate& p_left,
                const CrossEdgeCandidate& p_right) {
-                return EntryLess(p_left.edge, p_right.edge);
+                return EntryLess(p_left, p_right);
             });
         if (p_edges.size() == p_limit && it == p_edges.end()) return;
         p_edges.insert(it, p_candidate);
@@ -285,7 +286,9 @@ namespace
                                 }
 
                                 CrossEdgeCandidate edge{};
-                                edge.edge = {static_cast<std::int32_t>(globalVID), candidate.Dist};
+                                edge.neighborGlobalVID =
+                                    static_cast<std::int32_t>(globalVID);
+                                edge.dist = candidate.Dist;
                                 if (candidate.VID < target.h1HeadCount) {
                                     const size_t targetOrdinal =
                                         NodeStart(p_prefixes, targetSlot) +
@@ -313,7 +316,10 @@ namespace
         return !failed.load(std::memory_order_acquire);
     }
 
-    bool WriteRecord(FILE* p_file, const CrossEdgeRecord& p_record, size_t p_limit)
+    bool WriteRecord(FILE* p_file,
+                     const CrossEdgeRecord& p_record,
+                     size_t p_limit,
+                     bool p_includeDistance)
     {
         if (p_record.edges.size() > p_limit ||
             p_record.edges.size() > static_cast<size_t>((std::numeric_limits<std::uint16_t>::max)())) {
@@ -325,7 +331,17 @@ namespace
             return false;
         }
         for (const auto& edge : p_record.edges) {
-            if (std::fwrite(&edge.edge, sizeof(edge.edge), 1, p_file) != 1) return false;
+            if (std::fwrite(
+                    &edge.neighborGlobalVID,
+                    sizeof(edge.neighborGlobalVID),
+                    1,
+                    p_file) != 1) {
+                return false;
+            }
+            if (p_includeDistance &&
+                std::fwrite(&edge.dist, sizeof(edge.dist), 1, p_file) != 1) {
+                return false;
+            }
         }
         return true;
     }
@@ -342,7 +358,14 @@ namespace
         }
         p_record.edges.resize(static_cast<size_t>(edgeCount));
         for (auto& edge : p_record.edges) {
-            if (std::fread(&edge.edge, sizeof(edge.edge), 1, p_file) != 1) return false;
+            if (std::fread(
+                    &edge.neighborGlobalVID,
+                    sizeof(edge.neighborGlobalVID),
+                    1,
+                    p_file) != 1 ||
+                std::fread(&edge.dist, sizeof(edge.dist), 1, p_file) != 1) {
+                return false;
+            }
             edge.reverseTargetOrdinal = -1;
         }
         return true;
@@ -705,7 +728,7 @@ bool BuildHeadCrossEdges(
         for (size_t offset = 0; offset < records.size(); ++offset) {
             CrossEdgeRecord& record = records[offset];
             FILE* destination = hasUExtra ? base : output;
-            if (!WriteRecord(destination, record, edgeLimit)) {
+            if (!WriteRecord(destination, record, edgeLimit, hasUExtra)) {
                 ok = false;
                 break;
             }
@@ -721,7 +744,7 @@ bool BuildHeadCrossEdges(
                 const size_t shard = ReverseShard(
                     static_cast<size_t>(edge.reverseTargetOrdinal), totalHeads);
                 const ReverseCandidate reverse{
-                    edge.reverseTargetOrdinal, record.globalVID, edge.edge.dist};
+                    edge.reverseTargetOrdinal, record.globalVID, edge.dist};
                 if (!WriteReverseCandidate(reverseFiles[shard], reverse)) {
                     ok = false;
                     break;
@@ -797,12 +820,15 @@ bool BuildHeadCrossEdges(
                 if (localHid < p_nodes[sourceSlot].h1HeadCount) {
                     std::vector<std::int32_t> seen;
                     seen.reserve(record.edges.size() + edgeLimit);
-                    for (const auto& edge : record.edges) seen.push_back(edge.edge.neighborGlobalVID);
+                    for (const auto& edge : record.edges) {
+                        seen.push_back(edge.neighborGlobalVID);
+                    }
                     size_t accepted = 0;
                     while (hasCurrent && current.targetOrdinal == static_cast<std::int32_t>(ordinal)) {
                         if (std::find(seen.begin(), seen.end(), current.extraVID) == seen.end() &&
                             accepted < edgeLimit) {
-                            record.edges.push_back({{current.extraVID, current.dist}, -1});
+                            record.edges.push_back(
+                                {current.extraVID, current.dist, -1});
                             seen.push_back(current.extraVID);
                             ++accepted;
                             ++reverseAdded;
@@ -816,14 +842,14 @@ bool BuildHeadCrossEdges(
                     std::sort(record.edges.begin(), record.edges.end(),
                               [](const CrossEdgeCandidate& p_left,
                                  const CrossEdgeCandidate& p_right) {
-                                  return EntryLess(p_left.edge, p_right.edge);
+                                  return EntryLess(p_left, p_right);
                               });
                 }
                 if (hasCurrent && current.targetOrdinal < static_cast<std::int32_t>(ordinal)) {
                     ok = false;
                     break;
                 }
-                if (!WriteRecord(output, record, maxEdgesPerHead)) {
+                if (!WriteRecord(output, record, maxEdgesPerHead, false)) {
                     ok = false;
                     break;
                 }

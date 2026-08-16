@@ -246,27 +246,19 @@ struct PageBitmask {
 // semantic: pass if ANY of head's tags equals ANY of query's tags).
 // ═══════════════════════════════════════════════════════════════════
 
-// Generalised hierarchical posting mask: HIER_LEVELS independent levels, each a
-// HIER_LEVEL_BITS-wide bit array. A "level" is a categorical tag column
+// Generalised hierarchical posting mask: one independent lane per declared
+// categorical attribute. A lane is at most HIER_LEVEL_BITS wide. A "level" is
+// a physical categorical tag column
 // (0=org/country, 1=dept/year, ...). Bit position within a level is tag %
 // HIER_LEVEL_BITS. With 256 bits/level any column whose distinct values span a
 // contiguous range <= 256 maps collision-free (e.g. YFCC country 1000..1245).
 //
-// Backwards compatible with the legacy 4-level org/dept/team/project layout:
-// those columns (0..3) still map to levels 0..3, and 256 bits is >= every legacy
-// width (8/32/128/128) so pruning is equal-or-better. The wider/extra levels
-// change the persisted head_node_meta byte size (offsets derive from sizeof), so
-// indexes must be rebuilt -- there is no on-disk back-compat with old indexes.
-//
-// HIER_LEVELS is sized to the widest schema in use: YFCC scope-A = 5 facets
-// (year/month/camera/country/us_state), SIFT ACL = 4 (org/dept/team/project).
-// 5 covers both with no spare; raise it if a schema needs more categorical cols.
+// V7 persists the complete physical-column map and width list. V3-V6 remain
+// loadable through their historical five-lane layout.
+// Legacy persisted formats V3-V6 contain exactly five physical lanes.
 static constexpr int HIER_LEVELS     = 5;
 static constexpr int HIER_LEVEL_BITS = 256;                   // max width / level
 static constexpr int HIER_LEVEL_WORDS = HIER_LEVEL_BITS / 64;  // 4
-// Maximum total 64-bit words across all levels (used as the fixed storage
-// capacity of HierarchicalPostingMask so its compile-time sizeof stays stable).
-static constexpr int HIER_MAX_WORDS  = HIER_LEVELS * HIER_LEVEL_WORDS;  // 20
 
 // Legacy names kept for any external reference / documentation.
 static constexpr int HIER_ORG_BITS  = HIER_LEVEL_BITS;
@@ -283,26 +275,54 @@ static constexpr int HIER_PROJ_BITS = HIER_LEVEL_BITS;
 // 256, so the per-head posting-content mask packs tighter: e.g. YFCC widths
 // [256,64,64,128,64] -> 576 bits = 9 words = 72 B instead of 5*256 = 160 B.
 //
-// The table is a process-global set once per index:
-//   * at build  -> SetHierWidths() from the SPTAG_HIER_LEVEL_WIDTHS env list.
-//   * at load   -> SetHierWidths() from the widths persisted in the
-//                  head_node_meta.bin V5 header (so the byte layout matches).
-// Default (never set, or legacy V3/V4 indexes) is uniform HIER_LEVEL_BITS,
-// which reproduces the previous fixed 256-bit-per-level layout bit-for-bit.
-// Widths are clamped to [64, HIER_LEVEL_BITS] and rounded up to a multiple of
-// 64, guaranteeing totalWords <= HIER_MAX_WORDS (no storage overflow).
+// The process-global table is only the construction default. Each VectorIndex
+// copies its own layout into head metadata, so loaded tenants with different
+// schemas do not share mutable signature state.
 // ═══════════════════════════════════════════════════════════════════
 struct HierWidthTable {
-    int bits[HIER_LEVELS];
-    int wordOff[HIER_LEVELS];
-    int totalWords;
+    std::vector<int> columns;
+    std::vector<int> bits;
+    std::vector<int> wordOff;
+    int totalWords = 0;
 
     void Recompute() {
         int off = 0;
-        for (int l = 0; l < HIER_LEVELS; ++l) { wordOff[l] = off; off += bits[l] / 64; }
+        wordOff.resize(bits.size());
+        for (std::size_t lane = 0; lane < bits.size(); ++lane) {
+            wordOff[lane] = off;
+            off += bits[lane] / 64;
+        }
         totalWords = off;
     }
-    void SetUniform() { for (int l = 0; l < HIER_LEVELS; ++l) bits[l] = HIER_LEVEL_BITS; Recompute(); }
+
+    void Configure(const std::vector<int>& physicalColumns,
+                   const std::vector<int>& requestedBits = {}) {
+        columns = physicalColumns;
+        bits.resize(columns.size(), HIER_LEVEL_BITS);
+        for (std::size_t lane = 0; lane < bits.size(); ++lane) {
+            int width = lane < requestedBits.size()
+                ? requestedBits[lane]
+                : HIER_LEVEL_BITS;
+            width = (std::max)(64, (std::min)(width, HIER_LEVEL_BITS));
+            bits[lane] = ((width + 63) / 64) * 64;
+        }
+        Recompute();
+    }
+
+    void SetUniform() {
+        std::vector<int> legacyColumns(HIER_LEVELS);
+        for (int lane = 0; lane < HIER_LEVELS; ++lane) {
+            legacyColumns[static_cast<std::size_t>(lane)] = lane;
+        }
+        Configure(legacyColumns);
+    }
+
+    int LaneForColumn(int physicalColumn) const {
+        for (std::size_t lane = 0; lane < columns.size(); ++lane) {
+            if (columns[lane] == physicalColumn) return static_cast<int>(lane);
+        }
+        return -1;
+    }
 };
 
 inline HierWidthTable& MutableHierWidths() {
@@ -311,56 +331,70 @@ inline HierWidthTable& MutableHierWidths() {
 }
 inline const HierWidthTable& HierWidths() { return MutableHierWidths(); }
 
-// Set per-level widths (bits). n entries are consumed (n <= HIER_LEVELS);
-// remaining levels default to HIER_LEVEL_BITS. Each width is clamped to
-// [64, HIER_LEVEL_BITS] and rounded up to a multiple of 64.
+// Set widths for the currently configured lanes. Unspecified lanes default to
+// HIER_LEVEL_BITS. Each width is clamped and rounded to a 64-bit word boundary.
+inline void SetHierLayout(const std::vector<int>& columns,
+                          const std::vector<int>& bitsPerLevel = {}) {
+    MutableHierWidths().Configure(columns, bitsPerLevel);
+}
+
 inline void SetHierWidths(const int* bitsPerLevel, int n) {
     auto& t = MutableHierWidths();
-    for (int l = 0; l < HIER_LEVELS; ++l) {
-        int b = (l < n) ? bitsPerLevel[l] : HIER_LEVEL_BITS;
-        if (b < 64) b = 64;
-        if (b > HIER_LEVEL_BITS) b = HIER_LEVEL_BITS;
-        b = ((b + 63) / 64) * 64;
-        t.bits[l] = b;
+    std::vector<int> widths;
+    widths.reserve(t.columns.size());
+    for (std::size_t lane = 0; lane < t.columns.size(); ++lane) {
+        widths.push_back(
+            static_cast<int>(lane) < n ? bitsPerLevel[lane] : HIER_LEVEL_BITS);
     }
-    t.Recompute();
+    t.Configure(t.columns, widths);
 }
 inline void SetHierWidthsUniform() { MutableHierWidths().SetUniform(); }
 
 // Number of bytes actually occupied by one HierarchicalPostingMask given the
 // current width table. The per-head meta record uses this (NOT sizeof) so the
 // stored mask shrinks for narrow schemas.
-inline size_t HierPostingMaskBytes() { return static_cast<size_t>(HierWidths().totalWords) * sizeof(uint64_t); }
+inline size_t HierPostingMaskBytes(const HierWidthTable& layout) {
+    return static_cast<size_t>(layout.totalWords) * sizeof(uint64_t);
+}
+inline size_t HierPostingMaskBytes() { return HierPostingMaskBytes(HierWidths()); }
 
 struct HierarchicalPostingMask {
-    // Flat storage of up to HIER_MAX_WORDS words. Only the first
-    // HierWidths().totalWords words are ever used; level L occupies words
-    // [wordOff[L], wordOff[L] + bits[L]/64). The compile-time sizeof is fixed
-    // (160 B) so the type is a stable POD, but per-head persistence copies only
-    // HierPostingMaskBytes() bytes.
-    uint64_t mask[HIER_MAX_WORDS] = {};
+    HierWidthTable layout;
+    std::vector<uint64_t> mask;
 
-    void Clear() {
-        for (int w = 0; w < HIER_MAX_WORDS; ++w) mask[w] = 0;
+    HierarchicalPostingMask() { Reset(HierWidths()); }
+    explicit HierarchicalPostingMask(const HierWidthTable& p_layout) {
+        Reset(p_layout);
     }
 
-    // level: categorical tag column index (0=org/country, 1=dept/year, ...).
-    // tag is the raw tag id. Columns >= HIER_LEVELS are ignored (fail-open at
-    // query time via MayContain returning true), preserving correctness.
+    void Reset(const HierWidthTable& p_layout) {
+        layout = p_layout;
+        mask.assign(static_cast<std::size_t>(layout.totalWords), 0);
+    }
+
+    void Clear() {
+        std::fill(mask.begin(), mask.end(), 0);
+    }
+
+    // level is the physical categorical column and tag is its raw value.
     void Insert(int level, uint32_t tag) {
-        if (level < 0 || level >= HIER_LEVELS) return;
-        const auto& t = HierWidths();
-        uint32_t pos = tag % static_cast<uint32_t>(t.bits[level]);
-        mask[t.wordOff[level] + (pos >> 6)] |= (1ULL << (pos & 63));
+        const int lane = layout.LaneForColumn(level);
+        if (lane < 0) return;
+        uint32_t pos = tag % static_cast<uint32_t>(layout.bits[lane]);
+        mask[static_cast<std::size_t>(layout.wordOff[lane] + (pos >> 6))] |=
+            (1ULL << (pos & 63));
     }
 
     // OR-across-levels semantic: returns true if ANY level has a non-zero AND.
     // Because levels partition the used words (wordOff), a flat AND over the
     // used words [0, totalWords) is identical to the per-level OR-of-ANDs.
     bool MayIntersect(const HierarchicalPostingMask& q) const {
-        const int tw = HierWidths().totalWords;
+        if (layout.columns != q.layout.columns ||
+            layout.bits != q.layout.bits) return true;
+        const int tw = layout.totalWords;
         for (int w = 0; w < tw; ++w)
-            if ((mask[w] & q.mask[w]) != 0) return true;
+            if ((mask[static_cast<std::size_t>(w)] &
+                 q.mask[static_cast<std::size_t>(w)]) != 0) return true;
         return false;
     }
 
@@ -368,10 +402,38 @@ struct HierarchicalPostingMask {
     // the supported level count fails open (returns true) so such predicates are
     // never wrongly pruned here -- they are still enforced by the exact post-filter.
     bool MayContain(int level, uint32_t tag) const {
-        if (level < 0 || level >= HIER_LEVELS) return true;
-        const auto& t = HierWidths();
-        uint32_t pos = tag % static_cast<uint32_t>(t.bits[level]);
-        return (mask[t.wordOff[level] + (pos >> 6)] & (1ULL << (pos & 63))) != 0;
+        const int lane = layout.LaneForColumn(level);
+        if (lane < 0) return true;
+        uint32_t pos = tag % static_cast<uint32_t>(layout.bits[lane]);
+        return (mask[static_cast<std::size_t>(
+                    layout.wordOff[lane] + (pos >> 6))] &
+                (1ULL << (pos & 63))) != 0;
+    }
+};
+
+struct HierarchicalPostingMaskView {
+    const HierWidthTable* layout = nullptr;
+    const uint64_t* mask = nullptr;
+
+    bool MayContain(int column, uint32_t tag) const {
+        if (layout == nullptr || mask == nullptr) return true;
+        const int lane = layout->LaneForColumn(column);
+        if (lane < 0) return true;
+        const uint32_t pos =
+            tag % static_cast<uint32_t>(layout->bits[lane]);
+        return (mask[layout->wordOff[lane] + (pos >> 6)] &
+                (1ULL << (pos & 63))) != 0;
+    }
+
+    bool MayIntersect(const HierarchicalPostingMask& query) const {
+        if (layout == nullptr || mask == nullptr ||
+            layout->columns != query.layout.columns ||
+            layout->bits != query.layout.bits) return true;
+        for (int word = 0; word < layout->totalWords; ++word) {
+            if ((mask[word] & query.mask[static_cast<std::size_t>(word)]) != 0)
+                return true;
+        }
+        return false;
     }
 };
 
@@ -379,28 +441,31 @@ struct HierarchicalPostingMask {
 // Compact own-tags signature for a HEAD centroid.
 //
 // A head carries exactly ONE categorical value per column (single-valued
-// facets), so its own-tag mask has at most HIER_LEVELS bits set. Storing it as
-// a full HierarchicalPostingMask bitmap (HIER_LEVELS*HIER_LEVEL_BITS bits)
+// facets), so its own-tag mask has one value per categorical lane. Storing it as
+// a full HierarchicalPostingMask bitmap
 // wastes ~97% of the space. Keep the raw value per level instead: 4 B/level vs
 // 32 B/level. Empty levels (column index >= numTagsPerVec) use OWN_TAG_EMPTY and
 // are skipped at match time. Categorical tag ids are small (<< OWN_TAG_EMPTY),
 // so the sentinel never collides with a real value.
 // ═══════════════════════════════════════════════════════════════════
 static constexpr uint32_t OWN_TAG_EMPTY = 0xFFFFFFFFu;
+struct DNFPredicate;
 
 struct HierarchicalOwnTags {
-    uint32_t tag[HIER_LEVELS];
+    HierWidthTable layout;
+    std::vector<uint32_t> tag;
 
-    HierarchicalOwnTags() { Clear(); }
+    HierarchicalOwnTags() : layout(HierWidths()) { Clear(); }
+    explicit HierarchicalOwnTags(const HierWidthTable& p_layout)
+        : layout(p_layout) { Clear(); }
 
-    void Clear() { for (int l = 0; l < HIER_LEVELS; ++l) tag[l] = OWN_TAG_EMPTY; }
+    void Clear() { tag.assign(layout.columns.size(), OWN_TAG_EMPTY); }
 
-    // level: categorical tag column index. Columns >= HIER_LEVELS are ignored
-    // (matching HierarchicalPostingMask::Insert; enforced by the exact
-    // post-filter, never wrongly pruned here).
+    // level is the physical categorical column.
     void Insert(int level, uint32_t t) {
-        if (level < 0 || level >= HIER_LEVELS) return;
-        tag[level] = t;
+        const int lane = layout.LaneForColumn(level);
+        if (lane < 0) return;
+        tag[static_cast<std::size_t>(lane)] = t;
     }
 
     // Equivalent to the former (single-bit-per-level own bitmap) MayIntersect:
@@ -408,12 +473,28 @@ struct HierarchicalOwnTags {
     // level. q.MayContain(l, v) reproduces the exact bit-collision behaviour of
     // the old bitmap AND (pos = v % HIER_LEVEL_BITS), so pruning is unchanged.
     bool MayIntersect(const HierarchicalPostingMask& q) const {
-        for (int l = 0; l < HIER_LEVELS; ++l) {
-            if (tag[l] == OWN_TAG_EMPTY) continue;
-            if (q.MayContain(l, tag[l])) return true;
+        for (std::size_t lane = 0; lane < tag.size(); ++lane) {
+            if (tag[lane] == OWN_TAG_EMPTY) continue;
+            if (q.MayContain(layout.columns[lane], tag[lane])) return true;
         }
         return false;
     }
+};
+
+struct HierarchicalOwnTagsView {
+    const HierWidthTable* layout = nullptr;
+    const uint32_t* tag = nullptr;
+
+    bool MayIntersect(const HierarchicalPostingMask& query) const {
+        if (layout == nullptr || tag == nullptr) return false;
+        for (std::size_t lane = 0; lane < layout->columns.size(); ++lane) {
+            if (tag[lane] != OWN_TAG_EMPTY &&
+                query.MayContain(layout->columns[lane], tag[lane])) return true;
+        }
+        return false;
+    }
+
+    bool Matches(const DNFPredicate& predicate) const;
 };
 
 // ═══════════════════════════════════════════════════════════════════
@@ -619,7 +700,8 @@ struct DNFPredicate {
         return false;
     }
 
-    bool MayMatchHier(const HierarchicalPostingMask& h) const {
+    template <typename HierMask>
+    bool MayMatchHier(const HierMask& h) const {
         for (const auto& c : clauses) {
             if (c.lits.empty()) continue;
             bool all = true;
@@ -634,15 +716,16 @@ struct DNFPredicate {
     // Combined categorical + quantized-numeric posting pre-filter. A clause
     // passes iff EVERY one of its literals may match: categorical literals against
     // the hierarchical mask `h`, numeric literals against the posting's quantized
-    // numeric mask `quant` (M*NUM_QUANT_WORDS uint64). `qp` holds the per-column
-    // [lo,hi] domains; `numBaseCols` is the first numeric tag-column index (so a
-    // numeric literal at absolute column `col` maps to quant lane col-numBaseCols).
+    // numeric mask `quant` (M*NUM_QUANT_WORDS uint64). `qp` and
+    // `numericColumns` map each quant lane to its physical attribute column.
     // Conservative: a numeric literal "may match" iff some bucket overlapping its
     // range is set. When `quant` is null (no numeric signature present) numeric
     // literals are treated as always-may-match (fail open).
-    bool MayMatchHierQuant(const HierarchicalPostingMask& h,
+    template <typename HierMask>
+    bool MayMatchHierQuant(const HierMask& h,
                            const uint64_t* quant, int numQuantCols,
-                           const NumQuantParam* qp, int numBaseCols) const {
+                           const NumQuantParam* qp,
+                           const int* numericColumns) const {
         for (const auto& c : clauses) {
             if (c.lits.empty()) continue;
             bool all = true;
@@ -651,8 +734,15 @@ struct DNFPredicate {
                     if (l.op == DNF_EQ &&
                         !h.MayContain((int)l.col, l.val)) { all = false; break; }
                 } else if (quant != nullptr && qp != nullptr) {
-                    int lane = (int)l.col - numBaseCols;
-                    if (lane < 0 || lane >= numQuantCols) continue;  // unknown col: fail open
+                    int lane = -1;
+                    for (int candidate = 0; candidate < numQuantCols; ++candidate) {
+                        if (numericColumns != nullptr &&
+                            numericColumns[candidate] == static_cast<int>(l.col)) {
+                            lane = candidate;
+                            break;
+                        }
+                    }
+                    if (lane < 0) continue;  // unknown col: fail open
                     int blo, bhi;
                     NumQuantPredBuckets(qp[lane], l.op, l.val, blo, bhi);
                     if (!NumQuantAnyInRange(quant, lane, blo, bhi)) { all = false; break; }
@@ -664,18 +754,60 @@ struct DNFPredicate {
     }
 };
 
+inline bool HierarchicalOwnTagsView::Matches(
+    const DNFPredicate& predicate) const {
+    if (layout == nullptr || tag == nullptr) return false;
+    for (const auto& clause : predicate.clauses) {
+        if (clause.lits.empty()) continue;
+        bool matches = true;
+        for (const auto& literal : clause.lits) {
+            if (literal.kind != 0 || literal.op != DNF_EQ) {
+                matches = false;
+                break;
+            }
+            const int lane =
+                layout->LaneForColumn(static_cast<int>(literal.col));
+            if (lane < 0 ||
+                tag[static_cast<std::size_t>(lane)] != literal.val) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) return true;
+    }
+    return false;
+}
+
 // Bitmask-based Posting Signatures for one tenant.
 struct TenantBitmaskPS {
-    int num_postings = 0;
-    std::vector<PostingBitmask> ps;
+    struct Pair {
+        PostingBitmask pure;
+        PostingBitmask tail;
+    };
 
-    void Build(int num_posts, const std::vector<std::vector<uint32_t>>& posting_tags) {
+    static constexpr std::uint32_t kMagic = 0x32534250U; // 'PBS2'
+    static constexpr std::int32_t kVersion = 2;
+
+    int num_postings = 0;
+    bool has_tail_signatures = false;
+    std::vector<Pair> ps;
+
+    void Build(int num_posts,
+               const std::vector<std::vector<uint32_t>>& posting_tags,
+               const std::vector<std::vector<uint32_t>>& tail_tags) {
         num_postings = num_posts;
+        has_tail_signatures = true;
         ps.resize(num_posts);
         for (int i = 0; i < num_posts; i++) {
-            ps[i].Clear();
+            ps[i].pure.Clear();
+            ps[i].tail.Clear();
             for (uint32_t tag : posting_tags[i]) {
-                ps[i].Insert(tag);
+                ps[i].pure.Insert(tag);
+            }
+            if (i < static_cast<int>(tail_tags.size())) {
+                for (uint32_t tag : tail_tags[i]) {
+                    ps[i].tail.Insert(tag);
+                }
             }
         }
     }
@@ -684,31 +816,53 @@ struct TenantBitmaskPS {
         FILE* f = fopen(path.c_str(), "wb");
         if (!f) return false;
         int32_t n = num_postings;
-        fwrite(&n, sizeof(int32_t), 1, f);
-        fwrite(ps.data(), sizeof(PostingBitmask), n, f);
+        bool ok =
+            fwrite(&kMagic, sizeof(kMagic), 1, f) == 1 &&
+            fwrite(&kVersion, sizeof(kVersion), 1, f) == 1 &&
+            fwrite(&n, sizeof(n), 1, f) == 1 &&
+            fwrite(ps.data(), sizeof(Pair), n, f) == static_cast<size_t>(n);
         fclose(f);
-        return true;
+        return ok;
     }
 
     bool Load(const std::string& path) {
         FILE* f = fopen(path.c_str(), "rb");
         if (!f) return false;
-        int32_t n = 0;
-        if (fread(&n, sizeof(int32_t), 1, f) != 1) { fclose(f); return false; }
+        std::uint32_t magic = 0;
+        std::int32_t version = 0;
+        std::int32_t n = 0;
+        if (fread(&magic, sizeof(magic), 1, f) != 1 ||
+            fread(&version, sizeof(version), 1, f) != 1 ||
+            fread(&n, sizeof(n), 1, f) != 1 ||
+            magic != kMagic || version != kVersion || n < 0) {
+            fclose(f);
+            return false;
+        }
         num_postings = n;
+        has_tail_signatures = true;
         ps.resize(n);
-        if ((int)fread(ps.data(), sizeof(PostingBitmask), n, f) != n) { fclose(f); return false; }
+        if (fread(ps.data(), sizeof(Pair), n, f) != static_cast<size_t>(n)) {
+            fclose(f);
+            return false;
+        }
         fclose(f);
         return true;
     }
 
     size_t MemoryBytes() const {
-        return sizeof(*this) + ps.capacity() * sizeof(PostingBitmask);
+        return sizeof(*this) + ps.capacity() * sizeof(Pair);
     }
 
     bool ShouldReadPosting(int posting_id, const PostingBitmask& query_mask) const {
         if (posting_id < 0 || posting_id >= num_postings) return true;
-        return ps[posting_id].MayIntersect(query_mask);
+        return ps[posting_id].pure.MayIntersect(query_mask);
+    }
+
+    bool ShouldReadTail(int posting_id, const PostingBitmask& query_mask) const {
+        if (!has_tail_signatures || posting_id < 0 || posting_id >= num_postings) {
+            return true;
+        }
+        return ps[posting_id].tail.MayIntersect(query_mask);
     }
 };
 

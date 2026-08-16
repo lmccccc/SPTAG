@@ -176,6 +176,51 @@ BOOST_AUTO_TEST_CASE(GeneratesNumericRangeQuantiles)
     BOOST_CHECK(content.find("\t0<=5\n") != std::string::npos);
 }
 
+BOOST_AUTO_TEST_CASE(GeneratesInterleavedAttributeDNF)
+{
+    ScopedTempDir temp;
+    const std::filesystem::path output = temp.path / "interleaved.tsv";
+    const std::vector<std::uint32_t> attributes = {
+        1, 10, 100,
+        1, 20, 101,
+        2, 30, 100,
+        2, 40, 101,
+        3, 50, 102,
+        3, 60, 103,
+        4, 70, 102,
+        4, 80, 103,
+    };
+
+    SPTAG::PredicateWorkload::SyntheticDNFOptions options;
+    options.sourceId = "interleaved-attributes";
+    options.keyColumns = {1};
+    options.keyKind = SPTAG::PredicateWorkload::KeyKind::Range;
+    options.predicateColumns = {0, 1, 2};
+    options.categoricalColumnCount = 2;
+    options.attributeKinds = {0, 1, 0};
+    options.samplesPerAttribute = 4;
+    options.statisticsSampleRows = 8;
+    options.queryCount = 16;
+
+    SPTAG::PredicateWorkload::DNFTrainSetSummary summary;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(
+        SPTAG::PredicateWorkload::EnsureSyntheticDNFTrainSet(
+            output.string(),
+            attributes.data(),
+            8,
+            3,
+            options,
+            &summary,
+            &error),
+        error);
+    const std::string content = ReadFile(output);
+    BOOST_CHECK(
+        content.find("# attribute_types=label,range,label\n") !=
+        std::string::npos);
+    BOOST_CHECK_GT(summary.uniqueQueries, 0);
+}
+
 BOOST_AUTO_TEST_CASE(RejectsStaleGeneratedTrainSet)
 {
     ScopedTempDir temp;

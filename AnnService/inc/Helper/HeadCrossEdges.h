@@ -17,7 +17,7 @@ namespace Helper
 {
 
 constexpr std::uint32_t kHeadCrossEdgesMagic = 0x48434548U; // 'HCEH'
-constexpr std::int32_t  kHeadCrossEdgesVersion = 1;
+constexpr std::int32_t  kHeadCrossEdgesVersion = 2;
 constexpr const char*   kHeadCrossEdgesFileName = "head_cross_edges.bin";
 constexpr const char*   kHeadCrossEdgesDirtyFileName = "head_cross_edges.dirty";
 
@@ -32,16 +32,13 @@ struct HeadCrossEdgesHeader
     std::int32_t  reserved;
 };
 
-struct HeadCrossEdgeEntry
-{
-    std::int32_t neighborGlobalVID;
-    float        dist;
-};
-
 // Per-record layout in the file:
 //   int32 globalHeadVID
 //   int32 edgeCount  // <= maxEdgesPerHead
-//   HeadCrossEdgeEntry edges[edgeCount]
+//   int32 neighborGlobalVID[edgeCount]
+//
+// Distances are used only while selecting/building the nearest cross edges.
+// Runtime traversal needs only the neighbor IDs, so distances are not persisted.
 #pragma pack(pop)
 
 } // namespace Helper

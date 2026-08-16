@@ -8,8 +8,9 @@
 
 namespace SPTAG::SPANN
 {
-    static constexpr std::uint64_t kPrimaryHeadCSRMagic = 0x3152534348444850ULL; // "PHDHCSR1"
-    static constexpr std::uint32_t kPrimaryHeadCSRVersion = 1;
+    static constexpr std::uint64_t kPrimaryHeadCSRMagic =
+        0x3152534348444850ULL; // "PHDHCSR1"
+    static constexpr std::uint32_t kPrimaryHeadCSRVersion = 2;
 
 #pragma pack(push, 1)
     struct PrimaryHeadCSRHeader
@@ -18,20 +19,30 @@ namespace SPTAG::SPANN
         std::uint32_t version = kPrimaryHeadCSRVersion;
         std::uint32_t headCount = 0;
         std::uint64_t entryCount = 0;
+        std::uint32_t attributeCount = 0;
+        std::uint32_t reserved[4] = {};
+    };
+
+    struct LegacyPrimaryHeadCSRHeader
+    {
+        std::uint64_t magic = kPrimaryHeadCSRMagic;
+        std::uint32_t version = 1;
+        std::uint32_t headCount = 0;
+        std::uint64_t entryCount = 0;
         std::uint32_t tagBases[4] = {};
         std::uint32_t reserved = 0;
     };
 
-    struct PrimaryHeadCSREntry
+    struct LegacyPrimaryHeadCSREntry
     {
         std::uint32_t vid = 0;
-        // Low 32 bits: one local uint8 tag ID per categorical level.
-        // High 32 bits: numeric attribute.
         std::uint64_t attributes = 0;
     };
 #pragma pack(pop)
 
-    static_assert(sizeof(PrimaryHeadCSREntry) == 12, "primary CSR entries must remain compact");
+    static_assert(
+        sizeof(PrimaryHeadCSRHeader) == sizeof(LegacyPrimaryHeadCSRHeader),
+        "primary CSR headers must remain version-readable");
 
     class PrimaryHeadCSR
     {
@@ -41,75 +52,159 @@ namespace SPTAG::SPANN
             std::ifstream input(path, std::ios::binary);
             if (!input) return false;
 
-            PrimaryHeadCSRHeader header;
-            input.read(reinterpret_cast<char*>(&header), sizeof(header));
-            if (!input || header.magic != kPrimaryHeadCSRMagic ||
-                header.version != kPrimaryHeadCSRVersion ||
-                header.headCount != expectedHeadCount ||
-                header.entryCount > std::numeric_limits<std::uint32_t>::max()) {
+            std::uint64_t magic = 0;
+            std::uint32_t version = 0;
+            input.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+            input.read(reinterpret_cast<char*>(&version), sizeof(version));
+            if (!input || magic != kPrimaryHeadCSRMagic ||
+                (version != 1 && version != kPrimaryHeadCSRVersion)) {
                 return false;
             }
-
-            std::vector<std::uint32_t> offsets(static_cast<size_t>(header.headCount) + 1);
-            input.read(reinterpret_cast<char*>(offsets.data()),
-                       static_cast<std::streamsize>(offsets.size() * sizeof(std::uint32_t)));
-            if (!input || offsets.back() != header.entryCount) return false;
-
-            std::vector<PrimaryHeadCSREntry> entries(static_cast<size_t>(header.entryCount));
-            input.read(reinterpret_cast<char*>(entries.data()),
-                       static_cast<std::streamsize>(entries.size() * sizeof(PrimaryHeadCSREntry)));
-            if (!input) return false;
-
-            m_header = header;
-            m_offsets = std::move(offsets);
-            m_entries = std::move(entries);
-            return true;
+            input.seekg(0, std::ios::beg);
+            return version == 1
+                ? LoadLegacy(input, expectedHeadCount)
+                : LoadCurrent(input, expectedHeadCount);
         }
 
         bool Loaded() const { return !m_offsets.empty(); }
 
         std::uint32_t HeadCount() const { return m_header.headCount; }
 
+        std::uint32_t AttributeCount() const {
+            return m_header.attributeCount;
+        }
+
         const PrimaryHeadCSRHeader& Header() const { return m_header; }
 
-        const PrimaryHeadCSREntry* Begin(std::uint32_t headId) const
+        std::uint32_t Begin(std::uint32_t headId) const
         {
-            if (headId >= m_header.headCount) return nullptr;
-            return m_entries.data() + m_offsets[headId];
+            return headId < m_header.headCount ? m_offsets[headId] : 0;
         }
 
-        const PrimaryHeadCSREntry* End(std::uint32_t headId) const
+        std::uint32_t End(std::uint32_t headId) const
         {
-            if (headId >= m_header.headCount) return nullptr;
-            return m_entries.data() + m_offsets[headId + 1];
+            return headId < m_header.headCount ? m_offsets[headId + 1] : 0;
         }
 
-        bool IsProjectTag(std::uint32_t tag) const
+        std::uint32_t Vid(std::uint32_t entry) const
         {
-            const std::uint32_t base = m_header.tagBases[3];
-            return tag >= base && tag - base <= std::numeric_limits<std::uint8_t>::max();
+            return m_vids[entry];
         }
 
-        bool MatchesProject(const PrimaryHeadCSREntry& entry, std::uint32_t projectTag) const
+        const std::uint32_t* Attributes(std::uint32_t entry) const
         {
-            if (!IsProjectTag(projectTag)) return false;
-            const std::uint8_t expected = static_cast<std::uint8_t>(projectTag - m_header.tagBases[3]);
-            const std::uint8_t actual = static_cast<std::uint8_t>(entry.attributes >> 24);
-            return actual == expected;
+            return m_attributes.data() +
+                static_cast<std::size_t>(entry) * m_header.attributeCount;
         }
 
-        void UnpackAttributes(const PrimaryHeadCSREntry& entry, std::uint32_t vecTags[5]) const
+        bool MatchesAnyValue(std::uint32_t entry, std::uint32_t value) const
         {
-            const std::uint32_t packedTags = static_cast<std::uint32_t>(entry.attributes);
-            for (int level = 0; level < 4; ++level) {
-                vecTags[level] = m_header.tagBases[level] + ((packedTags >> (level * 8)) & 0xffU);
+            const std::uint32_t* row = Attributes(entry);
+            for (std::uint32_t column = 0;
+                 column < m_header.attributeCount;
+                 ++column) {
+                if (row[column] == value) return true;
             }
-            vecTags[4] = static_cast<std::uint32_t>(entry.attributes >> 32);
+            return false;
         }
 
     private:
+        bool ReadOffsets(std::ifstream& input)
+        {
+            m_offsets.resize(static_cast<std::size_t>(m_header.headCount) + 1);
+            input.read(
+                reinterpret_cast<char*>(m_offsets.data()),
+                static_cast<std::streamsize>(
+                    m_offsets.size() * sizeof(std::uint32_t)));
+            return input && m_offsets.front() == 0 &&
+                m_offsets.back() == m_header.entryCount;
+        }
+
+        bool LoadCurrent(std::ifstream& input,
+                         std::uint32_t expectedHeadCount)
+        {
+            PrimaryHeadCSRHeader header;
+            input.read(reinterpret_cast<char*>(&header), sizeof(header));
+            if (!input || header.magic != kPrimaryHeadCSRMagic ||
+                header.version != kPrimaryHeadCSRVersion ||
+                header.headCount != expectedHeadCount ||
+                header.entryCount >
+                    std::numeric_limits<std::uint32_t>::max() ||
+                header.attributeCount == 0 ||
+                header.attributeCount > 4096) {
+                return false;
+            }
+            m_header = header;
+            if (!ReadOffsets(input)) return false;
+
+            m_vids.resize(static_cast<std::size_t>(header.entryCount));
+            input.read(
+                reinterpret_cast<char*>(m_vids.data()),
+                static_cast<std::streamsize>(
+                    m_vids.size() * sizeof(std::uint32_t)));
+            if (!input ||
+                header.entryCount >
+                    std::numeric_limits<std::size_t>::max() /
+                        header.attributeCount) {
+                return false;
+            }
+            m_attributes.resize(
+                static_cast<std::size_t>(header.entryCount) *
+                header.attributeCount);
+            input.read(
+                reinterpret_cast<char*>(m_attributes.data()),
+                static_cast<std::streamsize>(
+                    m_attributes.size() * sizeof(std::uint32_t)));
+            return static_cast<bool>(input);
+        }
+
+        bool LoadLegacy(std::ifstream& input,
+                        std::uint32_t expectedHeadCount)
+        {
+            LegacyPrimaryHeadCSRHeader header;
+            input.read(reinterpret_cast<char*>(&header), sizeof(header));
+            if (!input || header.magic != kPrimaryHeadCSRMagic ||
+                header.version != 1 ||
+                header.headCount != expectedHeadCount ||
+                header.entryCount >
+                    std::numeric_limits<std::uint32_t>::max()) {
+                return false;
+            }
+            m_header = {};
+            m_header.headCount = header.headCount;
+            m_header.entryCount = header.entryCount;
+            m_header.attributeCount = 5;
+            if (!ReadOffsets(input)) return false;
+
+            std::vector<LegacyPrimaryHeadCSREntry> entries(
+                static_cast<std::size_t>(header.entryCount));
+            input.read(
+                reinterpret_cast<char*>(entries.data()),
+                static_cast<std::streamsize>(
+                    entries.size() * sizeof(LegacyPrimaryHeadCSREntry)));
+            if (!input) return false;
+
+            m_vids.resize(entries.size());
+            m_attributes.resize(entries.size() * 5);
+            for (std::size_t entry = 0; entry < entries.size(); ++entry) {
+                m_vids[entry] = entries[entry].vid;
+                const std::uint32_t packed =
+                    static_cast<std::uint32_t>(entries[entry].attributes);
+                for (int column = 0; column < 4; ++column) {
+                    m_attributes[entry * 5 + column] =
+                        header.tagBases[column] +
+                        ((packed >> (column * 8)) & 0xffU);
+                }
+                m_attributes[entry * 5 + 4] =
+                    static_cast<std::uint32_t>(
+                        entries[entry].attributes >> 32);
+            }
+            return true;
+        }
+
         PrimaryHeadCSRHeader m_header;
         std::vector<std::uint32_t> m_offsets;
-        std::vector<PrimaryHeadCSREntry> m_entries;
+        std::vector<std::uint32_t> m_vids;
+        std::vector<std::uint32_t> m_attributes;
     };
 }

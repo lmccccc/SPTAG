@@ -40,6 +40,7 @@ struct SyntheticDNFOptions {
     KeyKind keyKind = KeyKind::Label;
     std::vector<int> predicateColumns;
     int categoricalColumnCount = 0;
+    std::vector<std::uint8_t> attributeKinds;
     std::size_t samplesPerAttribute = 16;
     std::size_t statisticsSampleRows = 65536;
     std::size_t queryCount = 1024;
@@ -51,6 +52,28 @@ struct SyntheticDNFOptions {
         "auto_uniform_nonempty_attribute_masks";
     std::uint64_t seed = 20260813;
 };
+
+inline bool IsNumericAttribute(const SyntheticDNFOptions& options, int column)
+{
+    if (!options.attributeKinds.empty()) {
+        return column >= 0 &&
+            static_cast<std::size_t>(column) < options.attributeKinds.size() &&
+            options.attributeKinds[static_cast<std::size_t>(column)] != 0;
+    }
+
+    return column >= options.categoricalColumnCount;
+}
+
+inline std::string AttributeKindsText(
+    const std::vector<std::uint8_t>& attributeKinds)
+{
+    std::ostringstream output;
+    for (std::size_t column = 0; column < attributeKinds.size(); ++column) {
+        if (column != 0) output << ',';
+        output << (attributeKinds[column] == 0 ? "label" : "range");
+    }
+    return output.str();
+}
 
 struct DNFTrainSetSummary {
     bool reusedExisting = false;
@@ -153,8 +176,14 @@ inline bool ParseGeneratedPredicateShape(
     const std::unordered_set<int>& keyColumns,
     KeyKind keyKind,
     int categoricalColumnCount,
+    const std::vector<std::uint8_t>& attributeKinds,
     ParsedPredicateShape* shape)
 {
+    const auto isNumeric = [&](int column) {
+        return !attributeKinds.empty()
+            ? attributeKinds[static_cast<std::size_t>(column)] != 0
+            : column >= categoricalColumnCount;
+    };
     shape->clauseAttributeCounts.clear();
     if (predicate.empty() ||
         predicate.back() == '|' ||
@@ -247,6 +276,10 @@ inline bool ParseGeneratedPredicateShape(
             if (predicateColumns.find(column) == predicateColumns.end()) {
                 return false;
             }
+            if (!attributeKinds.empty() &&
+                static_cast<std::size_t>(column) >= attributeKinds.size()) {
+                return false;
+            }
             if (keyColumns.find(column) != keyColumns.end()) {
                 hasKey = true;
                 ++keyAtomCount;
@@ -264,7 +297,7 @@ inline bool ParseGeneratedPredicateShape(
                     return false;
                 }
             } else {
-                const bool numeric = column >= categoricalColumnCount;
+                const bool numeric = isNumeric(column);
                 if ((numeric && op != AtomOp::LessEqual) ||
                     (!numeric && op != AtomOp::Equal) ||
                     !nonKeyColumns.insert(column).second) {
@@ -291,6 +324,24 @@ inline bool ParseGeneratedPredicateShape(
         clauseBegin = clauseEnd + 1;
     }
     return !shape->clauseAttributeCounts.empty();
+}
+
+inline bool ParseGeneratedPredicateShape(
+    const std::string& predicate,
+    const std::unordered_set<int>& predicateColumns,
+    const std::unordered_set<int>& keyColumns,
+    KeyKind keyKind,
+    int categoricalColumnCount,
+    ParsedPredicateShape* shape)
+{
+    return ParseGeneratedPredicateShape(
+        predicate,
+        predicateColumns,
+        keyColumns,
+        keyKind,
+        categoricalColumnCount,
+        std::vector<std::uint8_t>(),
+        shape);
 }
 
 inline bool ReadGeneratedMetadata(const std::string& path,
@@ -360,7 +411,12 @@ inline bool ReuseExistingDNFTrainSet(const std::string& path,
         {"clause_attribute_count_weights", options.clauseAttributeCountWeightsText},
         {"seed", std::to_string(options.seed)},
     };
-    for (const auto& item : expected) {
+    std::vector<std::pair<std::string, std::string>> schemaExpected = expected;
+    if (!options.attributeKinds.empty()) {
+        schemaExpected.emplace_back(
+            "attribute_types", AttributeKindsText(options.attributeKinds));
+    }
+    for (const auto& item : schemaExpected) {
         const auto found = metadata.find(item.first);
         if (found == metadata.end() || found->second != item.second) {
             return SetError(
@@ -479,6 +535,7 @@ inline bool ReuseExistingDNFTrainSet(const std::string& path,
                 keyColumnSet,
                 options.keyKind,
                 options.categoricalColumnCount,
+                options.attributeKinds,
                 &shape)) {
             return SetError(
                 error,
@@ -829,9 +886,16 @@ inline bool EnsureSyntheticDNFTrainSet(const std::string& path,
         options.clauseAttributeCountWeightsText.empty()) {
         return SetError(error, "DNF shape policy metadata must not be empty");
     }
-    if (options.categoricalColumnCount < 0 ||
-        options.categoricalColumnCount > numTagsPerVector) {
+    if ((!options.attributeKinds.empty() &&
+         options.attributeKinds.size() !=
+             static_cast<std::size_t>(numTagsPerVector)) ||
+        (options.attributeKinds.empty() &&
+         (options.categoricalColumnCount < 0 ||
+          options.categoricalColumnCount > numTagsPerVector))) {
         return SetError(error, "categoricalColumnCount is outside the tag row");
+    }
+    for (std::uint8_t kind : options.attributeKinds) {
+        if (kind > 1) return SetError(error, "invalid attribute kind");
     }
     if (options.keyKind == KeyKind::Range && options.keyColumns.size() != 1) {
         return SetError(error, "range key attributes require exactly one numeric column");
@@ -871,7 +935,7 @@ inline bool EnsureSyntheticDNFTrainSet(const std::string& path,
                 relevantColumns.begin(), relevantColumns.end(), column)) {
             return SetError(error, "predicate columns must include every key column");
         }
-        const bool numeric = column >= options.categoricalColumnCount;
+        const bool numeric = IsNumericAttribute(options, column);
         if ((options.keyKind == KeyKind::Range) != numeric) {
             return SetError(error, "key kind does not match the key column type");
         }
@@ -986,7 +1050,7 @@ inline bool EnsureSyntheticDNFTrainSet(const std::string& path,
         ColumnCatalog catalog;
         catalog.rawColumn = rawColumn;
         catalog.sampleColumn = sampleColumnByRaw.at(rawColumn);
-        catalog.numeric = rawColumn >= options.categoricalColumnCount;
+        catalog.numeric = IsNumericAttribute(options, rawColumn);
 
         if (catalog.numeric) {
             std::vector<std::uint32_t> values(discoveryCount);
@@ -1570,6 +1634,10 @@ inline bool EnsureSyntheticDNFTrainSet(const std::string& path,
            << "# key_clause_policy=optional\n"
            << "# clause_marginal_policy=positive_on_statistics_sample\n"
            << "# categorical_column_count=" << options.categoricalColumnCount << "\n"
+           << (options.attributeKinds.empty()
+                   ? std::string()
+                   : "# attribute_types=" +
+                         AttributeKindsText(options.attributeKinds) + "\n")
            << "# vector_count=" << vectorCount << "\n"
            << "# samples_per_attribute=" << options.samplesPerAttribute << "\n"
            << "# statistics_sample_rows=" << options.statisticsSampleRows << "\n"

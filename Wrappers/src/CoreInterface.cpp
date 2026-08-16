@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <cctype>
 #include <filesystem>
 #include <map>
 #include <vector>
@@ -137,7 +138,7 @@ uint64_t GetPathSizeBytes(const std::string& path)
 bool BuildStaticPostingHierMasks(const std::string& p_snapshotPath,
                                  int p_expectedHeadCount,
                                  int p_expectedTagCount,
-                                 int p_aclTagCount,
+                                 const std::vector<int>& p_categoricalColumns,
                                  std::vector<SPTAG::Cache::HierarchicalPostingMask>& p_masks)
 {
     constexpr std::uint32_t kStaticMetadataMagic = 0x314D5453U; // "STM1"
@@ -172,11 +173,12 @@ bool BuildStaticPostingHierMasks(const std::string& p_snapshotPath,
                 p_expectedTagCount, listPageOffset);
         return false;
     }
-    const int aclTagCount = p_aclTagCount > 0 ? p_aclTagCount : tagCount;
-    if (aclTagCount > tagCount) {
-        fprintf(stderr, "[ERROR] STM1 ACL tag count %d exceeds record tag count %d in %s\n",
-                aclTagCount, tagCount, p_snapshotPath.c_str());
-        return false;
+    for (int column : p_categoricalColumns) {
+        if (column < 0 || column >= tagCount) {
+            fprintf(stderr, "[ERROR] STM1 categorical column %d exceeds record tag count %d in %s\n",
+                    column, tagCount, p_snapshotPath.c_str());
+            return false;
+        }
     }
 
     struct ListInfo {
@@ -281,7 +283,7 @@ bool BuildStaticPostingHierMasks(const std::string& p_snapshotPath,
             auto& mask = p_masks[postingId];
             for (int i = 0; i < list.pureCount; ++i) {
                 const char* record = records + static_cast<size_t>(i) * static_cast<size_t>(recordBytes);
-                for (int tagColumn = 0; tagColumn < aclTagCount; ++tagColumn) {
+                for (int tagColumn : p_categoricalColumns) {
                     std::uint32_t tag = 0;
                     std::memcpy(&tag, record + sizeof(std::int32_t) +
                                       static_cast<size_t>(tagColumn) * sizeof(tag),
@@ -546,6 +548,8 @@ bool TryGetAncestorTag(uint32_t tag,
 constexpr int32_t kHeadNodeMetaVersion = 3;       // base: categorical only
 constexpr int32_t kHeadNodeMetaVersionV4 = 4;     // V3 + quantized numeric block
 constexpr int32_t kHeadNodeMetaVersionV5 = 5;     // V4 + per-column hier mask widths
+constexpr int32_t kHeadNodeMetaVersionV6 = 6;     // V5 + adjacent tail posting mask
+constexpr int32_t kHeadNodeMetaVersionV7 = 7;     // V6 + dynamic categorical columns
 
 struct HeadNodeMetaFileHeader {
     int32_t version;
@@ -562,28 +566,99 @@ struct HeadNodeMetaFileHeader {
 // Parse SPTAG_HIER_LEVEL_WIDTHS (comma-separated per-column bit widths, e.g.
 // "256,64,64,128,64") and apply it to the process-global mask width table. With
 // the env unset, restores the uniform HIER_LEVEL_BITS default (legacy layout).
-void ApplyHierWidthsFromEnv()
+std::vector<int> ApplyHierWidthsFromEnv(
+    const std::vector<int>& categoricalColumns)
 {
+    std::vector<int> widths(
+        categoricalColumns.size(), SPTAG::Cache::HIER_LEVEL_BITS);
     const char* e = std::getenv("SPTAG_HIER_LEVEL_WIDTHS");
-    if (e == nullptr || e[0] == '\0') {
-        SPTAG::Cache::SetHierWidthsUniform();
-        return;
+    if (e != nullptr && e[0] != '\0') {
+        std::stringstream input(e);
+        std::string token;
+        std::size_t lane = 0;
+        while (lane < widths.size() && std::getline(input, token, ',')) {
+            widths[lane++] = atoi(token.c_str());
+        }
     }
-    int widths[SPTAG::Cache::HIER_LEVELS];
-    for (int l = 0; l < SPTAG::Cache::HIER_LEVELS; ++l) widths[l] = SPTAG::Cache::HIER_LEVEL_BITS;
-    int n = 0;
-    const char* p = e;
-    while (*p != '\0' && n < SPTAG::Cache::HIER_LEVELS) {
-        widths[n++] = atoi(p);
-        const char* comma = strchr(p, ',');
-        if (comma == nullptr) break;
-        p = comma + 1;
-    }
-    SPTAG::Cache::SetHierWidths(widths, n);
+    SPTAG::Cache::SetHierLayout(categoricalColumns, widths);
     const auto& t = SPTAG::Cache::HierWidths();
-    fprintf(stderr, "[INFO] Hier mask widths: bits=[%d,%d,%d,%d,%d] totalWords=%d (%zu B/head)\n",
-            t.bits[0], t.bits[1], t.bits[2], t.bits[3], t.bits[4], t.totalWords,
+    fprintf(stderr,
+            "[INFO] Hier mask layout: categoricalColumns=%zu totalWords=%d "
+            "(%zu B/head)\n",
+            t.columns.size(), t.totalWords,
             SPTAG::Cache::HierPostingMaskBytes());
+    return widths;
+}
+
+struct AttributeLayout {
+    std::vector<std::uint8_t> kinds;
+    std::vector<int> categoricalColumns;
+    std::vector<int> numericColumns;
+};
+
+bool ResolveAttributeLayout(int columnCount,
+                            AttributeLayout* layout,
+                            std::string* error = nullptr)
+{
+    if (layout == nullptr || columnCount <= 0) return false;
+    layout->kinds.clear();
+    layout->categoricalColumns.clear();
+    layout->numericColumns.clear();
+
+    const char* schema = std::getenv("SPTAG_ATTRIBUTE_TYPES");
+    if (schema != nullptr && schema[0] != '\0') {
+        std::stringstream input(schema);
+        std::string token;
+        while (std::getline(input, token, ',')) {
+            token.erase(token.begin(), std::find_if(
+                token.begin(), token.end(),
+                [](unsigned char c) { return !std::isspace(c); }));
+            token.erase(std::find_if(
+                token.rbegin(), token.rend(),
+                [](unsigned char c) { return !std::isspace(c); }).base(),
+                token.end());
+            std::transform(
+                token.begin(), token.end(), token.begin(),
+                [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+            if (token == "label" || token == "categorical" || token == "tag") {
+                layout->kinds.push_back(0);
+            } else if (
+                token == "range" || token == "numeric" || token == "number") {
+                layout->kinds.push_back(1);
+            } else {
+                if (error != nullptr) *error = "unknown attribute type: " + token;
+                return false;
+            }
+        }
+        if (layout->kinds.size() != static_cast<std::size_t>(columnCount)) {
+            if (error != nullptr) {
+                *error = "SPTAG_ATTRIBUTE_TYPES must contain exactly " +
+                    std::to_string(columnCount) + " entries";
+            }
+            return false;
+        }
+    } else {
+        int numericCount = 0;
+        if (const char* numeric = std::getenv("SPTAG_NUMERIC_COLS")) {
+            numericCount = std::clamp(atoi(numeric), 0, columnCount);
+        }
+        layout->kinds.assign(static_cast<std::size_t>(columnCount), 0);
+        for (int column = columnCount - numericCount;
+             column < columnCount;
+             ++column) {
+            layout->kinds[static_cast<std::size_t>(column)] = 1;
+        }
+    }
+
+    for (int column = 0; column < columnCount; ++column) {
+        (layout->kinds[static_cast<std::size_t>(column)] == 0
+             ? layout->categoricalColumns
+             : layout->numericColumns)
+            .push_back(column);
+    }
+    return true;
 }
 
 std::string HeadNodeMetaPath(const std::string& workDir)
@@ -609,26 +684,26 @@ bool SaveHeadNodeMetaFile(const std::string& workDir, const std::shared_ptr<SPTA
     HeadNodeMetaFileHeader header{};
     int32_t quantCols = headIndex->GetHeadNodeNumQuantCols();
 
-    // Persist per-column hier mask widths only when they are non-uniform; a
-    // uniform table reproduces the legacy V3/V4 layout exactly, so keep emitting
-    // V3/V4 for those (older readers stay compatible).
-    const auto& widths = SPTAG::Cache::HierWidths();
-    bool nonUniformWidths = false;
-    for (int l = 0; l < SPTAG::Cache::HIER_LEVELS; ++l)
-        if (widths.bits[l] != SPTAG::Cache::HIER_LEVEL_BITS) { nonUniformWidths = true; break; }
-
-    header.version = nonUniformWidths ? kHeadNodeMetaVersionV5
-                                      : (quantCols > 0 ? kHeadNodeMetaVersionV4 : kHeadNodeMetaVersion);
+    const auto& layout = headIndex->GetHeadNodeHierLayout();
+    header.version = kHeadNodeMetaVersionV7;
     header.numSamples = headIndex->GetHeadNodeMetaSampleCount();
     header.numTagsPerSample = quantCols;  // V4/V5: quantized numeric column count
     header.stride = static_cast<int32_t>(headIndex->GetHeadNodeMetaStride());
 
     const auto& blob = headIndex->GetHeadNodeMetaBlob();
     bool ok = fwrite(&header, sizeof(header), 1, f) == 1;
-    if (ok && header.version == kHeadNodeMetaVersionV5) {
-        int32_t wbits[SPTAG::Cache::HIER_LEVELS];
-        for (int l = 0; l < SPTAG::Cache::HIER_LEVELS; ++l) wbits[l] = widths.bits[l];
-        ok = fwrite(wbits, sizeof(int32_t), SPTAG::Cache::HIER_LEVELS, f) == (size_t)SPTAG::Cache::HIER_LEVELS;
+    if (ok) {
+        const int32_t categoricalCount =
+            static_cast<int32_t>(layout.columns.size());
+        ok = fwrite(&categoricalCount, sizeof(categoricalCount), 1, f) == 1;
+        const int32_t flags = headIndex->HasHeadNodeTailPS() ? 1 : 0;
+        ok = ok && fwrite(&flags, sizeof(flags), 1, f) == 1;
+        for (int lane = 0; ok && lane < categoricalCount; ++lane) {
+            const int32_t entry[2] = {
+                layout.columns[static_cast<std::size_t>(lane)],
+                layout.bits[static_cast<std::size_t>(lane)]};
+            ok = fwrite(entry, sizeof(entry), 1, f) == 1;
+        }
     }
     ok = ok && fwrite(blob.data(), 1, blob.size(), f) == blob.size();
     fclose(f);
@@ -660,33 +735,76 @@ bool LoadHeadNodeMetaFile(const std::string& workDir, const std::shared_ptr<SPTA
     // block) and V5 (V4 + per-column hier mask widths).
     if (header.version != kHeadNodeMetaVersion &&
         header.version != kHeadNodeMetaVersionV4 &&
-        header.version != kHeadNodeMetaVersionV5) {
-        fprintf(stderr, "[ERROR] head_node_meta.bin version mismatch: file has version %d, expected version %d, %d or %d. "
+        header.version != kHeadNodeMetaVersionV5 &&
+        header.version != kHeadNodeMetaVersionV6 &&
+        header.version != kHeadNodeMetaVersionV7) {
+        fprintf(stderr, "[ERROR] head_node_meta.bin version mismatch: file has version %d, expected version %d through %d. "
                         "Please rebuild the index to use the new hierarchical mask format.\n",
-                header.version, kHeadNodeMetaVersion, kHeadNodeMetaVersionV4, kHeadNodeMetaVersionV5);
+                header.version, kHeadNodeMetaVersion, kHeadNodeMetaVersionV7);
         fclose(f);
         return false;
     }
-    int quantCols = (header.version == kHeadNodeMetaVersionV4 || header.version == kHeadNodeMetaVersionV5)
+    int quantCols = (header.version == kHeadNodeMetaVersionV4 ||
+                    header.version == kHeadNodeMetaVersionV5 ||
+                    header.version == kHeadNodeMetaVersionV6 ||
+                    header.version == kHeadNodeMetaVersionV7)
                     ? header.numTagsPerSample : 0;
 
-    // Apply per-column mask widths BEFORE InitializeHeadNodeMeta so the computed
-    // stride matches the persisted byte layout. V5 carries explicit widths; V3/V4
-    // predate variable widths and use the uniform default.
-    if (header.version == kHeadNodeMetaVersionV5) {
+    std::vector<int> categoricalColumns;
+    std::vector<int> categoricalWidths;
+    bool includeTailPS = header.version == kHeadNodeMetaVersionV6;
+    if (header.version == kHeadNodeMetaVersionV7) {
+        int32_t categoricalCount = 0;
+        int32_t flags = 0;
+        if (fread(&categoricalCount, sizeof(categoricalCount), 1, f) != 1 ||
+            categoricalCount < 0 || categoricalCount > 4096 ||
+            fread(&flags, sizeof(flags), 1, f) != 1 ||
+            (flags & ~1) != 0) {
+            fclose(f);
+            return false;
+        }
+        includeTailPS = (flags & 1) != 0;
+        categoricalColumns.resize(static_cast<std::size_t>(categoricalCount));
+        categoricalWidths.resize(static_cast<std::size_t>(categoricalCount));
+        int previousColumn = -1;
+        for (int lane = 0; lane < categoricalCount; ++lane) {
+            int32_t entry[2] = {};
+            if (fread(entry, sizeof(entry), 1, f) != 1) {
+                fclose(f);
+                return false;
+            }
+            if (entry[0] <= previousColumn ||
+                entry[1] < 64 ||
+                entry[1] > SPTAG::Cache::HIER_LEVEL_BITS ||
+                entry[1] % 64 != 0) {
+                fclose(f);
+                return false;
+            }
+            categoricalColumns[static_cast<std::size_t>(lane)] = entry[0];
+            categoricalWidths[static_cast<std::size_t>(lane)] = entry[1];
+            previousColumn = entry[0];
+        }
+    } else if (header.version == kHeadNodeMetaVersionV5 ||
+               header.version == kHeadNodeMetaVersionV6) {
         int32_t wbits[SPTAG::Cache::HIER_LEVELS];
         if (fread(wbits, sizeof(int32_t), SPTAG::Cache::HIER_LEVELS, f) != (size_t)SPTAG::Cache::HIER_LEVELS) {
             fclose(f);
             return false;
         }
-        int widths[SPTAG::Cache::HIER_LEVELS];
-        for (int l = 0; l < SPTAG::Cache::HIER_LEVELS; ++l) widths[l] = wbits[l];
-        SPTAG::Cache::SetHierWidths(widths, SPTAG::Cache::HIER_LEVELS);
+        for (int lane = 0; lane < SPTAG::Cache::HIER_LEVELS; ++lane) {
+            categoricalColumns.push_back(lane);
+            categoricalWidths.push_back(wbits[lane]);
+        }
     } else {
-        SPTAG::Cache::SetHierWidthsUniform();
+        for (int lane = 0; lane < SPTAG::Cache::HIER_LEVELS; ++lane) {
+            categoricalColumns.push_back(lane);
+            categoricalWidths.push_back(SPTAG::Cache::HIER_LEVEL_BITS);
+        }
     }
 
-    headIndex->InitializeHeadNodeMeta(header.numSamples, quantCols);
+    headIndex->InitializeHeadNodeMeta(
+        header.numSamples, quantCols, includeTailPS,
+        categoricalColumns, categoricalWidths);
     if (static_cast<int32_t>(headIndex->GetHeadNodeMetaStride()) != header.stride) {
         fprintf(stderr, "[ERROR] head_node_meta.bin stride mismatch: file has stride %d, expected %zu. "
                         "Binary layout has changed.\n",
@@ -728,7 +846,8 @@ bool LoadPostingSignaturesIntoHeadIndex(const std::string& workDir,
         SizeType globalVID = spannInternalIdx->GetGlobalVID(hid);
         headIndex->SetHeadNodeGlobalVID(hid, globalVID);
         if (hid < sigs.num_postings) {
-            headIndex->SetHeadNodePS(hid, sigs.ps[hid]);
+            headIndex->SetHeadNodePS(hid, sigs.ps[hid].pure);
+            headIndex->SetHeadNodeTailPS(hid, sigs.ps[hid].tail);
         }
     }
     return true;
@@ -2363,6 +2482,29 @@ bool TenantIndexManager::ConfigurePredicateSubsetPlanner(
     m_predicateSubsetPlannerEnabled = true;
     m_predicateSubsetWorkloadFile = p_workloadFile;
     m_predicateSubsetCategoricalColumnCount = p_categoricalColumnCount;
+    m_predicateSubsetAttributeKinds.clear();
+    m_tenantPredicateSubsetPlans.clear();
+    m_tenantPredicateAtomToNodes.clear();
+    return true;
+}
+
+bool TenantIndexManager::ConfigurePredicateSubsetPlanner(
+    const char* p_workloadFile,
+    const std::vector<std::uint8_t>& p_attributeKinds)
+{
+    if (p_workloadFile == nullptr || p_workloadFile[0] == '\0' ||
+        p_attributeKinds.empty() || p_attributeKinds.size() > 4096) {
+        return false;
+    }
+    for (std::uint8_t kind : p_attributeKinds) {
+        if (kind > 1) return false;
+    }
+    m_predicateSubsetPlannerEnabled = true;
+    m_predicateSubsetWorkloadFile = p_workloadFile;
+    m_predicateSubsetAttributeKinds = p_attributeKinds;
+    m_predicateSubsetCategoricalColumnCount =
+        static_cast<int>(std::count(
+            p_attributeKinds.begin(), p_attributeKinds.end(), std::uint8_t{0}));
     m_tenantPredicateSubsetPlans.clear();
     m_tenantPredicateAtomToNodes.clear();
     return true;
@@ -2414,7 +2556,11 @@ bool TenantIndexManager::EnsurePredicateSubsetPlan(
         p_numVectors <= 0 ||
         p_numTagsPerVec <= 0 ||
         (m_predicateSubsetPlannerEnabled &&
-         m_predicateSubsetCategoricalColumnCount > p_numTagsPerVec)) {
+         ((!m_predicateSubsetAttributeKinds.empty() &&
+           m_predicateSubsetAttributeKinds.size() !=
+               static_cast<std::size_t>(p_numTagsPerVec)) ||
+          (m_predicateSubsetAttributeKinds.empty() &&
+           m_predicateSubsetCategoricalColumnCount > p_numTagsPerVec)))) {
         return false;
     }
 
@@ -2460,7 +2606,10 @@ bool TenantIndexManager::EnsurePredicateSubsetPlan(
                         p_numTagsPerVec ||
                     (m_predicateSubsetPlannerEnabled &&
                      plan->workload.categoricalColumnCount !=
-                         m_predicateSubsetCategoricalColumnCount)) {
+                         m_predicateSubsetCategoricalColumnCount) ||
+                    (!m_predicateSubsetAttributeKinds.empty() &&
+                     plan->workload.attributeKinds !=
+                         m_predicateSubsetAttributeKinds)) {
                     fprintf(stderr,
                             "[ERROR] Tenant %d: persisted predicate subset plan "
                             "does not match the tag layout\n",
@@ -2482,11 +2631,19 @@ bool TenantIndexManager::EnsurePredicateSubsetPlan(
                 return false;
             }
             SPTAG::PredicateSubsetPlanner::Workload workload;
-            if (!SPTAG::PredicateSubsetPlanner::LoadWorkload(
-                    m_predicateSubsetWorkloadFile,
-                    m_predicateSubsetCategoricalColumnCount,
-                    &workload,
-                    &error)) {
+            const bool workloadLoaded =
+                !m_predicateSubsetAttributeKinds.empty()
+                ? SPTAG::PredicateSubsetPlanner::LoadWorkload(
+                      m_predicateSubsetWorkloadFile,
+                      m_predicateSubsetAttributeKinds,
+                      &workload,
+                      &error)
+                : SPTAG::PredicateSubsetPlanner::LoadWorkload(
+                      m_predicateSubsetWorkloadFile,
+                      m_predicateSubsetCategoricalColumnCount,
+                      &workload,
+                      &error);
+            if (!workloadLoaded) {
                 fprintf(stderr,
                         "[ERROR] Tenant %d: predicate workload load failed: %s\n",
                         p_tenantId,
@@ -2763,14 +2920,14 @@ bool TenantIndexManager::EnsurePredicateSubsetPlan(
 
     fprintf(stderr,
             "[INFO] Tenant %d: workload planner %s %zu leaves "
-            "(sample=%zu/%d trainCost=%.6f validationCost=%.6f)\n",
+            "(sample=%zu/%d trainScore=%.6f validationScore=%.6f)\n",
             p_tenantId,
             plan->loadedFromFile ? "restored" : "selected",
             nodeCount,
             plan->sampleRows,
             p_numVectors,
-            plan->selectedTrainingCost,
-            plan->selectedValidationCost);
+            plan->selectedTrainingScore,
+            plan->selectedValidationScore);
     return true;
 }
 
@@ -3096,19 +3253,14 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                 fprintf(stderr, "[INFO] Tenant %d: SPTAG_DISABLE_PIVOT_ESTIMATOR set, skipping node-aware planning\n", tenantId);
             }
             if (!workloadPlanned && !skipPivot && !tenantLocalTags.empty()) {
-                // Routing/bundle planning must consider only the CATEGORICAL tag
-                // columns. Numeric attributes are inlined as the last
-                // SPTAG_NUMERIC_COLS columns (raw, high-cardinality values); if
-                // fed to the hierarchy pivot estimator they masquerade as deep
-                // hierarchy levels with ~unique values, collapsing the plan to a
-                // single bundle. Build a categorical-only view (first
-                // numBaseCols columns) for all three planning calls. The actual
-                // SPANN build below still uses the full m_buildNumTagsPerVec tags.
-                int numNumericCols = 0;
-                if (const char* e = std::getenv("SPTAG_NUMERIC_COLS")) numNumericCols = atoi(e);
-                if (numNumericCols < 0) numNumericCols = 0;
-                if (numNumericCols > m_buildNumTagsPerVec) numNumericCols = m_buildNumTagsPerVec;
-                const int numBaseCols = m_buildNumTagsPerVec - numNumericCols;
+                AttributeLayout attributeLayout;
+                std::string schemaError;
+                if (!ResolveAttributeLayout(
+                        m_buildNumTagsPerVec, &attributeLayout, &schemaError)) {
+                    fprintf(stderr, "[ERROR] Tenant %d: %s\n",
+                            tenantId, schemaError.c_str());
+                    return false;
+                }
 
                 // Categorical columns that drive routing/bundle planning. By
                 // default all categorical columns participate (the legacy ACL
@@ -3125,14 +3277,14 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                 //     YFCC country(col0) -> us_state(col4) => SPTAG_ACL_COLS=0,4.
                 //   * SPTAG_ROUTING_COLS=K     -> leading-K columns (legacy). Used
                 //     only when SPTAG_ACL_COLS is unset.
-                // Column indices are clamped to [0, numBaseCols); out-of-range or
-                // duplicate entries are dropped.
+                // Explicit routing columns must refer to categorical attributes.
                 std::vector<int> routingCols;
                 if (const char* e = std::getenv("SPTAG_ACL_COLS")) {
                     const char* p = e;
                     while (*p != '\0') {
                         int c = atoi(p);
-                        if (c >= 0 && c < numBaseCols) {
+                        if (c >= 0 && c < m_buildNumTagsPerVec &&
+                            attributeLayout.kinds[static_cast<std::size_t>(c)] == 0) {
                             bool dup = false;
                             for (int existing : routingCols) if (existing == c) { dup = true; break; }
                             if (!dup) routingCols.push_back(c);
@@ -3143,12 +3295,15 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                     }
                 }
                 if (routingCols.empty()) {
-                    int numRoutingCols = numBaseCols;
+                    int numRoutingCols =
+                        static_cast<int>(attributeLayout.categoricalColumns.size());
                     if (const char* e = std::getenv("SPTAG_ROUTING_COLS")) {
                         int k = atoi(e);
-                        if (k > 0) numRoutingCols = (k < numBaseCols) ? k : numBaseCols;
+                        if (k > 0) numRoutingCols = std::min(k, numRoutingCols);
                     }
-                    for (int t = 0; t < numRoutingCols; ++t) routingCols.push_back(t);
+                    routingCols.assign(
+                        attributeLayout.categoricalColumns.begin(),
+                        attributeLayout.categoricalColumns.begin() + numRoutingCols);
                 }
 
                 const uint32_t* planTags = tenantLocalTags.data();
@@ -3172,8 +3327,10 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                         colList += (t ? "," : "") + std::to_string(routingCols[t]);
                     fprintf(stderr,
                             "[INFO] Tenant %d: routing-node planning on %d categorical cols [%s] "
-                            "(of %d base, %d numeric)\n",
-                            tenantId, numRoutingCols, colList.c_str(), numBaseCols, numNumericCols);
+                            "(of %zu categorical, %zu numeric)\n",
+                            tenantId, numRoutingCols, colList.c_str(),
+                            attributeLayout.categoricalColumns.size(),
+                            attributeLayout.numericColumns.size());
                 }
 
                 PivotEstimatorComputation pivotComputation;
@@ -4225,21 +4382,35 @@ void TenantIndexManager::LoadTenantSparseIndices()
         FILE* nf = fopen(nmPath.c_str(), "rb");
         if (!nf) continue;
         int32_t magic = 0, base = 0, ncols = 0;
-        if (fread(&magic, sizeof(int32_t), 1, nf) == 1 && magic == 0x54454d4e &&
-            fread(&base, sizeof(int32_t), 1, nf) == 1 &&
-            fread(&ncols, sizeof(int32_t), 1, nf) == 1 && ncols > 0 && ncols < 4096) {
+        if (fread(&magic, sizeof(int32_t), 1, nf) == 1 &&
+            (magic == 0x54454d4e || magic == 0x32454d4e) &&
+            fread(&base, sizeof(int32_t), 1, nf) == 1) {
+            if (magic == 0x54454d4e) {
+                if (fread(&ncols, sizeof(int32_t), 1, nf) != 1) ncols = 0;
+            } else {
+                ncols = base;
+                base = 0;
+            }
+        }
+        if (ncols > 0 && ncols < 4096) {
             NumericMeta nm;
-            nm.numBaseCols = base;
+            nm.columns.resize(static_cast<size_t>(ncols));
             nm.params.resize(static_cast<size_t>(ncols));
             bool ok = true;
             for (int c = 0; c < ncols; ++c) {
+                if (magic == 0x32454d4e &&
+                    fread(&nm.columns[c], sizeof(int32_t), 1, nf) != 1) {
+                    ok = false;
+                    break;
+                }
+                if (magic == 0x54454d4e) nm.columns[c] = base + c;
                 if (fread(&nm.params[c].lo, sizeof(uint32_t), 1, nf) != 1 ||
                     fread(&nm.params[c].hi, sizeof(uint32_t), 1, nf) != 1) { ok = false; break; }
             }
             if (ok) {
                 m_tenantNumericMeta[tenantId] = std::move(nm);
-                fprintf(stderr, "[INFO] Tenant %d: loaded numeric_meta.bin (base=%d numeric=%d)\n",
-                        tenantId, base, ncols);
+                fprintf(stderr, "[INFO] Tenant %d: loaded numeric_meta.bin (%d numeric columns)\n",
+                        tenantId, ncols);
             }
         }
         fclose(nf);
@@ -4913,6 +5084,18 @@ void TenantIndexManager::EvictIfNeeded()
 bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p_numVectors, int p_numTagsPerVec)
 {
     const uint32_t* p_tagsPtr = reinterpret_cast<const uint32_t*>(p_tags.Data());
+    AttributeLayout signatureAttributeLayout;
+    std::string signatureSchemaError;
+    if (!ResolveAttributeLayout(
+            p_numTagsPerVec, &signatureAttributeLayout,
+            &signatureSchemaError)) {
+        fprintf(stderr, "[ERROR] Tenant %d: %s\n",
+                p_tenantId, signatureSchemaError.c_str());
+        return false;
+    }
+    const std::vector<int> signatureCategoricalWidths =
+        ApplyHierWidthsFromEnv(
+            signatureAttributeLayout.categoricalColumns);
 
     auto wdIt = m_tenantSpannWorkDirs.find(p_tenantId);
     if (wdIt == m_tenantSpannWorkDirs.end()) return false;
@@ -5011,7 +5194,41 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
         const std::string sigPath     = workDir + "/signatures_bitmask.bin";
         const std::string sparsePath  = workDir + "/sparse_tags.bin";
         const std::string tagPurePath = workDir + "/tagpure_meta.bin";
-        bool sigOk     = stat(sigPath.c_str(),     &st) == 0;
+        SPTAG::Cache::TenantBitmaskPS persistedSignatures;
+        bool sigOk = stat(sigPath.c_str(), &st) == 0 &&
+                     persistedSignatures.Load(sigPath) &&
+                     persistedSignatures.has_tail_signatures;
+        bool dynamicMetaOk = false;
+        if (FILE* meta = fopen(HeadNodeMetaPath(workDir).c_str(), "rb")) {
+            HeadNodeMetaFileHeader persistedHeader{};
+            int32_t categoricalCount = -1;
+            int32_t flags = 0;
+            if (fread(&persistedHeader, sizeof(persistedHeader), 1, meta) == 1 &&
+                persistedHeader.version == kHeadNodeMetaVersionV7 &&
+                fread(&categoricalCount, sizeof(categoricalCount), 1, meta) == 1 &&
+                fread(&flags, sizeof(flags), 1, meta) == 1 &&
+                (flags & 1) != 0 &&
+                categoricalCount ==
+                    static_cast<int32_t>(
+                       signatureAttributeLayout.categoricalColumns.size())) {
+                dynamicMetaOk = true;
+                for (int lane = 0;
+                     dynamicMetaOk && lane < categoricalCount;
+                     ++lane) {
+                    int32_t entry[2] = {};
+                    dynamicMetaOk =
+                       fread(entry, sizeof(entry), 1, meta) == 1 &&
+                       entry[0] ==
+                           signatureAttributeLayout.categoricalColumns[
+                               static_cast<std::size_t>(lane)] &&
+                       entry[1] ==
+                           SPTAG::Cache::HierWidths().bits[
+                               static_cast<std::size_t>(lane)];
+                }
+            }
+            fclose(meta);
+        }
+        sigOk = sigOk && dynamicMetaOk;
         bool sparseOk  = stat(sparsePath.c_str(),  &st) == 0;
         bool tagPureOk = stat(tagPurePath.c_str(), &st) == 0;
         bool predicateOk = !usePredicateSubsetPlan;
@@ -5180,12 +5397,6 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
     }
     if (numHeads <= 0) return false;
 
-    // Apply per-column hier mask widths from SPTAG_HIER_LEVEL_WIDTHS before any
-    // mask is built or InitializeHeadNodeMeta is called below; this fixes the
-    // per-head posting-mask byte layout for the whole build (and is persisted in
-    // the V5 head_node_meta header by SaveHeadNodeMetaFile).
-    ApplyHierWidthsFromEnv();
-
     // ── Routing-only fast path (SPTAG_ROUTING_ONLY=1) ───────────────────────
     // Regenerate ONLY the query-time routing sidecar (tag_node_index.bin) from
     // the loaded head index + per-vector tags, skipping the expensive posting
@@ -5219,7 +5430,10 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
             memoryIndex->HasHeadNodeMeta() &&
             memoryIndex->GetHeadNodeMetaSampleCount() >= numHeadSamples;
         if (!preserveHeadNodeMeta) {
-            memoryIndex->InitializeHeadNodeMeta(numHeadSamples);
+            memoryIndex->InitializeHeadNodeMeta(
+                numHeadSamples, 0, true,
+                signatureAttributeLayout.categoricalColumns,
+                signatureCategoricalWidths);
         }
         spannInternalIdx->PopulateHeadNodeGlobalVIDsFromBundles();
 
@@ -5264,24 +5478,22 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
             return routingOk && predicateOk && metaOk;
         }
 
-        // Reproduce the build-time routing-column projection so the recomputed
-        // pivot partition (and thus node numbering) matches the physical layout.
-        // The last SPTAG_NUMERIC_COLS columns are numeric attributes that do NOT
-        // form a tag hierarchy; feeding them to the estimator fails its
-        // parent-uniqueness check. SPTAG_ACL_COLS selects the categorical routing
-        // columns (identity 0..numBaseCols-1 by default). Mirrors lines ~2206-2268.
-        int numNumericCols = 0;
-        if (const char* e = std::getenv("SPTAG_NUMERIC_COLS")) numNumericCols = atoi(e);
-        if (numNumericCols < 0) numNumericCols = 0;
-        if (numNumericCols > p_numTagsPerVec) numNumericCols = p_numTagsPerVec;
-        const int numBaseCols = p_numTagsPerVec - numNumericCols;
+        AttributeLayout attributeLayout;
+        std::string schemaError;
+        if (!ResolveAttributeLayout(
+                p_numTagsPerVec, &attributeLayout, &schemaError)) {
+            fprintf(stderr, "[ERROR] Tenant %d: %s\n",
+                    p_tenantId, schemaError.c_str());
+            return false;
+        }
         std::vector<int> routingCols;
         if (const char* e = std::getenv("SPTAG_ACL_COLS")) {
             std::stringstream ss(e);
             std::string tok;
             while (std::getline(ss, tok, ',')) {
                 int c = atoi(tok.c_str());
-                if (c >= 0 && c < numBaseCols) {
+                if (c >= 0 && c < p_numTagsPerVec &&
+                    attributeLayout.kinds[static_cast<std::size_t>(c)] == 0) {
                     bool dup = false;
                     for (int existing : routingCols) if (existing == c) { dup = true; break; }
                     if (!dup) routingCols.push_back(c);
@@ -5289,12 +5501,15 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
             }
         }
         if (routingCols.empty()) {
-            int numRoutingCols = numBaseCols;
+            int numRoutingCols =
+                static_cast<int>(attributeLayout.categoricalColumns.size());
             if (const char* e = std::getenv("SPTAG_ROUTING_COLS")) {
                 int k = atoi(e);
-                if (k > 0) numRoutingCols = (k < numBaseCols) ? k : numBaseCols;
+                if (k > 0) numRoutingCols = std::min(k, numRoutingCols);
             }
-            for (int t = 0; t < numRoutingCols; ++t) routingCols.push_back(t);
+            routingCols.assign(
+                attributeLayout.categoricalColumns.begin(),
+                attributeLayout.categoricalColumns.begin() + numRoutingCols);
         }
         const int numRoutingCols = static_cast<int>(routingCols.size());
         const uint32_t* planTags = p_tagsPtr;
@@ -5314,7 +5529,10 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
             planNumTags = numRoutingCols;
         }
         fprintf(stderr, "[INFO] Tenant %d: ROUTING_ONLY planning on %d categorical cols "
-                "(of %d base, %d numeric)\n", p_tenantId, numRoutingCols, numBaseCols, numNumericCols);
+                "(of %zu categorical, %zu numeric)\n",
+                p_tenantId, numRoutingCols,
+                attributeLayout.categoricalColumns.size(),
+                attributeLayout.numericColumns.size());
 
         PivotEstimatorComputation pivotComputation;
         const PivotEstimatorCandidate* pivotCandidate = nullptr;
@@ -5391,33 +5609,52 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
             auto* spannInternalIdx = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(internalIdx.get());
             if (memoryIndex == nullptr || spannInternalIdx == nullptr) return false;
 
+            AttributeLayout attributeLayout;
+            std::string schemaError;
+            if (!ResolveAttributeLayout(
+                    p_numTagsPerVec, &attributeLayout, &schemaError)) {
+                fprintf(stderr, "[ERROR] Tenant %d: %s\n",
+                        p_tenantId, schemaError.c_str());
+                return false;
+            }
             const auto* staticOptions = spannInternalIdx->GetOptions();
             const int staticACLTagCols =
                 staticOptions != nullptr && staticOptions->m_staticACLTagCols > 0
                 ? staticOptions->m_staticACLTagCols
-                : p_numTagsPerVec;
-            if (staticACLTagCols <= 0 || staticACLTagCols > p_numTagsPerVec) {
+                : static_cast<int>(attributeLayout.categoricalColumns.size());
+            if (staticACLTagCols <= 0 ||
+                staticACLTagCols >
+                    static_cast<int>(attributeLayout.categoricalColumns.size())) {
                 fprintf(stderr, "[ERROR] Tenant %d: StaticACLTagCols=%d is invalid for %d tag columns.\n",
                         p_tenantId, staticACLTagCols, p_numTagsPerVec);
                 return false;
             }
+            std::vector<int> categoricalColumns(
+                attributeLayout.categoricalColumns.begin(),
+                attributeLayout.categoricalColumns.begin() + staticACLTagCols);
             SizeType numHeadSamples = memoryIndex->GetNumSamples();
             if (numHeadSamples < (SizeType)numHeads) numHeadSamples = (SizeType)numHeads;
 
             // tag_level_offsets.bin covers categorical hierarchy columns only.
             // Numeric columns are range-filter attributes, not hierarchy levels.
             {
-                const int numBaseCols = staticACLTagCols;
-                std::vector<uint32_t> levelMin(numBaseCols, std::numeric_limits<uint32_t>::max());
+                std::vector<uint32_t> levelMin(
+                    categoricalColumns.size(),
+                    std::numeric_limits<uint32_t>::max());
                 for (int vid = 0; vid < p_numVectors; ++vid)
-                    for (int t = 0; t < numBaseCols; ++t) {
-                        uint32_t tag = p_tagsPtr[(size_t)vid * p_numTagsPerVec + t];
-                        if (tag < levelMin[t]) levelMin[t] = tag;
+                    for (std::size_t lane = 0;
+                         lane < categoricalColumns.size();
+                         ++lane) {
+                        const int column = categoricalColumns[lane];
+                        uint32_t tag =
+                            p_tagsPtr[(size_t)vid * p_numTagsPerVec + column];
+                        if (tag < levelMin[lane]) levelMin[lane] = tag;
                     }
                 m_tenantTagLevelOffsets[p_tenantId] = levelMin;
                 const std::string offPath = workDir + "/tag_level_offsets.bin";
                 if (FILE* of = fopen(offPath.c_str(), "wb")) {
-                    int32_t nLevels = numBaseCols;
+                    int32_t nLevels =
+                        static_cast<int32_t>(categoricalColumns.size());
                     fwrite(&nLevels, sizeof(int32_t), 1, of);
                     fwrite(levelMin.data(), sizeof(uint32_t), levelMin.size(), of);
                     fclose(of);
@@ -5441,7 +5678,10 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                                                 m_tenantTagToNodes[p_tenantId]);
             }
 
-            memoryIndex->InitializeHeadNodeMeta(numHeadSamples);
+            memoryIndex->InitializeHeadNodeMeta(
+                numHeadSamples, 0, true,
+                signatureAttributeLayout.categoricalColumns,
+                signatureCategoricalWidths);
             // Monolithic roots resolve through their head-ID map; metadata-only
             // roots fall back to the bundle structures.
             spannInternalIdx->PopulateHeadNodeGlobalVIDsFromBundles();
@@ -5460,7 +5700,7 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                 struct stat staticSnapshotStat {};
                 if (stat(staticSnapshotPath.c_str(), &staticSnapshotStat) == 0) {
                     if (!BuildStaticPostingHierMasks(staticSnapshotPath, numHeads, p_numTagsPerVec,
-                                                      staticACLTagCols,
+                                                      categoricalColumns,
                                                       postingHierMasks)) {
                         return false;
                     }
@@ -5498,8 +5738,11 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                             for (size_t i = 0; i < n; ++i) {
                                 const std::uint8_t* e = base + i * (size_t)recSize;
                                 const uint32_t* vt = reinterpret_cast<const uint32_t*>(e + tagByteOff);
-                                for (int t = 0; t < p_numTagsPerVec; ++t)
-                                    postingHierMasks[h].Insert(t, vt[t]);
+                                for (int column :
+                                     attributeLayout.categoricalColumns) {
+                                    postingHierMasks[h].Insert(
+                                        column, vt[column]);
+                                }
                             }
                         }
                         fprintf(stderr, "[INFO] Tenant %d: built posting hier masks for %zu slim postings.\n",
@@ -5522,13 +5765,12 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                     memoryIndex->SetHeadNodePostingHierMask(hid, postingHierMasks[hid]);
                 if (globalVID == SPTAG::MaxSize || globalVID >= (SizeType)p_numVectors) continue;
                 ++resolved;
-                SPTAG::Cache::HierarchicalOwnTags ownMask;
-                ownMask.Clear();
-                for (int t = 0;
-                     t < (std::min)(p_numTagsPerVec, SPTAG::Cache::HIER_LEVELS);
-                     ++t) {
-                    uint32_t tag = p_tagsPtr[(size_t)globalVID * p_numTagsPerVec + t];
-                    ownMask.Insert(t, tag);
+                auto ownMask = memoryIndex->CreateHeadNodeOwnTags();
+                for (int column : attributeLayout.categoricalColumns) {
+                    uint32_t tag = p_tagsPtr[
+                        static_cast<size_t>(globalVID) * p_numTagsPerVec +
+                        static_cast<size_t>(column)];
+                    ownMask.Insert(column, tag);
                 }
                 memoryIndex->SetHeadNodeHierMask(hid, ownMask);
             }
@@ -5679,6 +5921,7 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
 
     // 4. For each posting, read its blocks and extract vector IDs
     std::vector<std::vector<uint32_t>> posting_tags(numHeads);
+    std::vector<std::vector<uint32_t>> posting_tail_tags(numHeads);
     std::vector<SPTAG::Cache::HierarchicalPostingMask> posting_hier_masks(numHeads);
     uint64_t totalAssignments = 0;
     std::vector<uint8_t> blockBuf(PAGE_SIZE);
@@ -5692,42 +5935,51 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
         return FULL_VEC_INFO_SIZE;
     };
 
-    // ── Numeric attribute setup (quantized signature) ──────────────────────
-    // The last `numNumericCols` tag columns are numeric attributes: the RAW value
-    // is stored inline per vector (read by the exact filter) and a quantized
-    // bucket is OR-ed into the per-posting numeric signature for range pruning.
-    // numNumericCols=0 => pure categorical (layout/behavior unchanged).
-    int numNumericCols = 0;
-    if (const char* e = std::getenv("SPTAG_NUMERIC_COLS")) numNumericCols = atoi(e);
-    if (numNumericCols < 0) numNumericCols = 0;
-    if (numNumericCols > p_numTagsPerVec) numNumericCols = p_numTagsPerVec;
-    const int numBaseCols = p_numTagsPerVec - numNumericCols;
+    AttributeLayout attributeLayout;
+    std::string schemaError;
+    if (!ResolveAttributeLayout(
+            p_numTagsPerVec, &attributeLayout, &schemaError)) {
+        fclose(postF);
+        fprintf(stderr, "[ERROR] Tenant %d: %s\n",
+                p_tenantId, schemaError.c_str());
+        return false;
+    }
+    const int numNumericCols =
+        static_cast<int>(attributeLayout.numericColumns.size());
     std::vector<SPTAG::Cache::NumQuantParam> quantParams(numNumericCols);
     if (numNumericCols > 0) {
         for (int c = 0; c < numNumericCols; ++c) { quantParams[c].lo = UINT32_MAX; quantParams[c].hi = 0; }
         for (int vid = 0; vid < p_numVectors; ++vid)
             for (int c = 0; c < numNumericCols; ++c) {
-                uint32_t v = p_tagsPtr[(size_t)vid * p_numTagsPerVec + numBaseCols + c];
+                const int column =
+                    attributeLayout.numericColumns[static_cast<std::size_t>(c)];
+                uint32_t v =
+                    p_tagsPtr[(size_t)vid * p_numTagsPerVec + column];
                 if (v < quantParams[c].lo) quantParams[c].lo = v;
                 if (v > quantParams[c].hi) quantParams[c].hi = v;
             }
         // Persist quant metadata so query processes can reconstruct the mapping.
         const std::string nmPath = workDir + "/numeric_meta.bin";
         if (FILE* nf = fopen(nmPath.c_str(), "wb")) {
-            int32_t magic = 0x54454d4e;  // 'NMET'
-            int32_t base = numBaseCols, ncols = numNumericCols;
+            int32_t magic = 0x32454d4e;  // 'NME2'
+            int32_t ncols = numNumericCols;
             fwrite(&magic, sizeof(int32_t), 1, nf);
-            fwrite(&base, sizeof(int32_t), 1, nf);
             fwrite(&ncols, sizeof(int32_t), 1, nf);
             for (int c = 0; c < numNumericCols; ++c) {
+                const int32_t column = attributeLayout.numericColumns[
+                    static_cast<std::size_t>(c)];
+                fwrite(&column, sizeof(int32_t), 1, nf);
                 fwrite(&quantParams[c].lo, sizeof(uint32_t), 1, nf);
                 fwrite(&quantParams[c].hi, sizeof(uint32_t), 1, nf);
             }
             fclose(nf);
-            fprintf(stderr, "[INFO] Tenant %d: wrote numeric_meta.bin (base=%d numeric=%d)\n",
-                    p_tenantId, numBaseCols, numNumericCols);
+            fprintf(stderr, "[INFO] Tenant %d: wrote numeric_meta.bin (%d numeric columns)\n",
+                    p_tenantId, numNumericCols);
         }
-        m_tenantNumericMeta[p_tenantId] = {numBaseCols, quantParams};
+        NumericMeta numericMeta;
+        numericMeta.columns = attributeLayout.numericColumns;
+        numericMeta.params = quantParams;
+        m_tenantNumericMeta[p_tenantId] = std::move(numericMeta);
     }
     std::vector<uint64_t> posting_num_quant(
         (size_t)numHeads * (size_t)numNumericCols * SPTAG::Cache::NUM_QUANT_WORDS, 0);
@@ -5778,22 +6030,28 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
             // Only the pure prefix drives the filter sidecars. Unfilter-tail
             // vectors (j >= nPure) must not pollute the per-head tag masks.
             if (j < nPure) {
-                // Categorical tags (cols 0..numBaseCols-1) -> Bloom + hier mask.
-                for (int t = 0; t < numBaseCols; t++) {
-                    uint32_t tag = p_tagsPtr[vid * p_numTagsPerVec + t];
+                for (int column : attributeLayout.categoricalColumns) {
+                    uint32_t tag =
+                        p_tagsPtr[vid * p_numTagsPerVec + column];
                     posting_tags[pid].push_back(tag);
-                    // Also insert into hierarchical mask at level t
-                    posting_hier_masks[pid].Insert(t, tag);
+                    posting_hier_masks[pid].Insert(column, tag);
                 }
-                // Numeric attributes (cols numBaseCols..) -> quantized signature.
                 for (int c = 0; c < numNumericCols; c++) {
-                    uint32_t v = p_tagsPtr[vid * p_numTagsPerVec + numBaseCols + c];
+                    const int column = attributeLayout.numericColumns[
+                        static_cast<std::size_t>(c)];
+                    uint32_t v =
+                        p_tagsPtr[vid * p_numTagsPerVec + column];
                     int b = SPTAG::Cache::NumQuantBucket(quantParams[c], v);
                     SPTAG::Cache::NumQuantInsert(
                         posting_num_quant.data() + (size_t)pid * numNumericCols * SPTAG::Cache::NUM_QUANT_WORDS,
                         c, b);
                 }
                 totalAssignments++;
+            } else {
+                for (int column : attributeLayout.categoricalColumns) {
+                    posting_tail_tags[pid].push_back(
+                        p_tagsPtr[vid * p_numTagsPerVec + column]);
+                }
             }
 
             // First-occurrence capture of vector payload for tag-pure path.
@@ -5810,7 +6068,7 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
     fclose(postF);
 
     auto sigs = std::make_shared<SPTAG::Cache::TenantBitmaskPS>();
-    sigs->Build(numHeads, posting_tags);
+    sigs->Build(numHeads, posting_tags, posting_tail_tags);
 
     std::string sigPath = workDir + "/signatures_bitmask.bin";
     sigs->Save(sigPath);
@@ -5823,17 +6081,23 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
     // Tag value ranges are disjoint per level, so the per-column minimum is a
     // valid level boundary. Persist these so query processes can load them.
     {
-        std::vector<uint32_t> levelMin(numBaseCols, std::numeric_limits<uint32_t>::max());
+        std::vector<uint32_t> levelMin(
+            attributeLayout.categoricalColumns.size(),
+            std::numeric_limits<uint32_t>::max());
         for (int vid = 0; vid < p_numVectors; ++vid) {
-            for (int t = 0; t < numBaseCols; ++t) {
-                uint32_t tag = p_tagsPtr[vid * p_numTagsPerVec + t];
-                if (tag < levelMin[t]) levelMin[t] = tag;
+            for (std::size_t lane = 0;
+                 lane < attributeLayout.categoricalColumns.size();
+                 ++lane) {
+                const int column = attributeLayout.categoricalColumns[lane];
+                uint32_t tag =
+                    p_tagsPtr[vid * p_numTagsPerVec + column];
+                if (tag < levelMin[lane]) levelMin[lane] = tag;
             }
         }
         m_tenantTagLevelOffsets[p_tenantId] = levelMin;
         const std::string offPath = workDir + "/tag_level_offsets.bin";
         if (FILE* of = fopen(offPath.c_str(), "wb")) {
-            int32_t nLevels = numBaseCols;
+            int32_t nLevels = static_cast<int32_t>(levelMin.size());
             fwrite(&nLevels, sizeof(int32_t), 1, of);
             fwrite(levelMin.data(), sizeof(uint32_t), levelMin.size(), of);
             fclose(of);
@@ -5979,20 +6243,24 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
         auto* spannInternalIdx = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(internalIdx.get());
         if (memoryIndex != nullptr && spannInternalIdx != nullptr) {
             const SizeType numHeadSamples = memoryIndex->GetNumSamples();
-            memoryIndex->InitializeHeadNodeMeta(numHeadSamples, numNumericCols);
+            memoryIndex->InitializeHeadNodeMeta(
+                numHeadSamples, numNumericCols, true,
+                signatureAttributeLayout.categoricalColumns,
+                signatureCategoricalWidths);
             for (SizeType hid = 0; hid < numHeadSamples; ++hid) {
                 SizeType globalVID = spannInternalIdx->GetGlobalVID(hid);
                 memoryIndex->SetHeadNodeGlobalVID(hid, globalVID);
                 if (hid < sigs->num_postings) {
-                    memoryIndex->SetHeadNodePS(hid, sigs->ps[hid]);
+                    memoryIndex->SetHeadNodePS(hid, sigs->ps[hid].pure);
+                    memoryIndex->SetHeadNodeTailPS(hid, sigs->ps[hid].tail);
                 }
 
                 // Posting-content mask: union of all member-vector tags in the
                 // head's posting. Drives the dense-path posting pre-filter so
                 // that a posting is kept iff at least one of its member vectors
                 // MAY carry a tag matching the query (no-false-negative filter).
-                SPTAG::Cache::HierarchicalPostingMask postingMask;
-                postingMask.Clear();
+                auto postingMask =
+                    memoryIndex->CreateHeadNodePostingHierMask();
                 if (hid < (SizeType)posting_hier_masks.size()) {
                     postingMask = posting_hier_masks[hid];
                 }
@@ -6032,11 +6300,13 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                 // (head centroids are real dataset vectors but are never stored
                 // as members of any posting, so without this gate they would
                 // either be lost or leaked regardless of their own tag).
-                SPTAG::Cache::HierarchicalOwnTags ownMask;
-                ownMask.Clear();
-                for (int t = 0; t < p_numTagsPerVec; ++t) {
-                    uint32_t tag = p_tagsPtr[static_cast<size_t>(globalVID) * static_cast<size_t>(p_numTagsPerVec) + static_cast<size_t>(t)];
-                    ownMask.Insert(t, tag);
+                auto ownMask = memoryIndex->CreateHeadNodeOwnTags();
+                for (int column : attributeLayout.categoricalColumns) {
+                    uint32_t tag = p_tagsPtr[
+                        static_cast<size_t>(globalVID) *
+                            static_cast<size_t>(p_numTagsPerVec) +
+                        static_cast<size_t>(column)];
+                    ownMask.Insert(column, tag);
                 }
                 memoryIndex->SetHeadNodeHierMask(hid, ownMask);
 
@@ -6338,7 +6608,8 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
 bool TenantIndexManager::BackfillPrimaryHeadCSR(int p_tenantId, ByteArray p_vectors, int p_numVectors,
                                                 ByteArray p_tags, int p_numTagsPerVec)
 {
-    if (p_vectors.Data() == nullptr || p_tags.Data() == nullptr || p_numVectors <= 0 || p_numTagsPerVec < 5) {
+    if (p_vectors.Data() == nullptr || p_tags.Data() == nullptr ||
+        p_numVectors <= 0 || p_numTagsPerVec <= 0) {
         return false;
     }
     if (!EnsureTenantLoaded(p_tenantId)) return false;
@@ -6964,6 +7235,28 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
     }
     auto memoryIndex = GetMemoryIndexForInternal(internalIdx);
     EnsureHeadNodeMetaLoaded(workDir, internalIdx);
+    if (memoryIndex != nullptr && memoryIndex->HasHeadNodeMeta() &&
+        queryHierMask.layout.columns !=
+            memoryIndex->GetHeadNodeHierLayout().columns) {
+        queryHierMask.Reset(memoryIndex->GetHeadNodeHierLayout());
+        for (int i = 0; i < effNumTags; ++i) {
+            const uint32_t qtag = effTagsPtr[i];
+            int level = 0;
+            if (levelOffsets != nullptr) {
+                for (int lane = 0;
+                     lane < static_cast<int>(levelOffsets->size());
+                     ++lane) {
+                    if (qtag >= (*levelOffsets)[lane]) {
+                        level = memoryIndex->GetHeadNodeHierLayout()
+                            .columns[static_cast<std::size_t>(lane)];
+                    } else {
+                        break;
+                    }
+                }
+            }
+            queryHierMask.Insert(level, qtag);
+        }
+    }
     auto _ck_qmask = s_wrapperTime ? std::chrono::high_resolution_clock::now()
                                    : std::chrono::high_resolution_clock::time_point{};
     SPTAG::VectorIndex::ThreadLocalSearchContext searchContext;
@@ -7015,9 +7308,13 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
                 const int quantCols = memoryIndex->GetHeadNodeNumQuantCols();
                 const SPTAG::Cache::NumQuantParam* qp =
                     (numMeta != nullptr && !numMeta->params.empty()) ? numMeta->params.data() : nullptr;
-                const int numBase = (numMeta != nullptr) ? numMeta->numBaseCols : 0;
+                const int* numericColumns =
+                    (numMeta != nullptr && !numMeta->columns.empty())
+                    ? numMeta->columns.data()
+                    : nullptr;
                 searchContext.m_postingFilter =
-                    [memIdx = memoryIndex.get(), queryHierMask, dnf, dnfHasNum, quantCols, qp, numBase](int localHid) {
+                    [memIdx = memoryIndex.get(), queryHierMask, dnf, dnfHasNum,
+                     quantCols, qp, numericColumns](int localHid) {
                         // Use the per-posting multi-membership mask (union of all
                         // member-vector tags). MayIntersect / MayMatchHier are
                         // no-false-negative so they are safe as a pre-filter; the
@@ -7025,17 +7322,27 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
                         // exact filtering (DNF eval when present). Numeric range
                         // literals additionally prune on the quantized numeric
                         // signature (MayMatchHierQuant) when present.
-                        const auto* hierMask = memIdx->GetHeadNodePostingHierMask(localHid);
-                        if (hierMask == nullptr) return true;  // fail open
+                        const auto hierMask =
+                            memIdx->GetHeadNodePostingHierMask(localHid);
+                        if (hierMask.mask == nullptr) return true;  // fail open
                         if (!dnf.Empty()) {
                             if (dnfHasNum && quantCols > 0 && qp != nullptr) {
                                 const std::uint64_t* quant = memIdx->GetHeadNodeNumQuant(localHid);
                                 if (quant != nullptr)
-                                    return dnf.MayMatchHierQuant(*hierMask, quant, quantCols, qp, numBase);
+                                    return dnf.MayMatchHierQuant(
+                                        hierMask, quant, quantCols, qp,
+                                        numericColumns);
                             }
-                            return dnf.MayMatchHier(*hierMask);
+                            return dnf.MayMatchHier(hierMask);
                         }
-                        return hierMask->MayIntersect(queryHierMask);
+                        return hierMask.MayIntersect(queryHierMask);
+                    };
+                searchContext.m_tailPostingFilter =
+                    [memIdx = memoryIndex.get(), queryMask,
+                     hasCategorical = effNumTags > 0](int localHid) {
+                        if (!hasCategorical) return true;
+                        const auto* tailMask = memIdx->GetHeadNodeTailPS(localHid);
+                        return tailMask == nullptr || tailMask->MayIntersect(queryMask);
                     };
                 }
             }

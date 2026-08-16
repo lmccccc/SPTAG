@@ -443,14 +443,18 @@ namespace SPTAG
                 if (m_staticPipePQ) {
                     return SearchIndexPipePQ(p_exWorkSpace, p_queryResults, p_index, p_stats, truth, found);
                 }
-                if (HasStaticMetadataFilter(p_exWorkSpace)) {
+                if (HasStaticMetadataFilter(p_exWorkSpace) ||
+                    UseStaticTailSuffix(p_exWorkSpace, nullptr)) {
                     auto& postingIDs = p_exWorkSpace->m_postingIDs;
                     postingIDs.erase(
                         std::remove_if(
                             postingIDs.begin(), postingIDs.end(),
                             [this, p_exWorkSpace](SizeType p_postingID) {
                                 return p_postingID < 0 || p_postingID >= m_totalListCount ||
-                                    StaticScanLimit(p_exWorkSpace, &m_listInfos[p_postingID]) == 0;
+                                    BuildStaticPostingReadRange(
+                                        p_exWorkSpace,
+                                        p_postingID,
+                                        &m_listInfos[p_postingID]).ScanCount() == 0;
                             }),
                         postingIDs.end());
                 }
@@ -711,14 +715,18 @@ namespace SPTAG
             virtual ErrorCode SearchIndexWithoutParsing(ExtraWorkSpace *p_exWorkSpace) override
             {
                 if (RejectUnsupportedStaticFilter(p_exWorkSpace)) return ErrorCode::Fail;
-                if (HasStaticMetadataFilter(p_exWorkSpace)) {
+                if (HasStaticMetadataFilter(p_exWorkSpace) ||
+                    UseStaticTailSuffix(p_exWorkSpace, nullptr)) {
                     auto& postingIDs = p_exWorkSpace->m_postingIDs;
                     postingIDs.erase(
                         std::remove_if(
                             postingIDs.begin(), postingIDs.end(),
                             [this, p_exWorkSpace](SizeType p_postingID) {
                                 return p_postingID < 0 || p_postingID >= m_totalListCount ||
-                                    StaticScanLimit(p_exWorkSpace, &m_listInfos[p_postingID]) == 0;
+                                    BuildStaticPostingReadRange(
+                                        p_exWorkSpace,
+                                        p_postingID,
+                                        &m_listInfos[p_postingID]).ScanCount() == 0;
                             }),
                         postingIDs.end());
                 }
@@ -1081,7 +1089,7 @@ namespace SPTAG
 
                 const int recordBytes = m_vectorInfoSize;
                 const bool unboundedTail = p_opt.m_unfilterTailBufferLength < 0;
-                const int extraTailPages = unboundedTail
+                const int tailPageLimit = unboundedTail
                     ? -1
                     : (std::max)(0, p_opt.m_unfilterTailBufferLength);
                 auto recordsForPages = [recordBytes](int p_pages) {
@@ -1093,7 +1101,7 @@ namespace SPTAG
                 auto tailHardCapForHead = [&](SizeType p_head) {
                     const int pure = p_pureCountPerHead[static_cast<size_t>(p_head)];
                     if (unboundedTail) return (std::numeric_limits<int>::max)();
-                    return (std::max)(pure, recordsForPages(pagesForRecords(pure) + extraTailPages));
+                    return pure + recordsForPages(tailPageLimit);
                 };
                 auto sparseTailLastPageKeep = [recordBytes](int p_pure, int p_keep) {
                     if (p_keep <= p_pure) return p_pure;
@@ -1109,37 +1117,31 @@ namespace SPTAG
                 };
 
                 const std::vector<Edge>& pure = p_selections.m_selections;
-                const bool haveCrossBundleOwners =
-                    m_staticBuildVectorOwners.size() == static_cast<size_t>(p_fullCount) &&
-                    m_staticBuildHeadOwners.size() == static_cast<size_t>(headCount);
-                const bool useSingleSeedCrossGraphTail =
-                    haveCrossBundleOwners && static_cast<bool>(m_staticCrossGraphSearch);
                 const bool useBundleFanoutRNGTail =
-                    !useSingleSeedCrossGraphTail &&
-                    haveCrossBundleOwners &&
                     m_staticHeadBundleLocalToGlobalHIDs != nullptr &&
-                    m_staticHeadBundleIndexes.size() == m_staticHeadBundleLocalToGlobalHIDs->size() &&
+                    m_staticHeadBundleIndexes.size() ==
+                        m_staticHeadBundleLocalToGlobalHIDs->size() &&
                     !m_staticHeadBundleIndexes.empty();
-                const bool useGlobalRNGTail = !useSingleSeedCrossGraphTail &&
-                    haveCrossBundleOwners && !useBundleFanoutRNGTail;
                 const auto& headOwners = m_staticHeadVectorOwnersView != nullptr
                     ? *m_staticHeadVectorOwnersView
                     : m_staticHeadVectorOwners;
-                const char* tailSource = useSingleSeedCrossGraphTail
-                    ? "single-seed-cross-graph-RNG"
-                    : (useBundleFanoutRNGTail
-                        ? "bundle-fanout-RNG-cross-bundle"
-                        : (useGlobalRNGTail ? "global-RNG-cross-bundle" : "nearest-head"));
+                const char* tailSource = useBundleFanoutRNGTail
+                    ? "bundle-fanout-RNG"
+                    : "global-RNG";
                 SPTAGLIB_LOG(
                     Helper::LogLevel::LL_Info,
                     "Static Phase 4 (unfilter-tail): K_replica=%d, source=%s, recordBytes=%d, "
-                    "extraTailPages=%d, scanning %d base vectors against %d heads\n",
+                    "tailPageLimit=%d, scanning %d base vectors against %d heads\n",
                     replicaCount, tailSource,
-                    recordBytes, extraTailPages, p_fullCount, headCount);
+                    recordBytes, tailPageLimit, p_fullCount, headCount);
                 std::atomic_size_t nextVector(0);
-                std::atomic_size_t skippedDuplicate(0);
                 std::atomic_size_t skippedCapacity(0);
                 std::atomic<bool> tailSearchFailed(false);
+                std::vector<std::atomic_size_t> rngReplicaHistogram(
+                    static_cast<size_t>(replicaCount + 1));
+                for (auto& count : rngReplicaHistogram) {
+                    count.store(0, std::memory_order_relaxed);
+                }
                 constexpr size_t kTailLockShards = 256;
                 std::vector<std::vector<Edge>> tailCandidatesByHead(static_cast<size_t>(headCount));
                 std::vector<std::mutex> tailCandidateLocks(kTailLockShards);
@@ -1152,19 +1154,6 @@ namespace SPTAG
                 };
                 auto offerTailCandidate = [&](SizeType p_vectorID, SizeType p_head, float p_distance) {
                     if (p_head < 0 || p_head >= headCount) return;
-
-                    const size_t pureBegin = std::lower_bound(
-                        pure.begin(), pure.end(), p_head, Selection::g_edgeComparer) - pure.begin();
-                    const size_t pureEnd = (std::min)(
-                        pure.size(),
-                        pureBegin + static_cast<size_t>(
-                            p_pureCountPerHead[static_cast<size_t>(p_head)]));
-                    for (size_t i = pureBegin; i < pureEnd && pure[i].node == p_head; ++i) {
-                        if (pure[i].tonode == p_vectorID) {
-                            ++skippedDuplicate;
-                            return;
-                        }
-                    }
 
                     Edge edge;
                     edge.node = p_head;
@@ -1206,12 +1195,8 @@ namespace SPTAG
                     }
                 };
                 auto collectTailCandidates = [&]() {
-                    COMMON::QueryResultSet<ValueType> nearbyHeads(nullptr, replicaCount);
                     std::vector<Edge> globalSelections(static_cast<size_t>(
                         (std::max)(replicaCount, m_opt->m_replicaCount)));
-                    std::vector<std::pair<SizeType, float>> crossCandidates;
-                    crossCandidates.reserve(static_cast<size_t>(
-                        (std::max)(1, m_opt->m_internalResultNum)));
                     while (!tailSearchFailed.load(std::memory_order_acquire)) {
                         const SizeType vectorID = nextVector.fetch_add(1);
                         if (vectorID >= p_fullCount) break;
@@ -1223,99 +1208,35 @@ namespace SPTAG
                         const ValueType* vector = static_cast<const ValueType*>(
                             p_fullVectors->GetVector(vectorID));
                         if (vector == nullptr) continue;
-                        const int vectorOwner =
-                            m_staticBuildVectorOwners[static_cast<size_t>(vectorID)];
-                        if (useSingleSeedCrossGraphTail) {
-                            crossCandidates.clear();
-                            if (!m_staticCrossGraphSearch(
-                                    vector,
-                                    vectorOwner,
-                                    (std::max)(1, m_opt->m_internalResultNum),
-                                    crossCandidates)) {
-                                tailSearchFailed.store(true, std::memory_order_release);
-                                return;
-                            }
-                            int globalCount = 0;
-                            if (!StaticCrossGraphRNGSelection(
-                                    globalSelections,
-                                    p_headIndex.get(),
-                                    crossCandidates,
-                                    vectorID,
-                                    globalCount)) {
-                                tailSearchFailed.store(true, std::memory_order_release);
-                                return;
-                            }
-                            for (int rank = 0;
-                                 rank < globalCount && rank < replicaCount;
-                                 ++rank) {
-                                const Edge& candidate =
-                                    globalSelections[static_cast<size_t>(rank)];
-                                if (candidate.node < 0 || candidate.node >= headCount ||
-                                    m_staticBuildHeadOwners[static_cast<size_t>(candidate.node)] ==
-                                        vectorOwner) {
-                                    continue;
-                                }
-                                offerTailCandidate(vectorID, candidate.node, candidate.distance);
-                            }
-                            continue;
-                        }
+                        int globalCount = 0;
                         if (useBundleFanoutRNGTail) {
-                            int globalCount = 0;
                             if (!StaticBundleFanoutRNGSelection(
                                     globalSelections,
                                     vector,
-                                    vectorID,
-                                    vectorOwner,
-                                    globalCount)) {
-                                continue;
-                            }
-                            for (int rank = 0;
-                                 rank < globalCount && rank < replicaCount;
-                                 ++rank) {
-                                const Edge& candidate =
-                                    globalSelections[static_cast<size_t>(rank)];
-                                if (candidate.node < 0 || candidate.node >= headCount ||
-                                    m_staticBuildHeadOwners[static_cast<size_t>(candidate.node)] ==
-                                        vectorOwner) {
-                                    continue;
-                                }
-                                offerTailCandidate(vectorID, candidate.node, candidate.distance);
-                            }
-                            continue;
-                        }
-                        if (useGlobalRNGTail) {
-                            int globalCount = 0;
-                            if (!StaticGlobalRNGSelection(
-                                    globalSelections,
-                                    vector,
                                     p_headIndex.get(),
                                     vectorID,
                                     globalCount)) {
                                 continue;
                             }
-                            for (int rank = 0;
-                                 rank < globalCount && rank < replicaCount;
-                                 ++rank) {
-                                const Edge& candidate =
-                                    globalSelections[static_cast<size_t>(rank)];
-                                if (candidate.node < 0 || candidate.node >= headCount ||
-                                    m_staticBuildHeadOwners[static_cast<size_t>(candidate.node)] ==
-                                        vectorOwner) {
-                                    continue;
-                                }
-                                offerTailCandidate(vectorID, candidate.node, candidate.distance);
-                            }
+                        }
+                        else if (!StaticGlobalRNGSelection(
+                                     globalSelections,
+                                     vector,
+                                     p_headIndex.get(),
+                                     vectorID,
+                                     globalCount)) {
                             continue;
                         }
-
-                        nearbyHeads.SetTarget(vector, p_headIndex->m_pQuantizer);
-                        nearbyHeads.Reset();
-                        if (p_headIndex->SearchIndex(nearbyHeads) != ErrorCode::Success) continue;
-
-                        BasicResult* results = nearbyHeads.GetResults();
-                        for (int rank = 0; rank < replicaCount; ++rank) {
-                            offerTailCandidate(
-                                vectorID, results[rank].VID, results[rank].Dist);
+                        globalCount = (std::min)(globalCount, replicaCount);
+                        rngReplicaHistogram[static_cast<size_t>(globalCount)].fetch_add(
+                            1, std::memory_order_relaxed);
+                        for (int rank = 0; rank < globalCount; ++rank) {
+                            const Edge& candidate =
+                                globalSelections[static_cast<size_t>(rank)];
+                            if (candidate.node < 0 || candidate.node >= headCount) {
+                                continue;
+                            }
+                            offerTailCandidate(vectorID, candidate.node, candidate.distance);
                         }
                     }
                 };
@@ -1329,8 +1250,16 @@ namespace SPTAG
                 if (tailSearchFailed.load(std::memory_order_acquire)) {
                     SPTAGLIB_LOG(
                         Helper::LogLevel::LL_Error,
-                        "Single-seed cross-graph tail candidate search failed.\n");
+                        "Static tail candidate search failed.\n");
                     return false;
+                }
+                for (int count = 0; count <= replicaCount; ++count) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Info,
+                        "Static Phase 4 RNG replica distribution: replicas=%d vectors=%zu\n",
+                        count,
+                        rngReplicaHistogram[static_cast<size_t>(count)].load(
+                            std::memory_order_relaxed));
                 }
 
                 auto logTailTiming = [&](const char* p_cap) {
@@ -1389,11 +1318,10 @@ namespace SPTAG
                     p_selections.m_totalsize = p_selections.m_end;
                     SPTAGLIB_LOG(
                         Helper::LogLevel::LL_Info,
-                        "Static Phase 4 done: pure=%zu tail=%zu skippedDuplicate=%zu "
-                        "skippedCapacity=%zu trimmed=0 final=%zu cap=unbounded\n",
+                        "Static Phase 4 done: pure=%zu tail=%zu skippedCapacity=%zu "
+                        "trimmed=0 final=%zu cap=unbounded overlap=enabled\n",
                         pureSelectionCount,
                         p_selections.m_selections.size() - pureSelectionCount,
-                        skippedDuplicate.load(),
                         skippedCapacity.load(),
                         p_selections.m_selections.size());
                     logTailTiming("unbounded");
@@ -1432,15 +1360,18 @@ namespace SPTAG
                 for (SizeType head = 0; head < headCount; ++head) {
                     const int pureCount = p_pureCountPerHead[static_cast<size_t>(head)];
                     const int totalCount = p_postingListSize[static_cast<size_t>(head)].load();
-                    const int maxPages = unboundedTail
-                        ? (std::numeric_limits<int>::max)()
-                        : pagesForRecords(pureCount) + extraTailPages;
-                    if (totalCount < pureCount ||
-                        (!unboundedTail && pagesForRecords(totalCount) > maxPages)) {
+                    const int tailCount = totalCount - pureCount;
+                    if (tailCount < 0 ||
+                        (!unboundedTail &&
+                         (pagesForRecords(pureCount) > p_opt.m_postingPageLimit ||
+                          pagesForRecords(tailCount) > tailPageLimit))) {
                         SPTAGLIB_LOG(
                             Helper::LogLevel::LL_Error,
-                            "Static tail page-budget violation: head=%d pure=%d total=%d maxPages=%d\n",
-                            head, pureCount, totalCount, maxPages);
+                            "Static tail page-budget violation: head=%d pure=%d tail=%d "
+                            "purePages=%d tailPages=%d limits=%d+%d\n",
+                            head, pureCount, tailCount,
+                            pagesForRecords(pureCount), pagesForRecords(tailCount),
+                            p_opt.m_postingPageLimit, tailPageLimit);
                         return false;
                     }
                 }
@@ -1451,19 +1382,18 @@ namespace SPTAG
                 p_selections.m_totalsize = p_selections.m_end;
                 SPTAGLIB_LOG(
                     Helper::LogLevel::LL_Info,
-                    "Static Phase 4 done: pure=%zu tail=%zu skippedDuplicate=%zu "
-                    "skippedCapacity=%zu trimmed=%zu final=%zu cap=%s\n",
+                    "Static Phase 4 done: pure=%zu tail=%zu skippedCapacity=%zu "
+                    "trimmed=%zu final=%zu cap=%s overlap=enabled\n",
                     pureSelectionCount,
                     p_selections.m_selections.size() - pureSelectionCount,
-                    skippedDuplicate.load(),
                     skippedCapacity.load(),
                     tailRecordsTrimmed,
                     p_selections.m_selections.size(),
                     unboundedTail ? "unbounded" :
-                        ("purePages+" + std::to_string(extraTailPages)).c_str());
+                        ("tailPages=" + std::to_string(tailPageLimit)).c_str());
                 logTailTiming(
                     unboundedTail ? "unbounded" :
-                        ("purePages+" + std::to_string(extraTailPages)).c_str());
+                        ("tailPages=" + std::to_string(tailPageLimit)).c_str());
                 return true;
             }
 
@@ -1623,15 +1553,19 @@ namespace SPTAG
 
                 p_replicaCount = 0;
                 for (int i = 0; i < queryResults.GetResultNum() &&
-                                p_replicaCount < m_opt->m_replicaCount; ++i) {
+                                p_replicaCount < static_cast<int>(p_selections.size()); ++i) {
                     BasicResult* result = queryResults.GetResult(i);
-                    if (result->VID == -1) break;
+                    if (result == nullptr || result->VID == -1) break;
+                    const void* candidateSample = p_index->GetSample(result->VID);
+                    if (candidateSample == nullptr) return false;
 
                     bool accepted = true;
                     for (int j = 0; j < p_replicaCount; ++j) {
+                        const void* selectedSample = p_index->GetSample(
+                            p_selections[static_cast<size_t>(j)].node);
+                        if (selectedSample == nullptr) return false;
                         const float headDistance = p_index->ComputeDistance(
-                            p_index->GetSample(result->VID),
-                            p_index->GetSample(p_selections[static_cast<size_t>(j)].node));
+                            candidateSample, selectedSample);
                         if (m_opt->m_rngFactor * headDistance <= result->Dist) {
                             accepted = false;
                             break;
@@ -1696,11 +1630,12 @@ namespace SPTAG
             bool StaticBundleFanoutRNGSelection(
                 std::vector<Edge>& p_selections,
                 const ValueType* p_queryVector,
+                VectorIndex* p_globalHeadIndex,
                 SizeType p_fullID,
-                int p_vectorOwner,
                 int& p_replicaCount)
             {
-                if (p_queryVector == nullptr || p_vectorOwner < 0 ||
+                if (p_queryVector == nullptr || p_globalHeadIndex == nullptr ||
+                    p_globalHeadIndex->m_pQuantizer != nullptr ||
                     m_staticHeadBundleLocalToGlobalHIDs == nullptr ||
                     m_staticHeadBundleIndexes.size() != m_staticHeadBundleLocalToGlobalHIDs->size()) {
                     return false;
@@ -1709,8 +1644,6 @@ namespace SPTAG
                 struct Candidate {
                     float distance;
                     SizeType globalHeadID;
-                    const void* sample;
-                    VectorIndex* index;
                 };
 
                 std::vector<Candidate> candidates;
@@ -1737,13 +1670,9 @@ namespace SPTAG
                             static_cast<size_t>(result->VID) >= localToGlobal.size()) {
                             continue;
                         }
-                        const void* sample = nodeIndex->GetSample(result->VID);
-                        if (sample == nullptr) continue;
                         candidates.push_back(
                             { result->Dist,
-                              localToGlobal[static_cast<size_t>(result->VID)],
-                              sample,
-                              nodeIndex.get() });
+                              localToGlobal[static_cast<size_t>(result->VID)] });
                     }
                 }
 
@@ -1753,23 +1682,13 @@ namespace SPTAG
                                   ? p_left.globalHeadID < p_right.globalHeadID
                                   : p_left.distance < p_right.distance;
                           });
+                if (candidates.size() > static_cast<size_t>(candidateCount)) {
+                    candidates.resize(static_cast<size_t>(candidateCount));
+                }
 
                 p_replicaCount = 0;
-                std::vector<const void*> selectedHeadVectors;
-                selectedHeadVectors.reserve(p_selections.size());
                 for (const Candidate& candidate : candidates) {
                     if (p_replicaCount >= static_cast<int>(p_selections.size())) break;
-
-                    bool accepted = true;
-                    for (const void* selectedSample : selectedHeadVectors) {
-                        const float headDistance =
-                            candidate.index->ComputeDistance(candidate.sample, selectedSample);
-                        if (m_opt->m_rngFactor * headDistance <= candidate.distance) {
-                            accepted = false;
-                            break;
-                        }
-                    }
-                    if (!accepted) continue;
 
                     bool duplicate = false;
                     for (int i = 0; i < p_replicaCount; ++i) {
@@ -1780,11 +1699,27 @@ namespace SPTAG
                     }
                     if (duplicate) continue;
 
+                    const void* candidateSample =
+                        p_globalHeadIndex->GetSample(candidate.globalHeadID);
+                    if (candidateSample == nullptr) return false;
+                    bool accepted = true;
+                    for (int i = 0; i < p_replicaCount; ++i) {
+                        const void* selectedSample = p_globalHeadIndex->GetSample(
+                            p_selections[static_cast<size_t>(i)].node);
+                        if (selectedSample == nullptr) return false;
+                        const float headDistance = p_globalHeadIndex->ComputeDistance(
+                            candidateSample, selectedSample);
+                        if (m_opt->m_rngFactor * headDistance <= candidate.distance) {
+                            accepted = false;
+                            break;
+                        }
+                    }
+                    if (!accepted) continue;
+
                     Edge& selection = p_selections[static_cast<size_t>(p_replicaCount)];
                     selection.node = candidate.globalHeadID;
                     selection.tonode = p_fullID;
                     selection.distance = candidate.distance;
-                    selectedHeadVectors.push_back(candidate.sample);
                     ++p_replicaCount;
                 }
                 return true;
@@ -3042,6 +2977,24 @@ namespace SPTAG
                 return (std::max)(0, (std::min)(p_listInfo->pureEleCount, p_listInfo->listEleCount));
             }
 
+            bool UseStaticTailSuffix(const ExtraWorkSpace* p_exWorkSpace,
+                                     const ListInfo* p_listInfo) const
+            {
+                if (m_opt == nullptr ||
+                    !m_opt->m_enableUnfilterTail || m_opt->m_ablateTail ||
+                    m_enableDataCompression || m_enablePostingListRearrange ||
+                    m_enableDeltaEncoding) {
+                    return false;
+                }
+                const bool hasFilter = HasStaticMetadataFilter(p_exWorkSpace);
+                if (hasFilter &&
+                    (p_exWorkSpace == nullptr ||
+                     !p_exWorkSpace->m_useGlobalTailWithPostFilter)) {
+                    return false;
+                }
+                return true;
+            }
+
             int StaticReadPageCount(const ExtraWorkSpace* p_exWorkSpace,
                                     const ListInfo* p_listInfo) const
             {
@@ -3116,6 +3069,23 @@ namespace SPTAG
                 range.m_scanEnd = scanLimit;
                 range.m_readStartPage = 0;
                 range.m_readPageCount = StaticReadPageCount(p_exWorkSpace, p_listInfo);
+                if (UseStaticTailSuffix(p_exWorkSpace, p_listInfo)) {
+                    const int pureCount = (std::max)(
+                        0, (std::min)(p_listInfo->pureEleCount, p_listInfo->listEleCount));
+                    const size_t startBytes = static_cast<size_t>(p_listInfo->pageOffset) +
+                        static_cast<size_t>(pureCount) * static_cast<size_t>(m_vectorInfoSize);
+                    const size_t endBytes = static_cast<size_t>(p_listInfo->pageOffset) +
+                        static_cast<size_t>(p_listInfo->listEleCount) *
+                            static_cast<size_t>(m_vectorInfoSize);
+                    const int readStart = static_cast<int>(startBytes >> PageSizeEx);
+                    const int readEnd = static_cast<int>(
+                        (endBytes + PageSize - 1) >> PageSizeEx);
+                    range.m_scanBegin = pureCount;
+                    range.m_scanEnd = p_listInfo->listEleCount;
+                    range.m_readStartPage = readStart;
+                    range.m_readPageCount = (std::max)(0, readEnd - readStart);
+                    return range;
+                }
                 const bool usePureDistancePrefix =
                     m_opt != nullptr &&
                     m_opt->m_unfilterPureDistanceScanPercent < 100 &&

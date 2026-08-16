@@ -257,6 +257,8 @@ void VectorIndex::ClearHeadNodeMeta()
 {
     m_headNodeMetaStride = 0;
     m_headNodePSOffset = 0;
+    m_headNodeTailPSOffset = 0;
+    m_headNodeHasTailPS = false;
     m_headNodeHierMaskOffset = 0;
     m_headNodePostingHierMaskOffset = 0;
     m_headNodeGlobalVIDOffset = 0;
@@ -267,24 +269,45 @@ void VectorIndex::ClearHeadNodeMeta()
     m_headNodeMeta.clear();
 }
 
-void VectorIndex::InitializeHeadNodeMeta(SizeType p_numSamples, int p_numQuantCols)
+void VectorIndex::InitializeHeadNodeMeta(SizeType p_numSamples,
+                                         int p_numQuantCols,
+                                         bool p_includeTailPS,
+                                         const std::vector<int>& p_categoricalColumns,
+                                         const std::vector<int>& p_categoricalWidths)
 {
     ClearHeadNodeMeta();
     if (p_numSamples <= 0) return;
+    if (p_categoricalColumns.empty()) {
+        m_headNodeHierLayout = Cache::HierWidths();
+    } else {
+        m_headNodeHierLayout.Configure(
+            p_categoricalColumns, p_categoricalWidths);
+    }
 
-    // V3 layout per sample:
-    // | PostingBitmask | HierarchicalOwnTags own-tags | HierarchicalPostingMask posting-content | globalVID (4B) | bundleNodeId (2B) | headOnly (1B) |
+    // Current layout places the pure and tail posting masks next to each other.
+    // Older persisted layouts omit the tail mask and pass p_includeTailPS=false.
     // V4 appends, after headOnly, a quantized numeric block of M*NUM_QUANT_WORDS
     // uint64 (one 256-bit lane per numeric column). With M==0 the stride is
     // byte-identical to V3, so V3 indexes load unchanged.
     m_headNodePSOffset = 0;
-    m_headNodeHierMaskOffset = AlignUp(m_headNodePSOffset + sizeof(Cache::PostingBitmask), alignof(Cache::HierarchicalOwnTags));
-    m_headNodePostingHierMaskOffset = AlignUp(m_headNodeHierMaskOffset + sizeof(Cache::HierarchicalOwnTags), alignof(Cache::HierarchicalPostingMask));
+    m_headNodeHasTailPS = p_includeTailPS;
+    m_headNodeTailPSOffset = m_headNodePSOffset + sizeof(Cache::PostingBitmask);
+    const size_t afterPostingMasks = m_headNodeHasTailPS
+        ? m_headNodeTailPSOffset + sizeof(Cache::PostingBitmask)
+        : m_headNodePSOffset + sizeof(Cache::PostingBitmask);
+    m_headNodeHierMaskOffset = AlignUp(afterPostingMasks, alignof(std::uint32_t));
+    const size_t ownTagBytes =
+        m_headNodeHierLayout.columns.size() * sizeof(std::uint32_t);
+    m_headNodePostingHierMaskOffset = AlignUp(
+        m_headNodeHierMaskOffset + ownTagBytes, alignof(std::uint64_t));
     // Posting-content mask uses the runtime per-column width packing
     // (HierPostingMaskBytes), not the type's compile-time sizeof, so narrow
     // schemas shrink the per-head record. Width table must be set (build: env;
     // load: V5 header) BEFORE this is called.
-    m_headNodeGlobalVIDOffset = AlignUp(m_headNodePostingHierMaskOffset + Cache::HierPostingMaskBytes(), alignof(SizeType));
+    m_headNodeGlobalVIDOffset = AlignUp(
+        m_headNodePostingHierMaskOffset +
+            Cache::HierPostingMaskBytes(m_headNodeHierLayout),
+        alignof(SizeType));
     m_headNodeBundleNodeIdOffset = AlignUp(m_headNodeGlobalVIDOffset + sizeof(SizeType), alignof(int16_t));
     m_headNodeHeadOnlyOffset = AlignUp(m_headNodeBundleNodeIdOffset + sizeof(int16_t), alignof(std::uint8_t));
     m_headNodeNumQuantCols = p_numQuantCols > 0 ? p_numQuantCols : 0;
@@ -300,6 +323,8 @@ void VectorIndex::InitializeHeadNodeMeta(SizeType p_numSamples, int p_numQuantCo
 
     m_headNodeMeta.assign(static_cast<size_t>(p_numSamples) * m_headNodeMetaStride, 0);
     for (SizeType sampleId = 0; sampleId < p_numSamples; ++sampleId) {
+        auto emptyOwnTags = CreateHeadNodeOwnTags();
+        SetHeadNodeHierMask(sampleId, emptyOwnTags);
         SetHeadNodeGlobalVID(sampleId, MaxSize);
         SetHeadNodeBundleNodeId(sampleId, -1);
     }
@@ -365,6 +390,23 @@ bool VectorIndex::HeadNodePSMayIntersect(SizeType p_sampleId, const Cache::Posti
     return ps != nullptr && ps->MayIntersect(p_queryMask);
 }
 
+void VectorIndex::SetHeadNodeTailPS(SizeType p_sampleId, const Cache::PostingBitmask& p_ps)
+{
+    if (!m_headNodeHasTailPS) return;
+    auto* base = HeadNodeMetaBase(this, p_sampleId);
+    if (base == nullptr) return;
+    std::memcpy(base + m_headNodeTailPSOffset, &p_ps, sizeof(Cache::PostingBitmask));
+}
+
+const Cache::PostingBitmask* VectorIndex::GetHeadNodeTailPS(SizeType p_sampleId) const
+{
+    if (!m_headNodeHasTailPS) return nullptr;
+    const auto* base = HeadNodeMetaBase(this, p_sampleId);
+    if (base == nullptr) return nullptr;
+    return reinterpret_cast<const Cache::PostingBitmask*>(
+        base + m_headNodeTailPSOffset);
+}
+
 void VectorIndex::SetHeadNodeHeadOnly(SizeType p_sampleId, bool p_isHeadOnly)
 {
     auto* base = HeadNodeMetaBase(this, p_sampleId);
@@ -381,31 +423,43 @@ bool VectorIndex::IsHeadNodeHeadOnly(SizeType p_sampleId) const
 void VectorIndex::SetHeadNodeHierMask(SizeType p_sampleId, const Cache::HierarchicalOwnTags& p_mask)
 {
     auto* base = HeadNodeMetaBase(this, p_sampleId);
-    if (base == nullptr) return;
-    std::memcpy(base + m_headNodeHierMaskOffset, &p_mask, sizeof(Cache::HierarchicalOwnTags));
+    if (base == nullptr ||
+        p_mask.layout.columns != m_headNodeHierLayout.columns ||
+        p_mask.tag.size() != m_headNodeHierLayout.columns.size()) return;
+    std::memcpy(
+        base + m_headNodeHierMaskOffset, p_mask.tag.data(),
+        p_mask.tag.size() * sizeof(std::uint32_t));
 }
 
-const Cache::HierarchicalOwnTags* VectorIndex::GetHeadNodeHierMask(SizeType p_sampleId) const
+Cache::HierarchicalOwnTagsView VectorIndex::GetHeadNodeHierMask(SizeType p_sampleId) const
 {
     const auto* base = HeadNodeMetaBase(this, p_sampleId);
-    if (base == nullptr) return nullptr;
-    return reinterpret_cast<const Cache::HierarchicalOwnTags*>(base + m_headNodeHierMaskOffset);
+    if (base == nullptr) return {};
+    return Cache::HierarchicalOwnTagsView{
+        &m_headNodeHierLayout,
+        reinterpret_cast<const std::uint32_t*>(
+            base + m_headNodeHierMaskOffset)};
 }
 
 void VectorIndex::SetHeadNodePostingHierMask(SizeType p_sampleId, const Cache::HierarchicalPostingMask& p_mask)
 {
     auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return;
-    // Copy only the bytes occupied by the current width packing (the mask's
-    // tail beyond HierPostingMaskBytes is unused and outside the per-head slot).
-    std::memcpy(base + m_headNodePostingHierMaskOffset, &p_mask, Cache::HierPostingMaskBytes());
+    if (p_mask.layout.columns != m_headNodeHierLayout.columns ||
+        p_mask.layout.bits != m_headNodeHierLayout.bits) return;
+    std::memcpy(
+        base + m_headNodePostingHierMaskOffset, p_mask.mask.data(),
+        Cache::HierPostingMaskBytes(m_headNodeHierLayout));
 }
 
-const Cache::HierarchicalPostingMask* VectorIndex::GetHeadNodePostingHierMask(SizeType p_sampleId) const
+Cache::HierarchicalPostingMaskView VectorIndex::GetHeadNodePostingHierMask(SizeType p_sampleId) const
 {
     const auto* base = HeadNodeMetaBase(this, p_sampleId);
-    if (base == nullptr) return nullptr;
-    return reinterpret_cast<const Cache::HierarchicalPostingMask*>(base + m_headNodePostingHierMaskOffset);
+    if (base == nullptr) return {};
+    return Cache::HierarchicalPostingMaskView{
+        &m_headNodeHierLayout,
+        reinterpret_cast<const std::uint64_t*>(
+            base + m_headNodePostingHierMaskOffset)};
 }
 
 void VectorIndex::SetHeadNodeBundleNodeId(SizeType p_sampleId, int16_t p_bundleNodeId)
@@ -443,25 +497,25 @@ bool VectorIndex::HeadNodeMatchesQuery(SizeType p_sampleId, const Cache::Hierarc
     }
 
     // Check hierarchical mask intersection
-    const auto* hierMask = GetHeadNodeHierMask(p_sampleId);
-    if (hierMask == nullptr) return false;
-    return hierMask->MayIntersect(p_queryMask);
+    const auto hierMask = GetHeadNodeHierMask(p_sampleId);
+    if (hierMask.tag == nullptr) return false;
+    return hierMask.MayIntersect(p_queryMask);
 }
 
 bool VectorIndex::HeadHierMaskMayIntersect(SizeType p_sampleId, const Cache::HierarchicalPostingMask& p_queryMask) const
 {
-    const auto* hierMask = GetHeadNodeHierMask(p_sampleId);
-    if (hierMask == nullptr) return false;
-    return hierMask->MayIntersect(p_queryMask);
+    const auto hierMask = GetHeadNodeHierMask(p_sampleId);
+    if (hierMask.tag == nullptr) return false;
+    return hierMask.MayIntersect(p_queryMask);
 }
 
 bool VectorIndex::HeadPostingHierMaskMayIntersect(SizeType p_sampleId, const Cache::HierarchicalPostingMask& p_queryMask) const
 {
-    const auto* postingMask = GetHeadNodePostingHierMask(p_sampleId);
+    const auto postingMask = GetHeadNodePostingHierMask(p_sampleId);
     // Fail-open: legacy / V2 indexes lack the posting-union mask. Keep head
     // so the caller doesn't drop posting candidates spuriously.
-    if (postingMask == nullptr) return true;
-    return postingMask->MayIntersect(p_queryMask);
+    if (postingMask.mask == nullptr) return true;
+    return postingMask.MayIntersect(p_queryMask);
 }
 
 void VectorIndex::ResetThreadLocalPostingScanStats()

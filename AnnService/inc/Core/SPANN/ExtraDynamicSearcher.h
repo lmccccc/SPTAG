@@ -425,29 +425,15 @@ namespace SPTAG::SPANN {
             m_hasHeadRole = (nread == static_cast<size_t>(sz));
         }
 
-        std::uint64_t PackPrimaryHeadAttributes(SizeType vid, const std::uint32_t tagBases[4]) const
-        {
-            const size_t tagOffset = static_cast<size_t>(vid) * static_cast<size_t>(m_numTagsPerVec);
-            std::uint32_t packedTags = 0;
-            for (int level = 0; level < 4; ++level) {
-                const std::uint32_t rawTag = m_vectorTags[tagOffset + static_cast<size_t>(level)];
-                const std::uint32_t localTag = rawTag - tagBases[level];
-                packedTags |= (localTag & 0xffU) << (level * 8);
-            }
-            const std::uint32_t numeric = m_vectorTags[tagOffset + 4];
-            return static_cast<std::uint64_t>(packedTags) |
-                   (static_cast<std::uint64_t>(numeric) << 32);
-        }
-
         bool WritePrimaryHeadCSR(Selection& selections,
                                  const std::unordered_map<SizeType, SizeType>& headVectorIDs,
                                  SizeType fullCount,
                                  SizeType headCount)
         {
-            if (m_numTagsPerVec < 5 ||
+            if (m_numTagsPerVec <= 0 ||
                 m_vectorTags.size() < static_cast<size_t>(fullCount) * static_cast<size_t>(m_numTagsPerVec)) {
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                             "[PrimaryHeadCSR] requires four categorical tags plus one numeric attribute.\n");
+                             "[PrimaryHeadCSR] requires a non-empty attribute row for every vector.\n");
                 return false;
             }
 
@@ -455,29 +441,6 @@ namespace SPTAG::SPANN {
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
                              "[PrimaryHeadCSR] batched selections are unsupported; use Batches=1.\n");
                 return false;
-            }
-
-            std::uint32_t tagBases[4] = {
-                std::numeric_limits<std::uint32_t>::max(),
-                std::numeric_limits<std::uint32_t>::max(),
-                std::numeric_limits<std::uint32_t>::max(),
-                std::numeric_limits<std::uint32_t>::max()
-            };
-            for (SizeType vid = 0; vid < fullCount; ++vid) {
-                const size_t tagOffset = static_cast<size_t>(vid) * static_cast<size_t>(m_numTagsPerVec);
-                for (int level = 0; level < 4; ++level) {
-                    tagBases[level] = std::min(tagBases[level], m_vectorTags[tagOffset + static_cast<size_t>(level)]);
-                }
-            }
-            for (SizeType vid = 0; vid < fullCount; ++vid) {
-                const size_t tagOffset = static_cast<size_t>(vid) * static_cast<size_t>(m_numTagsPerVec);
-                for (int level = 0; level < 4; ++level) {
-                    if (m_vectorTags[tagOffset + static_cast<size_t>(level)] - tagBases[level] > 0xffU) {
-                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                                     "[PrimaryHeadCSR] categorical level %d exceeds uint8 range.\n", level);
-                        return false;
-                    }
-                }
             }
 
             std::vector<SizeType> selfVIDs(static_cast<size_t>(headCount), MaxSize);
@@ -522,7 +485,7 @@ namespace SPTAG::SPANN {
             PrimaryHeadCSRHeader header;
             header.headCount = static_cast<std::uint32_t>(headCount);
             header.entryCount = entryCount;
-            for (int level = 0; level < 4; ++level) header.tagBases[level] = tagBases[level];
+            header.attributeCount = static_cast<std::uint32_t>(m_numTagsPerVec);
 
             const std::string path = m_opt->m_indexDirectory + FolderSep + m_opt->m_primaryHeadCSRFile;
             std::ofstream output(path, std::ios::binary | std::ios::trunc);
@@ -535,18 +498,10 @@ namespace SPTAG::SPANN {
             output.write(reinterpret_cast<const char*>(offsets.data()),
                          static_cast<std::streamsize>(offsets.size() * sizeof(std::uint32_t)));
 
-            std::vector<PrimaryHeadCSREntry> writeBuffer;
-            writeBuffer.reserve(1 << 20);
+            std::vector<std::uint32_t> orderedVIDs;
+            orderedVIDs.reserve(static_cast<std::size_t>(entryCount));
             auto appendEntry = [&](SizeType vid) {
-                PrimaryHeadCSREntry entry;
-                entry.vid = static_cast<std::uint32_t>(vid);
-                entry.attributes = PackPrimaryHeadAttributes(vid, tagBases);
-                writeBuffer.push_back(entry);
-                if (writeBuffer.size() == writeBuffer.capacity()) {
-                    output.write(reinterpret_cast<const char*>(writeBuffer.data()),
-                                 static_cast<std::streamsize>(writeBuffer.size() * sizeof(PrimaryHeadCSREntry)));
-                    writeBuffer.clear();
-                }
+                orderedVIDs.push_back(static_cast<std::uint32_t>(vid));
             };
 
             size_t selectionPos = 0;
@@ -586,9 +541,18 @@ namespace SPTAG::SPANN {
                     std::fabs(selections.m_selections[selectionPos].distance);
                 ++selectionPos;
             }
-            if (!writeBuffer.empty()) {
-                output.write(reinterpret_cast<const char*>(writeBuffer.data()),
-                             static_cast<std::streamsize>(writeBuffer.size() * sizeof(PrimaryHeadCSREntry)));
+            output.write(
+                reinterpret_cast<const char*>(orderedVIDs.data()),
+                static_cast<std::streamsize>(
+                    orderedVIDs.size() * sizeof(std::uint32_t)));
+            for (std::uint32_t vid : orderedVIDs) {
+                const std::uint32_t* row =
+                    m_vectorTags.data() +
+                    static_cast<std::size_t>(vid) * m_numTagsPerVec;
+                output.write(
+                    reinterpret_cast<const char*>(row),
+                    static_cast<std::streamsize>(
+                        m_numTagsPerVec * sizeof(std::uint32_t)));
             }
             output.close();
             if (!output || written != entryCount) {
@@ -3218,31 +3182,10 @@ namespace SPTAG::SPANN {
             }
 
             const SPTAG::Cache::DNFPredicate* dnf = p_exWorkSpace->m_dnf;
-            std::uint32_t projectTag = 0;
-            if (dnf != nullptr && !dnf->Empty()) {
-                // A project equality literal is a safe sparse candidate generator
-                // only when it constrains the sole DNF clause. Remaining
-                // categorical/numeric literals are evaluated exactly below.
-                if (dnf->clauses.size() != 1) return ErrorCode::Fail;
-                bool foundProjectAnchor = false;
-                for (const auto& literal : dnf->clauses.front().lits) {
-                    if (literal.kind == 0 && literal.col == 3 &&
-                        literal.op == SPTAG::Cache::DNF_EQ &&
-                        m_primaryHeadCSR.IsProjectTag(literal.val)) {
-                        projectTag = literal.val;
-                        foundProjectAnchor = true;
-                        break;
-                    }
-                }
-                if (!foundProjectAnchor) return ErrorCode::Fail;
-            } else {
-                if (p_exWorkSpace->m_numQueryTags != 1 || p_exWorkSpace->m_queryTags == nullptr) {
-                    return ErrorCode::Fail;
-                }
-                projectTag = p_exWorkSpace->m_queryTags[0];
-            }
-
-            if (!m_primaryHeadCSR.IsProjectTag(projectTag)) {
+            const bool hasDNF = dnf != nullptr && !dnf->Empty();
+            if (!hasDNF &&
+                (p_exWorkSpace->m_numQueryTags <= 0 ||
+                 p_exWorkSpace->m_queryTags == nullptr)) {
                 return ErrorCode::Fail;
             }
 
@@ -3254,18 +3197,34 @@ namespace SPTAG::SPANN {
 
             for (SizeType headId : p_exWorkSpace->m_postingIDs) {
                 if (headId < 0 || headId >= m_primaryHeadCSR.HeadCount()) continue;
-                const PrimaryHeadCSREntry* begin =
+                const std::uint32_t begin =
                     m_primaryHeadCSR.Begin(static_cast<std::uint32_t>(headId));
-                const PrimaryHeadCSREntry* end =
+                const std::uint32_t end =
                     m_primaryHeadCSR.End(static_cast<std::uint32_t>(headId));
-                for (const PrimaryHeadCSREntry* entry = begin; entry != end; ++entry) {
-                    const int vid = static_cast<int>(entry->vid);
-                    std::uint32_t vecTags[5];
-                    m_primaryHeadCSR.UnpackAttributes(*entry, vecTags);
+                for (std::uint32_t entry = begin; entry < end; ++entry) {
+                    const int vid =
+                        static_cast<int>(m_primaryHeadCSR.Vid(entry));
+                    const std::uint32_t* attributes =
+                        m_primaryHeadCSR.Attributes(entry);
+                    bool matches = hasDNF
+                        ? dnf->Matches(
+                              attributes,
+                              static_cast<int>(
+                                  m_primaryHeadCSR.AttributeCount()))
+                        : false;
+                    if (!hasDNF) {
+                        for (int queryTag = 0;
+                             queryTag < p_exWorkSpace->m_numQueryTags &&
+                             !matches;
+                             ++queryTag) {
+                            matches = m_primaryHeadCSR.MatchesAnyValue(
+                                entry,
+                                p_exWorkSpace->m_queryTags[queryTag]);
+                        }
+                    }
                     if (vid < 0 || vid >= m_versionMap->Count() ||
                         m_versionMap->Deleted(vid) ||
-                        !m_primaryHeadCSR.MatchesProject(*entry, projectTag) ||
-                        (dnf != nullptr && !dnf->Matches(vecTags, 5)) ||
+                        !matches ||
                         p_exWorkSpace->m_deduper.CheckAndSet(vid)) {
                         continue;
                     }
@@ -3282,8 +3241,10 @@ namespace SPTAG::SPANN {
             queryResults.Reset();
             RerankFromVecDB(candidates, queryResults.GetTarget(), m_opt->m_dim, queryResults);
             SPTAGLIB_LOG(Helper::LogLevel::LL_Debug,
-                         "[PrimaryHeadCSR] heads=%zu project=%u candidates=%zu\n",
-                         p_exWorkSpace->m_postingIDs.size(), projectTag, candidates.size());
+                         "[PrimaryHeadCSR] heads=%zu attributes=%u candidates=%zu\n",
+                         p_exWorkSpace->m_postingIDs.size(),
+                         m_primaryHeadCSR.AttributeCount(),
+                         candidates.size());
             return ErrorCode::Success;
         }
 
@@ -3393,6 +3354,12 @@ namespace SPTAG::SPANN {
                 hasPredicateFilter &&
                 !p_exWorkSpace->m_useGlobalTailWithPostFilter;
             const bool usePurePrefix = useUnfilterTail || ablateTail;
+            const bool useTailSuffix =
+                m_opt->m_enableUnfilterTail &&
+                m_hasPostingPureCounts &&
+                (!hasPredicateFilter ||
+                 p_exWorkSpace->m_useGlobalTailWithPostFilter) &&
+                !ablateTail;
 
             // Page-selective IO (env SPTAG_PAGE_SELECT=1): for filtered queries,
             // read only the posting pages whose per-page signature may contain a
@@ -3404,11 +3371,15 @@ namespace SPTAG::SPANN {
                 return env && env[0] == '1';
             }();
             bool usePageSelect =
-                s_pageSelect &&
-                hasInlineTagFilter &&
-                m_numTagsPerVec > 0 &&
-                !p_exWorkSpace->m_useGlobalTailWithPostFilter;
-            if (usePageSelect && !EnsurePagePS(p_exWorkSpace)) usePageSelect = false;
+                useTailSuffix ||
+                (s_pageSelect &&
+                 hasInlineTagFilter &&
+                 m_numTagsPerVec > 0 &&
+                 !p_exWorkSpace->m_useGlobalTailWithPostFilter);
+            const bool useTagPageSelect = usePageSelect && !useTailSuffix;
+            if (useTagPageSelect && !EnsurePagePS(p_exWorkSpace)) {
+                usePageSelect = false;
+            }
             const std::uint32_t searchPostingByteCap =
                 (m_opt->m_searchPostingPageLimit > 0)
                     ? static_cast<std::uint32_t>(static_cast<std::uint64_t>(
@@ -3442,9 +3413,39 @@ namespace SPTAG::SPANN {
                 for (size_t i = 0; i < ids.size(); ++i) {
                     SizeType hid = ids[i];
                     auto& sel = pageSel[i];
-                    if (hid < 0 || hid >= (SizeType)m_pagePS.size()) { sel.clear(); continue; }
+                    if (hid < 0 || hid >= m_postingSizes.GetPostingNum()) {
+                        sel.clear();
+                        continue;
+                    }
+                    const int total = m_postingSizes.GetSize(hid);
+                    const int numPages = total <= 0 ? 0 :
+                        static_cast<int>(
+                            (static_cast<size_t>(total) * m_vectorInfoSize +
+                             PageSize - 1) >> PageSizeEx);
+                    if (useTailSuffix) {
+                        const int pure = (std::max)(
+                            0, (std::min)(m_postingPureCounts.GetSize(hid), total));
+                        const size_t tailStart =
+                            static_cast<size_t>(pure) * m_vectorInfoSize;
+                        const size_t tailEnd =
+                            static_cast<size_t>(total) * m_vectorInfoSize;
+                        sel.assign(numPages, 0);
+                        if (tailStart < tailEnd) {
+                            const int pStart =
+                                static_cast<int>(tailStart >> PageSizeEx);
+                            const int pEnd = (std::min)(
+                                numPages,
+                                static_cast<int>(
+                                    (tailEnd + PageSize - 1) >> PageSizeEx));
+                            for (int p = pStart; p < pEnd; ++p) sel[p] = 1;
+                        }
+                        continue;
+                    }
+                    if (hid >= (SizeType)m_pagePS.size()) {
+                        sel.clear();
+                        continue;
+                    }
                     const auto& pages = m_pagePS[hid];
-                    int numPages = (int)pages.size();
                     int pStart = 0, pEnd = numPages;
                     if (m_hasPostingPureCounts &&
                         !p_exWorkSpace->m_useGlobalTailWithPostFilter) {
@@ -3532,7 +3533,10 @@ namespace SPTAG::SPANN {
                 int vectorNum = (int)(buffer.GetAvailableSize() / m_vectorInfoSize);
                 int scanStart = 0;
                 int scanLimit = vectorNum;
-                if (usePurePrefix) {
+                if (useTailSuffix) {
+                    const int pure = m_postingPureCounts.GetSize(curPostingID);
+                    scanStart = (std::max)(0, (std::min)(pure, scanLimit));
+                } else if (usePurePrefix) {
                     if (IsUnfilterOnlyHead((int)curPostingID)) {
                         // Tail-only (U_extra) head: never scanned by filtered queries.
                         scanLimit = 0;
@@ -4708,7 +4712,7 @@ namespace SPTAG::SPANN {
                     // For each vector v, find K_replica nearest heads (tag-agnostic),
                     // then append only tail candidates that fit the page budget.
                     std::atomic_size_t vec_cursor(0);
-                    std::atomic_size_t tail_added(0), tail_skipped_dup(0), tail_skipped_cap(0);
+                    std::atomic_size_t tail_added(0), tail_skipped_cap(0);
                     int n_threads = m_opt->m_iSSDNumberOfThreads;
                     auto recordsForPages = [&](int pages) -> int {
                         return std::max(0, (pages * PageSize) / std::max(1, m_vectorInfoSize));
@@ -4731,23 +4735,23 @@ namespace SPTAG::SPANN {
                         return std::max(pure, lastPageStart / m_vectorInfoSize);
                     };
                     const int recordsPerPage = recordsForPages(1);
-                    // Tail capacity is expressed relative to the already-built pure
-                    // prefix. The buffer setting means extra physical tail pages, not
-                    // an absolute posting-size target derived from the old pure
-                    // PostingPageLimit/BufferLength budget. Tail may still fill slack
-                    // in the pure prefix's final page at no extra page cost.
-                    const int extraTailPages = std::max(0, m_opt->m_unfilterTailBufferLength);
+                    // Pure and tail have independent page budgets. Tail candidates may
+                    // overlap pure candidates so the tail can later serve as a complete
+                    // tag-agnostic posting without depending on the pure prefix.
+                    const int tailPageLimit =
+                        std::max(0, m_opt->m_unfilterTailBufferLength);
+                    const int tailRecordLimit = recordsForPages(tailPageLimit);
                     auto tailHardCapForHead = [&](SizeType h) -> int {
                         if (h < 0 || static_cast<size_t>(h) >= pure_count_per_head.size()) return 0;
                         const int pure = pure_count_per_head[static_cast<size_t>(h)];
-                        const int purePages = pagesForRecords(pure);
-                        const int capPages = purePages + extraTailPages;
-                        return std::max(pure, recordsForPages(capPages));
+                        return pure + tailRecordLimit;
                     };
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
                                  "Phase 4 page-budget tail: recordBytes=%d recordsPerPage=%d "
-                                 "extraTailPages=%d cap=purePages+extra sparseLastPageThreshold=10%%\n",
-                                 m_vectorInfoSize, recordsPerPage, extraTailPages);
+                                 "tailPageLimit=%d tailRecordLimit=%d "
+                                 "sparseLastPageThreshold=10%%\n",
+                                 m_vectorInfoSize, recordsPerPage, tailPageLimit,
+                                 tailRecordLimit);
                     SizeType numHeadsLocal = p_headIndex->GetNumSamples();
 
                     // The pre-tail selection array still contains RNG candidates that
@@ -4785,8 +4789,6 @@ namespace SPTAG::SPANN {
                                  "Phase 4 compacted pure prefixes: kept=%zu dropped=%zu\n",
                                  pureSelectionCount, preTailSelectionCount - pureSelectionCount);
 
-                    std::vector<std::atomic_int> tailCountPerHead(static_cast<size_t>(numHeadsLocal));
-                    for (auto& count : tailCountPerHead) count.store(0, std::memory_order_relaxed);
                     std::vector<Edge> tailCandidates;
                     std::mutex tailMutex;
 
@@ -4832,17 +4834,12 @@ namespace SPTAG::SPANN {
                     std::vector<uint64_t> margin_hist(kHistBins, 0);
                     std::vector<uint64_t> replica_dist((size_t)k_replica + 1, 0);
 
-                    // Build a per-head set of vector-IDs already present in pure region,
-                    // for fast dup check. Memory: ~ sum(pure_count) * 8 bytes ≈ 400 MB worst case.
-                    // To keep it cheap, we instead do binary-search lookup on the sorted
-                    // `selections.m_selections` (sorted by node first).
                     auto worker = [&]() {
                         COMMON::QueryResultSet<ValueType> nearbyHeads(nullptr, k_replica);
                         std::vector<Edge> local_appends;
                         local_appends.reserve(4096);
                         std::vector<uint64_t> local_margin_hist(kHistBins, 0);
                         std::vector<uint64_t> local_replica_dist((size_t)k_replica + 1, 0);
-                        const std::vector<Edge>& pureSelections = selections.m_selections;
                         size_t v;
                         while (true) {
                             v = vec_cursor.fetch_add(1);
@@ -4874,41 +4871,13 @@ namespace SPTAG::SPANN {
                                 // heads, replicate only while within tau of the NEAREST head's
                                 // distance (anchored to d1, not the previous replica).
                                 if (closureMode && r > 0 && (res[r].Dist - d1c) >= (float)closure_tau) break;
-                                // Dup check: scan pure region of head h's posting
-                                size_t lo = std::lower_bound(pureSelections.begin(), pureSelections.end(), (int)h,
-                                                              Selection::g_edgeComparer) - pureSelections.begin();
-                                size_t pure_end = std::min(
-                                    pureSelectionCount,
-                                    lo + static_cast<size_t>(pure_count_per_head[h]));
-                                bool dup = false;
-                                for (size_t k = lo; k < pure_end; ++k) {
-                                    if (pureSelections[k].node != h) break;
-                                    if (pureSelections[k].tonode == (SizeType)v) { dup = true; break; }
-                                }
-                                if (dup) { ++tail_skipped_dup; continue; }
-
-                                const int tailCapacity = std::max(
-                                    0,
-                                    tailHardCapForHead(h) - pure_count_per_head[static_cast<size_t>(h)]);
-                                if (tailCapacity == 0) {
-                                    ++tail_skipped_cap;
-                                    continue;
-                                }
-                                const int prior = tailCountPerHead[static_cast<size_t>(h)].fetch_add(
-                                    1, std::memory_order_relaxed);
-                                if (prior >= tailCapacity) {
-                                    ++tail_skipped_cap;
-                                    continue;
-                                }
-
-                                // Keep true distance until the candidates have been
-                                // sorted per head. The final merge below restores the
-                                // FLT_MAX tail marker so the pure/tail boundary stays
-                                // physically contiguous in the posting.
+                                // Capacity is applied only after all workers finish.
+                                // Claiming slots here would make each posting retain
+                                // whichever vectors reached it first rather than its
+                                // nearest candidates.
                                 Edge e; e.node = h; e.tonode = (SizeType)v; e.distance = res[r].Dist;
                                 local_appends.push_back(e);
                                 ++v_replicas;
-                                ++tail_added;
                             }
                             if (v_replicas >= (int)local_replica_dist.size()) v_replicas = (int)local_replica_dist.size() - 1;
                             ++local_replica_dist[v_replicas];
@@ -4938,6 +4907,40 @@ namespace SPTAG::SPANN {
                     // same in the direct build so a newly built index needs no
                     // post-build tail rewrite for ordering.
                     std::sort(tailCandidates.begin(), tailCandidates.end(), EdgeCompare());
+                    size_t candidateRead = 0;
+                    size_t candidateWrite = 0;
+                    while (candidateRead < tailCandidates.size()) {
+                        const int head = tailCandidates[candidateRead].node;
+                        size_t candidateEnd = candidateRead + 1;
+                        while (candidateEnd < tailCandidates.size() &&
+                               tailCandidates[candidateEnd].node == head) {
+                            ++candidateEnd;
+                        }
+                        const int tailCapacity =
+                            head >= 0 &&
+                            static_cast<size_t>(head) < pure_count_per_head.size()
+                                ? std::max(
+                                    0,
+                                    tailHardCapForHead(head) -
+                                        pure_count_per_head[static_cast<size_t>(head)])
+                                : 0;
+                        const size_t keep = std::min(
+                            candidateEnd - candidateRead,
+                            static_cast<size_t>(tailCapacity));
+                        for (size_t i = 0; i < keep; ++i) {
+                            if (candidateWrite != candidateRead + i) {
+                                tailCandidates[candidateWrite] =
+                                    tailCandidates[candidateRead + i];
+                            }
+                            ++candidateWrite;
+                        }
+                        tail_skipped_cap.fetch_add(
+                            candidateEnd - candidateRead - keep,
+                            std::memory_order_relaxed);
+                        candidateRead = candidateEnd;
+                    }
+                    tailCandidates.resize(candidateWrite);
+                    tail_added.store(candidateWrite, std::memory_order_relaxed);
                     const size_t tailCandidateCount = tailCandidates.size();
                     selections.m_selections.resize(pureSelectionCount + tailCandidateCount);
                     size_t purePos = pureSelectionCount;
@@ -4975,9 +4978,9 @@ namespace SPTAG::SPANN {
                     std::vector<Edge>().swap(tailCandidates);
 
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
-                                 "Phase 4 done: tail_added=%zu tail_skipped_dup=%zu tail_skipped_cap=%zu "
+                                 "Phase 4 done: tail_added=%zu tail_skipped_cap=%zu "
                                  "pure=%zu final=%zu\n",
-                                 tail_added.load(), tail_skipped_dup.load(), tail_skipped_cap.load(),
+                                 tail_added.load(), tail_skipped_cap.load(),
                                  pureSelectionCount, selections.m_selections.size());
 
                     // Replica-count distribution after closure (Σ over base vectors).
@@ -5089,14 +5092,17 @@ namespace SPTAG::SPANN {
                         for (size_t h = 0; h < postingListSize.size(); ++h) {
                             const int pure = pure_count_per_head[h];
                             const int total = postingListSize[h].load();
-                            const int maxPages = pagesForRecords(pure) + extraTailPages;
-                            if (total < pure || pagesForRecords(total) > maxPages) {
+                            const int tail = total - pure;
+                            if (tail < 0 || tail > tailRecordLimit ||
+                                pagesForRecords(pure) > m_opt->m_postingPageLimit ||
+                                pagesForRecords(tail) > tailPageLimit) {
                                 if (pageBudgetViolations < 5) {
                                     SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
                                                  "Phase 4 page-budget violation: head=%d pure=%d total=%d "
-                                                 "pages=%d maxPages=%d\n",
+                                                 "purePages=%d tailPages=%d limits=%d+%d\n",
                                                  static_cast<int>(h), pure, total,
-                                                 pagesForRecords(total), maxPages);
+                                                 pagesForRecords(pure), pagesForRecords(tail),
+                                                 m_opt->m_postingPageLimit, tailPageLimit);
                                 }
                                 ++pageBudgetViolations;
                             }
@@ -5108,8 +5114,10 @@ namespace SPTAG::SPANN {
                             return false;
                         }
                         SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
-                                     "Phase 4 page-budget verified: heads=%zu cap=purePages+%d\n",
-                                     postingListSize.size(), extraTailPages);
+                                     "Phase 4 page-budget verified: heads=%zu purePages<=%d "
+                                     "tailPages<=%d overlap=enabled\n",
+                                     postingListSize.size(), m_opt->m_postingPageLimit,
+                                     tailPageLimit);
                         SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
                                      "Phase 4 page-budget trim: headsWithTail=%zu hardCapTrimHeads=%zu hardCapTrimRecords=%zu "
                                      "sparseSecondTrimHeads=%zu sparseSecondTrimRecords=%zu finalSelections=%zu\n",
@@ -6668,10 +6676,6 @@ namespace SPTAG::SPANN {
             auto recordsForPages = [&](int pages) -> int {
                 return std::max(0, (pages * PageSize) / std::max(1, recBytes));
             };
-            auto pagesForRecords = [&](int records) -> int {
-                if (records <= 0) return 0;
-                return (records * recBytes + PageSize - 1) / PageSize;
-            };
             auto sparseTailLastPageKeep = [&](int pure, int keep) -> int {
                 if (keep <= pure) return pure;
                 const int totalBytes = keep * recBytes;
@@ -6686,7 +6690,9 @@ namespace SPTAG::SPANN {
                 return std::max(pure, lastPageStart / recBytes);
             };
             const int recordsPerPage = recordsForPages(1);
-            const int extraTailPages = std::max(0, m_opt->m_unfilterTailBufferLength);
+            const int tailPageLimit =
+                std::max(0, m_opt->m_unfilterTailBufferLength);
+            const int tailRecordLimit = recordsForPages(tailPageLimit);
             SizeType maxVec = N;
             if (const char* e = std::getenv("SPTAG_TAIL_REWRITE_MAX_VECTORS")) {
                 long long v = std::atoll(e);
@@ -6694,9 +6700,9 @@ namespace SPTAG::SPANN {
             }
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
                 "[TailRewrite] START N=%d maxVec=%d heads=%d recBytes=%d recordsPerPage=%d "
-                "extraTailPages=%d cap=purePages+extra Kmax=%d\n",
+                "tailPageLimit=%d tailRecordLimit=%d overlap=enabled Kmax=%d\n",
                 (int)N, (int)maxVec, (int)numHeads, recBytes, recordsPerPage,
-                extraTailPages, kmax);
+                tailPageLimit, tailRecordLimit, kmax);
 
             auto fileDb = std::dynamic_pointer_cast<FileIO>(db);
             if (!fileDb) {
@@ -6715,7 +6721,6 @@ namespace SPTAG::SPANN {
                 return;
             }
 
-            std::vector<std::uint8_t> pureDeg(static_cast<size_t>(N), 0);
             ExtraWorkSpace ws; InitWorkSpace(&ws);
             std::string blob;
             size_t pureRecords = 0;
@@ -6730,7 +6735,6 @@ namespace SPTAG::SPANN {
                     const char* e = p + static_cast<size_t>(i) * recBytes;
                     SizeType vid = *reinterpret_cast<const SizeType*>(e);
                     if (vid < 0 || vid >= N) continue;
-                    if (pureDeg[static_cast<size_t>(vid)] < 255) ++pureDeg[static_cast<size_t>(vid)];
                     if (!recSeen[static_cast<size_t>(vid)]) {
                         std::memcpy(recByVid.data() + static_cast<size_t>(vid) * recBytes, e, recBytes);
                         recSeen[static_cast<size_t>(vid)] = 1;
@@ -6742,56 +6746,6 @@ namespace SPTAG::SPANN {
                         "[TailRewrite] pass1 counted pure heads=%d pureRecords=%zu\n", (int)h, pureRecords);
                 }
             }
-
-            std::vector<std::uint64_t> pureOff(static_cast<size_t>(N) + 1, 0);
-            for (SizeType v = 0; v < N; ++v) {
-                pureOff[static_cast<size_t>(v) + 1] = pureOff[static_cast<size_t>(v)] + pureDeg[static_cast<size_t>(v)];
-            }
-            std::vector<SizeType> pureHeads;
-            try {
-                pureHeads.assign(static_cast<size_t>(pureOff.back()), 0);
-            } catch (const std::bad_alloc&) {
-                SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                    "[TailRewrite] failed to allocate pureHeads (%zu entries)\n",
-                    static_cast<size_t>(pureOff.back()));
-                return;
-            }
-            std::vector<std::uint8_t> fillDeg(static_cast<size_t>(N), 0);
-            for (SizeType h = 0; h < numHeads; ++h) {
-                int pure = m_postingPureCounts.GetSize(h);
-                if (pure <= 0) continue;
-                if (db->Get(h, &blob, MaxTimeout, &(ws.m_diskRequests)) != ErrorCode::Success) continue;
-                int avail = static_cast<int>(blob.size() / static_cast<size_t>(recBytes));
-                if (pure > avail) pure = avail;
-                const char* p = blob.data();
-                for (int i = 0; i < pure; ++i) {
-                    const char* e = p + static_cast<size_t>(i) * recBytes;
-                    SizeType vid = *reinterpret_cast<const SizeType*>(e);
-                    if (vid < 0 || vid >= N) continue;
-                    std::uint8_t pos = fillDeg[static_cast<size_t>(vid)]++;
-                    pureHeads[static_cast<size_t>(pureOff[static_cast<size_t>(vid)] + pos)] = h;
-                }
-                if (h > 0 && (h % 1000000) == 0) {
-                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
-                        "[TailRewrite] pass2 filled pure heads=%d\n", (int)h);
-                }
-            }
-            std::vector<std::uint8_t>().swap(fillDeg);
-            std::vector<std::uint8_t>().swap(pureDeg);
-
-            auto isPureDup = [&](SizeType vid, SizeType h) -> bool {
-                if (vid < 0 || vid >= N) return true;
-                std::uint64_t b = pureOff[static_cast<size_t>(vid)];
-                std::uint64_t e = pureOff[static_cast<size_t>(vid) + 1];
-                for (std::uint64_t i = b; i < e; ++i) if (pureHeads[static_cast<size_t>(i)] == h) return true;
-                return false;
-            };
-            auto genCapForHead = [&](SizeType h) -> int {
-                int pure = m_postingPureCounts.GetSize(h);
-                int purePages = pagesForRecords(pure);
-                int capPages = purePages + extraTailPages;
-                return std::max(0, recordsForPages(capPages) - pure);
-            };
 
             int fd = open(m_opt->m_fullVectorFile.c_str(), O_RDONLY);
             if (fd < 0) {
@@ -6810,12 +6764,10 @@ namespace SPTAG::SPANN {
             const ValueType* base = reinterpret_cast<const ValueType*>(
                 reinterpret_cast<const std::uint8_t*>(map) + 8);
 
-            std::vector<std::atomic<int>> tailCounts(static_cast<size_t>(numHeads));
-            for (auto& c : tailCounts) c.store(0, std::memory_order_relaxed);
             std::vector<Edge> tailPairs;
             std::mutex tailMutex;
             std::atomic<SizeType> cursor(0);
-            std::atomic<size_t> generated(0), skippedDup(0), skippedCap(0), skippedNoRecord(0);
+            std::atomic<size_t> generated(0), skippedCap(0), skippedNoRecord(0);
             int nThreads = std::max(1, m_opt->m_iSSDNumberOfThreads);
             auto worker = [&]() {
                 COMMON::QueryResultSet<ValueType> heads(nullptr, kmax);
@@ -6833,11 +6785,6 @@ namespace SPTAG::SPANN {
                     for (int r = 0; r < kmax; ++r) {
                         SizeType h = res[r].VID;
                         if (h < 0 || h >= numHeads) continue;
-                        if (isPureDup(v, h)) { ++skippedDup; continue; }
-                        int cap = genCapForHead(h);
-                        if (cap <= 0) { ++skippedCap; continue; }
-                        int old = tailCounts[static_cast<size_t>(h)].fetch_add(1, std::memory_order_relaxed);
-                        if (old >= cap) { ++skippedCap; continue; }
                         Edge e;
                         e.node = h;
                         e.tonode = v;
@@ -6852,8 +6799,8 @@ namespace SPTAG::SPANN {
                     }
                     if (v > 0 && (v % 10000000) == 0) {
                         SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
-                            "[TailRewrite] generated up to vid=%d pairs=%zu dup=%zu cap=%zu noRecord=%zu\n",
-                            (int)v, generated.load(), skippedDup.load(), skippedCap.load(), skippedNoRecord.load());
+                            "[TailRewrite] generated up to vid=%d pairs=%zu cap=%zu noRecord=%zu\n",
+                            (int)v, generated.load(), skippedCap.load(), skippedNoRecord.load());
                     }
                 }
                 if (!local.empty()) {
@@ -6867,18 +6814,15 @@ namespace SPTAG::SPANN {
             munmap(map, static_cast<size_t>(st.st_size));
 
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
-                "[TailRewrite] generation done pairs=%zu generated=%zu dup=%zu cap=%zu noRecord=%zu; sorting\n",
-                tailPairs.size(), generated.load(), skippedDup.load(), skippedCap.load(), skippedNoRecord.load());
+                "[TailRewrite] generation done pairs=%zu generated=%zu cap=%zu noRecord=%zu; sorting\n",
+                tailPairs.size(), generated.load(), skippedCap.load(), skippedNoRecord.load());
             std::sort(tailPairs.begin(), tailPairs.end(), EdgeCompare());
 
             auto finalKeepTail = [&](SizeType h, size_t tailAvail) -> size_t {
-                int pure = m_postingPureCounts.GetSize(h);
-                int purePages = pagesForRecords(pure);
-                int capPages = purePages + extraTailPages;
-                int hardCap = recordsForPages(capPages);
-                int keep = pure + static_cast<int>(std::min<size_t>(tailAvail, static_cast<size_t>(std::max(0, hardCap - pure))));
-                keep = sparseTailLastPageKeep(pure, keep);
-                return static_cast<size_t>(std::max(0, keep - pure));
+                (void)h;
+                int keep = static_cast<int>(std::min<size_t>(
+                    tailAvail, static_cast<size_t>(tailRecordLimit)));
+                return static_cast<size_t>(sparseTailLastPageKeep(0, keep));
             };
 
             size_t pairPos = 0;
@@ -6922,7 +6866,7 @@ namespace SPTAG::SPANN {
             }
             Checkpoint(m_opt->m_indexDirectory);
             std::ofstream marker(m_opt->m_indexDirectory + FolderSep + "tail_rewrite_pagebudget.done", std::ios::binary);
-            int hdr[4] = { kmax, recBytes, recordsPerPage, extraTailPages };
+            int hdr[4] = { kmax, recBytes, recordsPerPage, tailPageLimit };
             marker.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
             marker.close();
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
@@ -7718,6 +7662,12 @@ namespace SPTAG::SPANN {
             const bool capScanToPure =
                 useUnfilterTail ||
                 (m_opt->m_ablateTail && m_hasPostingPureCounts && !hasInlineTagFilter);
+            const bool useTailSuffix =
+                m_opt->m_enableUnfilterTail &&
+                m_hasPostingPureCounts &&
+                (!hasPredicateFilter ||
+                 p_exWorkSpace->m_useGlobalTailWithPostFilter) &&
+                !ablateTail;
             // Experimental unfilter mode: read only the pages that cover the pure
             // prefix, but scan all records present in those pages. This keeps tail
             // records that fit in already-paid pure pages and avoids extra tail-page IO.
@@ -7824,7 +7774,35 @@ namespace SPTAG::SPANN {
             if (asyncScan) {
                 const auto postingIoStart = logPhaseTime ? std::chrono::high_resolution_clock::now()
                                                          : std::chrono::high_resolution_clock::time_point{};
-                if (((capScanToPure || capUnfilterToPurePages) && m_hasPostingPureCounts) ||
+                std::vector<std::vector<std::uint8_t>> tailPageSelect;
+                if (useTailSuffix) {
+                    tailPageSelect.resize(p_exWorkSpace->m_postingIDs.size());
+                    for (size_t i = 0; i < tailPageSelect.size(); ++i) {
+                        const SizeType hid = p_exWorkSpace->m_postingIDs[i];
+                        const int total = m_postingSizes.GetSize(hid);
+                        const int pure = (std::max)(
+                            0, (std::min)(m_postingPureCounts.GetSize(hid), total));
+                        const size_t start =
+                            static_cast<size_t>(pure) * m_vectorInfoSize;
+                        const size_t end =
+                            static_cast<size_t>(total) * m_vectorInfoSize;
+                        const int pages = end == 0 ? 0 :
+                            static_cast<int>((end + PageSize - 1) >> PageSizeEx);
+                        auto& select = tailPageSelect[i];
+                        select.assign(pages, 0);
+                        for (int page = static_cast<int>(start >> PageSizeEx);
+                             page < pages && start < end;
+                             ++page) {
+                            select[page] = 1;
+                        }
+                    }
+                    db->MultiGet(
+                        p_exWorkSpace->m_postingIDs,
+                        p_exWorkSpace->m_pageBuffers,
+                        tailPageSelect,
+                        HardLatencyLimit(),
+                        &(p_exWorkSpace->m_diskRequests));
+                } else if (((capScanToPure || capUnfilterToPurePages) && m_hasPostingPureCounts) ||
                     searchPostingByteCap > 0) {
                     // Cap each posting's READ to its pure prefix so tail-replica
                     // records are never fetched from SSD (saves IO, not just the
@@ -7870,8 +7848,14 @@ namespace SPTAG::SPANN {
                     const std::uint64_t logicalBytes =
                         p_exWorkSpace->m_pageBuffers[pi].GetAvailableSize();
                     if (logicalBytes == 0) continue;
-                    const std::uint64_t pageReads =
-                        (logicalBytes + PageSize - 1) / PageSize;
+                    std::uint64_t pageReads = 0;
+                    if (useTailSuffix && pi < tailPageSelect.size()) {
+                        for (std::uint8_t selected : tailPageSelect[pi]) {
+                            pageReads += selected != 0;
+                        }
+                    } else {
+                        pageReads = (logicalBytes + PageSize - 1) / PageSize;
+                    }
                     p_exWorkSpace->m_postingProbeStats.m_postingPageReads += pageReads;
                     p_exWorkSpace->m_postingProbeStats.m_postingLogicalBytes += logicalBytes;
                     // FileIO issues PageSize reads even for a posting's partial final page.
@@ -7884,15 +7868,19 @@ namespace SPTAG::SPANN {
                     auto& buffer = p_exWorkSpace->m_pageBuffers[pi];
                     const std::uint8_t* data = (const std::uint8_t*)buffer.GetBuffer();
                     int n = (int)(buffer.GetAvailableSize() / m_vectorInfoSize);
+                    int scanStart = 0;
                     int scanLimit = n;
-                    if (capScanToPure) {
+                    if (useTailSuffix) {
+                        scanStart = (std::max)(
+                            0, (std::min)(m_postingPureCounts.GetSize(h), scanLimit));
+                    } else if (capScanToPure) {
                         if (IsUnfilterOnlyHead((int)h)) scanLimit = 0;
                         else { int pure = m_postingPureCounts.GetSize(h); if (pure > 0 && pure < scanLimit) scanLimit = pure; }
                     }
                     p_exWorkSpace->m_postingProbeStats.m_adcScannedVectors +=
-                        static_cast<std::uint64_t>(scanLimit);
+                        static_cast<std::uint64_t>(scanLimit - scanStart);
                     int liveCount = n;
-                    for (int i = 0; i < scanLimit; i++) {
+                    for (int i = scanStart; i < scanLimit; i++) {
                         const std::uint8_t* e = data + (size_t)i * m_vectorInfoSize;
                         int vid = *(reinterpret_cast<const int*>(e));
                         // PipePQ records carry their ADC code inline. New tagged-update
@@ -7942,25 +7930,30 @@ namespace SPTAG::SPANN {
                 if (h < 0 || h >= postingNum) continue;
                 std::uint64_t o0 = m_slimOff[h], o1 = m_slimOff[h + 1];
                 int n = (int)((o1 - o0) / m_slimRec);
+                int scanStart = 0;
                 int scanLimit = n;
-                if (capScanToPure) {
+                if (useTailSuffix) {
+                    scanStart = (std::max)(
+                        0, (std::min)(m_postingPureCounts.GetSize(h), scanLimit));
+                } else if (capScanToPure) {
                     if (IsUnfilterOnlyHead((int)h)) scanLimit = 0;
                     else { int pure = m_postingPureCounts.GetSize(h); if (pure > 0 && pure < scanLimit) scanLimit = pure; }
                 }
                 if (searchPostingByteCap > 0) {
-                    scanLimit = (std::min)(
-                        scanLimit,
+                    scanLimit = (std::min)(scanLimit, scanStart +
                         static_cast<int>(searchPostingByteCap / m_slimRec));
                 }
-                slimBytesRead += (size_t)scanLimit * m_slimRec;
+                slimBytesRead += static_cast<size_t>(scanLimit - scanStart) * m_slimRec;
                 int liveCount = n;
                 const std::uint8_t* base;
-                if (m_slimDirectFd >= 0 && scanLimit > 0) {
-                    // O_DIRECT device-bound read of the scanned posting range [o0, o0+scanLimit*rec).
+                const std::uint64_t scanOffset =
+                    o0 + static_cast<std::uint64_t>(scanStart) * m_slimRec;
+                if (m_slimDirectFd >= 0 && scanLimit > scanStart) {
+                    // O_DIRECT device-bound read of the selected posting range.
                     // Align the offset/length to the device block size into a per-thread bounce buffer.
                     const size_t ALIGN = 4096;
                     std::uint64_t readEnd = o0 + (std::uint64_t)scanLimit * m_slimRec;
-                    std::uint64_t aStart = o0 & ~(std::uint64_t)(ALIGN - 1);
+                    std::uint64_t aStart = scanOffset & ~(std::uint64_t)(ALIGN - 1);
                     std::uint64_t aEnd = (readEnd + ALIGN - 1) & ~(std::uint64_t)(ALIGN - 1);
                     size_t aLen = (size_t)(aEnd - aStart);
                     static thread_local std::uint8_t* t_buf = nullptr;
@@ -7971,15 +7964,16 @@ namespace SPTAG::SPANN {
                         else t_cap = aLen;
                     }
                     if (t_buf && pread(m_slimDirectFd, t_buf, aLen, (off_t)aStart) > 0) {
-                        base = t_buf + (o0 - aStart);
+                        base = t_buf + (scanOffset - aStart);
                     } else {
-                        base = m_slim + o0;
+                        base = m_slim + scanOffset;
                     }
                 } else {
-                    base = m_slim + o0;
+                    base = m_slim + scanOffset;
                 }
-                for (int i = 0; i < scanLimit; i++) {
-                    const std::uint8_t* e = base + (size_t)i * m_slimRec;
+                for (int i = scanStart; i < scanLimit; i++) {
+                    const std::uint8_t* e =
+                        base + static_cast<size_t>(i - scanStart) * m_slimRec;
                     int vid = *(reinterpret_cast<const int*>(e));
                     if (vid < 0 || vid >= m_opqN) {
                         --liveCount;

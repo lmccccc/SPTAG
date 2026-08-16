@@ -805,6 +805,18 @@ break;
                 return m_iRuntimeEdgeSuffixSize;
             }
 
+            ErrorCode CommitRuntimeEdgeSuffix()
+            {
+                if (m_iRuntimeEdgeSuffixSize <= 0 ||
+                    m_iNeighborhoodSize + m_iRuntimeEdgeSuffixSize !=
+                        m_pNeighborhoodGraph.C()) {
+                    return ErrorCode::Fail;
+                }
+                m_iNeighborhoodSize += m_iRuntimeEdgeSuffixSize;
+                m_iRuntimeEdgeSuffixSize = 0;
+                return ErrorCode::Success;
+            }
+
             inline SizeType* RuntimeEdgeSuffix(SizeType p_node)
             {
                 return m_pNeighborhoodGraph[p_node] + m_iNeighborhoodSize;

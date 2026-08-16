@@ -262,6 +262,11 @@ public:
     // builds. The workload is parsed and planned natively before SelectHead.
     bool ConfigurePredicateSubsetPlanner(const char* p_workloadFile,
                                          int p_categoricalColumnCount);
+#ifndef SWIG
+    bool ConfigurePredicateSubsetPlanner(
+        const char* p_workloadFile,
+        const std::vector<std::uint8_t>& p_attributeKinds);
+#endif
 
     // Set HeadIndex LRU cache size limit (in bytes). 0 = unlimited.
     void SetHeadIndexCacheLimit(uint64_t p_bytesLimit);
@@ -299,7 +304,7 @@ public:
     // --- ACL/Tag Filtered Search ---
     // Build posting signatures (PS + NS) for a tenant from per-vector tags.
     // p_tags: ByteArray of uint32_t, layout [p_numVectors × p_numTagsPerVec].
-    // Each vector can have multiple tags (e.g. org, dept, team, project).
+    // Each vector can have an arbitrary fixed-width uint32 attribute row.
     bool BuildSignatures(int p_tenantId, ByteArray p_tags, int p_numVectors, int p_numTagsPerVec);
 
     // Recompute each vector's nearest persisted head and write primary_head_csr.bin
@@ -399,11 +404,9 @@ private:
     std::map<int, std::vector<uint32_t>> m_tenantTagLevelOffsets;
 
     // Numeric attribute metadata per tenant: the first numeric tag-column index
-    // (numBaseCols) and the per-column quantization domain [lo,hi]. Used by the
-    // query path to build the quantized numeric pre-filter. Loaded from
-    // numeric_meta.bin; absent => no numeric columns.
+    // Physical numeric column IDs and their quantization domains [lo,hi].
     struct NumericMeta {
-        int numBaseCols = 0;
+        std::vector<int> columns;
         std::vector<SPTAG::Cache::NumQuantParam> params;
     };
     std::map<int, NumericMeta> m_tenantNumericMeta;
@@ -427,6 +430,7 @@ private:
     bool m_predicateSubsetPlannerEnabled = false;
     std::string m_predicateSubsetWorkloadFile;
     int m_predicateSubsetCategoricalColumnCount = 0;
+    std::vector<std::uint8_t> m_predicateSubsetAttributeKinds;
     std::map<int, std::shared_ptr<SPTAG::PredicateSubsetPlanner::Plan>>
         m_tenantPredicateSubsetPlans;
     std::map<int, std::unordered_map<std::string, std::vector<int>>>

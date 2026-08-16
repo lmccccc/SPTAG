@@ -304,7 +304,11 @@ template <bool EnableCrossEdges,
 void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_space,
                       std::function<bool(const ByteArray &)> filterFunc,
                       const CrossGraphSearchContext* p_crossContext,
-                      CrossGraphSearchStats* p_crossStats) const
+                      CrossGraphSearchStats* p_crossStats,
+                      std::function<bool(SizeType)> p_idFilterFunc,
+                      int p_treeIndex,
+                      DimensionType p_edgeCount,
+                      DimensionType p_checkPos) const
 {
     std::shared_lock<std::shared_timed_mutex> treeLock;
     std::vector<std::shared_lock<std::shared_timed_mutex>> crossTreeLocks;
@@ -330,7 +334,8 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
     {
         treeStart = std::chrono::high_resolution_clock::now();
     }
-    m_pTrees.InitSearchTrees(m_pSamples, m_fComputeDistance, p_query, p_space);
+    m_pTrees.InitSearchTrees(
+        m_pSamples, m_fComputeDistance, p_query, p_space, p_treeIndex);
     m_pTrees.SearchTrees(m_pSamples, m_fComputeDistance, p_query, p_space, m_iNumberOfInitialDynamicPivots);
     std::chrono::high_resolution_clock::time_point graphStart;
 
@@ -471,12 +476,20 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
         }
 
         const DimensionType localEdgeCount =
-            currentIndex->m_pGraph.m_iNeighborhoodSize;
+            !EnableCrossEdges && p_edgeCount > 0
+            ? (std::min)(
+                p_edgeCount,
+                currentIndex->m_pGraph.m_iNeighborhoodSize)
+            : currentIndex->m_pGraph.m_iNeighborhoodSize;
         const DimensionType crossEdgeCount = EnableCrossEdges
             ? currentIndex->m_pGraph.GetRuntimeEdgeSuffixSize()
             : 0;
         const DimensionType edgeCount = localEdgeCount + crossEdgeCount;
-        const DimensionType checkPos = localEdgeCount - 1;
+        const DimensionType checkPos =
+            !EnableCrossEdges && p_checkPos >= 0 &&
+                    p_checkPos < edgeCount
+                ? p_checkPos
+                : localEdgeCount - 1;
         const SizeType* node = currentIndex->m_pGraph[currentLocal];
 
         if constexpr (!EnableCrossEdges)
@@ -517,6 +530,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                                     static_cast<size_t>(collapsedLocal)];
                         }
                         if (collapsedResult >= 0 &&
+                            (!p_idFilterFunc || p_idFilterFunc(collapsedResult)) &&
                             notDeleted(
                                 currentIndex->m_deletedID,
                                 collapsedLocal) &&
@@ -541,6 +555,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
             else if (notDeleted(
                          currentIndex->m_deletedID,
                          currentLocal) &&
+                     (!p_idFilterFunc || p_idFilterFunc(resultNode)) &&
                      checkFilter(
                          currentIndex->m_pMetadata,
                          currentLocal,
@@ -1001,6 +1016,64 @@ ErrorCode Index<T>::SearchIndexWithFilter(QueryResult &p_query, std::function<bo
             p_query.SetMetadata(i, (result < 0) ? ByteArray::c_empty : m_pMetadata->GetMetadataCopy(result));
         }
     }
+    return ErrorCode::Success;
+}
+
+template <typename T>
+ErrorCode Index<T>::SearchIndexWithIDFilter(
+    QueryResult& p_query,
+    std::function<bool(SizeType)> p_filterFunc,
+    int p_maxCheck,
+    int p_treeIndex,
+    DimensionType p_edgeCount,
+    DimensionType p_checkPos) const
+{
+    if (!m_bReady) return ErrorCode::EmptyIndex;
+    auto workSpace = RentWorkSpace(
+        p_query.GetResultNum(), nullptr, p_maxCheck);
+    Search<false,
+           StaticDispatch::AlwaysTrue,
+           StaticDispatch::CheckDup,
+           StaticDispatch::AlwaysTrue>(
+        *((COMMON::QueryResultSet<T>*)&p_query),
+        *workSpace,
+        nullptr,
+        nullptr,
+        nullptr,
+        std::move(p_filterFunc),
+        p_treeIndex,
+        p_edgeCount,
+        p_checkPos);
+    p_query.SetScanned(workSpace->m_iNumberOfCheckedLeaves);
+    m_workSpaceFactory->ReturnWorkSpace(std::move(workSpace));
+    return ErrorCode::Success;
+}
+
+template <typename T>
+ErrorCode Index<T>::SearchIndexWithGraphLimits(
+    QueryResult& p_query,
+    DimensionType p_edgeCount,
+    DimensionType p_checkPos,
+    int p_treeIndex) const
+{
+    if (!m_bReady) return ErrorCode::EmptyIndex;
+    auto workSpace = RentWorkSpace(
+        p_query.GetResultNum(), nullptr, m_iMaxCheck);
+    Search<false,
+           StaticDispatch::AlwaysTrue,
+           StaticDispatch::CheckDup,
+           StaticDispatch::AlwaysTrue>(
+        *((COMMON::QueryResultSet<T>*)&p_query),
+        *workSpace,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        p_treeIndex,
+        p_edgeCount,
+        p_checkPos);
+    p_query.SetScanned(workSpace->m_iNumberOfCheckedLeaves);
+    m_workSpaceFactory->ReturnWorkSpace(std::move(workSpace));
     return ErrorCode::Success;
 }
 

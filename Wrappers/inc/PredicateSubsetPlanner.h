@@ -30,18 +30,10 @@
 namespace SPTAG {
 namespace PredicateSubsetPlanner {
 
-// SIFT1M UInt8 static-SPANN calibration, measured on the local single-threaded
-// SearchWithACL path with 100 queries and three repetitions.
+// Build-time planner limits are structural and independent of index timings.
 constexpr std::size_t kPlannerSampleRows = 4096;
 constexpr std::size_t kPlannerMaxLeaves = 64;
 constexpr std::size_t kPlannerConvergencePatience = 8;
-constexpr double kBaseQueryCostMs = 0.40657040;
-constexpr double kFullPopulationScanCostMs = 0.10746861;
-constexpr double kAdditionalSubsetCostMs = 0.02330404;
-// Cross-edge on/off differed by less than one microsecond at the median. Keep
-// that measurement resolution as a conservative boundary regularizer.
-constexpr double kBoundaryCutCostMs = 0.001;
-constexpr double kSubsetMaintenanceCostMs = 0.0;
 // Runtime route calibration for the full-precision SIFT1M index at nprobe 96.
 // The common nprobe scale cancels in the pure-vs-tail comparison.
 constexpr double kRuntimeHeadSearchCostMs = 0.607;
@@ -75,6 +67,7 @@ struct Query {
 
 struct Workload {
     int categoricalColumnCount = 0;
+    std::vector<std::uint8_t> attributeKinds;
     std::vector<Atom> atoms;
     std::vector<Query> queries;
 };
@@ -93,8 +86,8 @@ struct DecisionNode {
 
 struct Snapshot {
     int leafCount = 0;
-    double trainingCost = 0.0;
-    double validationCost = 0.0;
+    double trainingScore = 0.0;
+    double validationScore = 0.0;
     std::vector<int> activeNodes;
 };
 
@@ -117,14 +110,9 @@ struct Plan {
     std::vector<Snapshot> snapshots;
     std::size_t sampleRows = 0;
     std::size_t sourceRows = 0;
-    double startupCost = 0.0;
-    double scanCost = kFullPopulationScanCostMs;
-    double coordinationCost = 0.0;
-    double boundaryPenalty = 0.0;
-    double subsetOverhead = 0.0;
     double selectedBoundaryFraction = 0.0;
-    double selectedTrainingCost = 0.0;
-    double selectedValidationCost = 0.0;
+    double selectedTrainingScore = 0.0;
+    double selectedValidationScore = 0.0;
     bool loadedFromFile = false;
 };
 
@@ -330,7 +318,7 @@ inline bool ParseColumn(const std::string& text, int* column)
 }
 
 inline bool ParseAtom(const std::string& text,
-                      int categoricalColumnCount,
+                      const std::vector<std::uint8_t>& attributeKinds,
                       Atom* atom,
                       std::string* error)
 {
@@ -371,15 +359,15 @@ inline bool ParseAtom(const std::string& text,
         !ParseUnsigned(input.substr(opPosition + opLength), &value)) {
         return SetError(error, "invalid predicate atom: " + input);
     }
-    if (categoricalColumnCount < 0) {
-        return SetError(error, "categorical column count must be non-negative");
+    if (column < 0 ||
+        static_cast<std::size_t>(column) >= attributeKinds.size()) {
+        return SetError(error, "predicate column outside attribute schema: " + input);
     }
 
     atom->column = column;
     atom->value = value;
     atom->op = op;
-    atom->kind = static_cast<std::uint8_t>(
-        column < categoricalColumnCount ? 0 : 1);
+    atom->kind = attributeKinds[static_cast<std::size_t>(column)];
     return true;
 }
 
@@ -486,7 +474,7 @@ inline std::string CanonicalizeQuery(std::vector<Clause>* clauses,
 }
 
 inline bool ParseQuery(const std::string& predicate,
-                       int categoricalColumnCount,
+                       const std::vector<std::uint8_t>& attributeKinds,
                        std::vector<Atom>* atoms,
                        std::unordered_map<std::string, int>* atomIds,
                        Query* query,
@@ -503,7 +491,7 @@ inline bool ParseQuery(const std::string& predicate,
         Clause clause;
         for (const std::string& atomText : Split(clauseText, '&')) {
             Atom atom;
-            if (!ParseAtom(atomText, categoricalColumnCount, &atom, error)) {
+            if (!ParseAtom(atomText, attributeKinds, &atom, error)) {
                 return false;
             }
             const std::string key = AtomKey(atom);
@@ -527,6 +515,25 @@ inline bool ParseQuery(const std::string& predicate,
     }
     query->canonical = CanonicalizeQuery(&query->clauses, *atoms);
     return !query->canonical.empty();
+}
+
+inline bool ParseQuery(const std::string& predicate,
+                       int categoricalColumnCount,
+                       std::vector<Atom>* atoms,
+                       std::unordered_map<std::string, int>* atomIds,
+                       Query* query,
+                       std::string* error)
+{
+    if (categoricalColumnCount < 0 || categoricalColumnCount > 4096) {
+        return SetError(error, "categorical column count is invalid");
+    }
+    std::vector<std::uint8_t> legacyKinds(4096, 1);
+    std::fill(
+        legacyKinds.begin(),
+        legacyKinds.begin() + categoricalColumnCount,
+        std::uint8_t{0});
+    return ParseQuery(
+        predicate, legacyKinds, atoms, atomIds, query, error);
 }
 
 inline bool ParseWeightAndPredicate(const std::string& line,
@@ -566,16 +573,22 @@ inline bool ParseWeightAndPredicate(const std::string& line,
 }
 
 inline bool LoadWorkload(const std::string& path,
-                         int categoricalColumnCount,
+                         const std::vector<std::uint8_t>& attributeKinds,
                          Workload* workload,
                          std::string* error)
 {
     if (workload == nullptr) return SetError(error, "null workload output");
+    if (attributeKinds.empty()) return SetError(error, "attribute schema is empty");
+    for (std::uint8_t kind : attributeKinds) {
+        if (kind > 1) return SetError(error, "invalid attribute kind");
+    }
     std::ifstream input(path);
     if (!input) return SetError(error, "cannot open predicate workload: " + path);
 
     Workload parsed;
-    parsed.categoricalColumnCount = categoricalColumnCount;
+    parsed.attributeKinds = attributeKinds;
+    parsed.categoricalColumnCount = static_cast<int>(std::count(
+        attributeKinds.begin(), attributeKinds.end(), std::uint8_t{0}));
     std::unordered_map<std::string, int> atomIds;
     std::unordered_map<std::string, std::size_t> queryIds;
     std::string line;
@@ -596,7 +609,7 @@ inline bool LoadWorkload(const std::string& path,
         query.weight = weight;
         std::string parseError;
         if (!ParseQuery(predicate,
-                        categoricalColumnCount,
+                        attributeKinds,
                         &parsed.atoms,
                         &atomIds,
                         &query,
@@ -650,6 +663,24 @@ inline bool LoadWorkload(const std::string& path,
     parsed.atoms.swap(compactAtoms);
     *workload = std::move(parsed);
     return true;
+}
+
+inline bool LoadWorkload(const std::string& path,
+                         int categoricalColumnCount,
+                         Workload* workload,
+                         std::string* error)
+{
+    if (categoricalColumnCount < 0 || categoricalColumnCount > 4096) {
+        return SetError(error, "categorical column count must be non-negative");
+    }
+    std::vector<std::uint8_t> legacyKinds(4096, 1);
+    std::fill(
+        legacyKinds.begin(),
+        legacyKinds.begin() + categoricalColumnCount,
+        std::uint8_t{0});
+    const bool loaded = LoadWorkload(path, legacyKinds, workload, error);
+    if (loaded) workload->attributeKinds.clear();
+    return loaded;
 }
 
 class Bitmap {
@@ -816,7 +847,7 @@ inline std::vector<Bitmap> BuildQueryMatches(
     return queryMatches;
 }
 
-inline double EvaluatePartitionCost(
+inline double EvaluatePartitionStructuralScore(
     const std::vector<int>& activeNodes,
     const std::vector<WorkingNode>& nodes,
     const std::vector<Atom>& atoms,
@@ -824,21 +855,17 @@ inline double EvaluatePartitionCost(
     const std::vector<Bitmap>& queryMatches,
     const std::vector<std::size_t>& atomPopulations,
     const std::vector<int>& queryIds,
-    std::size_t sampleRows,
-    double baseQueryCost,
-    double scanCost,
-    double additionalSubsetCost)
+    std::size_t sampleRows)
 {
     if (sampleRows == 0 || queryIds.empty()) {
-        return baseQueryCost + scanCost;
+        return 1.0;
     }
-    const double globalCost = baseQueryCost + scanCost;
-    double weightedCost = 0.0;
+    double weightedScore = 0.0;
     double totalWeight = 0.0;
     for (int queryId : queryIds) {
         const Query& query = queries[static_cast<std::size_t>(queryId)];
         if (QueryRequiresGlobalFallback(query, atoms, atomPopulations)) {
-            weightedCost += query.weight * globalCost;
+            weightedScore += query.weight;
             totalWeight += query.weight;
             continue;
         }
@@ -856,20 +883,20 @@ inline double EvaluatePartitionCost(
             routedPopulation += node.population;
         }
         if (touched == 0) {
-            weightedCost += query.weight * globalCost;
+            weightedScore += query.weight;
         } else {
-            const double routed =
-                baseQueryCost +
-                scanCost *
-                    static_cast<double>(routedPopulation) /
-                    static_cast<double>(sampleRows) +
-                additionalSubsetCost *
-                    static_cast<double>(std::max(0, touched - 1));
-            weightedCost += query.weight * std::min(globalCost, routed);
+            const double populationFraction =
+                static_cast<double>(routedPopulation) /
+                static_cast<double>(sampleRows);
+            const double fanoutFraction =
+                static_cast<double>(std::max(0, touched - 1)) /
+                static_cast<double>(kPlannerMaxLeaves - 1);
+            weightedScore += query.weight *
+                std::min(1.0, populationFraction + fanoutFraction);
         }
         totalWeight += query.weight;
     }
-    return totalWeight > 0.0 ? weightedCost / totalWeight : globalCost;
+    return totalWeight > 0.0 ? weightedScore / totalWeight : 1.0;
 }
 
 template <typename DistanceAccessor>
@@ -1047,16 +1074,11 @@ bool BuildPlan(const Workload& workload,
         }
     }
 
-    const double startupCost = kBaseQueryCostMs;
-    const double scanCost = kFullPopulationScanCostMs;
-    const double coordinationCost = kAdditionalSubsetCostMs;
     const std::size_t leafLimit =
         leafLimitOverride > 0 ? leafLimitOverride : kPlannerMaxLeaves;
     if (leafLimit > kPlannerMaxLeaves) {
         return SetError(error, "predicate planner leaf limit exceeds 64");
     }
-    const double boundaryPenalty = kBoundaryCutCostMs;
-    const double subsetOverhead = kSubsetMaintenanceCostMs;
     double totalAffinityWeight = 0.0;
     for (const AffinityEdge& edge : affinityEdges) {
         if (edge.first >= sampleRows || edge.second >= sampleRows ||
@@ -1079,8 +1101,8 @@ bool BuildPlan(const Workload& workload,
 
     struct SearchState {
         std::vector<int> activeNodes;
-        double trainingCost = 0.0;
-        double validationCost = 0.0;
+        double trainingScore = 0.0;
+        double validationScore = 0.0;
         double boundaryWeight = 0.0;
         int parentState = -1;
         int splitNode = -1;
@@ -1095,27 +1117,32 @@ bool BuildPlan(const Workload& workload,
         int splitAtom = -1;
         WorkingNode left;
         WorkingNode right;
-        double trainingCost = 0.0;
-        double validationCost = 0.0;
+        double trainingScore = 0.0;
+        double validationScore = 0.0;
         double boundaryWeight = 0.0;
         int maxDepth = 0;
         std::string partitionKey;
     };
 
-    auto objective = [&](double queryCost,
+    auto objective = [&](double queryScore,
                          double boundaryWeight,
                          std::size_t leaves) {
         const double boundaryFraction =
             totalAffinityWeight > 0.0
                 ? boundaryWeight / totalAffinityWeight
                 : 0.0;
-        return queryCost + boundaryPenalty * boundaryFraction +
-               subsetOverhead * static_cast<double>(leaves);
+        const double leafFraction =
+            leafLimit > 1
+                ? static_cast<double>(leaves - 1) /
+                      static_cast<double>(leafLimit - 1)
+                : 0.0;
+        return queryScore * (1.0 + boundaryFraction) *
+               (1.0 + leafFraction);
     };
     auto candidateBetter = [](const Candidate& left,
                               const Candidate& right) {
-        if (left.trainingCost < right.trainingCost - 1e-12) return true;
-        if (left.trainingCost > right.trainingCost + 1e-12) return false;
+        if (left.trainingScore < right.trainingScore - 1e-12) return true;
+        if (left.trainingScore > right.trainingScore + 1e-12) return false;
         if (left.maxDepth != right.maxDepth) {
             return left.maxDepth < right.maxDepth;
         }
@@ -1131,25 +1158,27 @@ bool BuildPlan(const Workload& workload,
     std::vector<SearchState> states;
     SearchState rootState;
     rootState.activeNodes.push_back(0);
-    rootState.trainingCost = objective(
-        EvaluatePartitionCost(
+    rootState.trainingScore = objective(
+        EvaluatePartitionStructuralScore(
             rootState.activeNodes, nodes, workload.atoms, workload.queries,
-            queryMatches, atomPopulations, trainingQueries, sampleRows,
-            startupCost, scanCost, coordinationCost),
+            queryMatches, atomPopulations, trainingQueries, sampleRows),
         0.0,
         1);
-    rootState.validationCost = objective(
-        EvaluatePartitionCost(
+    rootState.validationScore = objective(
+        EvaluatePartitionStructuralScore(
             rootState.activeNodes, nodes, workload.atoms, workload.queries,
-            queryMatches, atomPopulations, validationQueries, sampleRows,
-            startupCost, scanCost, coordinationCost),
+            queryMatches, atomPopulations, validationQueries, sampleRows),
         0.0,
         1);
     states.push_back(std::move(rootState));
 
     std::vector<int> beam(1, 0);
     std::vector<int> allStateIds(1, 0);
-    double bestValidationCost = states[0].validationCost;
+    // Prefer cuts whose structural benefit holds on both independent query splits.
+    const auto robustScore = [](const SearchState& state) {
+        return std::max(state.trainingScore, state.validationScore);
+    };
+    double bestRobustScore = robustScore(states[0]);
     std::size_t staleLeafCounts = 0;
     for (std::size_t leafCount = 1;
          leafCount < leafLimit && !beam.empty();
@@ -1223,20 +1252,18 @@ bool BuildPlan(const Workload& workload,
                         state.boundaryWeight + addedBoundary;
                     candidate.maxDepth =
                         std::max(state.maxDepth, parent.depth + 1);
-                    candidate.trainingCost = objective(
-                        EvaluatePartitionCost(
+                    candidate.trainingScore = objective(
+                        EvaluatePartitionStructuralScore(
                             candidateNodes, nodes, workload.atoms,
                             workload.queries, queryMatches, atomPopulations,
-                            trainingQueries, sampleRows, startupCost,
-                            scanCost, coordinationCost),
+                            trainingQueries, sampleRows),
                         candidate.boundaryWeight,
                         candidateNodes.size());
-                    candidate.validationCost = objective(
-                        EvaluatePartitionCost(
+                    candidate.validationScore = objective(
+                        EvaluatePartitionStructuralScore(
                             candidateNodes, nodes, workload.atoms,
                             workload.queries, queryMatches, atomPopulations,
-                            validationQueries, sampleRows, startupCost,
-                            scanCost, coordinationCost),
+                            validationQueries, sampleRows),
                         candidate.boundaryWeight,
                         candidateNodes.size());
                     candidate.partitionKey =
@@ -1289,8 +1316,8 @@ bool BuildPlan(const Workload& workload,
             next.activeNodes.push_back(leftId);
             next.activeNodes.push_back(rightId);
             std::sort(next.activeNodes.begin(), next.activeNodes.end());
-            next.trainingCost = candidate.trainingCost;
-            next.validationCost = candidate.validationCost;
+            next.trainingScore = candidate.trainingScore;
+            next.validationScore = candidate.validationScore;
             next.boundaryWeight = candidate.boundaryWeight;
             next.parentState = candidate.parentState;
             next.splitNode = candidate.splitNode;
@@ -1303,14 +1330,14 @@ bool BuildPlan(const Workload& workload,
             beam.push_back(stateId);
             allStateIds.push_back(stateId);
         }
-        double layerBestValidation = std::numeric_limits<double>::infinity();
+        double layerBestRobustScore = std::numeric_limits<double>::infinity();
         for (int stateId : beam) {
-            layerBestValidation = std::min(
-                layerBestValidation,
-                states[static_cast<std::size_t>(stateId)].validationCost);
+            layerBestRobustScore = std::min(
+                layerBestRobustScore,
+                robustScore(states[static_cast<std::size_t>(stateId)]));
         }
-        if (layerBestValidation < bestValidationCost - 1e-12) {
-            bestValidationCost = layerBestValidation;
+        if (layerBestRobustScore < bestRobustScore - 1e-12) {
+            bestRobustScore = layerBestRobustScore;
             staleLeafCounts = 0;
         } else {
             ++staleLeafCounts;
@@ -1324,14 +1351,17 @@ bool BuildPlan(const Workload& workload,
             states[static_cast<std::size_t>(stateId)];
         const SearchState& selected =
             states[static_cast<std::size_t>(selectedState)];
-        if (candidate.validationCost < selected.validationCost - 1e-12 ||
-            (std::fabs(candidate.validationCost -
-                       selected.validationCost) <= 1e-12 &&
+        const double candidateRobustScore = robustScore(candidate);
+        const double selectedRobustScore = robustScore(selected);
+        if (candidateRobustScore < selectedRobustScore - 1e-12 ||
+            (std::fabs(candidateRobustScore -
+                       selectedRobustScore) <= 1e-12 &&
              (candidate.activeNodes.size() < selected.activeNodes.size() ||
               (candidate.activeNodes.size() == selected.activeNodes.size() &&
                (candidate.maxDepth < selected.maxDepth ||
                 (candidate.maxDepth == selected.maxDepth &&
-                 candidate.trainingCost < selected.trainingCost - 1e-12)))))) {
+                 candidate.validationScore <
+                     selected.validationScore - 1e-12)))))) {
             selectedState = stateId;
         }
     }
@@ -1351,8 +1381,8 @@ bool BuildPlan(const Workload& workload,
     cellToDecisionNode.emplace(0, 0);
     Snapshot rootSnapshot;
     rootSnapshot.leafCount = 1;
-    rootSnapshot.trainingCost = states[0].trainingCost;
-    rootSnapshot.validationCost = states[0].validationCost;
+    rootSnapshot.trainingScore = states[0].trainingScore;
+    rootSnapshot.validationScore = states[0].validationScore;
     rootSnapshot.activeNodes.push_back(0);
     plan.snapshots.push_back(std::move(rootSnapshot));
     for (std::size_t chainIndex = 1;
@@ -1381,8 +1411,8 @@ bool BuildPlan(const Workload& workload,
 
         Snapshot snapshot;
         snapshot.leafCount = static_cast<int>(state.activeNodes.size());
-        snapshot.trainingCost = state.trainingCost;
-        snapshot.validationCost = state.validationCost;
+        snapshot.trainingScore = state.trainingScore;
+        snapshot.validationScore = state.validationScore;
         for (int cell : state.activeNodes) {
             auto decisionIt = cellToDecisionNode.find(cell);
             if (decisionIt == cellToDecisionNode.end()) {
@@ -1402,19 +1432,14 @@ bool BuildPlan(const Workload& workload,
     }
     plan.sampleRows = sampleRows;
     plan.sourceRows = rowCount;
-    plan.startupCost = startupCost;
-    plan.scanCost = scanCost;
-    plan.coordinationCost = coordinationCost;
-    plan.boundaryPenalty = boundaryPenalty;
-    plan.subsetOverhead = subsetOverhead;
     const SearchState& selected =
         states[static_cast<std::size_t>(selectedState)];
     plan.selectedBoundaryFraction =
         totalAffinityWeight > 0.0
             ? selected.boundaryWeight / totalAffinityWeight
             : 0.0;
-    plan.selectedTrainingCost = selected.trainingCost;
-    plan.selectedValidationCost = selected.validationCost;
+    plan.selectedTrainingScore = selected.trainingScore;
+    plan.selectedValidationScore = selected.validationScore;
     *output = std::move(plan);
     return true;
 }
@@ -1629,7 +1654,8 @@ inline bool SavePlan(const std::string& path,
     }
 
     const char magic[8] = {'S', 'P', 'T', 'P', 'L', 'N', '1', '\0'};
-    const std::uint32_t version = 1;
+    const std::uint32_t version =
+        plan.workload.attributeKinds.empty() ? 2 : 3;
     const std::int32_t categoricalColumnCount =
         plan.workload.categoricalColumnCount;
     const std::uint64_t sourceRows =
@@ -1658,17 +1684,24 @@ inline bool SavePlan(const std::string& path,
     output.write(
         reinterpret_cast<const char*>(&selectedCount), sizeof(selectedCount));
     output.write(
-        reinterpret_cast<const char*>(&plan.startupCost),
-        sizeof(plan.startupCost));
+        reinterpret_cast<const char*>(&plan.selectedBoundaryFraction),
+        sizeof(plan.selectedBoundaryFraction));
     output.write(
-        reinterpret_cast<const char*>(&plan.coordinationCost),
-        sizeof(plan.coordinationCost));
+        reinterpret_cast<const char*>(&plan.selectedTrainingScore),
+        sizeof(plan.selectedTrainingScore));
     output.write(
-        reinterpret_cast<const char*>(&plan.selectedTrainingCost),
-        sizeof(plan.selectedTrainingCost));
-    output.write(
-        reinterpret_cast<const char*>(&plan.selectedValidationCost),
-        sizeof(plan.selectedValidationCost));
+        reinterpret_cast<const char*>(&plan.selectedValidationScore),
+        sizeof(plan.selectedValidationScore));
+    if (version == 3) {
+        const std::uint32_t attributeCount =
+            static_cast<std::uint32_t>(plan.workload.attributeKinds.size());
+        output.write(
+            reinterpret_cast<const char*>(&attributeCount),
+            sizeof(attributeCount));
+        output.write(
+            reinterpret_cast<const char*>(plan.workload.attributeKinds.data()),
+            static_cast<std::streamsize>(plan.workload.attributeKinds.size()));
+    }
 
     for (const Atom& atom : plan.workload.atoms) {
         const std::int32_t column = atom.column;
@@ -1788,23 +1821,11 @@ inline bool LoadPlan(const std::string& path,
     input.read(reinterpret_cast<char*>(&atomCount), sizeof(atomCount));
     input.read(reinterpret_cast<char*>(&nodeCount), sizeof(nodeCount));
     input.read(reinterpret_cast<char*>(&selectedCount), sizeof(selectedCount));
-    input.read(
-        reinterpret_cast<char*>(&loaded.startupCost),
-        sizeof(loaded.startupCost));
-    input.read(
-        reinterpret_cast<char*>(&loaded.coordinationCost),
-        sizeof(loaded.coordinationCost));
-    input.read(
-        reinterpret_cast<char*>(&loaded.selectedTrainingCost),
-        sizeof(loaded.selectedTrainingCost));
-    input.read(
-        reinterpret_cast<char*>(&loaded.selectedValidationCost),
-        sizeof(loaded.selectedValidationCost));
     const char expectedMagic[8] =
         {'S', 'P', 'T', 'P', 'L', 'N', '1', '\0'};
     if (!input ||
         !std::equal(magic, magic + sizeof(magic), expectedMagic) ||
-        version != 1 ||
+        (version != 1 && version != 2 && version != 3) ||
         categoricalColumnCount < 0 ||
         sourceRows == 0 ||
         sampleRows == 0 ||
@@ -1817,6 +1838,60 @@ inline bool LoadPlan(const std::string& path,
         selectedCount > 64 ||
         selectedCount > nodeCount) {
         return SetError(error, "invalid predicate subset plan header: " + path);
+    }
+    if (version == 1) {
+        double legacyStartupCost = 0.0;
+        double legacyCoordinationCost = 0.0;
+        input.read(
+            reinterpret_cast<char*>(&legacyStartupCost),
+            sizeof(legacyStartupCost));
+        input.read(
+            reinterpret_cast<char*>(&legacyCoordinationCost),
+            sizeof(legacyCoordinationCost));
+        input.read(
+            reinterpret_cast<char*>(&loaded.selectedTrainingScore),
+            sizeof(loaded.selectedTrainingScore));
+        input.read(
+            reinterpret_cast<char*>(&loaded.selectedValidationScore),
+            sizeof(loaded.selectedValidationScore));
+    } else {
+        input.read(
+            reinterpret_cast<char*>(&loaded.selectedBoundaryFraction),
+            sizeof(loaded.selectedBoundaryFraction));
+        input.read(
+            reinterpret_cast<char*>(&loaded.selectedTrainingScore),
+            sizeof(loaded.selectedTrainingScore));
+        input.read(
+            reinterpret_cast<char*>(&loaded.selectedValidationScore),
+            sizeof(loaded.selectedValidationScore));
+    }
+    if (version == 3) {
+        std::uint32_t attributeCount = 0;
+        input.read(
+            reinterpret_cast<char*>(&attributeCount),
+            sizeof(attributeCount));
+        if (!input || attributeCount == 0 || attributeCount > 4096) {
+            return SetError(error, "invalid predicate subset attribute schema: " + path);
+        }
+        loaded.workload.attributeKinds.resize(attributeCount);
+        input.read(
+            reinterpret_cast<char*>(loaded.workload.attributeKinds.data()),
+            static_cast<std::streamsize>(attributeCount));
+        for (std::uint8_t kind : loaded.workload.attributeKinds) {
+            if (kind > 1) {
+                return SetError(error, "invalid predicate subset attribute kind: " + path);
+            }
+        }
+        const int persistedCategorical = static_cast<int>(std::count(
+            loaded.workload.attributeKinds.begin(),
+            loaded.workload.attributeKinds.end(),
+            std::uint8_t{0}));
+        if (persistedCategorical != categoricalColumnCount) {
+            return SetError(error, "predicate subset schema count mismatch: " + path);
+        }
+    }
+    if (!input) {
+        return SetError(error, "invalid predicate subset plan scores: " + path);
     }
 
     loaded.workload.categoricalColumnCount = categoricalColumnCount;
@@ -1832,7 +1907,12 @@ inline bool LoadPlan(const std::string& path,
         input.read(reinterpret_cast<char*>(&atom.kind), sizeof(atom.kind));
         if (!input || column < 0 ||
             op > static_cast<std::uint8_t>(Operator::GreaterEqual) ||
-            atom.kind > 1) {
+            atom.kind > 1 ||
+            (version == 3 &&
+             (static_cast<std::size_t>(column) >=
+                  loaded.workload.attributeKinds.size() ||
+              atom.kind != loaded.workload.attributeKinds[
+                  static_cast<std::size_t>(column)]))) {
             return SetError(error, "invalid atom in subset plan: " + path);
         }
         atom.column = column;
@@ -1888,29 +1968,25 @@ inline bool WriteManifest(const std::string& path,
 {
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     if (!output) return SetError(error, "cannot write subset plan: " + path);
-    output << "# sptag_predicate_subset_plan_v1\n"
+    output << "# sptag_predicate_subset_plan_v2\n"
            << "# source_rows=" << plan.sourceRows << "\n"
            << "# sample_rows=" << plan.sampleRows << "\n"
            << "# atom_count=" << plan.workload.atoms.size() << "\n"
            << "# query_count=" << plan.workload.queries.size() << "\n"
            << "# selected_leaf_count=" << plan.selectedNodes.size() << "\n"
-           << "# cost_unit=milliseconds\n"
-           << "# base_query_cost=" << std::setprecision(17)
-           << plan.startupCost << "\n"
-           << "# full_population_scan_cost=" << plan.scanCost << "\n"
-           << "# additional_subset_cost=" << plan.coordinationCost << "\n"
-           << "# planner=global_beam_hypergraph\n"
-           << "# boundary_penalty=" << plan.boundaryPenalty << "\n"
-           << "# subset_overhead=" << plan.subsetOverhead << "\n"
+           << "# score_unit=normalized_structural_work\n"
+           << "# planner=global_beam_hypergraph_structural\n"
+           << "# score=routed_population_plus_normalized_fanout"
+              "_times_boundary_and_leaf_factors\n"
            << "# selected_boundary_fraction="
-           << plan.selectedBoundaryFraction << "\n"
-           << "# selected_training_cost=" << plan.selectedTrainingCost << "\n"
-           << "# selected_validation_cost=" << plan.selectedValidationCost << "\n"
-           << "# columns=leaf_count\ttraining_cost\tvalidation_cost\tactive_nodes\n";
+           << std::setprecision(17) << plan.selectedBoundaryFraction << "\n"
+           << "# selected_training_score=" << plan.selectedTrainingScore << "\n"
+           << "# selected_validation_score=" << plan.selectedValidationScore << "\n"
+           << "# columns=leaf_count\ttraining_score\tvalidation_score\tactive_nodes\n";
     for (const Snapshot& snapshot : plan.snapshots) {
         output << snapshot.leafCount << '\t'
-               << snapshot.trainingCost << '\t'
-               << snapshot.validationCost << '\t';
+               << snapshot.trainingScore << '\t'
+               << snapshot.validationScore << '\t';
         for (std::size_t i = 0; i < snapshot.activeNodes.size(); ++i) {
             if (i > 0) output << ',';
             output << snapshot.activeNodes[i];

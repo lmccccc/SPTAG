@@ -157,6 +157,7 @@ bool ParseColumnList(const std::string& value, std::vector<int>* columns, std::s
             if (error != nullptr) {
                 *error = "invalid column list: " + value;
             }
+
             return false;
         }
         char* end = nullptr;
@@ -178,6 +179,42 @@ bool ParseColumnList(const std::string& value, std::vector<int>* columns, std::s
     if (columns->empty()) {
         if (error != nullptr) {
             *error = "column list is empty";
+        }
+        return false;
+    }
+    return true;
+}
+
+bool ParseAttributeTypes(const std::string& value,
+                         int columnCount,
+                         std::vector<std::uint8_t>* kinds,
+                         std::string* error) {
+    kinds->clear();
+    std::stringstream input(value);
+    std::string token;
+    while (std::getline(input, token, ',')) {
+        token.erase(token.begin(), std::find_if(
+            token.begin(), token.end(),
+            [](unsigned char c) { return !std::isspace(c); }));
+        token.erase(std::find_if(
+            token.rbegin(), token.rend(),
+            [](unsigned char c) { return !std::isspace(c); }).base(), token.end());
+        std::transform(
+            token.begin(), token.end(), token.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (token == "label" || token == "categorical" || token == "tag") {
+            kinds->push_back(0);
+        } else if (token == "range" || token == "numeric" || token == "number") {
+            kinds->push_back(1);
+        } else {
+            if (error != nullptr) *error = "unknown attribute type: " + token;
+            return false;
+        }
+    }
+    if (static_cast<int>(kinds->size()) != columnCount) {
+        if (error != nullptr) {
+            *error = "AttributeTypes must contain exactly " +
+                std::to_string(columnCount) + " entries";
         }
         return false;
     }
@@ -698,6 +735,7 @@ int main(int argc, char** argv) {
             IniEnv(ini, "MultiTenant", "ACLCols",                 "SPTAG_ACL_COLS");
             IniEnv(ini, "MultiTenant", "HierLevelWidths",         "SPTAG_HIER_LEVEL_WIDTHS");
             IniEnv(ini, "MultiTenant", "NumericCols",             "SPTAG_NUMERIC_COLS");
+            IniEnv(ini, "Tags",       "AttributeTypes",           "SPTAG_ATTRIBUTE_TYPES");
             IniEnv(ini, "MultiTenant", "PivotForceNodeCount",     "SPTAG_PIVOT_FORCE_NODE_COUNT");
             IniEnv(ini, "MultiTenant", "DisablePivotEstimator",   "SPTAG_DISABLE_PIVOT_ESTIMATOR");
         }
@@ -714,7 +752,8 @@ int main(int argc, char** argv) {
             "usage: spannbuilder -c <config.ini>   (native SPANN ini, single source of truth)\n"
             "   or: spannbuilder --vectors <f> --vec-offset <b> --n <N> --dim <D> "
             "--value-type Int8|UInt8|Float [--tags <f> --tags-offset <b> "
-            "--num-tags-per-vec <K>] --index-dir <out> [--tenant 0] "
+            "--num-tags-per-vec <K> --attribute-types label,range,...] "
+            "--index-dir <out> [--tenant 0] "
             "[--storage-backend FILEIO|ROCKSDBIO] [--build-signatures] "
             "[--with-meta-index] [--normalized] [--share-build-ownership] "
             "[--posting-quantizer None|RaBitQ|OPQ|PipePQ] [--posting-quant-m <B>] "
@@ -741,6 +780,7 @@ int main(int argc, char** argv) {
     const std::string distCalcMethod =
         Resolve(argc, argv, "--dist-calc-method", ini, "Base", "DistCalcMethod", "Cosine");
     const bool hasTags = tagPath != nullptr || numTagsPerVec > 0;
+    std::vector<std::uint8_t> attributeKinds;
 
     std::string predicateKeyAttribute;
     std::string predicateTrainSetFile;
@@ -870,28 +910,48 @@ int main(int argc, char** argv) {
                 "KeyAttribute and TrainSetFile\n");
         return 2;
     }
+    if (hasTags) {
+        std::string schemaError;
+        const std::string attributeTypes = Resolve(
+            argc, argv, "--attribute-types", ini, "Tags", "AttributeTypes", "");
+        if (!attributeTypes.empty()) {
+            if (!ParseAttributeTypes(
+                    attributeTypes, numTagsPerVec, &attributeKinds, &schemaError)) {
+                fprintf(stderr, "[spannbuilder] invalid AttributeTypes: %s\n",
+                        schemaError.c_str());
+                return 2;
+            }
+            ::setenv("SPTAG_ATTRIBUTE_TYPES", attributeTypes.c_str(), 1);
+        } else {
+            std::uint64_t numericCols = 0;
+            if (ini && ini->DoesParameterExist("MultiTenant", "NumericCols") &&
+                !ParseUnsignedSetting(
+                    ini->GetParameter<std::string>(
+                        "MultiTenant", "NumericCols", std::string("0")),
+                    0, static_cast<std::uint64_t>(numTagsPerVec),
+                    &numericCols, &schemaError)) {
+                fprintf(stderr, "[spannbuilder] invalid NumericCols: %s\n",
+                        schemaError.c_str());
+                return 2;
+            }
+            attributeKinds.assign(static_cast<std::size_t>(numTagsPerVec), 0);
+            for (std::size_t column =
+                     static_cast<std::size_t>(numTagsPerVec) -
+                     static_cast<std::size_t>(numericCols);
+                 column < attributeKinds.size();
+                 ++column) {
+                attributeKinds[column] = 1;
+            }
+        }
+    }
     if (predicateWorkloadEnabled) {
         if (!hasTags) {
             fprintf(stderr,
                     "[spannbuilder][predicate-workload] workload generation requires tags\n");
             return 2;
         }
-        std::uint64_t numericCols = 0;
-        if (ini && ini->DoesParameterExist("MultiTenant", "NumericCols")) {
-            std::string numericError;
-            if (!ParseUnsignedSetting(
-                    ini->GetParameter<std::string>(
-                        "MultiTenant", "NumericCols", std::string("0")),
-                    0, static_cast<std::uint64_t>(numTagsPerVec),
-                    &numericCols, &numericError)) {
-                fprintf(stderr,
-                        "[spannbuilder][predicate-workload] invalid NumericCols: %s\n",
-                        numericError.c_str());
-                return 2;
-            }
-        }
-        predicateNumericCols = static_cast<int>(numericCols);
-        const int categoricalCols = numTagsPerVec - predicateNumericCols;
+        predicateNumericCols = static_cast<int>(std::count(
+            attributeKinds.begin(), attributeKinds.end(), std::uint8_t{1}));
         std::unordered_set<int> seenColumns;
         bool hasCategorical = false;
         bool hasNumeric = false;
@@ -904,8 +964,10 @@ int main(int argc, char** argv) {
                         column, numTagsPerVec);
                 return 2;
             }
-            hasCategorical = hasCategorical || column < categoricalCols;
-            hasNumeric = hasNumeric || column >= categoricalCols;
+            hasCategorical = hasCategorical ||
+                attributeKinds[static_cast<std::size_t>(column)] == 0;
+            hasNumeric = hasNumeric ||
+                attributeKinds[static_cast<std::size_t>(column)] == 1;
         }
         if (hasCategorical && hasNumeric) {
             fprintf(stderr,
@@ -1007,9 +1069,8 @@ int main(int argc, char** argv) {
             static_cast<std::size_t>(n),
             numTagsPerVec,
             workloadColumns);
-        const int categoricalCols = numTagsPerVec - predicateNumericCols;
         const PredicateWorkload::KeyKind keyKind =
-            predicateKeyColumns[0] >= categoricalCols
+            attributeKinds[static_cast<std::size_t>(predicateKeyColumns[0])] != 0
                 ? PredicateWorkload::KeyKind::Range
                 : (predicateKeyColumns.size() == 1
                        ? PredicateWorkload::KeyKind::Label
@@ -1034,7 +1095,9 @@ int main(int argc, char** argv) {
             options.keyColumns = predicateKeyColumns;
             options.keyKind = keyKind;
             options.predicateColumns = predicateColumns;
-            options.categoricalColumnCount = categoricalCols;
+            options.categoricalColumnCount =
+                numTagsPerVec - predicateNumericCols;
+            options.attributeKinds = attributeKinds;
             options.samplesPerAttribute = predicateSamplesPerLevel;
             options.statisticsSampleRows = predicateStatisticsSampleRows;
             options.queryCount = predicateQueryCount;
@@ -1134,9 +1197,8 @@ int main(int argc, char** argv) {
     TenantIndexManager mgr(dim, "SPANN", valueType.c_str());
     if (storageBackend != "FILEIO") mgr.SetStorageBackend(storageBackend.c_str());
     if (predicateDNFEnabled) {
-        const int categoricalCols = numTagsPerVec - predicateNumericCols;
         if (!mgr.ConfigurePredicateSubsetPlanner(
-                predicateTrainSetFile.c_str(), categoricalCols)) {
+                predicateTrainSetFile.c_str(), attributeKinds)) {
             fprintf(stderr,
                     "[spannbuilder][predicate-workload] failed to configure "
                     "workload-aware subset planning\n");

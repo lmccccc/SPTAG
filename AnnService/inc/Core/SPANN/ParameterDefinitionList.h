@@ -93,11 +93,11 @@ DefineSSDParameter(m_zstdCompressLevel, int, 0, "ZstdCompressLevel")
 DefineSSDParameter(m_internalResultNum, int, 64, "InternalResultNum")
 DefineSSDParameter(m_postingPageLimit, int, 3, "PostingPageLimit")
 DefineSSDParameter(m_replicaCount, int, 8, "ReplicaCount")
-// Independent tail replica Kmax for the unfilter-tail. Each base vector considers
-// its top-m_tailReplicaCount nearest heads for the tag-agnostic tail region, then
-// the build trims per-head tail by page budget (currently <=2 pages, sparse page-2
-// dropped). Decoupled from m_replicaCount above, which governs the per-tag pure
-// posting region. Default 0 = unfilter-tail disabled.
+// Independent tail replica Kmax for the unfilter-tail. Each base vector collects
+// global nearest-head candidates and applies the standard RNG pruning before the
+// build trims each head's tail to m_unfilterTailBufferLength pages. Tail is an
+// independent candidate region and may overlap the per-tag pure posting.
+// Decoupled from m_replicaCount above. Default 0 = unfilter-tail disabled.
 DefineSSDParameter(m_tailReplicaCount, int, 0, "TailReplicaCount")
 DefineSSDParameter(m_outputEmptyReplicaID, bool, false, "OutputEmptyReplicaID")
 DefineSSDParameter(m_batches, int, 1, "Batches")
@@ -123,8 +123,8 @@ DefineSSDParameter(m_enableWAL, bool, false, "EnableWAL")
 DefineSSDParameter(m_disableCheckpoint, bool, false, "DisableCheckpoint")
 DefineSSDParameter(m_headRoleFile, std::string, std::string("head_role.bin"), "HeadRoleFile")
 DefineSSDParameter(m_numTagsPerVec, int, 0, "NumTagsPerVec")
-// 0 scans every STM1 tag column; a positive value restricts flat ACL matching
-// to the categorical prefix, excluding trailing numeric attributes.
+// Legacy flat-query limit over categorical columns. DNF3 uses explicit
+// attribute columns and types from [Tags] AttributeTypes.
 DefineSSDParameter(m_staticACLTagCols, int, 0, "StaticACLTagCols")
 // Build the bundle cross-edge sidecar before STATIC tail construction. This is
 // separate from the mutable runtime DisableCrossEdges diagnostic switch below.
@@ -272,8 +272,8 @@ DefineSSDParameter(m_headBatch, int, 32, "IterativeSearchHeadBatch") // Mutable
 
 DefineSSDParameter(m_shareDB, bool, false, "ShareDB")
 
-// Primary-head CSR bypass. The build emits one exact primary owner per vector;
-// project-filtered searches can expand graph heads from RAM without posting IO.
+// Primary-head CSR bypass. The build emits one exact primary owner and the full
+// attribute row per vector, allowing column-aware DNF filtering from RAM.
 DefineSSDParameter(m_buildPrimaryHeadCSR, bool, false, "BuildPrimaryHeadCSR")
 DefineSSDParameter(m_primaryHeadCSRFile, std::string, std::string("primary_head_csr.bin"), "PrimaryHeadCSRFile")
 DefineSSDParameter(m_enablePrimaryHeadBypass, bool, false, "EnablePrimaryHeadBypass")

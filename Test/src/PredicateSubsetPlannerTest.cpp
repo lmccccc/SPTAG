@@ -3,6 +3,7 @@
 
 #include "inc/CoreInterface.h"
 #include "inc/PredicateSubsetPlanner.h"
+#include "inc/Core/SPANN/PrimaryHeadCSR.h"
 #include "inc/Test.h"
 
 #include <chrono>
@@ -123,6 +124,47 @@ BOOST_AUTO_TEST_CASE(CategoricalRangeSignaturesFailOpen)
     BOOST_CHECK(!predicate.Matches(rejectedTags, 2));
 }
 
+BOOST_AUTO_TEST_CASE(SupportsDynamicCategoricalSignatureColumns)
+{
+    using namespace SPTAG::Cache;
+    HierWidthTable layout;
+    layout.Configure({0, 2, 5, 7, 9, 12}, {64, 128, 64, 256, 64, 128});
+
+    HierarchicalPostingMask posting(layout);
+    posting.Insert(7, 7007);
+    posting.Insert(12, 12012);
+
+    DNFPredicate matching;
+    matching.clauses.push_back(
+        DNFClause{{DNFLiteral{7, 7007, DNF_EQ, 0}}});
+    DNFPredicate rejected;
+    rejected.clauses.push_back(
+        DNFClause{{DNFLiteral{7, 7008, DNF_EQ, 0}}});
+
+    BOOST_CHECK(matching.MayMatchHier(posting));
+    BOOST_CHECK(!rejected.MayMatchHier(posting));
+
+    auto index = SPTAG::VectorIndex::CreateInstance(
+        SPTAG::IndexAlgoType::BKT,
+        SPTAG::VectorValueType::Float);
+    BOOST_REQUIRE(index != nullptr);
+    index->InitializeHeadNodeMeta(
+        1, 0, true, layout.columns, layout.bits);
+    index->SetHeadNodePostingHierMask(0, posting);
+    const auto persisted = index->GetHeadNodePostingHierMask(0);
+    BOOST_REQUIRE(persisted.mask != nullptr);
+    BOOST_CHECK(matching.MayMatchHier(persisted));
+    BOOST_CHECK(!rejected.MayMatchHier(persisted));
+
+    HierarchicalOwnTags own(layout);
+    own.Insert(7, 7007);
+    index->SetHeadNodeHierMask(0, own);
+    const auto persistedOwn = index->GetHeadNodeHierMask(0);
+    BOOST_REQUIRE(persistedOwn.tag != nullptr);
+    BOOST_CHECK(persistedOwn.Matches(matching));
+    BOOST_CHECK(!persistedOwn.Matches(rejected));
+}
+
 BOOST_AUTO_TEST_CASE(ParsesCanonicalArbitraryDNF)
 {
     using namespace SPTAG::PredicateSubsetPlanner;
@@ -154,6 +196,98 @@ BOOST_AUTO_TEST_CASE(ParsesCanonicalArbitraryDNF)
              atom.op == Operator::Greater && atom.value == 10);
     }
     BOOST_CHECK(foundNumericGreater);
+}
+
+BOOST_AUTO_TEST_CASE(ParsesInterleavedAttributeSchema)
+{
+    using namespace SPTAG::PredicateSubsetPlanner;
+    ScopedPlannerTempDir temp;
+    const auto workloadPath = temp.path / "interleaved.tsv";
+    {
+        std::ofstream output(workloadPath);
+        output << "1\t0=7&1<=100&2=9\n";
+    }
+
+    Workload workload;
+    std::string error;
+    const std::vector<std::uint8_t> kinds = {0, 1, 0};
+    BOOST_REQUIRE_MESSAGE(
+        LoadWorkload(workloadPath.string(), kinds, &workload, &error),
+        error);
+    BOOST_CHECK_EQUAL(workload.categoricalColumnCount, 2);
+    BOOST_CHECK(workload.attributeKinds == kinds);
+    BOOST_REQUIRE_EQUAL(workload.atoms.size(), 3);
+    BOOST_CHECK_EQUAL(workload.atoms[0].kind, 0);
+    BOOST_CHECK_EQUAL(workload.atoms[1].kind, 1);
+    BOOST_CHECK_EQUAL(workload.atoms[2].kind, 0);
+}
+
+BOOST_AUTO_TEST_CASE(LoadsGenericPrimaryHeadCSR)
+{
+    using namespace SPTAG::SPANN;
+    ScopedPlannerTempDir temp;
+    const auto path = temp.path / "primary_head_csr.bin";
+    PrimaryHeadCSRHeader header;
+    header.headCount = 2;
+    header.entryCount = 3;
+    header.attributeCount = 3;
+    const std::uint32_t offsets[] = {0, 2, 3};
+    const std::uint32_t vids[] = {4, 7, 9};
+    const std::uint32_t attributes[] = {
+        10, 100, 20,
+        11, 101, 21,
+        12, 102, 22,
+    };
+    {
+        std::ofstream output(path, std::ios::binary);
+        output.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        output.write(reinterpret_cast<const char*>(offsets), sizeof(offsets));
+        output.write(reinterpret_cast<const char*>(vids), sizeof(vids));
+        output.write(
+            reinterpret_cast<const char*>(attributes), sizeof(attributes));
+    }
+
+    PrimaryHeadCSR csr;
+    BOOST_REQUIRE(csr.Load(path.string(), 2));
+    BOOST_CHECK_EQUAL(csr.AttributeCount(), 3);
+    BOOST_CHECK_EQUAL(csr.Begin(0), 0);
+    BOOST_CHECK_EQUAL(csr.End(0), 2);
+    BOOST_CHECK_EQUAL(csr.Vid(2), 9);
+    BOOST_CHECK_EQUAL(csr.Attributes(1)[1], 101);
+    BOOST_CHECK(csr.MatchesAnyValue(2, 22));
+
+    const auto legacyPath = temp.path / "primary_head_csr_v1.bin";
+    LegacyPrimaryHeadCSRHeader legacyHeader;
+    legacyHeader.headCount = 1;
+    legacyHeader.entryCount = 1;
+    legacyHeader.tagBases[0] = 100;
+    legacyHeader.tagBases[1] = 200;
+    legacyHeader.tagBases[2] = 300;
+    legacyHeader.tagBases[3] = 400;
+    const std::uint32_t legacyOffsets[] = {0, 1};
+    LegacyPrimaryHeadCSREntry legacyEntry;
+    legacyEntry.vid = 5;
+    legacyEntry.attributes =
+        1ULL | (2ULL << 8) | (3ULL << 16) | (4ULL << 24) |
+        (999ULL << 32);
+    {
+        std::ofstream output(legacyPath, std::ios::binary);
+        output.write(
+            reinterpret_cast<const char*>(&legacyHeader),
+            sizeof(legacyHeader));
+        output.write(
+            reinterpret_cast<const char*>(legacyOffsets),
+            sizeof(legacyOffsets));
+        output.write(
+            reinterpret_cast<const char*>(&legacyEntry),
+            sizeof(legacyEntry));
+    }
+    PrimaryHeadCSR legacy;
+    BOOST_REQUIRE(legacy.Load(legacyPath.string(), 1));
+    BOOST_CHECK_EQUAL(legacy.AttributeCount(), 5);
+    BOOST_CHECK_EQUAL(legacy.Attributes(0)[0], 101);
+    BOOST_CHECK_EQUAL(legacy.Attributes(0)[3], 404);
+    BOOST_CHECK_EQUAL(legacy.Attributes(0)[4], 999);
 }
 
 BOOST_AUTO_TEST_CASE(ParsesFourClauseStressQuery)
@@ -223,7 +357,6 @@ BOOST_AUTO_TEST_CASE(SelectsWorkloadAwareCutWithUniqueOwners)
             {0.04, "0=0|0=1|0=2|0=3"},
         },
         1);
-
     Plan plan;
     std::string error;
     BOOST_REQUIRE_MESSAGE(
@@ -389,6 +522,7 @@ BOOST_AUTO_TEST_CASE(PersistsExactDecisionTreeAndSelectedCut)
             {0.25, "0=3"},
         },
         1);
+    workload.attributeKinds = {0, 1};
     Plan original;
     std::string error;
     BOOST_REQUIRE_MESSAGE(
@@ -411,6 +545,7 @@ BOOST_AUTO_TEST_CASE(PersistsExactDecisionTreeAndSelectedCut)
     BOOST_CHECK_EQUAL(loaded.sourceRows, original.sourceRows);
     BOOST_CHECK_EQUAL(loaded.selectedNodes.size(), original.selectedNodes.size());
     BOOST_CHECK_EQUAL(loaded.workload.atoms.size(), original.workload.atoms.size());
+    BOOST_CHECK(loaded.workload.attributeKinds == workload.attributeKinds);
     BOOST_CHECK(loaded.snapshots.empty());
     for (std::size_t row = 0; row < 64; ++row) {
         const auto accessor = [&](int column) {

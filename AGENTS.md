@@ -152,7 +152,11 @@ How the `.ini` maps to the engine (`Wrappers/src/SpannAttrBuilder.cpp` `-c` read
   option (including `RefineIterations`, `MaxCheckForRefineGraph`, and
   `TPTBalanceFactor`) are direct INI settings. Historical `[MultiTenant]`
   `PerVectorTagsFile` and U_extra settings are staged into native SelectHead
-  options. `ACLCols`/`HierLevelWidths`/`NumericCols` remain wrapper-only routing
+  options. `[Tags] AttributeTypes` declares every column as `label` or `range`;
+  types may be interleaved and column count is not fixed. `NumericCols` remains
+  a legacy suffix fallback. Categorical posting signatures use one dynamically
+  persisted lane per declared label column; they are not capped at five columns.
+  `ACLCols`/`HierLevelWidths` remain wrapper-only routing
   extensions. The unfilter-tail K/buffer and pre-tail cross-edge settings are
   native SSD params (`[BuildSSDIndex] TailReplicaCount`/
   `UnfilterTailBufferLength`/`CrossEdges`/`CrossExtraEdges`), read straight from
