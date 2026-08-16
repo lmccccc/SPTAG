@@ -124,6 +124,21 @@ BOOST_AUTO_TEST_CASE(CategoricalRangeSignaturesFailOpen)
     BOOST_CHECK(!predicate.Matches(rejectedTags, 2));
 }
 
+BOOST_AUTO_TEST_CASE(EmptyPureAndTailSignaturesFailOpen)
+{
+    using namespace SPTAG::Cache;
+    PostingBitmask pure;
+    PostingBitmask tail;
+    PostingBitmask query;
+    query.Insert(42);
+
+    BOOST_CHECK(PostingUnionMayIntersect(&pure, &tail, query));
+    pure.Insert(7);
+    BOOST_CHECK(!PostingUnionMayIntersect(&pure, &tail, query));
+    tail.Insert(42);
+    BOOST_CHECK(PostingUnionMayIntersect(&pure, &tail, query));
+}
+
 BOOST_AUTO_TEST_CASE(SupportsDynamicCategoricalSignatureColumns)
 {
     using namespace SPTAG::Cache;

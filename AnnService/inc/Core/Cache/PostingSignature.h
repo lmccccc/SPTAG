@@ -198,6 +198,14 @@ struct PostingBitmask {
     }
 };
 
+inline bool PostingUnionMayIntersect(const PostingBitmask* pure,
+                                     const PostingBitmask* tail,
+                                     const PostingBitmask& query) {
+    if (pure == nullptr || tail == nullptr) return true;
+    if (pure->Popcount() == 0 && tail->Popcount() == 0) return true;
+    return pure->MayIntersect(query) || tail->MayIntersect(query);
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Wider page-level signature (collision-free for >256 distinct tags).
 // Used by the page-selective IO directory: the org+dept+team+project tag

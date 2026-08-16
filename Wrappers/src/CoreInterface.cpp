@@ -7341,8 +7341,11 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
                     [memIdx = memoryIndex.get(), queryMask,
                      hasCategorical = effNumTags > 0](int localHid) {
                         if (!hasCategorical) return true;
+                        const auto* pureMask =
+                            memIdx->GetHeadNodePS(localHid);
                         const auto* tailMask = memIdx->GetHeadNodeTailPS(localHid);
-                        return tailMask == nullptr || tailMask->MayIntersect(queryMask);
+                        return SPTAG::Cache::PostingUnionMayIntersect(
+                            pureMask, tailMask, queryMask);
                     };
                 }
             }
