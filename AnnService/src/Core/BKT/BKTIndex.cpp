@@ -452,6 +452,47 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                 p_space.m_NGQueue.insert(seed);
                 p_space.m_Results.insert(seed.distance);
             }
+            // Predicate seeds join the normal BKT frontier before the one graph
+            // traversal starts. The shared visited set removes tree duplicates.
+            int predicateSeeded = 0;
+            for (const auto& seed :
+                 p_crossContext->m_predicateSeeds)
+            {
+                if (seed.m_local < 0 ||
+                    seed.m_local >=
+                        p_crossContext
+                            ->m_nodes[static_cast<size_t>(
+                                p_crossContext->m_entryNode)]
+                            .m_index->GetNumSamples() ||
+                    !std::isfinite(seed.m_vectorDistance) ||
+                    p_space.CheckAndSet(seed.m_local))
+                {
+                    continue;
+                }
+                const float routeDistance =
+                    routeDistanceForLocal(
+                        p_crossContext->m_entryNode,
+                        p_crossContext
+                            ->m_nodes[static_cast<size_t>(
+                                p_crossContext->m_entryNode)]
+                            .m_index,
+                        seed.m_local,
+                        seed.m_vectorDistance);
+                ++p_space.m_iNumberOfCheckedLeaves;
+                if (p_space.m_Results.insert(routeDistance))
+                {
+                    p_space.m_NGQueue.insert(
+                        NodeDistPair(
+                            seed.m_local,
+                            routeDistance));
+                    ++predicateSeeded;
+                }
+            }
+            if (p_crossStats != nullptr)
+            {
+                p_crossStats->m_predicateSeeded =
+                    predicateSeeded;
+            }
         }
     }
 

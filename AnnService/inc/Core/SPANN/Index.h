@@ -119,6 +119,10 @@ namespace SPTAG
             mutable std::mutex m_headCrossEdgesMutex;
             mutable std::atomic<bool> m_headCrossEdgesDirty{false};
             mutable HybridHeadGraph m_hybridHeadGraph;
+            mutable std::unordered_map<
+                std::uint32_t,
+                std::vector<SizeType>>
+                m_hybridSignatureHeads;
             mutable HybridDistanceConfig m_hybridDistance;
             mutable HybridRoutingStats m_hybridRoutingStats;
             mutable std::atomic<bool> m_headHybridGraphLoaded{false};
@@ -339,6 +343,7 @@ namespace SPTAG
             ErrorCode ResizeInlineHeadCrossEdges(
                 DimensionType p_crossEdgeCount) const;
             ErrorCode LoadHeadHybridGraph() const;
+            void BuildHybridSignatureIndex() const;
             ErrorCode LoadHybridRoutingStats();
             ErrorCode LoadHeadCrossEdges() const;
             ErrorCode EnsureHeadHybridGraph();

@@ -55,6 +55,7 @@ constexpr std::int32_t kHeadBundleManifestVersion = 2;
 constexpr std::int32_t kHeadNodeRoutingIndexVersion = 1;
 constexpr int kRequiredHybridBaseGraphDegree = 32;
 constexpr int kRequiredHybridGraphDegree = 16;
+constexpr int kMaxHybridSignatureSamples = 1024;
 
 bool ValidHybridRouteConfig(const Options& p_options)
 {
@@ -63,6 +64,12 @@ bool ValidHybridRouteConfig(const Options& p_options)
         p_options.m_hybridRouteSampleCount <=
             static_cast<int>(
                 kMaxHybridRouteSamples) &&
+        p_options.m_hybridSignatureSampleCount > 0 &&
+        p_options.m_hybridSignatureSampleCount <=
+            kMaxHybridSignatureSamples &&
+        p_options.m_hybridSignatureSeedCount > 0 &&
+        p_options.m_hybridSignatureSeedCount <=
+            p_options.m_hybridSignatureSampleCount &&
         std::isfinite(
             p_options
                 .m_hybridRouteSelectivityThreshold) &&
@@ -75,6 +82,25 @@ bool ValidHybridRouteConfig(const Options& p_options)
                 .m_hybridRouteDeformationThreshold) &&
         p_options.m_hybridRouteDeformationThreshold >=
             0.0f;
+}
+
+template <typename T>
+std::uint64_t HybridQuerySeedHash(
+    const T* p_target,
+    DimensionType p_dimension)
+{
+    if (p_target == nullptr || p_dimension <= 0) return 0;
+    const auto* bytes =
+        reinterpret_cast<const std::uint8_t*>(p_target);
+    const size_t byteCount =
+        static_cast<size_t>(p_dimension) * sizeof(T);
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (size_t index = 0; index < byteCount; ++index)
+    {
+        hash ^= bytes[index];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
 }
 
 bool ParseHybridGeneration(
@@ -1268,6 +1294,7 @@ template <typename T> ErrorCode Index<T>::InitializeHeadBundleRuntime(const std:
         m_globalHeadVIDToLocalHID.clear();
     }
     m_hybridHeadGraph.Clear();
+    m_hybridSignatureHeads.clear();
     m_hybridDistance = HybridDistanceConfig();
     m_headHybridGraphLoaded.store(false, std::memory_order_release);
     m_headInlineCrossEdgeSize = 0;
@@ -1846,6 +1873,7 @@ ErrorCode Index<T>::LoadHeadHybridGraph() const
             node.m_neighbors);
     }
     m_hybridHeadGraph = std::move(graph);
+    BuildHybridSignatureIndex();
     m_hybridDistance = std::move(distance);
     m_headHybridGraphLoaded.store(
         true, std::memory_order_release);
@@ -1857,6 +1885,45 @@ ErrorCode Index<T>::LoadHeadHybridGraph() const
         degree, m_headInlineCrossEdgeTotal,
         m_options.m_numTagsPerVec);
     return ErrorCode::Success;
+}
+
+template <typename T>
+void Index<T>::BuildHybridSignatureIndex() const
+{
+    m_hybridSignatureHeads.clear();
+    if (m_hybridHeadGraph.m_nodes.size() != 1 ||
+        m_hybridHeadGraph.m_numTagColumns <= 0)
+    {
+        return;
+    }
+
+    const auto& node = m_hybridHeadGraph.m_nodes.front();
+    for (SizeType local = 0;
+         local < node.m_headCount; ++local)
+    {
+        const auto* attributes = node.Attributes(
+            local, m_hybridHeadGraph.m_numTagColumns);
+        if (attributes == nullptr) continue;
+        for (int column = 0;
+             column < m_hybridHeadGraph.m_numTagColumns;
+             ++column)
+        {
+            bool duplicate = false;
+            for (int prior = 0; prior < column; ++prior)
+            {
+                if (attributes[prior] == attributes[column])
+                {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate)
+            {
+                m_hybridSignatureHeads[
+                    attributes[column]].push_back(local);
+            }
+        }
+    }
 }
 
 template <typename T>
@@ -2165,6 +2232,7 @@ ErrorCode Index<T>::EnsureHeadHybridGraph()
             node.m_neighbors);
     }
     m_hybridHeadGraph = std::move(graph);
+    BuildHybridSignatureIndex();
     m_hybridDistance = std::move(distance);
     m_headCrossEdgesDirty.store(
         false, std::memory_order_release);
@@ -2815,9 +2883,9 @@ ErrorCode Index<T>::SearchHeadBundleCrossEdgesNative(
     context.m_locatorLocalBits = m_headLocatorLocalBits;
     context.m_locatorLocalMask = m_headLocatorLocalMask;
     context.m_useHybridDistance = p_useHybrid;
+    std::vector<std::pair<int, std::uint32_t>>
+        flatCategoricalValues;
     if (p_useHybrid) {
-        std::vector<std::pair<int, std::uint32_t>>
-            flatCategoricalValues;
         HybridQueryDistanceTransform vectorDistanceTransform;
         if (m_options.m_distCalcMethod ==
             DistCalcMethod::Cosine) {
@@ -2858,8 +2926,7 @@ ErrorCode Index<T>::SearchHeadBundleCrossEdgesNative(
         context.m_queryDistance =
             [this, p_queryDNF,
              vectorDistanceTransform,
-             flatCategoricalValues = std::move(
-                 flatCategoricalValues)](
+             flatCategoricalValues](
                 int p_nodeID,
                 SizeType p_localHead,
                 float p_vectorDistance) {
@@ -2919,6 +2986,153 @@ ErrorCode Index<T>::SearchHeadBundleCrossEdgesNative(
         return ErrorCode::Fail;
     }
 
+    size_t signatureCandidateCount = 0;
+    size_t signatureSampleCount = 0;
+    // The persisted exact head attributes form a compact predicate signature.
+    // Compare only a bounded, query-dependent sample and seed the same graph
+    // traversal; do not run a second graph search or materialize tag subsets.
+    if (p_useHybrid &&
+        !m_hybridSignatureHeads.empty() &&
+        !flatCategoricalValues.empty())
+    {
+        std::vector<SizeType> candidates;
+        for (const auto& value : flatCategoricalValues)
+        {
+            const auto found =
+                m_hybridSignatureHeads.find(value.second);
+            if (found != m_hybridSignatureHeads.end())
+            {
+                candidates.insert(
+                    candidates.end(),
+                    found->second.begin(),
+                    found->second.end());
+            }
+        }
+        std::sort(candidates.begin(), candidates.end());
+        candidates.erase(
+            std::unique(
+                candidates.begin(),
+                candidates.end()),
+            candidates.end());
+        const auto& hybridNode =
+            m_hybridHeadGraph.m_nodes.front();
+        candidates.erase(
+            std::remove_if(
+                candidates.begin(), candidates.end(),
+                [&](SizeType p_local) {
+                    const auto* attributes =
+                        hybridNode.Attributes(
+                            p_local,
+                            m_hybridHeadGraph
+                                .m_numTagColumns);
+                    if (attributes == nullptr) return true;
+                    if (p_queryDNF != nullptr &&
+                        !p_queryDNF->Empty())
+                    {
+                        return !p_queryDNF->Matches(
+                            attributes,
+                            m_hybridHeadGraph
+                                .m_numTagColumns);
+                    }
+                    for (const auto& value :
+                         flatCategoricalValues)
+                    {
+                        if (value.first >= 0 &&
+                            value.first <
+                                m_hybridHeadGraph
+                                    .m_numTagColumns &&
+                            attributes[value.first] ==
+                                value.second)
+                        {
+                            return false;
+                        }
+                    }
+                    return true;
+                }),
+            candidates.end());
+        signatureCandidateCount = candidates.size();
+        signatureSampleCount = (std::min)(
+            candidates.size(),
+            static_cast<size_t>(
+                m_options
+                    .m_hybridSignatureSampleCount));
+
+        struct RankedSeed
+        {
+            float m_routeDistance;
+            SizeType m_local;
+            float m_vectorDistance;
+        };
+        std::vector<RankedSeed> sampled;
+        sampled.reserve(signatureSampleCount);
+        if (signatureSampleCount > 0)
+        {
+            const auto* target =
+                static_cast<const T*>(
+                    p_queryResults
+                        ->GetQuantizedTarget());
+            const std::uint64_t offset =
+                (HybridQuerySeedHash(
+                     target, GetFeatureDim()) ^
+                 m_hybridHeadGraph
+                     .m_generationFingerprint) %
+                static_cast<std::uint64_t>(
+                    candidates.size());
+            for (size_t sample = 0;
+                 sample < signatureSampleCount;
+                 ++sample)
+            {
+                const std::uint64_t center =
+                    ((2ULL * sample + 1ULL) *
+                     static_cast<std::uint64_t>(
+                         candidates.size())) /
+                    (2ULL * signatureSampleCount);
+                const SizeType local =
+                    candidates[static_cast<size_t>(
+                        (offset + center) %
+                        static_cast<std::uint64_t>(
+                            candidates.size()))];
+                const void* vector =
+                    entryIndex->GetSample(local);
+                if (vector == nullptr) continue;
+                const float vectorDistance =
+                    entryIndex->ComputeDistance(
+                        p_queryResults
+                            ->GetQuantizedTarget(),
+                        vector);
+                sampled.push_back(
+                    {context.m_queryDistance(
+                         p_entryNode, local,
+                         vectorDistance),
+                     local, vectorDistance});
+            }
+        }
+        std::sort(
+            sampled.begin(), sampled.end(),
+            [](const RankedSeed& p_left,
+               const RankedSeed& p_right) {
+                if (p_left.m_routeDistance !=
+                    p_right.m_routeDistance)
+                {
+                    return p_left.m_routeDistance <
+                        p_right.m_routeDistance;
+                }
+                return p_left.m_local < p_right.m_local;
+            });
+        const size_t seedCount = (std::min)(
+            sampled.size(),
+            static_cast<size_t>(
+                m_options
+                    .m_hybridSignatureSeedCount));
+        context.m_predicateSeeds.reserve(seedCount);
+        for (size_t seed = 0; seed < seedCount; ++seed)
+        {
+            context.m_predicateSeeds.push_back(
+                {sampled[seed].m_local,
+                 sampled[seed].m_vectorDistance});
+        }
+    }
+
     p_queryResults->Reset();
     typename BKT::Index<T>::CrossGraphSearchStats stats;
     const ErrorCode status = entryIndex->SearchIndexWithCrossEdges(
@@ -2939,11 +3153,15 @@ ErrorCode Index<T>::SearchHeadBundleCrossEdgesNative(
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Info,
             "HeadBundleGraph: nodes=%d totalSeeded=%d checks=%d hybrid=%d "
-            "nodesVisited=%d crossEdgesSeen=%d\n",
+            "signatureCandidates=%zu signatureSamples=%zu "
+            "signatureSeeds=%d nodesVisited=%d crossEdgesSeen=%d\n",
             loadedNodes,
             stats.m_seeded,
             stats.m_expanded,
             p_useHybrid ? 1 : 0,
+            signatureCandidateCount,
+            signatureSampleCount,
+            stats.m_predicateSeeded,
             stats.m_checked,
             stats.m_crossEdges);
     }

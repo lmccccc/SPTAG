@@ -100,6 +100,8 @@ namespace SPTAG {
             int m_hybridGraphDegree;
             int m_hybridCandidateCount;
             int m_hybridRouteSampleCount;
+            int m_hybridSignatureSampleCount;
+            int m_hybridSignatureSeedCount;
             float m_hybridRouteSelectivityThreshold;
             float m_hybridRouteDeformationThreshold;
             bool m_logHybridRoute;

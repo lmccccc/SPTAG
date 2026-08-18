@@ -119,18 +119,26 @@ namespace SPTAG
 
             struct CrossGraphSearchContext
             {
+                struct PredicateSeed
+                {
+                    SizeType m_local = -1;
+                    float m_vectorDistance = MaxDist;
+                };
+
                 std::vector<CrossGraphNode> m_nodes;
                 int m_entryNode = -1;
                 DimensionType m_locatorLocalBits = 0;
                 SizeType m_locatorLocalMask = 0;
                 bool m_useHybridDistance = false;
                 std::function<float(int, SizeType, float)> m_queryDistance;
+                std::vector<PredicateSeed> m_predicateSeeds;
             };
 
             struct CrossGraphSearchStats
             {
                 int m_seeded = 0;
                 int m_seedChecked = 0;
+                int m_predicateSeeded = 0;
                 int m_checked = 0;
                 int m_expanded = 0;
                 int m_crossEdges = 0;

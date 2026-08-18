@@ -2752,6 +2752,10 @@ BOOST_AUTO_TEST_CASE(StaticHybridWorkspaceResetAndOptionDefaults)
     BOOST_CHECK_EQUAL(opt.m_hybridCandidateCount, 128);
     BOOST_CHECK_EQUAL(opt.m_hybridRouteSampleCount, 64);
     BOOST_CHECK_EQUAL(
+        opt.m_hybridSignatureSampleCount, 64);
+    BOOST_CHECK_EQUAL(
+        opt.m_hybridSignatureSeedCount, 8);
+    BOOST_CHECK_EQUAL(
         opt.m_hybridRouteSelectivityThreshold,
         0.02f);
     BOOST_CHECK_EQUAL(

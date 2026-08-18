@@ -93,6 +93,8 @@ DefineSSDParameter(m_hybridNumericWeights, std::string, std::string(""), "Hybrid
 DefineSSDParameter(m_hybridGraphDegree, int, 16, "HybridGraphDegree")
 DefineSSDParameter(m_hybridCandidateCount, int, 128, "HybridCandidateCount")
 DefineSSDParameter(m_hybridRouteSampleCount, int, 64, "HybridRouteSampleCount")
+DefineSSDParameter(m_hybridSignatureSampleCount, int, 64, "HybridSignatureSampleCount")
+DefineSSDParameter(m_hybridSignatureSeedCount, int, 8, "HybridSignatureSeedCount")
 DefineSSDParameter(m_hybridRouteSelectivityThreshold, float, 0.02f, "HybridRouteSelectivityThreshold")
 DefineSSDParameter(m_hybridRouteDeformationThreshold, float, 1.0f, "HybridRouteDeformationThreshold")
 DefineSSDParameter(m_logHybridRoute, bool, false, "LogHybridRoute")
