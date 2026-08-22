@@ -12,6 +12,7 @@
 #include "inc/Helper/KeyValueIO.h"
 #include "inc/Core/Cache/HeadIndexCache.h"
 #include "inc/Core/Cache/PostingSignature.h"
+#include "inc/Core/Cache/ExtremeSparseTagStore.h"
 #include <map>
 #include <string>
 #include <vector>
@@ -108,6 +109,9 @@ public:
 
     // Set per-vector tags for embedding in SPANN posting metadata
     void SetVectorTags(const uint32_t* tags, int numVecs, int numTagsPerVec);
+    // Borrow tags until the synchronous Build call returns.
+    void SetVectorTagsView(
+        const uint32_t* tags, int numVecs, int numTagsPerVec);
 
     // Set build-time node->vector assignments for SPANN posting construction
     void SetNodeVectorAssignments(const std::vector<std::vector<int>>& nodeVectorAssignments);
@@ -180,6 +184,11 @@ public:
     // Returns true on success, false otherwise
     bool BuildFromData(ByteArray p_vectors, ByteArray p_metadata, SizeType p_vectorNum, 
                       bool p_withMetaIndex, bool p_normalized);
+    // Native bulk path for tenant 0; avoids per-vector routing objects.
+    bool BuildFromDataSingleTenant(
+        ByteArray p_vectors, int p_tenantId,
+        SizeType p_vectorNum, bool p_withMetaIndex,
+        bool p_normalized);
 
     // --- String tenant ID support ---
     // Register a string tenant ID, returns its internal integer ID
@@ -220,6 +229,9 @@ public:
 
     // Load all tenant indices from a base directory (unified storage)
     bool LoadAll(const char* p_baseDir);
+    // Maintenance-only loader used by spannbuilder to regenerate a stale EST.
+    bool LoadAllForSignatureRepair(
+        const char* p_baseDir);
 
     // Get vector count for a specific tenant
     int GetTenantVectorCount(int p_tenantId) const;
@@ -293,7 +305,12 @@ public:
     // Build posting signatures (PS + NS) for a tenant from per-vector tags.
     // p_tags: ByteArray of uint32_t, layout [p_numVectors × p_numTagsPerVec].
     // Each vector can have multiple tags (e.g. org, dept, team, project).
-    bool BuildSignatures(int p_tenantId, ByteArray p_tags, int p_numVectors, int p_numTagsPerVec);
+    bool BuildSignatures(int p_tenantId, ByteArray p_tags, int p_numVectors,
+                         int p_numTagsPerVec);
+    bool BuildSignaturesWithVectors(
+        int p_tenantId, ByteArray p_tags,
+        int p_numVectors, int p_numTagsPerVec,
+        ByteArray p_vectors);
 
     // Recompute each vector's nearest persisted head and write primary_head_csr.bin
     // without touching the posting store. Intended for an existing SPANN index.
@@ -306,6 +323,11 @@ public:
     bool BuildFromDataWithTags(ByteArray p_vectors, ByteArray p_metadata, SizeType p_vectorNum,
                                ByteArray p_tags, int p_numTagsPerVec,
                                bool p_withMetaIndex, bool p_normalized);
+    bool BuildFromDataWithTagsSingleTenant(
+        ByteArray p_vectors, int p_tenantId,
+        SizeType p_vectorNum, ByteArray p_tags,
+        int p_numTagsPerVec, bool p_withMetaIndex,
+        bool p_normalized);
 
     // Search with ACL tag filter: PS hard reject + NS soft navigation.
     // p_queryTags: ByteArray of uint32_t allowed tag IDs.
@@ -351,6 +373,13 @@ private:
     // Per-tenant sparse tag index: tag → [posting_ids] for low-selectivity tags
     std::map<int, std::shared_ptr<SPTAG::Cache::SparseTagIndex>> m_tenantSparseIdx;
 
+    // Versioned tag-keyed sidecar whose records are contiguous by extreme
+    // sparse tag. It duplicates only the selected records; ordinary SPANN
+    // postings remain authoritative for unfiltered and fallback searches.
+    std::map<int, std::shared_ptr<SPTAG::Cache::ExtremeSparseTagStore>>
+        m_tenantExtremeSparseTagStores;
+    bool m_allowExtremeSparseTagRepairLoad = false;
+
     // Per-tenant tag-pure postings (chunked, stored inside the same KV/FileIO
     // backend that holds the regular SPANN postings — reuses its cache).
     // Each metadata entry carries the chunk-key list + per-chunk entry counts;
@@ -376,6 +405,7 @@ private:
     // Temporary storage during BuildFromDataWithTags
     ByteArray m_buildTags;
     int m_buildNumTagsPerVec = 0;
+    int m_buildSingleTenantId = -1;
     std::map<int, std::vector<int>> m_tenantGlobalIndices;  // tenantId → [global vector indices]
     
     // tenant_id -> vector count mapping  
@@ -397,9 +427,16 @@ private:
     // numeric_meta.bin; absent => no numeric columns.
     struct NumericMeta {
         int numBaseCols = 0;
+        int vectorCount = 0;
+        int tagColumnCount = 0;
+        std::uint64_t generationFingerprint = 0;
+        std::uint64_t contentFingerprint = 0;
+        bool generationBound = false;
         std::vector<SPTAG::Cache::NumQuantParam> params;
     };
     std::map<int, NumericMeta> m_tenantNumericMeta;
+    std::unordered_set<int>
+        m_warnedInvalidNumericMetaTenants;
 
     // Build-time pivot plan selected by the estimator.
     std::map<int, int> m_tenantPivotLevels;
@@ -511,6 +548,11 @@ private:
     // Called from both LoadUnifiedStorage and the legacy load path; safe to
     // call repeatedly (skips tenants that already have an entry).
     void LoadTenantSparseIndices();
+
+    // Load optional extreme_sparse_tags.bin sidecars. The file header is
+    // self-describing and is validated again against the loaded SPANN options
+    // before a query can use it.
+    bool LoadTenantExtremeSparseTagStores();
 
     // Load per-tenant tagpure_meta.bin sidecars into m_tenantTagPurePostings.
     // Also resolves and caches the KV store handle + page budget needed by

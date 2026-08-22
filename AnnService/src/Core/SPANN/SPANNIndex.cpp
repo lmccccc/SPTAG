@@ -110,6 +110,22 @@ bool ValidSecondLevelRouteConfig(
         p_options
                 .m_secondLevelRouteSelectivityThreshold <=
             1.0f &&
+        std::isfinite(
+            p_options
+                .m_secondLevelSignatureMinSelectivity) &&
+        std::isfinite(
+            p_options
+                .m_secondLevelSignatureMaxSelectivity) &&
+        p_options
+                .m_secondLevelSignatureMinSelectivity >=
+            0.0f &&
+        p_options
+                .m_secondLevelSignatureMaxSelectivity <=
+            1.0f &&
+        p_options
+                .m_secondLevelSignatureMinSelectivity <
+            p_options
+                .m_secondLevelSignatureMaxSelectivity &&
         p_options.m_secondLevelMaxCheck > 0;
 }
 
@@ -464,6 +480,10 @@ std::string JoinPath(const std::string& baseDir, const std::string& relativePath
 bool IsSafeArtifactName(const std::string& p_name)
 {
     if (p_name.empty()) return false;
+    if (p_name.back() == '.' ||
+        p_name.back() == ' ') {
+        return false;
+    }
     const std::filesystem::path path(p_name);
     return !path.is_absolute() &&
         !path.has_root_path() &&
@@ -477,16 +497,118 @@ bool ArtifactNamesEqual(
     const std::string& p_left,
     const std::string& p_right)
 {
-    const std::string left =
+    std::string left =
         std::filesystem::path(p_left)
             .lexically_normal()
             .generic_string();
-    const std::string right =
+    std::string right =
         std::filesystem::path(p_right)
             .lexically_normal()
             .generic_string();
+    while (!left.empty() &&
+           (left.back() == '.' ||
+            left.back() == ' ')) {
+        left.pop_back();
+    }
+    while (!right.empty() &&
+           (right.back() == '.' ||
+            right.back() == ' ')) {
+        right.pop_back();
+    }
     return Helper::StrUtils::StrEqualIgnoreCase(
         left.c_str(), right.c_str());
+}
+
+bool ValidLimitedTagArtifactLayout(
+    const Options& p_options)
+{
+    if (!p_options.m_enableLimitedTagPosting)
+        return !p_options.m_enableExtremeSparseTag;
+
+    std::vector<std::string> published = {
+        p_options.m_limitedTagSupportFile};
+    if (p_options.m_enableExtremeSparseTag)
+    {
+        published.push_back(
+            p_options.m_extremeSparseTagFile);
+    }
+    std::vector<std::string> publishedNames;
+    publishedNames.reserve(published.size() * 2);
+    for (const std::string& artifact : published)
+    {
+        if (!IsSafeArtifactName(artifact)) return false;
+        publishedNames.push_back(artifact);
+        publishedNames.push_back(
+            artifact + ".tmp");
+    }
+    for (size_t left = 0;
+         left < publishedNames.size(); ++left)
+    {
+        for (size_t right = left + 1;
+             right < publishedNames.size(); ++right)
+        {
+            if (ArtifactNamesEqual(
+                    publishedNames[left],
+                    publishedNames[right]))
+                return false;
+        }
+    }
+
+    const std::vector<std::string> reserved = {
+        p_options.m_headVectorFile,
+        p_options.m_headIDFile,
+        p_options.m_headIndexFolder,
+        p_options.m_deleteIDFile,
+        p_options.m_ssdIndex,
+        p_options.m_fullDeletedIDFile,
+        p_options.m_KVFile,
+        p_options.m_ssdMappingFile,
+        p_options.m_ssdInfoFile,
+        p_options.m_checksumFile,
+        p_options.m_postingPureCountsFile,
+        p_options.m_headRoleFile,
+        p_options.m_primaryHeadCSRFile,
+        p_options.m_updateVectorFile,
+        p_options.m_secondLevelHeadVectorFile,
+        p_options.m_secondLevelHeadIDFile,
+        p_options.m_secondLevelPostingFile,
+        p_options.m_secondLevelHeadIndexFolder,
+        "indexloader.ini",
+        "metadata.bin",
+        "metadataIndex.bin",
+        "quantizer.bin",
+        "signatures_bitmask.bin",
+        "sparse_tags.bin",
+        "tag_level_offsets.bin",
+        "numeric_meta.bin",
+        "tagpure_meta.bin",
+        "tag_routing_stats.bin",
+        "head_select_state.bin",
+        "page_signatures.bin",
+        "ordered_page_starts.bin",
+        "pipepq_pivots.bin",
+        "inpost_quant.bin",
+        "inpost_rbq.bin",
+        "inpost_opq.bin",
+        "inpost_pipepq.bin"};
+    for (const std::string& artifact : reserved)
+    {
+        if (artifact.empty()) continue;
+        const std::array<std::string, 2> reservedNames = {
+            artifact, artifact + ".tmp"};
+        for (const std::string& reservedName :
+             reservedNames)
+        {
+            for (const std::string& name :
+                 publishedNames)
+            {
+                if (ArtifactNamesEqual(
+                        name, reservedName))
+                    return false;
+            }
+        }
+    }
+    return true;
 }
 
 bool ValidSecondLevelArtifactLayout(
@@ -540,6 +662,7 @@ bool ValidSecondLevelArtifactLayout(
         p_options.m_deleteIDFile,
         p_options.m_ssdIndex,
         p_options.m_limitedTagSupportFile,
+        p_options.m_extremeSparseTagFile,
         p_options.m_fullDeletedIDFile,
         p_options.m_KVFile,
         p_options.m_ssdMappingFile,
@@ -550,6 +673,15 @@ bool ValidSecondLevelArtifactLayout(
         p_options.m_primaryHeadCSRFile,
         p_options.m_updateVectorFile,
         "indexloader.ini",
+        "metadata.bin",
+        "metadataIndex.bin",
+        "quantizer.bin",
+        "signatures_bitmask.bin",
+        "sparse_tags.bin",
+        "tag_level_offsets.bin",
+        "numeric_meta.bin",
+        "tagpure_meta.bin",
+        "tag_routing_stats.bin",
         "head_select_state.bin",
         "page_signatures.bin",
         "ordered_page_starts.bin",
@@ -2295,11 +2427,23 @@ ErrorCode Index<T>::LoadLimitedTagSupport(
     if (!m_options.m_enableLimitedTagPosting) {
         return ErrorCode::Success;
     }
-    if (m_options.m_enableHybridDistance ||
+    const int categoricalColumns =
+        m_options.m_staticACLTagCols > 0
+        ? m_options.m_staticACLTagCols
+        : m_options.m_numTagsPerVec;
+    if (!ValidLimitedTagArtifactLayout(m_options) ||
+        m_options.m_enableHybridDistance ||
         m_options.m_storage != Storage::STATIC ||
         m_extraSearcher == nullptr ||
         !m_extraSearcher->HasHybridPurePostings() ||
         m_index == nullptr ||
+        m_options.m_numTagsPerVec <= 0 ||
+        categoricalColumns <= 0 ||
+        m_options.m_limitedTagColumn < 0 ||
+        m_options.m_limitedTagColumn >=
+            categoricalColumns ||
+        m_options.m_limitedTagColumn >=
+            m_options.m_numTagsPerVec ||
         !LimitedTagSupport::IsSupportedSlotCount(
             m_options.m_limitedTagSlotsPerHead) ||
         m_options.m_limitedTagSupportFile.empty()) {
@@ -2330,6 +2474,8 @@ ErrorCode Index<T>::LoadLimitedTagSupport(
             m_options.m_limitedTagSlotsPerHead,
             m_options.m_limitedTagVoteHeadCount,
             m_options.m_limitedTagMinHeadCount,
+            m_options.m_limitedTagColumn,
+            m_options.m_numTagsPerVec,
             generation,
             &error)) {
         SPTAGLIB_LOG(
@@ -2340,9 +2486,11 @@ ErrorCode Index<T>::LoadLimitedTagSupport(
     }
     SPTAGLIB_LOG(
         Helper::LogLevel::LL_Info,
-        "Loaded limited-tag support for %d heads with at most %d tags/head.\n",
+        "Loaded limited-tag support for %d heads with at most %d tags/head "
+        "on attribute column %d.\n",
         static_cast<int>(m_limitedTagSupport.HeadCount()),
-        m_limitedTagSupport.SlotsPerHead());
+        m_limitedTagSupport.SlotsPerHead(),
+        m_limitedTagSupport.KeyColumn());
     return ErrorCode::Success;
 }
 
@@ -2367,6 +2515,7 @@ ErrorCode Index<T>::BuildSecondLevelHeadPostings()
         m_limitedTagSupport.HeadCount() !=
             m_index->GetNumSamples() ||
         m_limitedTagSupport.ContentFingerprint() == 0 ||
+        !m_limitedTagSupport.HasTagVectorCounts() ||
         m_index->GetNumSamples() <= 0 ||
         m_secondLevelIndex->GetNumSamples() <= 0)
     {
@@ -2854,6 +3003,25 @@ ErrorCode Index<T>::BuildSecondLevelHeadPostings()
 
     using Signature =
         SecondLevelHeadPostings::Signature;
+    std::uint64_t eligibleTagCount = 0;
+    std::uint64_t excludedTagCount = 0;
+    for (const auto& entry :
+         m_limitedTagSupport.TagHeads())
+    {
+        if (m_limitedTagSupport.TagSelectivityInRange(
+                entry.first,
+                m_options
+                    .m_secondLevelSignatureMinSelectivity,
+                m_options
+                    .m_secondLevelSignatureMaxSelectivity))
+        {
+            ++eligibleTagCount;
+        }
+        else
+        {
+            ++excludedTagCount;
+        }
+    }
     std::vector<Signature> signatures;
     try
     {
@@ -2876,6 +3044,7 @@ ErrorCode Index<T>::BuildSecondLevelHeadPostings()
     }
 
     std::atomic<std::int64_t> nextSecond(0);
+    std::atomic<std::uint64_t> nonemptySignatureCount(0);
     std::vector<std::thread> sortWorkers;
     const auto buildSignatures = [&]() {
         while (!failed.load(
@@ -2927,17 +3096,23 @@ ErrorCode Index<T>::BuildSecondLevelHeadPostings()
                     {
                         continue;
                     }
+                    if (!m_limitedTagSupport
+                             .TagSelectivityInRange(
+                                 tag,
+                                 m_options
+                                     .m_secondLevelSignatureMinSelectivity,
+                                 m_options
+                                     .m_secondLevelSignatureMaxSelectivity))
+                    {
+                        continue;
+                    }
                     signature.Insert(tag);
                     hasTag = true;
                 }
             }
-            if (!hasTag)
-            {
-                failed.store(
-                    true,
-                    std::memory_order_relaxed);
-                return;
-            }
+            if (hasTag)
+                nonemptySignatureCount.fetch_add(
+                    1, std::memory_order_relaxed);
             signatures[
                 static_cast<size_t>(
                     second)] = signature;
@@ -3020,6 +3195,10 @@ ErrorCode Index<T>::BuildSecondLevelHeadPostings()
             firstIDFingerprint,
             m_limitedTagSupport
                 .ContentFingerprint(),
+            m_options
+                .m_secondLevelSignatureMinSelectivity,
+            m_options
+                .m_secondLevelSignatureMaxSelectivity,
             secondToFirst, std::move(offsets),
             std::move(members),
             std::move(signatures), &error))
@@ -3050,12 +3229,27 @@ ErrorCode Index<T>::BuildSecondLevelHeadPostings()
     SPTAGLIB_LOG(
         Helper::LogLevel::LL_Info,
         "Built second-level ID-only postings with 256-bit signatures: "
-        "H1=%d H2=%d replicas=%d members=%llu.\n",
+        "H1=%d H2=%d replicas=%d members=%llu "
+        "selectivity=(%.8g,%.8g] eligibleTags=%llu excludedTags=%llu "
+        "nonemptyRows=%llu.\n",
         static_cast<int>(firstCount),
         static_cast<int>(secondCount),
         effectiveReplicas,
         static_cast<unsigned long long>(
-            assignmentCount));
+            assignmentCount),
+        static_cast<double>(
+            m_options
+                .m_secondLevelSignatureMinSelectivity),
+        static_cast<double>(
+            m_options
+                .m_secondLevelSignatureMaxSelectivity),
+        static_cast<unsigned long long>(
+            eligibleTagCount),
+        static_cast<unsigned long long>(
+            excludedTagCount),
+        static_cast<unsigned long long>(
+            nonemptySignatureCount.load(
+                std::memory_order_relaxed)));
     return ErrorCode::Success;
 }
 
@@ -3209,6 +3403,10 @@ ErrorCode Index<T>::LoadSecondLevelIndex(
             firstIDFingerprint,
             m_limitedTagSupport
                 .ContentFingerprint(),
+            m_options
+                .m_secondLevelSignatureMinSelectivity,
+            m_options
+                .m_secondLevelSignatureMaxSelectivity,
             generation,
             secondToFirst, &error))
     {
@@ -4812,8 +5010,9 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
     {
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
-            "SecondLevelRouteSelectivityThreshold must be in [0,1] and "
-            "SecondLevelMaxCheck must be positive.\n");
+            "SecondLevelRouteSelectivityThreshold must be in [0,1], "
+            "SecondLevelSignature selectivity must satisfy 0<=min<max<=1, "
+            "and SecondLevelMaxCheck must be positive.\n");
         return ErrorCode::FailedParseValue;
     }
     if (m_options.m_selectSecondLevel &&
@@ -5381,6 +5580,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     const auto* threadLocalSearchContext = SPTAG::VectorIndex::GetThreadLocalSearchContext();
     static const std::vector<SizeType> kEmptyDirectPostingIDs;
     static const std::function<bool(int)> kEmptyPostingFilter;
+    static const std::function<bool(SizeType)> kEmptyHeadFilter;
     const std::vector<SizeType>& directPostingIDs = threadLocalSearchContext != nullptr
         ? threadLocalSearchContext->m_directPostingIDs
         : kEmptyDirectPostingIDs;
@@ -5393,6 +5593,19 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     const int numQueryTags = threadLocalSearchContext != nullptr
         ? threadLocalSearchContext->NumQueryTags()
         : 0;
+    static const std::vector<std::uint32_t>
+        kEmptyLimitedTagQueryValues;
+    const std::vector<std::uint32_t>&
+        limitedTagQueryValues =
+            threadLocalSearchContext != nullptr
+            ? threadLocalSearchContext
+                  ->m_limitedTagQueryValues
+            : kEmptyLimitedTagQueryValues;
+    const bool limitedTagRouteEligible =
+        threadLocalSearchContext != nullptr &&
+        threadLocalSearchContext
+            ->m_limitedTagRouteEligible &&
+        !limitedTagQueryValues.empty();
     const SPTAG::Cache::DNFPredicate* queryDNF = threadLocalSearchContext != nullptr
         ? threadLocalSearchContext->DNF()
         : nullptr;
@@ -5405,12 +5618,20 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     const std::function<bool(int)>& postingFilter = threadLocalSearchContext != nullptr
         ? threadLocalSearchContext->m_postingFilter
         : kEmptyPostingFilter;
+    const std::function<bool(int)>& tailPostingFilter =
+        threadLocalSearchContext != nullptr
+        ? threadLocalSearchContext
+              ->m_tailPostingFilter
+        : kEmptyPostingFilter;
     const bool hasExactFilter =
         (queryDNF != nullptr && !queryDNF->Empty()) ||
         (queryTags != nullptr && numQueryTags > 0);
+    const bool useLimitedTagPure =
+        m_options.m_enableLimitedTagPosting &&
+        hasExactFilter && limitedTagRouteEligible;
     const auto limitedSupportMatchesPredicate =
-        [this, queryDNF, queryTags,
-         numQueryTags](SizeType p_head) {
+        [this, &limitedTagQueryValues](
+            SizeType p_head) {
             const std::uint32_t* supportedTags =
                 m_limitedTagSupport.HeadTagData(
                     p_head);
@@ -5427,52 +5648,56 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                     LimitedTagSupport::EmptyTag) {
                     continue;
                 }
-                if (queryDNF != nullptr &&
-                    !queryDNF->Empty()) {
-                    if (queryDNF->Matches(
-                            &tag, 1)) {
-                        return true;
-                    }
-                    continue;
-                }
-                for (int query = 0;
-                     query < numQueryTags;
-                     ++query) {
-                    if (tag == queryTags[query])
+                for (std::uint32_t queryTag :
+                     limitedTagQueryValues) {
+                    if (tag == queryTag)
                         return true;
                 }
             }
             return false;
         };
-    const auto limitedOwnTagMatchesPredicate =
+    const auto limitedHeadMatchesExactPredicate =
         [this, queryDNF, queryTags,
          numQueryTags](SizeType p_head) {
-            const std::uint32_t ownTag =
-                m_limitedTagSupport.OwnTag(
+            const std::uint32_t* attributes =
+                m_limitedTagSupport.HeadAttributes(
                     p_head);
-            if (ownTag ==
-                LimitedTagSupport::EmptyTag) {
+            const int attributeCount =
+                m_limitedTagSupport.AttributeCount();
+            if (attributes == nullptr ||
+                attributeCount <= 0) {
                 return false;
             }
             if (queryDNF != nullptr &&
                 !queryDNF->Empty()) {
                 return queryDNF->Matches(
-                    &ownTag, 1);
+                    attributes, attributeCount);
             }
-            for (int query = 0;
-                 query < numQueryTags;
-                 ++query) {
-                if (ownTag ==
-                    queryTags[query]) {
-                    return true;
+            const int categoricalColumns =
+                (std::max)(
+                    0,
+                    (std::min)(
+                        m_options.m_staticACLTagCols > 0
+                        ? m_options.m_staticACLTagCols
+                        : attributeCount,
+                        attributeCount));
+            for (int column = 0;
+                 column < categoricalColumns;
+                 ++column) {
+                for (int query = 0;
+                     query < numQueryTags;
+                     ++query) {
+                    if (attributes[column] ==
+                        queryTags[query]) {
+                        return true;
+                    }
                 }
             }
             return false;
         };
     std::function<bool(SizeType)>
         limitedTagHeadAdmission;
-    if (m_options.m_enableLimitedTagPosting &&
-        hasExactFilter) {
+    if (useLimitedTagPure) {
         limitedTagHeadAdmission =
             limitedSupportMatchesPredicate;
     }
@@ -5568,7 +5793,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 if (m_options
                         .m_enableLimitedTagPosting &&
                     hasExactFilter) {
-                    return limitedOwnTagMatchesPredicate(
+                    return limitedHeadMatchesExactPredicate(
                         localHid);
                 }
                 if (!hasTagFilter) return true;
@@ -5660,7 +5885,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 bool matches = false;
                 if (useLimitedHeadSupport) {
                     matches =
-                        limitedOwnTagMatchesPredicate(
+                        limitedHeadMatchesExactPredicate(
                             sampleId);
                 } else {
                     static const std::vector<uint8_t>
@@ -6173,10 +6398,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     const bool primaryHeadBypassRequested =
         m_options.m_enablePrimaryHeadBypass && m_extraSearcher != nullptr &&
         m_extraSearcher->HasPrimaryHeadCSR();
-    const bool useLimitedTagPure =
-        m_options.m_enableLimitedTagPosting &&
-        hasExactFilter;
-    const bool useSecondLevelBySelectivity =
+    const bool secondLevelSelectivityEligible =
         useLimitedTagPure &&
         m_options.m_selectSecondLevel &&
         std::isfinite(routeSelectivity) &&
@@ -6189,47 +6411,43 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     secondLevelQuerySignature.Clear();
     std::vector<const std::vector<SizeType>*>
         limitedMatchingHeadLists;
+    bool allSecondLevelAnchorsRepresented =
+        !limitedTagQueryValues.empty();
     if (useLimitedTagPure)
     {
         const auto& tagHeads =
             m_limitedTagSupport.TagHeads();
-        if (queryDNF != nullptr &&
-            !queryDNF->Empty())
+        for (std::uint32_t tag :
+             limitedTagQueryValues)
         {
-            for (const auto& entry : tagHeads)
+            if (!m_limitedTagSupport
+                     .TagSelectivityInRange(
+                         tag,
+                         m_secondLevelPostings
+                             .SignatureMinSelectivity(),
+                         m_secondLevelPostings
+                             .SignatureMaxSelectivity()))
             {
-                if (queryDNF->Matches(
-                        &entry.first, 1))
-                {
-                    secondLevelQuerySignature.Insert(
-                        entry.first);
-                    limitedMatchingHeadLists.push_back(
-                        &entry.second);
-                }
+                allSecondLevelAnchorsRepresented =
+                    false;
             }
-        }
-        else
-        {
-            for (int query = 0;
-                 query < numQueryTags; ++query)
+            secondLevelQuerySignature.Insert(tag);
+            const auto found = tagHeads.find(tag);
+            if (found != tagHeads.end() &&
+                std::find(
+                    limitedMatchingHeadLists.begin(),
+                    limitedMatchingHeadLists.end(),
+                    &found->second) ==
+                    limitedMatchingHeadLists.end())
             {
-                secondLevelQuerySignature.Insert(
-                    queryTags[query]);
-                const auto found =
-                    tagHeads.find(queryTags[query]);
-                if (found != tagHeads.end() &&
-                    std::find(
-                        limitedMatchingHeadLists.begin(),
-                        limitedMatchingHeadLists.end(),
-                        &found->second) ==
-                        limitedMatchingHeadLists.end())
-                {
-                    limitedMatchingHeadLists.push_back(
-                        &found->second);
-                }
+                limitedMatchingHeadLists.push_back(
+                    &found->second);
             }
         }
     }
+    const bool useSecondLevelBySelectivity =
+        secondLevelSelectivityEligible &&
+        allSecondLevelAnchorsRepresented;
 
     std::vector<SizeType> limitedMatchingHeads;
     bool limitedMatchingHeadsMaterialized = false;
@@ -6308,48 +6526,6 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             p_priorScanned + exactScanned);
         return exactScanned;
     };
-    bool limitedUnionDefinitelyTooLarge = false;
-    if (useLimitedTagPure &&
-        !useSecondLevelBySelectivity)
-    {
-        const size_t slotsPerHead =
-            static_cast<size_t>((std::max)(
-                1,
-                m_limitedTagSupport
-                    .SlotsPerHead()));
-        const size_t maxExactHeadReferences =
-            limitedExactHeadLimit >
-                    (std::numeric_limits<size_t>::max)() /
-                        slotsPerHead
-                ? (std::numeric_limits<size_t>::max)()
-                : limitedExactHeadLimit *
-                      slotsPerHead;
-        size_t matchingHeadReferences = 0;
-        for (const auto* heads :
-             limitedMatchingHeadLists)
-        {
-            // Each head occurs in at most one inverted list per support slot.
-            // A larger reference count therefore cannot deduplicate below the
-            // exact-scan limit, so broad predicates need not touch the IDs.
-            if (heads->size() >
-                    limitedExactHeadLimit ||
-                heads->size() >
-                    maxExactHeadReferences -
-                        matchingHeadReferences)
-            {
-                limitedUnionDefinitelyTooLarge = true;
-                break;
-            }
-            matchingHeadReferences +=
-                heads->size();
-        }
-    }
-    const bool useLimitedExactHeadScan =
-        useLimitedTagPure &&
-        !useSecondLevelBySelectivity &&
-        !limitedUnionDefinitelyTooLarge &&
-        materializeLimitedMatchingHeads().size() <=
-            limitedExactHeadLimit;
     const bool s_phaseTime = m_options.m_logPhaseTime;
     int phaseHeadMaxCheck = 0;
     g_bktSeedMs = 0.0;
@@ -6370,9 +6546,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                     .m_secondLevelRouteSelectivityThreshold),
             useSecondLevelBySelectivity
                 ? "H2"
-                : (useLimitedExactHeadScan
-                       ? "exact"
-                       : "H1"));
+                : "H1");
     }
     auto _phT0 = s_phaseTime ? std::chrono::high_resolution_clock::now()
                              : std::chrono::high_resolution_clock::time_point{};
@@ -6486,8 +6660,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         }
     }
 
-    if (!useLimitedExactHeadScan &&
-        !usedHeadBundleSearch &&
+    if (!usedHeadBundleSearch &&
         !candidateNodes.empty())
     {
         bool canUseHeadBundle = true;
@@ -6588,7 +6761,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                             candidateNodes,
                             graphResultNum,
                             scanned,
-                            limitedTagHeadAdmission);
+                            kEmptyHeadFilter);
                     }
                 }
                 else
@@ -6598,7 +6771,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                         candidateNodes,
                         graphResultNum,
                         scanned,
-                        limitedTagHeadAdmission);
+                        kEmptyHeadFilter);
                 }
                 if (ret != ErrorCode::Success) {
                     canUseHeadBundle = false;
@@ -6623,45 +6796,14 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         }
     }
 
-    if (!useLimitedExactHeadScan &&
-        !usedHeadBundleSearch)
+    if (!usedHeadBundleSearch)
     {
         // In the dual-pool slim head store the root index physically holds only the
         // U_extra heads, so its tree cannot navigate H1; skip this dead fallback.
         if (!m_metadataOnlyHeadStore) {
-            ret = limitedTagHeadAdmission
-                ? m_index->SearchIndexWithResultFilter(
-                      *p_queryResults,
-                      limitedTagHeadAdmission,
-                      m_options.m_maxCheck)
-                : m_index->SearchIndex(
-                      *p_queryResults);
+            ret = m_index->SearchIndex(
+                *p_queryResults);
             if (ret != ErrorCode::Success) return ret;
-        }
-    }
-
-    if (useLimitedTagPure && m_index != nullptr)
-    {
-        int admittedHeads = 0;
-        for (; admittedHeads < graphResultNum;
-             ++admittedHeads)
-        {
-            const BasicResult* result =
-                p_queryResults->GetResult(
-                    admittedHeads);
-            if (result == nullptr ||
-                result->VID < 0) {
-                break;
-            }
-        }
-        if (useLimitedExactHeadScan ||
-            (admittedHeads < graphResultNum &&
-             !limitedUnionDefinitelyTooLarge))
-        {
-            const int graphScanned =
-                p_queryResults->GetScanned();
-            scanExactLimitedHeads(
-                graphScanned);
         }
     }
 
@@ -6772,26 +6914,35 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 m_options.m_enableDataCompression);
         }
 
-        // Propagate posting-level PS pre-filter (applied in ExtraDynamicSearcher before MultiGet)
+        // H1 navigation remains distance-only. Limited-tag eligibility, like
+        // posting signatures, is evaluated only after graph heads are selected.
         workSpace->m_useHybridPure =
             useHybridRoute ||
             useLimitedTagPure;
+        const bool scanGlobalTailForFilter =
+            (m_options.m_enableHybridDistance &&
+             hasExactFilter && !useHybridRoute) ||
+            (m_options.m_enableLimitedTagPosting &&
+             hasExactFilter && !useLimitedTagPure);
         workSpace->m_scanFullPostingForFilter =
-            m_options.m_enableHybridDistance &&
-            hasExactFilter && !useHybridRoute;
+            scanGlobalTailForFilter;
         // Pure-prefix signatures are safe only for the column-aware DNF hybrid
         // route. The full route may match only in the tail, while legacy flat
         // tags are column-agnostic and cannot safely use a column-specific mask.
         workSpace->m_postingFilter =
-            useLimitedTagPure
-                ? nullptr
-                : (m_options.m_enableHybridDistance &&
-                           hasExactFilter &&
-                           (!useHybridRoute ||
-                            queryDNF == nullptr ||
-                            queryDNF->Empty())
-                       ? nullptr
-                       : postingFilter);
+            scanGlobalTailForFilter &&
+                    tailPostingFilter
+                ? tailPostingFilter
+                : (useLimitedTagPure
+                       ? limitedTagHeadAdmission
+                       : (m_options
+                                      .m_enableHybridDistance &&
+                                  hasExactFilter &&
+                                  (!useHybridRoute ||
+                                   queryDNF == nullptr ||
+                                   queryDNF->Empty())
+                              ? nullptr
+                              : postingFilter));
         // Propagate inline tag filter (for per-vector exact tag check in posting scan)
         workSpace->m_queryTags = queryTags;
         workSpace->m_numQueryTags = numQueryTags;
@@ -6863,7 +7014,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         auto shouldKeepHeadResult = [&](SizeType localHid) -> bool {
                 if (m_options.m_enableLimitedTagPosting &&
                     hasExactFilter) {
-                    return limitedOwnTagMatchesPredicate(
+                    return limitedHeadMatchesExactPredicate(
                         localHid);
                 }
                 // Intentionally uses HeadNodeMatchesQuery (with IsHeadNodeHeadOnly
@@ -8468,8 +8619,9 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
     {
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
-            "SecondLevelRouteSelectivityThreshold must be in [0,1] and "
-            "SecondLevelMaxCheck must be positive.\n");
+            "SecondLevelRouteSelectivityThreshold must be in [0,1], "
+            "SecondLevelSignature selectivity must satisfy 0<=min<max<=1, "
+            "and SecondLevelMaxCheck must be positive.\n");
         return ErrorCode::FailedParseValue;
     }
     if (!ValidSecondLevelArtifactLayout(
@@ -8478,6 +8630,14 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
             "Second-level artifacts must be safe, distinct names that do not collide with index outputs.\n");
+        return ErrorCode::FailedParseValue;
+    }
+    if (!ValidLimitedTagArtifactLayout(
+            m_options))
+    {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "Limited-tag artifacts must be safe, distinct names that do not collide with index outputs.\n");
         return ErrorCode::FailedParseValue;
     }
 
@@ -8557,10 +8717,20 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
             "Hybrid distance requires IndexAlgoType=BKT.\n");
         return ErrorCode::FailedParseValue;
     }
+    const int limitedCategoricalColumns =
+        m_options.m_staticACLTagCols > 0
+        ? m_options.m_staticACLTagCols
+        : m_options.m_numTagsPerVec;
     if (m_options.m_enableLimitedTagPosting &&
         (m_options.m_indexAlgoType != IndexAlgoType::BKT ||
          m_options.m_storage != Storage::STATIC ||
-         m_options.m_numTagsPerVec != 1 ||
+         m_options.m_numTagsPerVec <= 0 ||
+         limitedCategoricalColumns <= 0 ||
+         limitedCategoricalColumns >
+             m_options.m_numTagsPerVec ||
+         m_options.m_limitedTagColumn < 0 ||
+         m_options.m_limitedTagColumn >=
+             limitedCategoricalColumns ||
          !m_options.m_excludehead ||
          !LimitedTagSupport::IsSupportedSlotCount(
              m_options.m_limitedTagSlotsPerHead) ||
@@ -8580,12 +8750,26 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
              m_options.m_postingQuantizer.c_str(), "None"))) {
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
-            "Limited-tag posting requires raw one-column STATIC BKT, "
+            "Limited-tag posting requires raw multi-attribute STATIC BKT with "
+            "a valid categorical LimitedTagColumn, "
             "ExcludeHead=true, two or four support slots "
             "(self plus one or three external), "
             "positive replica/tail/support parameters, "
             "one batch/file, and no compression, rearrangement, ordered pages, "
             "or posting quantizer.\n");
+        return ErrorCode::FailedParseValue;
+    }
+    if (m_options.m_enableExtremeSparseTag &&
+        (!m_options.m_enableLimitedTagPosting ||
+         m_options.m_extremeSparseTagFile.empty() ||
+         !std::isfinite(
+             m_options.m_extremeSparseTagMaxSelectivity) ||
+         m_options.m_extremeSparseTagMaxSelectivity <= 0.0f ||
+         m_options.m_extremeSparseTagMaxSelectivity > 1.0f)) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "Extreme-sparse tag routing requires limited-tag mode, a file name, "
+            "and ExtremeSparseTagMaxSelectivity in (0,1].\n");
         return ErrorCode::FailedParseValue;
     }
     if (m_options.m_enableHybridDistance &&
@@ -9053,7 +9237,18 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
 
         // Tags are optional, but bundle ownership is required whenever static
         // placement/tails use multiple preselected head bundles.
-        if (!m_pendingVectorTags.empty() && m_pendingNumTagsPerVec > 0) {
+        if (m_pendingVectorTagsView != nullptr &&
+            m_pendingVectorTagCount > 0 &&
+            m_pendingNumTagsPerVec > 0) {
+            const int numVecs = static_cast<int>(
+                m_pendingVectorTagCount /
+                static_cast<size_t>(
+                    m_pendingNumTagsPerVec));
+            m_extraSearcher->SetVectorTagsView(
+                m_pendingVectorTagsView, numVecs,
+                m_pendingNumTagsPerVec);
+        } else if (!m_pendingVectorTags.empty() &&
+                   m_pendingNumTagsPerVec > 0) {
             int numVecs = (int)(m_pendingVectorTags.size() / m_pendingNumTagsPerVec);
             m_extraSearcher->SetVectorTags(
                 m_pendingVectorTags.data(), numVecs, m_pendingNumTagsPerVec);

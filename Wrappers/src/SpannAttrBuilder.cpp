@@ -5,10 +5,10 @@
 //
 // This is the C++ analog of the Python demo build_yfcc_facetA.py /
 // build_5col.py: it drives the EXACT same attribute pipeline
-// (TenantIndexManager::BuildFromDataWithTags -> SetVectorTags posting
+// (TenantIndexManager::BuildFromDataWithTagsSingleTenant -> tag-view posting
 // embedding + PerTagBKT head selection + ACL pivot routing + numeric quant
 // signatures) but without the Python/SWIG layer. It mmaps the vector and tag
-// files, with optional zero-copy borrowing for inputs that are safe to borrow.
+// files and avoids per-vector tenant metadata/routing objects.
 //
 // Attribute/routing configuration comes from the native sectioned INI. Standard
 // SPANN sections are staged directly into the core parameter system; a small
@@ -16,11 +16,10 @@
 // bridge until those extensions gain native option fields.
 //
 // Usage:
-//   spannbuilder \
-//     --vectors <file> --vec-offset <bytes> --n <count> --dim <D> \
-//     --value-type Int8|UInt8|Float \
-//     --tags <file> --tags-offset <bytes> --num-tags-per-vec <K> \
-//     --index-dir <out> [--tenant 0] [--storage-backend FILEIO|ROCKSDBIO] \
+//   spannbuilder --vectors <file> --vec-offset <bytes> --n <count> --dim <D>
+//     --value-type Int8|UInt8|Float
+//     --tags <file> --tags-offset <bytes> --num-tags-per-vec <K>
+//     --index-dir <out> [--tenant 0] [--storage-backend FILEIO|ROCKSDBIO]
 //     [--build-signatures] [--with-meta-index] [--normalized]
 //     [--share-build-ownership]
 
@@ -580,6 +579,12 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[spannbuilder] invalid value-type/dim/tag configuration\n");
         return 2;
     }
+    if (tenant != 0 || withMetaIndex) {
+        fprintf(stderr,
+                "[spannbuilder] the bulk build path requires Tenant=0 and "
+                "WithMetaIndex=false\n");
+        return 2;
+    }
     if (shareBuildOwnership && !normalized &&
         (distCalcMethod == "Cosine" || distCalcMethod == "cosine")) {
         fprintf(stderr,
@@ -626,14 +631,6 @@ int main(int argc, char** argv) {
         tags = ByteArray(tagPtr, tagBytes, false);
     }
 
-    // Single-tenant metadata: one integer tenant id per line ("<tenant>\n").
-    std::string tline = std::to_string(tenant) + "\n";
-    std::string meta;
-    meta.reserve((size_t)n * tline.size());
-    for (long long i = 0; i < n; ++i) meta.append(tline);
-    ByteArray metadata(reinterpret_cast<std::uint8_t*>(const_cast<char*>(meta.data())),
-                       meta.size(), false);
-
     // Cosine normalization mutates input vectors, while these mappings are read-only.
     setenv("SPTAG_BUILD_SHARE_OWNERSHIP", shareBuildOwnership ? "1" : "0", 1);
 
@@ -644,7 +641,9 @@ int main(int argc, char** argv) {
     // tenant index. TenantIndexManager applies them after its automatic defaults,
     // so an explicit INI value always wins over a size-based heuristic.
     if (ini) {
-        for (const char* name : {"DistCalcMethod", "IndexAlgoType"}) {
+        for (const char* name : {
+                 "DistCalcMethod", "IndexAlgoType",
+                 "SSDIndex"}) {
             if (!ini->DoesParameterExist("Base", name)) continue;
             const std::string value = ini->GetParameter<std::string>(
                 "Base", name, std::string());
@@ -773,7 +772,9 @@ int main(int argc, char** argv) {
         if (gfs) mgr.SetSSDBuildParam("GrowthFileSizeGB", gfs);
     }
 
-    fprintf(stderr, "[spannbuilder] %s ...\n", hasTags ? "BuildFromDataWithTags" : "BuildFromData");
+    fprintf(stderr, "[spannbuilder] %s ...\n",
+            hasTags ? "BuildFromDataWithTagsSingleTenant"
+                    : "BuildFromDataSingleTenant");
     if (ArgFlag(argc, argv, "--backfill-primary-head-csr")) {
         if (!hasTags) {
             fprintf(stderr, "[spannbuilder] PRIMARY-HEAD-CSR requires tags\n");
@@ -797,11 +798,13 @@ int main(int argc, char** argv) {
             fprintf(stderr, "[spannbuilder] BUILD-SIGNATURES-ONLY requires tags\n");
             return 2;
         }
-        if (!mgr.LoadAll(indexDir)) {
+        if (!mgr.LoadAllForSignatureRepair(indexDir)) {
             fprintf(stderr, "[spannbuilder] BUILD-SIGNATURES-ONLY LoadAll FAILED\n");
             return 1;
         }
-        if (!mgr.BuildSignatures(tenant, tags, static_cast<int>(n), numTagsPerVec)) {
+        if (!mgr.BuildSignaturesWithVectors(
+                tenant, tags, static_cast<int>(n),
+                numTagsPerVec, vectors)) {
             fprintf(stderr, "[spannbuilder] BUILD-SIGNATURES-ONLY BuildSignatures FAILED\n");
             return 1;
         }
@@ -825,7 +828,9 @@ int main(int argc, char** argv) {
             return 1;
         }
         fprintf(stderr, "[spannbuilder] ROUTING-ONLY: BuildSignatures ...\n");
-        if (!mgr.BuildSignatures(tenant, tags, (SizeType)n, numTagsPerVec)) {
+        if (!mgr.BuildSignaturesWithVectors(
+                tenant, tags, (SizeType)n,
+                numTagsPerVec, vectors)) {
             fprintf(stderr, "[spannbuilder] ROUTING-ONLY BuildSignatures FAILED\n");
             return 1;
         }
@@ -833,12 +838,16 @@ int main(int argc, char** argv) {
         return 0;
     }
     bool ok = hasTags
-        ? mgr.BuildFromDataWithTags(vectors, metadata, (SizeType)n,
-                                    tags, numTagsPerVec, withMetaIndex, normalized)
-        : mgr.BuildFromData(vectors, metadata, (SizeType)n, withMetaIndex, normalized);
+        ? mgr.BuildFromDataWithTagsSingleTenant(
+              vectors, tenant, static_cast<SizeType>(n), tags,
+              numTagsPerVec, withMetaIndex, normalized)
+        : mgr.BuildFromDataSingleTenant(
+              vectors, tenant, static_cast<SizeType>(n),
+              withMetaIndex, normalized);
     if (!ok) {
         fprintf(stderr, "[spannbuilder] %s FAILED\n",
-                hasTags ? "BuildFromDataWithTags" : "BuildFromData");
+                hasTags ? "BuildFromDataWithTagsSingleTenant"
+                        : "BuildFromDataSingleTenant");
         return 1;
     }
 
@@ -848,7 +857,9 @@ int main(int argc, char** argv) {
             return 2;
         }
         fprintf(stderr, "[spannbuilder] BuildSignatures (numeric quant) ...\n");
-        if (!mgr.BuildSignatures(tenant, tags, (SizeType)n, numTagsPerVec)) {
+        if (!mgr.BuildSignaturesWithVectors(
+                tenant, tags, (SizeType)n,
+                numTagsPerVec, vectors)) {
             fprintf(stderr, "[spannbuilder] BuildSignatures FAILED\n");
             return 1;
         }

@@ -226,12 +226,12 @@ This fork adds production-grade multi-tenant support on top of SPANN:
 ### ACL/Tag Filtered Search
 - **STM1 static metadata**: static records store `[VID | tags[N] | vector]`;
   flat ACL checks are exact and scan only each posting's pure prefix.
-- **Hybrid STM1 v2 posting**: let `O` be the original vector-distance
+- **Hybrid STM1 v3 posting**: let `O` be the original vector-distance
   pure+tail posting and `H` the hybrid-distance pure prefix. The single
-  posting stores `H | (O \ H)`; the suffix preserves every original record
-  absent from `H`, is sorted by vector distance, and contains no duplicate
-  VID from the prefix. Filtered search chooses the pure prefix or the full
-  posting; unfiltered search always scans the full contiguous posting.
+  posting stores `H | O`; each region is internally unique, while cross-region
+  overlap is intentional. Filtered pure routing scans only `H`; unfiltered and
+  exact-filter fallback routing read and scan only the self-contained `O`
+  suffix. Older constrained STM1 versions fail closed and require rebuilding.
 - **Hybrid BKT navigation**: the original degree-32 vector graph is unchanged;
   degree-16 hybrid edges use the generation- and content-bound
   `head_cross_edges.bin` runtime suffix rather than a second graph store.
@@ -242,9 +242,12 @@ This fork adds production-grade multi-tenant support on top of SPANN:
   (SIFT tags5 uses `4`). The default `0` checks every tag column and is only safe
   when their value domains do not overlap. The same prefix defines STM1's
   hierarchical posting-mask inputs.
-- **Optional exact posting prefilter**: `[SearchSSDIndex] EnableHierPostingFilter=true`
-  uses a member-OR hierarchical mask built from STM1 pure records. It is an I/O
-  hint only; per-vector ACL checking remains authoritative.
+- **Optional posting prefilter**: `[SearchSSDIndex] EnableHierPostingFilter=true`
+  uses independent member-OR signatures for `H` and `O`, so each route is
+  pruned against the records it actually scans. Categorical columns use
+  per-column masks; numeric columns use independent 256-bucket quantized
+  masks. Both are conservative I/O hints; exact per-vector DNF checking
+  remains authoritative.
 - **Hierarchical routing**: org/dept/team/project tags route head-bundle search;
   sparse predicates retain the normal fallback path when a direct sparse sidecar
   is unavailable.

@@ -4,14 +4,17 @@
 #ifndef _SPTAG_HELPER_ATOMICFILE_H_
 #define _SPTAG_HELPER_ATOMICFILE_H_
 
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <string>
 
 #ifdef _WIN32
+#include <io.h>
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -19,6 +22,39 @@ namespace SPTAG
 {
 namespace Helper
 {
+
+inline bool GetOpenFileSize(
+    FILE* p_file,
+    std::uint64_t& p_bytes)
+{
+    p_bytes = 0;
+    if (p_file == nullptr) return false;
+#ifdef _WIN32
+    const intptr_t osHandle =
+        _get_osfhandle(_fileno(p_file));
+    if (osHandle == -1) return false;
+    LARGE_INTEGER fileSize;
+    if (GetFileSizeEx(
+            reinterpret_cast<HANDLE>(osHandle),
+            &fileSize) == 0 ||
+        fileSize.QuadPart < 0) {
+        return false;
+    }
+    p_bytes =
+        static_cast<std::uint64_t>(
+            fileSize.QuadPart);
+#else
+    struct stat fileStatus;
+    if (fstat(fileno(p_file), &fileStatus) != 0 ||
+        fileStatus.st_size < 0) {
+        return false;
+    }
+    p_bytes =
+        static_cast<std::uint64_t>(
+            fileStatus.st_size);
+#endif
+    return true;
+}
 
 inline bool AtomicReplaceFile(
     const std::string& p_temporary,

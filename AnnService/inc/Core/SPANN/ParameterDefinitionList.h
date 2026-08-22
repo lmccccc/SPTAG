@@ -96,10 +96,17 @@ DefineSSDParameter(m_hybridGenerationFingerprint, std::string, std::string("0"),
 DefineSSDParameter(m_enableLimitedTagPosting, bool, false, "EnableLimitedTagPosting")
 DefineSSDParameter(m_limitedTagGenerationFingerprint, std::string, std::string("0"), "LimitedTagGenerationFingerprint")
 DefineSSDParameter(m_limitedTagSupportFile, std::string, std::string("limited_tag_support.bin"), "LimitedTagSupportFile")
+DefineSSDParameter(m_limitedTagColumn, int, 0, "LimitedTagColumn")
 DefineSSDParameter(m_limitedTagSlotsPerHead, int, 2, "LimitedTagSlotsPerHead")
 DefineSSDParameter(m_limitedTagVoteHeadCount, int, 2, "LimitedTagVoteHeadCount")
 DefineSSDParameter(m_limitedTagMinHeadCount, int, 8, "LimitedTagMinHeadCount")
+DefineSSDParameter(m_enableExtremeSparseTag, bool, false, "EnableExtremeSparseTag")
+DefineSSDParameter(m_extremeSparseTagMaxSelectivity, double, 0.00001, "ExtremeSparseTagMaxSelectivity")
+DefineSSDParameter(m_extremeSparseTagFile, std::string, std::string("extreme_sparse_tags.bin"), "ExtremeSparseTagFile")
+DefineSSDParameter(m_logExtremeSparseTagRoute, bool, false, "LogExtremeSparseTagRoute")
 DefineSSDParameter(m_secondLevelRouteSelectivityThreshold, float, 0.02f, "SecondLevelRouteSelectivityThreshold") // Mutable
+DefineSSDParameter(m_secondLevelSignatureMinSelectivity, double, 0.0, "SecondLevelSignatureMinSelectivity")
+DefineSSDParameter(m_secondLevelSignatureMaxSelectivity, double, 1.0, "SecondLevelSignatureMaxSelectivity")
 DefineSSDParameter(m_secondLevelMaxCheck, int, 112, "SecondLevelMaxCheck") // Mutable
 DefineSSDParameter(m_hybridVectorWeight, float, 1.0f, "HybridVectorWeight")
 DefineSSDParameter(m_hybridCategoricalCols, std::string, std::string(""), "HybridCategoricalCols")

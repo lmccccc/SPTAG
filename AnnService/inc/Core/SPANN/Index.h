@@ -81,6 +81,8 @@ namespace SPTAG
             virtual SizeType GetGlobalVID(SizeType vid) = 0;
             virtual bool PopulateHeadNodeGlobalVIDsFromBundles() = 0;
             virtual void SetVectorTags(const uint32_t* tags, int numVecs, int numTagsPerVec) = 0;
+            // The caller keeps this view alive until BuildIndex returns.
+            virtual void SetVectorTagsView(const uint32_t* tags, int numVecs, int numTagsPerVec) = 0;
             virtual void SetNodeVectorAssignments(const std::vector<std::vector<SizeType>>& nodeVectorAssignments) = 0;
             virtual void SetPrimaryNodeVectorAssignments(const std::vector<std::vector<SizeType>>& primaryNodeVectorAssignments) = 0;
             virtual void SetSharedDB(std::shared_ptr<Helper::KeyValueIO> p_db) = 0;
@@ -169,6 +171,8 @@ namespace SPTAG
 
             // Pre-set vector tags for embedding in postings during build
             std::vector<uint32_t> m_pendingVectorTags;
+            const uint32_t* m_pendingVectorTagsView = nullptr;
+            size_t m_pendingVectorTagCount = 0;
             int m_pendingNumTagsPerVec = 0;
             std::vector<std::vector<SizeType>> m_pendingNodeVectorAssignments;
             std::vector<std::vector<SizeType>> m_pendingPrimaryNodeVectorAssignments;
@@ -231,6 +235,18 @@ namespace SPTAG
                 m_pendingNumTagsPerVec = numTagsPerVec;
                 m_options.m_numTagsPerVec = numTagsPerVec;
                 m_pendingVectorTags.assign(tags, tags + (size_t)numVecs * numTagsPerVec);
+                m_pendingVectorTagsView = nullptr;
+                m_pendingVectorTagCount = 0;
+            }
+
+            void SetVectorTagsView(const uint32_t* tags, int numVecs, int numTagsPerVec) {
+                m_pendingNumTagsPerVec = numTagsPerVec;
+                m_options.m_numTagsPerVec = numTagsPerVec;
+                m_pendingVectorTags.clear();
+                m_pendingVectorTagsView = tags;
+                m_pendingVectorTagCount =
+                    static_cast<size_t>(numVecs) *
+                    static_cast<size_t>(numTagsPerVec);
             }
 
             void SetNodeVectorAssignments(const std::vector<std::vector<SizeType>>& nodeVectorAssignments)

@@ -62,16 +62,19 @@ struct Totals {
     std::uint64_t rawPayloadBytes = 0;
     std::uint64_t metadataPayloadBytes = 0;
     std::uint64_t storedPageSum = 0;
+    std::uint64_t fullExtentPageSum = 0;
     std::uint64_t currentRuntimePageSum = 0;
     std::uint64_t currentZeroOffsetPageSum = 0;
     std::uint64_t rawZeroOffsetPageSum = 0;
     std::uint64_t rawSameOffsetPageSum = 0;
-    std::uint64_t storedRuntimePageMismatches = 0;
+    std::uint64_t storedExtentPageMismatches = 0;
     std::uint64_t nonzeroPageOffsetLists = 0;
     std::uint64_t pageOffsetPageIncreaseLists = 0;
     std::uint64_t maxPageOffset = 0;
     std::uint64_t pureRuntimePageSum = 0;
     std::uint64_t maxPureRuntimePages = 0;
+    std::uint64_t tailRuntimePageSum = 0;
+    std::uint64_t maxTailRuntimePages = 0;
     std::uint64_t capAffectedLists = 0;
     std::uint64_t capPurePrefixOverflowLists = 0;
     std::uint64_t capRetainedElements = 0;
@@ -153,7 +156,8 @@ bool ReadHeader(std::istream& input, std::uint32_t valueBytes, Header& header)
             ReadExact(input, header.tailPageBudget))) {
             return false;
         }
-        if (header.version == 2) {
+        if (header.version == 2 ||
+            header.version == 3) {
             std::uint32_t generationLo = 0;
             std::uint32_t generationHi = 0;
             if (!ReadExact(input, generationLo) ||
@@ -162,7 +166,8 @@ bool ReadHeader(std::istream& input, std::uint32_t valueBytes, Header& header)
             }
         }
         return (header.version == 1 ||
-                header.version == 2) &&
+                header.version == 2 ||
+                header.version == 3) &&
             ReadExact(input, header.listPageOffset);
     }
 
@@ -288,7 +293,8 @@ double PercentReduction(std::uint64_t before, std::uint64_t after)
 }
 
 bool Audit(const Options& options, Header& header, Totals& totals,
-           Histogram& currentRuntimeHistogram, Histogram& rawZeroOffsetHistogram,
+           Histogram& currentRuntimeHistogram, Histogram& tailRuntimeHistogram,
+           Histogram& rawZeroOffsetHistogram,
            PackingStats& packing)
 {
     std::ifstream input(options.postingFile, std::ios::binary);
@@ -309,6 +315,8 @@ bool Audit(const Options& options, Header& header, Totals& totals,
         return false;
     }
     const bool metadataFormat = header.format == LayoutFormat::STM1;
+    const bool selfContainedTailFormat =
+        metadataFormat && header.version >= 3;
     if ((metadataFormat && (static_cast<std::uint32_t>(header.magic) != kStaticMetadataMagic ||
                             header.version <= 0 || header.numTagsPerVec <= 0)) ||
         header.listCount <= 0 || header.totalDocumentCount < 0 ||
@@ -367,18 +375,36 @@ bool Audit(const Options& options, Header& header, Totals& totals,
             return false;
         }
         const std::uint64_t elements = static_cast<std::uint64_t>(listElements);
+        const std::uint64_t pure =
+            static_cast<std::uint64_t>(pureElements);
+        const std::uint64_t runtimeElements =
+            selfContainedTailFormat ? pure : elements;
         const std::uint64_t offset = pageOffset;
         const std::uint64_t currentListBytes =
             elements * static_cast<std::uint64_t>(header.recordBytes);
-        const std::uint64_t currentRuntimePages =
+        const std::uint64_t fullExtentPages =
             PageCount(elements, static_cast<std::uint64_t>(header.recordBytes), offset);
+        const std::uint64_t currentRuntimePages =
+            PageCount(runtimeElements, static_cast<std::uint64_t>(header.recordBytes), offset);
         const std::uint64_t pureRuntimePages =
-            PageCount(static_cast<std::uint64_t>(pureElements),
+            PageCount(pure,
                       static_cast<std::uint64_t>(header.recordBytes), offset);
+        std::uint64_t tailRuntimePages = 0;
+        if (selfContainedTailFormat && pure < elements) {
+            const std::uint64_t tailStartBytes =
+                offset +
+                pure * static_cast<std::uint64_t>(
+                    header.recordBytes);
+            tailRuntimePages =
+                fullExtentPages -
+                tailStartBytes / kPageSize;
+        }
         const std::uint64_t currentZeroOffsetPages =
-            PageCount(elements, static_cast<std::uint64_t>(header.recordBytes), 0);
-        const std::uint64_t rawZeroOffsetPages = PageCount(elements, rawRecordBytes, 0);
-        const std::uint64_t rawSameOffsetPages = PageCount(elements, rawRecordBytes, offset);
+            PageCount(runtimeElements, static_cast<std::uint64_t>(header.recordBytes), 0);
+        const std::uint64_t rawZeroOffsetPages =
+            PageCount(runtimeElements, rawRecordBytes, 0);
+        const std::uint64_t rawSameOffsetPages =
+            PageCount(runtimeElements, rawRecordBytes, offset);
 
         totals.nonemptyLists += elements > 0;
         totals.totalListElements += elements;
@@ -389,16 +415,19 @@ bool Audit(const Options& options, Header& header, Totals& totals,
         totals.metadataPayloadBytes +=
             elements * static_cast<std::uint64_t>(header.numTagsPerVec) * sizeof(std::uint32_t);
         totals.storedPageSum += storedPages;
+        totals.fullExtentPageSum += fullExtentPages;
         totals.currentRuntimePageSum += currentRuntimePages;
         totals.currentZeroOffsetPageSum += currentZeroOffsetPages;
         totals.rawZeroOffsetPageSum += rawZeroOffsetPages;
         totals.rawSameOffsetPageSum += rawSameOffsetPages;
-        totals.storedRuntimePageMismatches += storedPages != currentRuntimePages;
+        totals.storedExtentPageMismatches += storedPages != fullExtentPages;
         totals.nonzeroPageOffsetLists += offset != 0;
         totals.pageOffsetPageIncreaseLists += currentRuntimePages > currentZeroOffsetPages;
         totals.maxPageOffset = (std::max)(totals.maxPageOffset, offset);
         totals.pureRuntimePageSum += pureRuntimePages;
         totals.maxPureRuntimePages = (std::max)(totals.maxPureRuntimePages, pureRuntimePages);
+        totals.tailRuntimePageSum += tailRuntimePages;
+        totals.maxTailRuntimePages = (std::max)(totals.maxTailRuntimePages, tailRuntimePages);
 
         if (options.pageCap > 0) {
             const std::uint64_t cappedBytes =
@@ -426,8 +455,11 @@ bool Audit(const Options& options, Header& header, Totals& totals,
             ++packing.remainderCounts[static_cast<std::size_t>(currentListBytes % kPageSize)];
             ++packing.listCount;
         }
-        AddHistogram(currentRuntimeHistogram, currentRuntimePages, elements);
-        AddHistogram(rawZeroOffsetHistogram, rawZeroOffsetPages, elements);
+        AddHistogram(currentRuntimeHistogram, currentRuntimePages, runtimeElements);
+        if (selfContainedTailFormat) {
+            AddHistogram(tailRuntimeHistogram, tailRuntimePages, elements - pure);
+        }
+        AddHistogram(rawZeroOffsetHistogram, rawZeroOffsetPages, runtimeElements);
     }
 
     if (!SimulateSourceBestFitPages(packing, totals.sourceBestFitContentPages) ||
@@ -455,7 +487,9 @@ bool Audit(const Options& options, Header& header, Totals& totals,
 }
 
 bool WriteReport(const Options& options, const Header& header, const Totals& totals,
-                 const Histogram& currentRuntimeHistogram, const Histogram& rawZeroOffsetHistogram)
+                 const Histogram& currentRuntimeHistogram,
+                 const Histogram& tailRuntimeHistogram,
+                 const Histogram& rawZeroOffsetHistogram)
 {
     std::ofstream outputFile;
     std::ostream* output = &std::cout;
@@ -471,6 +505,9 @@ bool WriteReport(const Options& options, const Header& header, const Totals& tot
     const std::uint64_t rawRecordBytes =
         static_cast<std::uint64_t>(header.dataDimension) * options.valueBytes + sizeof(std::int32_t);
     const char* format = header.format == LayoutFormat::STM1 ? "STM1" : "legacy_raw";
+    const bool selfContainedTailFormat =
+        header.format == LayoutFormat::STM1 &&
+        header.version >= 3;
     *output << std::fixed << std::setprecision(6);
     *output << "{\n"
             << "  \"posting_file\":\"" << options.postingFile << "\",\n"
@@ -486,9 +523,27 @@ bool WriteReport(const Options& options, const Header& header, const Totals& tot
             << ",\"tail_page_budget\":" << header.tailPageBudget
             << ",\"list_page_offset\":" << header.listPageOffset << "},\n"
             << "  \"page_formulas\":{"
-            << "\"current_runtime\":\"ceil((list_ele_count * current_record_bytes + page_offset) / 4096)\","
-            << "\"raw_counterfactual\":\"ceil(list_ele_count * raw_record_bytes / 4096)\","
-            << "\"raw_same_offsets\":\"ceil((list_ele_count * raw_record_bytes + current_page_offset) / 4096)\""
+            << "\"current_runtime\":\""
+            << (selfContainedTailFormat
+                    ? "ceil((pure_ele_count * current_record_bytes + page_offset) / 4096)"
+                    : "ceil((list_ele_count * current_record_bytes + page_offset) / 4096)")
+            << "\",";
+    if (selfContainedTailFormat) {
+        *output << "\"unfiltered_tail_runtime\":\""
+                << "ceil((list_ele_count * current_record_bytes + page_offset) / 4096) - "
+                << "floor((pure_ele_count * current_record_bytes + page_offset) / 4096)\",";
+    }
+    const char* runtimeCount =
+        selfContainedTailFormat
+            ? "pure_ele_count"
+            : "list_ele_count";
+    *output
+            << "\"raw_counterfactual\":\"ceil("
+            << runtimeCount
+            << " * raw_record_bytes / 4096)\","
+            << "\"raw_same_offsets\":\"ceil(("
+            << runtimeCount
+            << " * raw_record_bytes + current_page_offset) / 4096)\""
             << "},\n"
             << "  \"totals\":{\n"
             << "    \"nonempty_list_count\":" << totals.nonemptyLists << ",\n"
@@ -499,20 +554,25 @@ bool WriteReport(const Options& options, const Header& header, const Totals& tot
             << "    \"raw_counterfactual_payload_bytes\":" << totals.rawPayloadBytes << ",\n"
             << "    \"metadata_payload_bytes\":" << totals.metadataPayloadBytes << ",\n"
             << "    \"stored_page_sum\":" << totals.storedPageSum << ",\n"
+            << "    \"full_extent_per_list_page_sum\":" << totals.fullExtentPageSum << ",\n"
             << "    \"current_runtime_per_list_page_sum\":" << totals.currentRuntimePageSum << ",\n"
             << "    \"current_zero_offset_per_list_page_sum\":" << totals.currentZeroOffsetPageSum << ",\n"
             << "    \"raw_zero_offset_per_list_page_sum\":" << totals.rawZeroOffsetPageSum << ",\n"
             << "    \"raw_same_offsets_per_list_page_sum\":" << totals.rawSameOffsetPageSum << ",\n"
             << "    \"raw_zero_offset_page_reduction_percent\":"
             << PercentReduction(totals.currentRuntimePageSum, totals.rawZeroOffsetPageSum) << ",\n"
-            << "    \"stored_runtime_page_mismatch_list_count\":"
-            << totals.storedRuntimePageMismatches << ",\n"
+            << "    \"stored_extent_page_mismatch_list_count\":"
+            << totals.storedExtentPageMismatches << ",\n"
             << "    \"nonzero_page_offset_list_count\":" << totals.nonzeroPageOffsetLists << ",\n"
             << "    \"page_offset_page_increase_list_count\":"
             << totals.pageOffsetPageIncreaseLists << ",\n"
             << "    \"max_page_offset\":" << totals.maxPageOffset << ",\n"
             << "    \"pure_runtime_per_list_page_sum\":" << totals.pureRuntimePageSum << ",\n"
-            << "    \"max_pure_runtime_pages\":" << totals.maxPureRuntimePages;
+            << "    \"max_pure_runtime_pages\":" << totals.maxPureRuntimePages << ",\n"
+            << "    \"unfiltered_tail_runtime_per_list_page_sum\":"
+            << totals.tailRuntimePageSum << ",\n"
+            << "    \"max_unfiltered_tail_runtime_pages\":"
+            << totals.maxTailRuntimePages;
     if (options.pageCap > 0) {
         *output << ",\n"
                 << "    \"page_cap\":" << options.pageCap << ",\n"
@@ -539,13 +599,15 @@ bool WriteReport(const Options& options, const Header& header, const Totals& tot
             << "  },\n"
             << "  \"notes\":["
             << "\"Per-list page sums count scan ranges, not unique physical pages in the file.\","
-            << "\"The raw counterfactual uses list_ele_count and assumes each list starts at offset zero; it does not model a rebuilt raw bin-packing layout.\","
+            << "\"The raw counterfactual uses the same runtime record count and assumes each list starts at offset zero; it does not model a rebuilt raw bin-packing layout.\","
             << "\"source_best_fit reproduces SelectPostingOffset's largest-fitting-remainder page packing for the current uncompressed list sizes.\","
-            << "\"STM1 v1/v2 stores one contiguous pure prefix followed by its vector-distance tail; full scans use total list elements.\""
+            << "\"For constrained STM1 v3, current_runtime is the filtered H prefix and unfiltered_tail_runtime is the self-contained O suffix beginning at the persisted pure boundary.\""
             << "],\n"
             << "  \"page_histograms\":{\n"
             << "    \"current_runtime\":";
     WriteHistogram(*output, currentRuntimeHistogram);
+    *output << ",\n    \"unfiltered_tail_runtime\":";
+    WriteHistogram(*output, tailRuntimeHistogram);
     *output << ",\n    \"raw_zero_offset_counterfactual\":";
     WriteHistogram(*output, rawZeroOffsetHistogram);
     *output << "\n  }\n}\n";
@@ -565,10 +627,13 @@ int main(int argc, char** argv)
     Header header;
     Totals totals;
     Histogram currentRuntimeHistogram;
+    Histogram tailRuntimeHistogram;
     Histogram rawZeroOffsetHistogram;
     PackingStats packing;
-    if (!Audit(options, header, totals, currentRuntimeHistogram, rawZeroOffsetHistogram, packing) ||
-        !WriteReport(options, header, totals, currentRuntimeHistogram, rawZeroOffsetHistogram)) {
+    if (!Audit(options, header, totals, currentRuntimeHistogram,
+               tailRuntimeHistogram, rawZeroOffsetHistogram, packing) ||
+        !WriteReport(options, header, totals, currentRuntimeHistogram,
+                     tailRuntimeHistogram, rawZeroOffsetHistogram)) {
         return 1;
     }
     return 0;

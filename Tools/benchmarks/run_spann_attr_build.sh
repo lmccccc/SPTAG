@@ -215,8 +215,8 @@ with primary_path.open("rb") as f:
     layouts = [struct.unpack("<iHiHi", f.read(16)) for _ in range(primary[2])]
 if primary[0] != 0x314D5453:
     raise SystemExit("[launcher] primary posting is not an STM1 snapshot")
-if primary[1] != 2:
-    raise SystemExit("[launcher] hybrid posting is not generation-bound STM1 v2")
+if primary[1] != 3:
+    raise SystemExit("[launcher] hybrid posting is not self-contained H|O STM1 v3")
 primary_generation = (primary[9] & 0xffffffff) << 32 | (primary[8] & 0xffffffff)
 if primary_generation != int(generation):
     raise SystemExit(

@@ -315,6 +315,57 @@ namespace SPTAG {
                 int m_readStartPage = 0;
                 int m_readPageCount = 0;
 
+                void SetContiguousRecordRange(
+                    int p_pageOffset,
+                    int p_scanBegin,
+                    int p_scanEnd,
+                    int p_recordBytes)
+                {
+                    m_secondScanBegin = -1;
+                    m_secondScanEnd = -1;
+                    m_scanBegin =
+                        (std::max)(0, p_scanBegin);
+                    m_scanEnd =
+                        (std::max)(
+                            m_scanBegin, p_scanEnd);
+                    if (p_pageOffset < 0 ||
+                        p_recordBytes <= 0 ||
+                        m_scanEnd <= m_scanBegin) {
+                        m_scanEnd = m_scanBegin;
+                        m_readStartPage = 0;
+                        m_readPageCount = 0;
+                        return;
+                    }
+                    const std::uint64_t beginBytes =
+                        static_cast<std::uint64_t>(
+                            p_pageOffset) +
+                        static_cast<std::uint64_t>(
+                            m_scanBegin) *
+                            static_cast<std::uint64_t>(
+                                p_recordBytes);
+                    const std::uint64_t endBytes =
+                        static_cast<std::uint64_t>(
+                            p_pageOffset) +
+                        static_cast<std::uint64_t>(
+                            m_scanEnd) *
+                            static_cast<std::uint64_t>(
+                                p_recordBytes);
+                    m_readStartPage =
+                        static_cast<int>(
+                            beginBytes >>
+                            PageSizeEx);
+                    const int readEndPage =
+                        static_cast<int>(
+                            (endBytes +
+                             PageSize - 1) >>
+                            PageSizeEx);
+                    m_readPageCount =
+                        (std::max)(
+                            0,
+                            readEndPage -
+                                m_readStartPage);
+                }
+
                 void SetPureDistancePrefix(int p_pureCount,
                                            int p_totalCount,
                                            int p_percent)
@@ -510,6 +561,13 @@ namespace SPTAG {
             virtual void SetVectorTags(const uint32_t* /*p_tags*/, int /*p_numVectors*/,
                                        int /*p_numTagsPerVec*/)
             {
+            }
+            virtual void SetVectorTagsView(
+                const uint32_t* p_tags, int p_numVectors,
+                int p_numTagsPerVec)
+            {
+                SetVectorTags(
+                    p_tags, p_numVectors, p_numTagsPerVec);
             }
             virtual void SetHybridGenerationFingerprint(
                 std::uint64_t /*p_generationFingerprint*/)

@@ -87,6 +87,8 @@ namespace SPTAG {
             std::string m_secondLevelPostingFile;
             std::string m_secondLevelGenerationFingerprint;
             float m_secondLevelRouteSelectivityThreshold;
+            double m_secondLevelSignatureMinSelectivity;
+            double m_secondLevelSignatureMaxSelectivity;
             int m_secondLevelMaxCheck;
 
             // Section 3: for build head
@@ -105,9 +107,14 @@ namespace SPTAG {
             bool m_enableLimitedTagPosting;
             std::string m_limitedTagGenerationFingerprint;
             std::string m_limitedTagSupportFile;
+            int m_limitedTagColumn;
             int m_limitedTagSlotsPerHead;
             int m_limitedTagVoteHeadCount;
             int m_limitedTagMinHeadCount;
+            bool m_enableExtremeSparseTag;
+            double m_extremeSparseTagMaxSelectivity;
+            std::string m_extremeSparseTagFile;
+            bool m_logExtremeSparseTagRoute;
             float m_hybridVectorWeight;
             std::string m_hybridCategoricalCols;
             std::string m_hybridCategoricalWeights;

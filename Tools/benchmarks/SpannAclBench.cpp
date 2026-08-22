@@ -28,6 +28,7 @@ struct Options
     std::string truthFile;
     std::string truthDir;
     std::string queryTagsFile;
+    std::string queryDNFFile;
     std::string searchIni;
     std::vector<std::string> searchSweepInis;
     std::string valueType = "Float";
@@ -65,6 +66,7 @@ void Usage(const char* p_program)
               << " [--query-tags <tags.npy> --tag-column <0..N-1>]"
               << " [--query-tags <tags.npy> --or-tag-count <N>]"
               << " [--dnf-and-cols <col[,col...]>]"
+              << " [--query-dnf <length-prefixed-dnf3.npy>]"
               << " [--search-ini <native-search.ini>]"
               << " [--search-sweep-ini <native-search.ini>]..."
               << " [--value-type Float|UInt8]"
@@ -146,6 +148,8 @@ bool ParseArgs(int p_argc, char** p_argv, Options& p_options)
             p_options.truthDir = value;
         } else if (std::strcmp(arg, "--query-tags") == 0) {
             p_options.queryTagsFile = value;
+        } else if (std::strcmp(arg, "--query-dnf") == 0) {
+            p_options.queryDNFFile = value;
         } else if (std::strcmp(arg, "--search-ini") == 0) {
             p_options.searchIni = value;
         } else if (std::strcmp(arg, "--search-sweep-ini") == 0) {
@@ -183,7 +187,8 @@ bool ParseArgs(int p_argc, char** p_argv, Options& p_options)
     const int filterModes =
         (p_options.tagColumn >= 0 ? 1 : 0) +
         (p_options.orTagCount > 0 ? 1 : 0) +
-        (!p_options.dnfAndColumns.empty() ? 1 : 0);
+        (!p_options.dnfAndColumns.empty() ? 1 : 0) +
+        (!p_options.queryDNFFile.empty() ? 1 : 0);
     if (!basicOptions || filterModes > 1) {
         return false;
     }
@@ -191,12 +196,19 @@ bool ParseArgs(int p_argc, char** p_argv, Options& p_options)
         return !p_options.directSearch && p_options.tagColumn < 0 &&
             p_options.orTagCount == 0 &&
             p_options.dnfAndColumns.empty() &&
+            p_options.queryDNFFile.empty() &&
             !p_options.queryTagsFile.empty();
     }
-    return ((filterModes == 0 &&
-             p_options.queryTagsFile.empty()) ||
-            (filterModes == 1 &&
-             !p_options.queryTagsFile.empty())) &&
+    const bool validFilterInput =
+        (filterModes == 0 &&
+         p_options.queryTagsFile.empty() &&
+         p_options.queryDNFFile.empty()) ||
+        (filterModes == 1 &&
+         ((!p_options.queryDNFFile.empty() &&
+           p_options.queryTagsFile.empty()) ||
+          (p_options.queryDNFFile.empty() &&
+           !p_options.queryTagsFile.empty())));
+    return validFilterInput &&
         (!p_options.directSearch ||
          filterModes == 0);
 }
@@ -320,8 +332,10 @@ int main(int argc, char** argv)
 
     std::vector<float> queries;
     std::vector<std::uint32_t> queryTags;
+    std::vector<std::uint32_t> queryDNF;
     std::size_t queryCount = 0, dimension = 0;
     std::size_t tagCount = 0, tagCols = 0;
+    std::size_t dnfCount = 0, dnfCols = 0;
     const bool requiresQueryTags =
         options.allAclLevels || options.tagColumn >= 0 ||
         options.orTagCount > 0 ||
@@ -338,6 +352,31 @@ int main(int argc, char** argv)
                       [tagCols](int column) { return static_cast<std::size_t>(column) >= tagCols; })))) {
         std::cerr << "Invalid query, truth, or tag npy input\n";
         return 1;
+    }
+    if (!options.queryDNFFile.empty()) {
+        constexpr std::uint32_t kDNF3Magic =
+            0x444E4633U;
+        if (!ReadNpyMatrix(
+                options.queryDNFFile, "<u4",
+                queryDNF, dnfCount, dnfCols) ||
+            dnfCount != queryCount ||
+            dnfCols < 2) {
+            std::cerr << "Invalid per-query DNF input\n";
+            return 1;
+        }
+        for (std::size_t query = 0;
+             query < dnfCount; ++query) {
+            const std::uint32_t* row =
+                queryDNF.data() + query * dnfCols;
+            if (row[0] == 0 ||
+                row[0] >= dnfCols ||
+                row[1] != kDNF3Magic) {
+                std::cerr
+                    << "Invalid length-prefixed DNF3 row "
+                    << query << "\n";
+                return 1;
+            }
+        }
     }
 
     const char* allLevelNames[] = {"unfilter", "org", "dept", "team", "project"};
@@ -404,26 +443,30 @@ int main(int argc, char** argv)
         int tagColumn;
         int orTagCount;
         const std::vector<int>* dnfAndColumns;
+        bool queryDNF;
         const TruthMatrix* truth;
     };
 
     std::vector<Scenario> scenarios;
     if (options.allAclLevels) {
         scenarios = {
-            {"unfilter", -1, 0, nullptr, &truthMatrices[0]},
-            {"org", 0, 0, nullptr, &truthMatrices[1]},
-            {"dept", 1, 0, nullptr, &truthMatrices[2]},
-            {"team", 2, 0, nullptr, &truthMatrices[3]},
-            {"project", 3, 0, nullptr, &truthMatrices[4]},
+            {"unfilter", -1, 0, nullptr, false, &truthMatrices[0]},
+            {"org", 0, 0, nullptr, false, &truthMatrices[1]},
+            {"dept", 1, 0, nullptr, false, &truthMatrices[2]},
+            {"team", 2, 0, nullptr, false, &truthMatrices[3]},
+            {"project", 3, 0, nullptr, false, &truthMatrices[4]},
         };
     } else {
         scenarios.push_back(
-            {options.orTagCount > 0
+            {!options.queryDNFFile.empty()
+                 ? "dnf"
+                 : options.orTagCount > 0
                  ? "or"
                  : (options.tagColumn < 0 ? "unfilter" : "custom"),
              options.tagColumn,
              options.orTagCount,
              &options.dnfAndColumns,
+             !options.queryDNFFile.empty(),
              &truthMatrices.front()});
     }
 
@@ -458,6 +501,19 @@ int main(int argc, char** argv)
                         queryBytes, options.tenant,
                         options.topk, tagBytes,
                         scenario.orTagCount);
+                }
+                if (scenario.queryDNF) {
+                    auto* row = queryDNF.data() +
+                        p_queryIndex * dnfCols;
+                    const ByteArray dnfBytes(
+                        reinterpret_cast<std::uint8_t*>(
+                            row + 1),
+                        static_cast<size_t>(row[0]) *
+                            sizeof(std::uint32_t),
+                        false);
+                    return manager.SearchWithACL(
+                        queryBytes, options.tenant,
+                        options.topk, dnfBytes, -1);
                 }
                 if (scenario.dnfAndColumns != nullptr && !scenario.dnfAndColumns->empty()) {
                     constexpr std::uint32_t kDNF3Magic = 0x444E4633U;
@@ -571,6 +627,8 @@ int main(int argc, char** argv)
                       << "\"or_tag_count\":" << scenario.orTagCount << ","
                       << "\"dnf_and_columns\":"
                       << (scenario.dnfAndColumns == nullptr ? 0 : scenario.dnfAndColumns->size()) << ","
+                      << "\"query_dnf\":"
+                      << (scenario.queryDNF ? "true" : "false") << ","
                       << "\"recall\":" << recall << ","
                       << "\"qps\":" << static_cast<double>(measuredQueries) / elapsed << ","
                       << "\"mean_latency_ms\":" << 1000.0 * elapsed / measuredQueries << ","

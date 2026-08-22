@@ -310,13 +310,19 @@ void VectorIndex::ClearHeadNodeMeta()
 {
     m_headNodeMetaStride = 0;
     m_headNodePSOffset = 0;
+    m_headNodeTailPSOffset = 0;
+    m_headNodeHasTailPS = false;
     m_headNodeHierMaskOffset = 0;
     m_headNodePostingHierMaskOffset = 0;
     m_headNodeGlobalVIDOffset = 0;
     m_headNodeBundleNodeIdOffset = 0;
     m_headNodeHeadOnlyOffset = 0;
     m_headNodeNumQuantOffset = 0;
+    m_headNodeTailNumQuantOffset = 0;
     m_headNodeNumQuantCols = 0;
+    m_headNodeNumericDomainFingerprint = 0;
+    m_headNodeOwnTagsAvailable = false;
+    m_headNodePostingHierMasksAvailable = false;
     EraseHeadNodeHierWidths(this);
     m_headNodeMeta.clear();
 }
@@ -326,7 +332,7 @@ bool VectorIndex::TryComputeHeadNodeMetaStride(
 {
     return TryComputeHeadNodeMetaStride(
         p_numQuantCols, Cache::HierWidths(),
-        p_stride);
+        false, p_stride);
 }
 
 bool VectorIndex::TryComputeHeadNodeMetaStride(
@@ -334,11 +340,34 @@ bool VectorIndex::TryComputeHeadNodeMetaStride(
     const Cache::HierWidthTable& p_hierWidths,
     size_t& p_stride)
 {
+    return TryComputeHeadNodeMetaStride(
+        p_numQuantCols, p_hierWidths,
+        false, p_stride);
+}
+
+bool VectorIndex::TryComputeHeadNodeMetaStride(
+    int p_numQuantCols,
+    const Cache::HierWidthTable& p_hierWidths,
+    bool p_includeTailPS,
+    size_t& p_stride)
+{
     p_stride = 0;
     if (p_numQuantCols < 0) return false;
 
     size_t offset =
         sizeof(Cache::PostingBitmask);
+    if (p_includeTailPS) {
+        if (!TryAlignUp(
+                offset,
+                alignof(Cache::PostingBitmask),
+                offset) ||
+            offset >
+                (std::numeric_limits<size_t>::max)() -
+                    sizeof(Cache::PostingBitmask)) {
+            return false;
+        }
+        offset += sizeof(Cache::PostingBitmask);
+    }
     if (!TryAlignUp(
             offset,
             alignof(Cache::HierarchicalOwnTags),
@@ -412,6 +441,18 @@ bool VectorIndex::TryComputeHeadNodeMetaStride(
             return false;
         }
         offset += numericBytes;
+        if (p_includeTailPS) {
+            if (!TryAlignUp(
+                    offset,
+                    alignof(std::uint64_t),
+                    offset) ||
+                offset >
+                    (std::numeric_limits<size_t>::max)() -
+                        numericBytes) {
+                return false;
+            }
+            offset += numericBytes;
+        }
     }
     return TryAlignUp(
         offset,
@@ -433,6 +474,16 @@ void VectorIndex::InitializeHeadNodeMeta(
     SizeType p_numSamples, int p_numQuantCols,
     const Cache::HierWidthTable& p_hierWidths)
 {
+    InitializeHeadNodeMeta(
+        p_numSamples, p_numQuantCols,
+        p_hierWidths, false);
+}
+
+void VectorIndex::InitializeHeadNodeMeta(
+    SizeType p_numSamples, int p_numQuantCols,
+    const Cache::HierWidthTable& p_hierWidths,
+    bool p_includeTailPS)
+{
     ClearHeadNodeMeta();
     if (p_numSamples <= 0) return;
     StoreHeadNodeHierWidths(
@@ -442,6 +493,7 @@ void VectorIndex::InitializeHeadNodeMeta(
     size_t computedStride = 0;
     if (!TryComputeHeadNodeMetaStride(
             quantCols, p_hierWidths,
+            p_includeTailPS,
             computedStride) ||
         static_cast<size_t>(p_numSamples) >
             (std::numeric_limits<size_t>::max)() /
@@ -450,12 +502,27 @@ void VectorIndex::InitializeHeadNodeMeta(
     }
 
     // V3 layout per sample:
-    // | PostingBitmask | HierarchicalOwnTags own-tags | HierarchicalPostingMask posting-content | globalVID (4B) | bundleNodeId (2B) | headOnly (1B) |
+    // | pure PostingBitmask | HierarchicalOwnTags own-tags | HierarchicalPostingMask posting-content | globalVID (4B) | bundleNodeId (2B) | headOnly (1B) |
     // V4 appends, after headOnly, a quantized numeric block of M*NUM_QUANT_WORDS
     // uint64 (one 256-bit lane per numeric column). With M==0 the stride is
     // byte-identical to V3, so V3 indexes load unchanged.
+    // V6 inserts a second PostingBitmask for the self-contained global tail.
     m_headNodePSOffset = 0;
-    m_headNodeHierMaskOffset = AlignUp(m_headNodePSOffset + sizeof(Cache::PostingBitmask), alignof(Cache::HierarchicalOwnTags));
+    m_headNodeHasTailPS = p_includeTailPS;
+    size_t afterPostingPS =
+        m_headNodePSOffset +
+        sizeof(Cache::PostingBitmask);
+    if (m_headNodeHasTailPS) {
+        m_headNodeTailPSOffset = AlignUp(
+            afterPostingPS,
+            alignof(Cache::PostingBitmask));
+        afterPostingPS =
+            m_headNodeTailPSOffset +
+            sizeof(Cache::PostingBitmask);
+    } else {
+        m_headNodeTailPSOffset = 0;
+    }
+    m_headNodeHierMaskOffset = AlignUp(afterPostingPS, alignof(Cache::HierarchicalOwnTags));
     m_headNodePostingHierMaskOffset = AlignUp(m_headNodeHierMaskOffset + sizeof(Cache::HierarchicalOwnTags), alignof(Cache::HierarchicalPostingMask));
     // Posting-content masks use this index's persisted width packing rather
     // than process-global state, so separately loaded tenants cannot alter the
@@ -473,8 +540,22 @@ void VectorIndex::InitializeHeadNodeMeta(
         m_headNodeNumQuantOffset = AlignUp(afterHeadOnly, alignof(std::uint64_t));
         afterHeadOnly = m_headNodeNumQuantOffset +
             (size_t)m_headNodeNumQuantCols * Cache::NUM_QUANT_WORDS * sizeof(std::uint64_t);
+        if (m_headNodeHasTailPS) {
+            m_headNodeTailNumQuantOffset =
+                AlignUp(
+                    afterHeadOnly,
+                    alignof(std::uint64_t));
+            afterHeadOnly =
+                m_headNodeTailNumQuantOffset +
+                (size_t)m_headNodeNumQuantCols *
+                    Cache::NUM_QUANT_WORDS *
+                    sizeof(std::uint64_t);
+        } else {
+            m_headNodeTailNumQuantOffset = 0;
+        }
     } else {
         m_headNodeNumQuantOffset = 0;
+        m_headNodeTailNumQuantOffset = 0;
     }
     m_headNodeMetaStride = computedStride;
 
@@ -501,6 +582,59 @@ const std::uint64_t* VectorIndex::GetHeadNodeNumQuant(SizeType p_sampleId) const
     size_t bytes = (size_t)m_headNodeNumQuantCols * Cache::NUM_QUANT_WORDS * sizeof(std::uint64_t);
     if (base + bytes > m_headNodeMeta.size()) return nullptr;
     return reinterpret_cast<const std::uint64_t*>(m_headNodeMeta.data() + base);
+}
+
+std::uint64_t*
+VectorIndex::GetHeadNodeTailNumQuantMutable(
+    SizeType p_sampleId)
+{
+    if (!m_headNodeHasTailPS ||
+        m_headNodeNumQuantCols <= 0 ||
+        m_headNodeMetaStride == 0) {
+        return nullptr;
+    }
+    const size_t base =
+        static_cast<size_t>(p_sampleId) *
+            m_headNodeMetaStride +
+        m_headNodeTailNumQuantOffset;
+    const size_t bytes =
+        static_cast<size_t>(
+            m_headNodeNumQuantCols) *
+        Cache::NUM_QUANT_WORDS *
+        sizeof(std::uint64_t);
+    if (base + bytes >
+        m_headNodeMeta.size()) {
+        return nullptr;
+    }
+    return reinterpret_cast<std::uint64_t*>(
+        m_headNodeMeta.data() + base);
+}
+
+const std::uint64_t*
+VectorIndex::GetHeadNodeTailNumQuant(
+    SizeType p_sampleId) const
+{
+    if (!m_headNodeHasTailPS ||
+        m_headNodeNumQuantCols <= 0 ||
+        m_headNodeMetaStride == 0) {
+        return nullptr;
+    }
+    const size_t base =
+        static_cast<size_t>(p_sampleId) *
+            m_headNodeMetaStride +
+        m_headNodeTailNumQuantOffset;
+    const size_t bytes =
+        static_cast<size_t>(
+            m_headNodeNumQuantCols) *
+        Cache::NUM_QUANT_WORDS *
+        sizeof(std::uint64_t);
+    if (base + bytes >
+        m_headNodeMeta.size()) {
+        return nullptr;
+    }
+    return reinterpret_cast<
+        const std::uint64_t*>(
+            m_headNodeMeta.data() + base);
 }
 
 SizeType VectorIndex::GetHeadNodeMetaSampleCount() const
@@ -545,6 +679,41 @@ bool VectorIndex::HeadNodePSMayIntersect(SizeType p_sampleId, const Cache::Posti
     return ps != nullptr && ps->MayIntersect(p_queryMask);
 }
 
+void VectorIndex::SetHeadNodeTailPS(
+    SizeType p_sampleId,
+    const Cache::PostingBitmask& p_ps)
+{
+    if (!m_headNodeHasTailPS) return;
+    auto* base = HeadNodeMetaBase(this, p_sampleId);
+    if (base == nullptr) return;
+    std::memcpy(
+        base + m_headNodeTailPSOffset,
+        &p_ps, sizeof(Cache::PostingBitmask));
+}
+
+const Cache::PostingBitmask*
+VectorIndex::GetHeadNodeTailPS(
+    SizeType p_sampleId) const
+{
+    if (!m_headNodeHasTailPS) return nullptr;
+    const auto* base = HeadNodeMetaBase(
+        this, p_sampleId);
+    if (base == nullptr) return nullptr;
+    return reinterpret_cast<
+        const Cache::PostingBitmask*>(
+            base + m_headNodeTailPSOffset);
+}
+
+bool VectorIndex::HeadNodeTailPSMayIntersect(
+    SizeType p_sampleId,
+    const Cache::PostingBitmask& p_queryMask) const
+{
+    const auto* ps = GetHeadNodeTailPS(
+        p_sampleId);
+    return ps != nullptr &&
+        ps->MayIntersect(p_queryMask);
+}
+
 void VectorIndex::SetHeadNodeHeadOnly(SizeType p_sampleId, bool p_isHeadOnly)
 {
     auto* base = HeadNodeMetaBase(this, p_sampleId);
@@ -563,10 +732,12 @@ void VectorIndex::SetHeadNodeHierMask(SizeType p_sampleId, const Cache::Hierarch
     auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return;
     std::memcpy(base + m_headNodeHierMaskOffset, &p_mask, sizeof(Cache::HierarchicalOwnTags));
+    m_headNodeOwnTagsAvailable = true;
 }
 
 const Cache::HierarchicalOwnTags* VectorIndex::GetHeadNodeHierMask(SizeType p_sampleId) const
 {
+    if (!m_headNodeOwnTagsAvailable) return nullptr;
     const auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return nullptr;
     return reinterpret_cast<const Cache::HierarchicalOwnTags*>(base + m_headNodeHierMaskOffset);
@@ -581,10 +752,12 @@ void VectorIndex::SetHeadNodePostingHierMask(SizeType p_sampleId, const Cache::H
         &p_mask,
         m_headNodeGlobalVIDOffset -
             m_headNodePostingHierMaskOffset);
+    m_headNodePostingHierMasksAvailable = true;
 }
 
 const Cache::HierarchicalPostingMask* VectorIndex::GetHeadNodePostingHierMask(SizeType p_sampleId) const
 {
+    if (!m_headNodePostingHierMasksAvailable) return nullptr;
     const auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return nullptr;
     return reinterpret_cast<const Cache::HierarchicalPostingMask*>(base + m_headNodePostingHierMaskOffset);

@@ -235,11 +235,23 @@ public:
             int p_numQuantCols,
             const Cache::HierWidthTable& p_hierWidths);
 
+        void InitializeHeadNodeMeta(
+            SizeType p_numSamples,
+            int p_numQuantCols,
+            const Cache::HierWidthTable& p_hierWidths,
+            bool p_includeTailPS);
+
         static bool TryComputeHeadNodeMetaStride(int p_numQuantCols, size_t& p_stride);
 
         static bool TryComputeHeadNodeMetaStride(
             int p_numQuantCols,
             const Cache::HierWidthTable& p_hierWidths,
+            size_t& p_stride);
+
+        static bool TryComputeHeadNodeMetaStride(
+            int p_numQuantCols,
+            const Cache::HierWidthTable& p_hierWidths,
+            bool p_includeTailPS,
             size_t& p_stride);
 
         bool HasHeadNodeMeta() const { return m_headNodeMetaStride > 0 && !m_headNodeMeta.empty(); }
@@ -264,6 +276,14 @@ public:
 
         bool HeadNodePSMayIntersect(SizeType p_sampleId, const Cache::PostingBitmask& p_queryMask) const;
 
+        bool HasHeadNodeTailPS() const { return m_headNodeHasTailPS; }
+
+        void SetHeadNodeTailPS(SizeType p_sampleId, const Cache::PostingBitmask& p_ps);
+
+        const Cache::PostingBitmask* GetHeadNodeTailPS(SizeType p_sampleId) const;
+
+        bool HeadNodeTailPSMayIntersect(SizeType p_sampleId, const Cache::PostingBitmask& p_queryMask) const;
+
         void SetHeadNodeHeadOnly(SizeType p_sampleId, bool p_isHeadOnly);
 
         bool IsHeadNodeHeadOnly(SizeType p_sampleId) const;
@@ -271,6 +291,16 @@ public:
         void SetHeadNodeHierMask(SizeType p_sampleId, const Cache::HierarchicalOwnTags& p_mask);
 
         const Cache::HierarchicalOwnTags* GetHeadNodeHierMask(SizeType p_sampleId) const;
+
+        bool HasHeadNodeOwnTags() const
+        {
+            return m_headNodeOwnTagsAvailable;
+        }
+
+        void SetHeadNodeOwnTagsAvailable(bool p_available)
+        {
+            m_headNodeOwnTagsAvailable = p_available;
+        }
 
         // Posting-content mask: union of all member-vector tags in the head's
         // posting. Distinct from the head's own-tag HierMask (used by
@@ -282,13 +312,36 @@ public:
 
         const Cache::HierarchicalPostingMask* GetHeadNodePostingHierMask(SizeType p_sampleId) const;
 
+        bool HasHeadNodePostingHierMasks() const
+        {
+            return m_headNodePostingHierMasksAvailable;
+        }
+
+        void SetHeadNodePostingHierMasksAvailable(bool p_available)
+        {
+            m_headNodePostingHierMasksAvailable = p_available;
+        }
+
         // Quantized numeric posting signature (range pruning). Per head, a flat
         // M*NUM_QUANT_WORDS uint64 block = union of member-vector numeric buckets
         // (one 256-bit lane per numeric column). M=0 => no block (V3 layout, byte
         // identical). Used by the posting pre-filter for numeric range predicates.
         int GetHeadNodeNumQuantCols() const { return m_headNodeNumQuantCols; }
+        void SetHeadNodeNumericDomainFingerprint(
+            std::uint64_t p_fingerprint)
+        {
+            m_headNodeNumericDomainFingerprint =
+                p_fingerprint;
+        }
+        std::uint64_t
+        GetHeadNodeNumericDomainFingerprint() const
+        {
+            return m_headNodeNumericDomainFingerprint;
+        }
         std::uint64_t* GetHeadNodeNumQuantMutable(SizeType p_sampleId);
         const std::uint64_t* GetHeadNodeNumQuant(SizeType p_sampleId) const;
+        std::uint64_t* GetHeadNodeTailNumQuantMutable(SizeType p_sampleId);
+        const std::uint64_t* GetHeadNodeTailNumQuant(SizeType p_sampleId) const;
 
         void SetHeadNodeBundleNodeId(SizeType p_sampleId, int16_t p_bundleNodeId);
 
@@ -358,6 +411,7 @@ public:
         struct ThreadLocalSearchContext {
             bool m_active = false;
             std::function<bool(int)> m_postingFilter;
+            std::function<bool(int)> m_tailPostingFilter;
             std::vector<uint32_t> m_queryTags;
             float m_filterSelectivity = 1.0f;
             // Unmodified predicate selectivity for pre-search route selection.
@@ -379,10 +433,17 @@ public:
             // authoritative filter and supersedes the flat OR/IN m_queryTags list.
             SPTAG::Cache::DNFPredicate m_dnf;
 
+            // A limited-tag pure prefix is safe only when every satisfiable DNF
+            // clause is anchored by equality on the configured key column (or
+            // when a legacy flat query has exactly that one categorical column).
+            bool m_limitedTagRouteEligible = false;
+            std::vector<uint32_t> m_limitedTagQueryValues;
+
             void Reset()
             {
                 m_active = false;
                 m_postingFilter = nullptr;
+                m_tailPostingFilter = nullptr;
                 m_queryTags.clear();
                 m_filterSelectivity = 1.0f;
                 m_routeSelectivity = 1.0f;
@@ -391,6 +452,8 @@ public:
                 m_searchHeadBundleNodes.clear();
                 m_tagLevelOffsets.clear();
                 m_dnf.Clear();
+                m_limitedTagRouteEligible = false;
+                m_limitedTagQueryValues.clear();
             }
 
             const SPTAG::Cache::DNFPredicate* DNF() const
@@ -466,18 +529,25 @@ protected:
 
 public:
     // Per-head-node metadata blob, indexed by local head sample id (hid).
-    // Layout V3 (each record stores):
-    //   [PostingBitmask][HierarchicalOwnTags own-tags][HierarchicalPostingMask posting-content][globalVID][bundleNodeId][headOnly]
+    // Layout V6 optionally stores a second coarse signature for the
+    // self-contained global tail:
+    //   [pure PostingBitmask][tail PostingBitmask][own-tags][posting-content][globalVID][bundleNodeId][headOnly]
     // Aligned to alignof(PostingBitmask)=8 for stride.
     size_t m_headNodeMetaStride = 0;
     size_t m_headNodePSOffset = 0;
+    size_t m_headNodeTailPSOffset = 0;
+    bool m_headNodeHasTailPS = false;
     size_t m_headNodeHierMaskOffset = 0;
     size_t m_headNodePostingHierMaskOffset = 0;
     size_t m_headNodeGlobalVIDOffset = 0;
     size_t m_headNodeBundleNodeIdOffset = 0;
     size_t m_headNodeHeadOnlyOffset = 0;
     size_t m_headNodeNumQuantOffset = 0;   // offset of quantized numeric block (V4)
+    size_t m_headNodeTailNumQuantOffset = 0;
     int m_headNodeNumQuantCols = 0;        // numeric columns in quant block (0 = none)
+    std::uint64_t m_headNodeNumericDomainFingerprint = 0;
+    bool m_headNodeOwnTagsAvailable = false;
+    bool m_headNodePostingHierMasksAvailable = false;
     std::vector<std::uint8_t> m_headNodeMeta;
 
 public:

@@ -52,12 +52,13 @@ edge body. It does not create a second graph store or attribute subset. Its
 sole STM1 posting is:
 
 ```text
-H | (O \ H)
+H | O
 ```
 
 Here `H` is the hybrid-distance pure prefix and `O` is the complete original
-vector-distance pure+tail posting. The suffix preserves every record in `O`
-that is absent from `H`, sorted by vector distance:
+vector-distance pure+tail posting. Each region is internally unique, while a
+VID may intentionally occur once in each region. The `O` suffix remains sorted
+by vector distance:
 
 ```text
 D_hybrid = w_v D_vector
@@ -65,8 +66,8 @@ D_hybrid = w_v D_vector
          + sum_j w_num,j |query_j - head_j|
 ```
 
-Unfiltered queries always navigate the original degree-32 graph and scan the
-full contiguous pure+tail posting. Before filtered graph search, the router
+Unfiltered queries always navigate the original degree-32 graph and read only
+the self-contained `O` suffix. Before filtered graph search, the router
 computes pure-vector and predicate distances to a deterministic sample of head
 vectors. It chooses hybrid navigation plus the pure prefix only when the
 predicate is selective and its attribute penalty is large relative to the
@@ -89,9 +90,14 @@ and distance weights are native INI parameters.
 
 ## Limited-Tag Static Postings
 
-`build_spann_attr_sift1m_zipf200_limited_tag.ini` builds the single-attribute
-limited-tag experiment. It keeps one canonical BKT head graph and does not
-create attribute subsets, hybrid edges, or cross edges. Native
+`build_spann_attr_sift1m_zipf200_limited_tag.ini` builds the two-column
+categorical/numeric limited-tag experiment. It keeps one canonical H1 head
+graph and does not create attribute subsets, hybrid edges, or cross edges.
+The record schema is driven by native `NumTagsPerVec`, `ACLCols`,
+`NumericCols`, and `LimitedTagColumn` values rather than a fixed attribute
+count. Limited-tag placement and H1/H2 routing use only categorical equality
+anchors on `LimitedTagColumn`; all categorical and numeric DNF3 literals are
+still evaluated exactly on posting records. Native
 `[BuildSSDIndex] LimitedTagSlotsPerHead` accepts `2` (the default) or `4`.
 Each head persists exactly that many support values in generation-bound
 `limited_tag_support.bin`:
@@ -107,45 +113,86 @@ experiment.
 
 Non-head vectors are assigned only to heads supporting their attribute, using
 the normal BKT candidate search and RNG pruning for up to eight replicas. The
-single STM1 posting remains `H | (O \ H)`: filtered queries scan `H`, while
-unfiltered queries navigate the original graph and scan the complete union.
+single STM1 v3 posting is `H | O`: limited-tag queries scan `H`, while
+unfiltered and exact-filter fallback queries navigate the original graph and
+read only the complete `O` suffix. Cross-region overlap is intentional.
+With `EnableHierPostingFilter=true`, V8 head metadata stores separate
+categorical and quantized-numeric signatures for `H` and `O`; the selected
+route consults only its matching signature before I/O. Numeric signatures use
+256 uniform buckets per numeric column and remain conservative at bucket
+boundaries, with exact record-level DNF evaluation removing false positives.
+V8 binds the complete metadata blob to the constrained-posting generation and
+a content fingerprint, records whether own-tag and hierarchical posting masks
+and the tail-signature layout are actually available, and binds numeric signatures to the NUM2 v2
+numeric-domain content fingerprint. Legacy or mismatched metadata falls back
+to validated PBS3 categorical masks when available; missing masks and numeric
+metadata fail open rather than rejecting a potentially matching posting. The PBS3
+`signatures_bitmask.bin` sidecar likewise binds `H`/`O` masks to the posting
+generation and body fingerprint, rejects legacy tail-bearing PBS2 files, and
+is published atomically.
 At load, the validated support sidecar builds only a compact tag-to-head lookup.
-If a predicate matches no more heads than native `MaxCheck`, search computes
-those head distances exactly; broader predicates use result admission on the
-global BKT. This lookup is not a second graph or per-tag ANN index.
+H1 search always performs distance-only graph navigation for exactly the
+configured `InternalResultNum` heads, then applies the support predicate to
+those posting IDs before I/O. Tag support never participates in the H1 graph
+inner loop.
+
+Tags at or below `ExtremeSparseTagMaxSelectivity` additionally retain one
+contiguous EST3 copy of `[VID | all attributes | vector]`. EST is an exact
+tag-only route; the same vectors remain in ordinary postings for unfiltered,
+numeric-only, and other-attribute predicates. A partially covered DNF is split
+into an exact EST scan and a dense search of only its uncovered clauses, then
+deduplicated by VID. H2 posting signatures include only tags in
+`(SecondLevelSignatureMinSelectivity, SecondLevelSignatureMaxSelectivity]`.
+H2 signatures are categorical only; numeric pruning applies to H1 posting
+selection and the self-contained `O` fallback route.
+Every dense DNF clause must have a signature-represented equality anchor before H2 is
+used; otherwise search falls back safely to H1 or complete ordinary postings.
+`--extreme-tag-ratio` derives the generated extreme-tag count as
+`floor(vector_count * ratio)`. The canonical `1e-5` ratio therefore yields
+10 vectors on SIFT1M and 10,000 vectors at 1B scale, matching
+`ExtremeSparseTagMaxSelectivity=0.00001`.
 
 Generate the reproducible Zipf-200 attribute and build with:
 
 ```bash
 python3 Tools/benchmarks/generate_sift1m_zipf_attribute.py \
-  --output-dir /datadisk/yfcc_fast/sptag_sift1m_zipf200
-Tools/benchmarks/run_spann_attr_build.sh \
-  Tools/benchmarks/build_spann_attr_sift1m_zipf200_limited_tag.ini
+  --output-dir /datadisk/yfcc_fast/sptag_sift1m_zipf200_sparse_numeric \
+  --extreme-tag-ratio 0.00001 --numeric-column \
+  --output-prefix sift1m_zipf200_sparse10_numeric
+python3 Tools/benchmarks/generate_sift1m_sparse_numeric_workloads.py \
+  --attributes /datadisk/yfcc_fast/sptag_sift1m_zipf200_sparse_numeric/sift1m_zipf200_sparse10_numeric_attrs.npy \
+  --output-dir /datadisk/yfcc_fast/sptag_sift1m_zipf200_sparse_numeric/query
+Release/spannbuilder \
+  -c Tools/benchmarks/build_spann_attr_sift1m_zipf200_limited_tag.ini
 ```
 
-## SIFT1B Raw STM1 Recommendation
+## SIFT1B Limited-Tag Recommendation
 
-The SIFT1B recommendation uses raw UInt8 vectors in postings, four ACL
-bundles, cross edges, distance-ordered pure/tail segments, and U_extra
-disabled. Pure postings have a six-page budget and tail replicas have the
-same six-page budget beyond the pure prefix. Attribute tuple reordering is
-not enabled. It retains SIFT1B's documented BKT construction and search
-defaults rather than copying SIFT1M-scale build or search budgets.
+The SIFT1B generator replaces the old four-level ACL hierarchy with exactly
+two attributes: one Zipf-200 categorical tag and one deterministic numeric
+value. It writes the final row-major `uint32 [N,2]` SPTAG input directly in
+bounded-memory chunks; no `tags5` merge or per-vector routing-key text file is
+used. The categorical assignment is an exact affine permutation of the Zipf
+counts, so the `1e-5` extreme-tag ratio produces exactly 10,000 vectors at
+1B scale. `spannbuilder` uses its tenant-0 bulk path for these inputs: mapped
+vectors and attributes are borrowed through the synchronous build instead of
+materializing one metadata string, pointer pair, and global ID per vector.
+Both original and constrained placement retain only emitted RNG edges rather
+than initializing `N * ReplicaCount` slots.
 
 ```bash
-CFG=Tools/benchmarks/build_spann_attr_sift1b_raw_static_tail_capped_distance_order.ini
+Tools/benchmarks/prep_sift1b_inputs.sh
+CFG=Tools/benchmarks/build_spann_attr_sift1b_zipf200_limited_tag.ini
 Tools/benchmarks/run_spann_attr_build.sh "$CFG"
 ```
 
-It consumes `sift1b_tags5.u32` and the group-tag routing file, but no quantizer
-codes, quantizer pivots, `FullVectorFile`, or rerank source. Its 152-byte STM1
-records still require multi-terabyte final storage.
-
-`build_spann_attr_sift1b_raw_static_tail_unbounded_distance_order.ini` is
-retained only to reproduce the existing unbounded-tail diagnostic artifact.
-`build_spann_attr_sift1b_pipepq32_r010_tail_unbounded.ini` remains available
-only as a quantized PipePQ32 comparison control; it is not the raw-vector
-recommendation.
+The canonical build uses one global BKT graph, `ACLCols=0`, `NumericCols=1`,
+`LimitedTagColumn=0`, and `HierLevelWidths=201,64,64,64,64` for the 201
+active values plus minimum-width inactive lanes. EST3 retains tags whose
+measured selectivity is at most `1e-5`; H2 covers the configured intermediate
+range. The historical four-ACL SIFT1B INIs remain only as reproduction
+controls for archived `sift1b_tags5.u32` inputs and are not produced by the
+current generator.
 
 ## Ordered ACL Page Starts for Static STM1
 

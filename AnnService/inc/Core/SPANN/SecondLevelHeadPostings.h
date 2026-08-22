@@ -9,6 +9,7 @@
 #include "inc/Helper/AtomicFile.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -32,6 +33,27 @@ public:
     struct Header
     {
         std::uint64_t m_magic = 0x325253324E4E4153ULL; // "SANN2SR2"
+        std::uint32_t m_version = 3;
+        std::uint32_t m_headerBytes = 104;
+        std::uint32_t m_firstLevelHeadCount = 0;
+        std::uint32_t m_secondLevelHeadCount = 0;
+        std::uint32_t m_replicaCount = 0;
+        std::uint32_t m_memberBytes = sizeof(Member);
+        std::uint32_t m_signatureBytes = sizeof(Signature);
+        std::uint32_t m_reserved = 0;
+        double m_signatureMinSelectivity = 0.0;
+        double m_signatureMaxSelectivity = 1.0;
+        std::uint64_t m_memberCount = 0;
+        std::uint64_t m_firstLevelIDFingerprint = 0;
+        std::uint64_t m_secondLevelIDFingerprint = 0;
+        std::uint64_t m_limitedTagSupportFingerprint = 0;
+        std::uint64_t m_bodyFingerprint = 0;
+        std::uint64_t m_generationFingerprint = 0;
+    };
+
+    struct HeaderV2
+    {
+        std::uint64_t m_magic = 0x325253324E4E4153ULL;
         std::uint32_t m_version = 2;
         std::uint32_t m_headerBytes = 88;
         std::uint32_t m_firstLevelHeadCount = 0;
@@ -50,8 +72,11 @@ public:
 #pragma pack(pop)
 
     static_assert(
-        sizeof(Header) == 88,
+        sizeof(Header) == 104,
         "second-level posting header layout changed");
+    static_assert(
+        sizeof(HeaderV2) == 88,
+        "second-level posting v2 header layout changed");
     static_assert(
         sizeof(Signature) == 32,
         "second-level signature must match PostingBitmask");
@@ -90,6 +115,8 @@ public:
         int p_replicaCount,
         std::uint64_t p_firstLevelIDFingerprint,
         std::uint64_t p_limitedTagSupportFingerprint,
+        double p_signatureMinSelectivity,
+        double p_signatureMaxSelectivity,
         const std::vector<std::uint64_t>& p_secondLevelToFirst,
         std::vector<std::uint64_t> p_offsets,
         std::vector<Member> p_members,
@@ -102,6 +129,9 @@ public:
             p_replicaCount <= 0 ||
             p_firstLevelIDFingerprint == 0 ||
             p_limitedTagSupportFingerprint == 0 ||
+            !ValidSignatureRange(
+                p_signatureMinSelectivity,
+                p_signatureMaxSelectivity) ||
             static_cast<std::uint64_t>(
                 p_firstLevelHeadCount) >
                 (std::numeric_limits<std::uint32_t>::max)() ||
@@ -128,6 +158,10 @@ public:
             p_firstLevelIDFingerprint;
         m_header.m_limitedTagSupportFingerprint =
             p_limitedTagSupportFingerprint;
+        m_header.m_signatureMinSelectivity =
+            p_signatureMinSelectivity;
+        m_header.m_signatureMaxSelectivity =
+            p_signatureMaxSelectivity;
         m_header.m_secondLevelIDFingerprint =
             FingerprintIDs(
                 p_secondLevelToFirst.data(),
@@ -209,6 +243,8 @@ public:
         int p_expectedReplicaCount,
         std::uint64_t p_expectedFirstLevelIDFingerprint,
         std::uint64_t p_expectedLimitedTagSupportFingerprint,
+        double p_expectedSignatureMinSelectivity,
+        double p_expectedSignatureMaxSelectivity,
         std::uint64_t p_expectedGeneration,
         const std::vector<std::uint64_t>&
             p_secondLevelToFirst,
@@ -225,13 +261,86 @@ public:
 
         const std::streamoff fileBytes = input.tellg();
         input.seekg(0);
+        std::uint64_t magic = 0;
+        std::uint32_t version = 0;
+        std::uint32_t headerBytes = 0;
         input.read(
-            reinterpret_cast<char*>(&m_header),
-            sizeof(m_header));
+            reinterpret_cast<char*>(&magic),
+            sizeof(magic));
+        input.read(
+            reinterpret_cast<char*>(&version),
+            sizeof(version));
+        input.read(
+            reinterpret_cast<char*>(&headerBytes),
+            sizeof(headerBytes));
+        if (!input || magic != Header().m_magic)
+        {
+            Reset();
+            return Fail(
+                p_error,
+                "second-level posting configuration mismatch");
+        }
+        input.clear();
+        input.seekg(0);
+
+        bool legacyV2 = false;
+        std::uint64_t serializedHeaderBytes = 0;
+        HeaderV2 legacyHeader;
+        if (version == Header().m_version &&
+            headerBytes == sizeof(Header))
+        {
+            input.read(
+                reinterpret_cast<char*>(&m_header),
+                sizeof(m_header));
+            serializedHeaderBytes = sizeof(Header);
+        }
+        else if (version == HeaderV2().m_version &&
+                 headerBytes == sizeof(HeaderV2) &&
+                 p_expectedSignatureMinSelectivity == 0.0 &&
+                 p_expectedSignatureMaxSelectivity == 1.0)
+        {
+            input.read(
+                reinterpret_cast<char*>(&legacyHeader),
+                sizeof(legacyHeader));
+            legacyV2 = true;
+            serializedHeaderBytes = sizeof(HeaderV2);
+            m_header.m_firstLevelHeadCount =
+                legacyHeader.m_firstLevelHeadCount;
+            m_header.m_secondLevelHeadCount =
+                legacyHeader.m_secondLevelHeadCount;
+            m_header.m_replicaCount =
+                legacyHeader.m_replicaCount;
+            m_header.m_memberBytes =
+                legacyHeader.m_memberBytes;
+            m_header.m_signatureBytes =
+                legacyHeader.m_signatureBytes;
+            m_header.m_reserved =
+                legacyHeader.m_reserved;
+            m_header.m_signatureMinSelectivity = 0.0;
+            m_header.m_signatureMaxSelectivity = 1.0;
+            m_header.m_memberCount =
+                legacyHeader.m_memberCount;
+            m_header.m_firstLevelIDFingerprint =
+                legacyHeader.m_firstLevelIDFingerprint;
+            m_header.m_secondLevelIDFingerprint =
+                legacyHeader.m_secondLevelIDFingerprint;
+            m_header.m_limitedTagSupportFingerprint =
+                legacyHeader
+                    .m_limitedTagSupportFingerprint;
+            m_header.m_bodyFingerprint =
+                legacyHeader.m_bodyFingerprint;
+            m_header.m_generationFingerprint =
+                legacyHeader.m_generationFingerprint;
+        }
+        else
+        {
+            Reset();
+            return Fail(
+                p_error,
+                "second-level posting configuration mismatch");
+        }
+
         if (!input ||
-            m_header.m_magic != Header().m_magic ||
-            m_header.m_version != Header().m_version ||
-            m_header.m_headerBytes != sizeof(Header) ||
             m_header.m_memberBytes != sizeof(Member) ||
             m_header.m_signatureBytes !=
                 sizeof(Signature) ||
@@ -249,6 +358,11 @@ public:
                 p_expectedFirstLevelIDFingerprint ||
             m_header.m_limitedTagSupportFingerprint !=
                 p_expectedLimitedTagSupportFingerprint ||
+            (!legacyV2 &&
+             (m_header.m_signatureMinSelectivity !=
+                  p_expectedSignatureMinSelectivity ||
+              m_header.m_signatureMaxSelectivity !=
+                  p_expectedSignatureMaxSelectivity)) ||
             m_header.m_secondLevelIDFingerprint !=
                 FingerprintIDs(
                     p_secondLevelToFirst.data(),
@@ -298,7 +412,7 @@ public:
                 sizeof(Signature),
                 signatureBytes) ||
             !CheckedAdd(
-                sizeof(Header),
+                serializedHeaderBytes,
                 offsetBytes,
                 expectedBytes) ||
             !CheckedAdd(
@@ -388,7 +502,9 @@ public:
         if (!input ||
             BodyFingerprint() !=
                 m_header.m_bodyFingerprint ||
-            GenerationFingerprint(m_header) !=
+            (legacyV2
+                 ? GenerationFingerprint(legacyHeader)
+                 : GenerationFingerprint(m_header)) !=
                 m_header.m_generationFingerprint ||
             !Validate(
                 p_secondLevelToFirst, p_error))
@@ -442,6 +558,16 @@ public:
         return m_header.m_generationFingerprint;
     }
 
+    double SignatureMinSelectivity() const
+    {
+        return m_header.m_signatureMinSelectivity;
+    }
+
+    double SignatureMaxSelectivity() const
+    {
+        return m_header.m_signatureMaxSelectivity;
+    }
+
     const Member* Begin(SizeType p_secondLevelHead) const
     {
         if (p_secondLevelHead < 0 ||
@@ -491,6 +617,18 @@ private:
         1469598103934665603ULL;
     static constexpr std::uint64_t kFNVPrime =
         1099511628211ULL;
+
+    static bool ValidSignatureRange(
+        double p_minExclusive,
+        double p_maxInclusive)
+    {
+        return
+            std::isfinite(p_minExclusive) &&
+            std::isfinite(p_maxInclusive) &&
+            p_minExclusive >= 0.0 &&
+            p_maxInclusive <= 1.0 &&
+            p_minExclusive < p_maxInclusive;
+    }
 
     static bool CheckedMultiply(
         std::uint64_t p_left,
@@ -565,7 +703,7 @@ private:
     }
 
     static std::uint64_t GenerationFingerprint(
-        const Header& p_header)
+        const HeaderV2& p_header)
     {
         std::uint64_t hash = kFNVOffset;
         hash = HashBytes(
@@ -613,6 +751,67 @@ private:
             sizeof(p_header.m_bodyFingerprint));
     }
 
+    static std::uint64_t GenerationFingerprint(
+        const Header& p_header)
+    {
+        std::uint64_t hash = kFNVOffset;
+        hash = HashBytes(
+            hash,
+            &p_header.m_firstLevelHeadCount,
+            sizeof(p_header.m_firstLevelHeadCount));
+        hash = HashBytes(
+            hash,
+            &p_header.m_secondLevelHeadCount,
+            sizeof(p_header.m_secondLevelHeadCount));
+        hash = HashBytes(
+            hash,
+            &p_header.m_replicaCount,
+            sizeof(p_header.m_replicaCount));
+        hash = HashBytes(
+            hash,
+            &p_header.m_signatureBytes,
+            sizeof(p_header.m_signatureBytes));
+        hash = HashBytes(
+            hash,
+            &p_header.m_signatureMinSelectivity,
+            sizeof(
+                p_header
+                    .m_signatureMinSelectivity));
+        hash = HashBytes(
+            hash,
+            &p_header.m_signatureMaxSelectivity,
+            sizeof(
+                p_header
+                    .m_signatureMaxSelectivity));
+        hash = HashBytes(
+            hash,
+            &p_header.m_memberCount,
+            sizeof(p_header.m_memberCount));
+        hash = HashBytes(
+            hash,
+            &p_header.m_firstLevelIDFingerprint,
+            sizeof(
+                p_header
+                    .m_firstLevelIDFingerprint));
+        hash = HashBytes(
+            hash,
+            &p_header.m_secondLevelIDFingerprint,
+            sizeof(
+                p_header
+                    .m_secondLevelIDFingerprint));
+        hash = HashBytes(
+            hash,
+            &p_header
+                 .m_limitedTagSupportFingerprint,
+            sizeof(
+                p_header
+                    .m_limitedTagSupportFingerprint));
+        return HashBytes(
+            hash,
+            &p_header.m_bodyFingerprint,
+            sizeof(p_header.m_bodyFingerprint));
+    }
+
     bool Validate(
         const std::vector<std::uint64_t>&
             p_secondLevelToFirst,
@@ -625,6 +824,9 @@ private:
             m_header.m_signatureBytes !=
                 sizeof(Signature) ||
             m_header.m_reserved != 0 ||
+            !ValidSignatureRange(
+                m_header.m_signatureMinSelectivity,
+                m_header.m_signatureMaxSelectivity) ||
             m_header.m_firstLevelHeadCount == 0 ||
             m_header.m_secondLevelHeadCount == 0 ||
             m_header.m_replicaCount == 0 ||

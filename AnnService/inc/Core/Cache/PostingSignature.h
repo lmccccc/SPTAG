@@ -13,6 +13,8 @@
 #ifndef _SPTAG_POSTING_SIGNATURE_H_
 #define _SPTAG_POSTING_SIGNATURE_H_
 
+#include "inc/Helper/AtomicFile.h"
+
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -24,6 +26,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
+#include <limits>
 
 namespace SPTAG {
 namespace Cache {
@@ -587,6 +590,72 @@ struct DNFPredicate {
         return false;
     }
 
+    // Extract one categorical equality anchor on `column` from every
+    // satisfiable clause. Clauses containing conflicting equalities on the same
+    // single-valued column are unsatisfiable and do not require retrieval.
+    // False means at least one potentially satisfiable clause has no anchor, so
+    // a column-conditioned index cannot safely serve the whole predicate.
+    bool TryGetEqualityAnchors(
+        std::uint32_t column,
+        std::vector<std::uint32_t>& anchors) const {
+        anchors.clear();
+        if (clauses.empty()) return false;
+        for (const auto& clause : clauses) {
+            if (clause.lits.empty()) return false;
+            bool found = false;
+            bool conflicting = false;
+            std::uint32_t value = 0;
+            for (const auto& literal : clause.lits) {
+                if (literal.kind != 0 ||
+                    literal.op != DNF_EQ ||
+                    literal.col != column) {
+                    continue;
+                }
+                if (!found) {
+                    value = literal.val;
+                    found = true;
+                } else if (value != literal.val) {
+                    conflicting = true;
+                }
+            }
+            if (!found) return false;
+            if (!conflicting) anchors.push_back(value);
+        }
+        std::sort(anchors.begin(), anchors.end());
+        anchors.erase(
+            std::unique(anchors.begin(), anchors.end()),
+            anchors.end());
+        return true;
+    }
+
+    bool AnchorValueMayMatch(
+        std::uint32_t column,
+        std::uint32_t value) const {
+        for (const auto& clause : clauses) {
+            bool found = false;
+            bool conflicting = false;
+            std::uint32_t clauseValue = 0;
+            for (const auto& literal : clause.lits) {
+                if (literal.kind != 0 ||
+                    literal.op != DNF_EQ ||
+                    literal.col != column) {
+                    continue;
+                }
+                if (!found) {
+                    clauseValue = literal.val;
+                    found = true;
+                } else if (clauseValue != literal.val) {
+                    conflicting = true;
+                }
+            }
+            if (found && !conflicting &&
+                clauseValue == value) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // All distinct CATEGORICAL (tag, kind==0) literal values across every clause
     // (union) -- used to build the coarse union signatures, routing and the
     // selectivity estimate. Numeric literals are excluded: their values are raw
@@ -679,7 +748,8 @@ struct DNFPredicate {
     // literals are treated as always-may-match (fail open).
     bool MayMatchHierQuant(const HierarchicalPostingMask& h,
                            const uint64_t* quant, int numQuantCols,
-                           const NumQuantParam* qp, int numBaseCols,
+                           const NumQuantParam* qp, int numQuantParams,
+                           int numBaseCols,
                            const HierWidthTable& widths) const {
         for (const auto& c : clauses) {
             if (c.lits.empty()) continue;
@@ -693,7 +763,10 @@ struct DNFPredicate {
                     }
                 } else if (quant != nullptr && qp != nullptr) {
                     int lane = (int)l.col - numBaseCols;
-                    if (lane < 0 || lane >= numQuantCols) continue;  // unknown col: fail open
+                    if (lane < 0 || lane >= numQuantCols ||
+                        lane >= numQuantParams) {
+                        continue;  // unknown col: fail open
+                    }
                     int blo, bhi;
                     NumQuantPredBuckets(qp[lane], l.op, l.val, blo, bhi);
                     if (!NumQuantAnyInRange(quant, lane, blo, bhi)) { all = false; break; }
@@ -706,10 +779,57 @@ struct DNFPredicate {
 
     bool MayMatchHierQuant(const HierarchicalPostingMask& h,
                            const uint64_t* quant, int numQuantCols,
-                           const NumQuantParam* qp, int numBaseCols) const {
+                           const NumQuantParam* qp, int numQuantParams,
+                           int numBaseCols) const {
         return MayMatchHierQuant(
-            h, quant, numQuantCols, qp, numBaseCols,
+            h, quant, numQuantCols, qp, numQuantParams,
+            numBaseCols,
             HierWidths());
+    }
+
+    // Same conservative DNF test for a compact, column-agnostic categorical
+    // signature. Categorical collisions across columns can only introduce
+    // false positives; exact record filtering remains authoritative.
+    bool MayMatchCoarseQuant(
+        const PostingBitmask& categorical,
+        const uint64_t* quant, int numQuantCols,
+        const NumQuantParam* qp, int numQuantParams,
+        int numBaseCols) const {
+        for (const auto& c : clauses) {
+            if (c.lits.empty()) continue;
+            bool all = true;
+            for (const auto& l : c.lits) {
+                if (l.kind == 0) {
+                    if (!categorical.MayContain(l.val)) {
+                        all = false;
+                        break;
+                    }
+                } else if (quant != nullptr &&
+                           qp != nullptr) {
+                    const int lane =
+                        static_cast<int>(l.col) -
+                        numBaseCols;
+                    if (lane < 0 ||
+                        lane >= numQuantCols ||
+                        lane >= numQuantParams) {
+                        continue;
+                    }
+                    int bucketLow = 0;
+                    int bucketHigh = 0;
+                    NumQuantPredBuckets(
+                        qp[lane], l.op, l.val,
+                        bucketLow, bucketHigh);
+                    if (!NumQuantAnyInRange(
+                            quant, lane,
+                            bucketLow, bucketHigh)) {
+                        all = false;
+                        break;
+                    }
+                }
+            }
+            if (all) return true;
+        }
+        return false;
     }
 };
 
@@ -717,9 +837,55 @@ struct DNFPredicate {
 struct TenantBitmaskPS {
     int num_postings = 0;
     std::vector<PostingBitmask> ps;
+    std::vector<PostingBitmask> tail_ps;
+    bool has_tail_signatures = false;
+    std::uint64_t generation_fingerprint = 0;
+    std::uint64_t content_fingerprint = 0;
+    bool generation_bound = false;
+
+    std::uint64_t ContentFingerprint(
+        int32_t flags,
+        std::uint64_t generation) const {
+        constexpr std::uint64_t offset =
+            1469598103934665603ULL;
+        constexpr std::uint64_t prime =
+            1099511628211ULL;
+        std::uint64_t hash = offset;
+        const auto append =
+            [&](const void* data, size_t bytes) {
+                const auto* begin =
+                    static_cast<const std::uint8_t*>(
+                        data);
+                for (size_t i = 0; i < bytes; ++i) {
+                    hash ^= begin[i];
+                    hash *= prime;
+                }
+            };
+        const int32_t count = num_postings;
+        append(&count, sizeof(count));
+        append(&flags, sizeof(flags));
+        append(&generation, sizeof(generation));
+        if (!ps.empty()) {
+            append(ps.data(),
+                   ps.size() *
+                       sizeof(PostingBitmask));
+        }
+        if ((flags & 1) != 0 &&
+            !tail_ps.empty()) {
+            append(tail_ps.data(),
+                   tail_ps.size() *
+                       sizeof(PostingBitmask));
+        }
+        return hash;
+    }
 
     void Build(int num_posts, const std::vector<std::vector<uint32_t>>& posting_tags) {
         num_postings = num_posts;
+        has_tail_signatures = false;
+        generation_fingerprint = 0;
+        content_fingerprint = 0;
+        generation_bound = false;
+        tail_ps.clear();
         ps.resize(num_posts);
         for (int i = 0; i < num_posts; i++) {
             ps[i].Clear();
@@ -729,35 +895,236 @@ struct TenantBitmaskPS {
         }
     }
 
-    bool Save(const std::string& path) const {
-        FILE* f = fopen(path.c_str(), "wb");
+    void Build(
+        int num_posts,
+        const std::vector<std::vector<uint32_t>>& posting_tags,
+        const std::vector<std::vector<uint32_t>>& tail_posting_tags) {
+        Build(num_posts, posting_tags);
+        has_tail_signatures =
+            tail_posting_tags.size() >=
+            static_cast<size_t>(num_posts);
+        if (!has_tail_signatures) return;
+        tail_ps.resize(num_posts);
+        for (int i = 0; i < num_posts; ++i) {
+            tail_ps[i].Clear();
+            for (uint32_t tag : tail_posting_tags[i]) {
+                tail_ps[i].Insert(tag);
+            }
+        }
+    }
+
+    bool Save(
+        const std::string& path,
+        std::uint64_t generation = 0) const {
+        constexpr int32_t kMagic =
+            0x33534250; // "PBS3"
+        constexpr int32_t kVersion = 3;
+        const int32_t n = num_postings;
+        const int32_t flags =
+            has_tail_signatures ? 1 : 0;
+        if (n < 0 ||
+            ps.size() != static_cast<size_t>(n) ||
+            (has_tail_signatures &&
+             tail_ps.size() !=
+                 static_cast<size_t>(n)) ||
+            (has_tail_signatures &&
+             generation == 0)) {
+            return false;
+        }
+        const std::uint64_t fingerprint =
+            ContentFingerprint(flags, generation);
+        const std::string temporary =
+            path + ".tmp";
+        FILE* f = fopen(temporary.c_str(), "wb");
         if (!f) return false;
-        int32_t n = num_postings;
-        fwrite(&n, sizeof(int32_t), 1, f);
-        fwrite(ps.data(), sizeof(PostingBitmask), n, f);
-        fclose(f);
+        bool ok =
+            fwrite(&kMagic, sizeof(kMagic), 1, f) == 1 &&
+            fwrite(&kVersion, sizeof(kVersion), 1, f) == 1 &&
+            fwrite(&n, sizeof(n), 1, f) == 1 &&
+            fwrite(&flags, sizeof(flags), 1, f) == 1 &&
+            fwrite(&generation,
+                   sizeof(generation), 1, f) == 1 &&
+            fwrite(&fingerprint,
+                   sizeof(fingerprint), 1, f) == 1 &&
+            static_cast<int>(
+                fwrite(ps.data(), sizeof(PostingBitmask),
+                       static_cast<size_t>(n), f)) == n;
+        if (ok && has_tail_signatures) {
+            ok =
+                tail_ps.size() ==
+                    static_cast<size_t>(n) &&
+                static_cast<int>(
+                    fwrite(tail_ps.data(),
+                           sizeof(PostingBitmask),
+                           static_cast<size_t>(n), f)) == n;
+        }
+        ok = fclose(f) == 0 && ok;
+        if (!ok ||
+            !SPTAG::Helper::AtomicReplaceFile(
+                temporary, path)) {
+            std::remove(temporary.c_str());
+            return false;
+        }
         return true;
     }
 
-    bool Load(const std::string& path) {
+    bool Load(
+        const std::string& path,
+        std::uint64_t expectedGeneration = 0) {
         FILE* f = fopen(path.c_str(), "rb");
         if (!f) return false;
-        int32_t n = 0;
-        if (fread(&n, sizeof(int32_t), 1, f) != 1) { fclose(f); return false; }
+        std::uint64_t fileBytes = 0;
+        if (!SPTAG::Helper::GetOpenFileSize(
+                f, fileBytes)) {
+            fclose(f);
+            return false;
+        }
+        constexpr int32_t kMagicV3 =
+            0x33534250; // "PBS3"
+        constexpr int32_t kMagicV2 =
+            0x32534250; // "PBS2"
+        int32_t first = 0;
+        if (fread(&first, sizeof(first), 1, f) != 1) {
+            fclose(f);
+            return false;
+        }
+        int32_t n = first;
+        int32_t flags = 0;
+        std::uint64_t generation = 0;
+        std::uint64_t fingerprint = 0;
+        bool isV3 = false;
+        bool isV2 = false;
+        size_t headerBytes = sizeof(int32_t);
+        if (first == kMagicV3) {
+            int32_t version = 0;
+            if (fread(&version, sizeof(version), 1, f) != 1 ||
+                fread(&n, sizeof(n), 1, f) != 1 ||
+                fread(&flags, sizeof(flags), 1, f) != 1 ||
+                fread(&generation,
+                      sizeof(generation), 1, f) != 1 ||
+                fread(&fingerprint,
+                      sizeof(fingerprint), 1, f) != 1 ||
+                version != 3 ||
+                (flags & ~1) != 0 ||
+                (expectedGeneration != 0 &&
+                 generation !=
+                     expectedGeneration)) {
+                fclose(f);
+                return false;
+            }
+            isV3 = true;
+            headerBytes =
+                4 * sizeof(int32_t) +
+                2 * sizeof(std::uint64_t);
+        } else if (first == kMagicV2) {
+            int32_t version = 0;
+            if (fread(&version, sizeof(version), 1, f) != 1 ||
+                fread(&n, sizeof(n), 1, f) != 1 ||
+                fread(&flags, sizeof(flags), 1, f) != 1 ||
+                version != 2 ||
+                (flags & ~1) != 0) {
+                fclose(f);
+                return false;
+            }
+            isV2 = true;
+            headerBytes = 4 * sizeof(int32_t);
+        }
+        if (n < 0) {
+            fclose(f);
+            return false;
+        }
+        const bool hasTail =
+            (isV3 || isV2) &&
+            (flags & 1) != 0;
+        if (expectedGeneration != 0 &&
+            hasTail && !isV3) {
+            fclose(f);
+            return false;
+        }
+        const std::uint64_t count =
+            static_cast<std::uint64_t>(n);
+        const std::uint64_t signatureCount =
+            count * (hasTail ? 2ULL : 1ULL);
+        if (count >
+                ps.max_size() ||
+            (hasTail &&
+             count > tail_ps.max_size()) ||
+            signatureCount >
+                ((std::numeric_limits<
+                      std::uint64_t>::max)() -
+                 headerBytes) /
+                    sizeof(PostingBitmask) ||
+            fileBytes !=
+                headerBytes +
+                    signatureCount *
+                        sizeof(PostingBitmask)) {
+            fclose(f);
+            return false;
+        }
         num_postings = n;
         ps.resize(n);
-        if ((int)fread(ps.data(), sizeof(PostingBitmask), n, f) != n) { fclose(f); return false; }
-        fclose(f);
+        if (static_cast<int>(
+                fread(ps.data(), sizeof(PostingBitmask),
+                      static_cast<size_t>(n), f)) != n) {
+            fclose(f);
+            return false;
+        }
+        has_tail_signatures = hasTail;
+        tail_ps.clear();
+        if (has_tail_signatures) {
+            tail_ps.resize(n);
+            if (static_cast<int>(
+                    fread(tail_ps.data(),
+                          sizeof(PostingBitmask),
+                          static_cast<size_t>(n), f)) != n) {
+                fclose(f);
+                return false;
+            }
+        }
+        if (fclose(f) != 0) return false;
+        generation_fingerprint = generation;
+        generation_bound = isV3;
+        content_fingerprint =
+            isV3
+            ? ContentFingerprint(flags, generation)
+            : 0;
+        if (isV3 &&
+            content_fingerprint != fingerprint) {
+            num_postings = 0;
+            ps.clear();
+            tail_ps.clear();
+            has_tail_signatures = false;
+            generation_fingerprint = 0;
+            content_fingerprint = 0;
+            generation_bound = false;
+            return false;
+        }
         return true;
     }
 
     size_t MemoryBytes() const {
-        return sizeof(*this) + ps.capacity() * sizeof(PostingBitmask);
+        return sizeof(*this) +
+            (ps.capacity() + tail_ps.capacity()) *
+                sizeof(PostingBitmask);
     }
 
     bool ShouldReadPosting(int posting_id, const PostingBitmask& query_mask) const {
         if (posting_id < 0 || posting_id >= num_postings) return true;
         return ps[posting_id].MayIntersect(query_mask);
+    }
+
+    bool ShouldReadTailPosting(
+        int posting_id,
+        const PostingBitmask& query_mask) const {
+        if (!has_tail_signatures ||
+            posting_id < 0 ||
+            posting_id >= num_postings ||
+            static_cast<size_t>(posting_id) >=
+                tail_ps.size()) {
+            return true;
+        }
+        return tail_ps[posting_id].MayIntersect(
+            query_mask);
     }
 };
 

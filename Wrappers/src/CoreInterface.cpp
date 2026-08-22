@@ -69,6 +69,295 @@ constexpr std::uint32_t kTagRoutingStatsMagic = 0x53525454U; // TTRS
 constexpr std::uint32_t kTagRoutingStatsVersion = 4;
 constexpr std::uint32_t kLegacyRoutingColumn =
     (std::numeric_limits<std::uint32_t>::max)();
+constexpr std::uint32_t kLegacyNumericMetaMagic =
+    0x54454D4EU; // NMET
+constexpr std::uint32_t kNumericMetaMagic =
+    0x324D554EU; // NUM2
+constexpr std::uint32_t kNumericMetaVersion = 2;
+
+struct NumericMetaFileHeader {
+    std::uint32_t magic = kNumericMetaMagic;
+    std::uint32_t version = kNumericMetaVersion;
+    std::int32_t numBaseColumns = 0;
+    std::int32_t numNumericColumns = 0;
+    std::int32_t vectorCount = 0;
+    std::int32_t tagColumnCount = 0;
+    std::uint64_t generationFingerprint = 0;
+    std::uint64_t contentFingerprint = 0;
+};
+
+static_assert(sizeof(NumericMetaFileHeader) == 40,
+              "Unexpected NumericMetaFileHeader layout");
+
+struct NumericMetaDiskData {
+    int numBaseColumns = 0;
+    int vectorCount = 0;
+    int tagColumnCount = 0;
+    std::uint64_t generationFingerprint = 0;
+    std::uint64_t contentFingerprint = 0;
+    bool generationBound = false;
+    std::vector<SPTAG::Cache::NumQuantParam> params;
+};
+
+std::uint64_t NumericMetaFingerprint(
+    const NumericMetaFileHeader& header,
+    const std::vector<SPTAG::Cache::NumQuantParam>& params)
+{
+    constexpr std::uint64_t offset =
+        1469598103934665603ULL;
+    constexpr std::uint64_t prime =
+        1099511628211ULL;
+    std::uint64_t hash = offset;
+    const auto append =
+        [&](const void* data, size_t bytes) {
+            const auto* begin =
+                static_cast<const std::uint8_t*>(data);
+            for (size_t i = 0; i < bytes; ++i) {
+                hash ^= begin[i];
+                hash *= prime;
+            }
+        };
+    append(&header.numBaseColumns,
+           sizeof(header.numBaseColumns));
+    append(&header.numNumericColumns,
+           sizeof(header.numNumericColumns));
+    append(&header.vectorCount,
+           sizeof(header.vectorCount));
+    append(&header.tagColumnCount,
+           sizeof(header.tagColumnCount));
+    append(&header.generationFingerprint,
+           sizeof(header.generationFingerprint));
+    if (!params.empty()) {
+        append(params.data(),
+               params.size() * sizeof(params[0]));
+    }
+    return hash;
+}
+
+std::uint64_t ComputeNumericMetaContentFingerprint(
+    int numBaseColumns,
+    int vectorCount,
+    int tagColumnCount,
+    std::uint64_t generationFingerprint,
+    const std::vector<SPTAG::Cache::NumQuantParam>&
+        params)
+{
+    NumericMetaFileHeader header;
+    header.numBaseColumns = numBaseColumns;
+    header.numNumericColumns =
+        static_cast<std::int32_t>(params.size());
+    header.vectorCount = vectorCount;
+    header.tagColumnCount = tagColumnCount;
+    header.generationFingerprint =
+        generationFingerprint;
+    return NumericMetaFingerprint(header, params);
+}
+
+bool SaveNumericMetaFile(
+    const std::string& path,
+    int numBaseColumns,
+    int vectorCount,
+    int tagColumnCount,
+    std::uint64_t generationFingerprint,
+    const std::vector<SPTAG::Cache::NumQuantParam>&
+        params,
+    std::uint64_t* contentFingerprint = nullptr)
+{
+    const std::int64_t totalColumns =
+        static_cast<std::int64_t>(numBaseColumns) +
+        static_cast<std::int64_t>(params.size());
+    if (numBaseColumns < 0 ||
+        params.empty() ||
+        params.size() >
+            static_cast<size_t>(
+                (std::numeric_limits<std::int32_t>::max)()) ||
+        vectorCount <= 0 ||
+        tagColumnCount <= numBaseColumns ||
+        totalColumns !=
+            tagColumnCount) {
+        return false;
+    }
+    for (const auto& param : params) {
+        if (param.lo > param.hi) return false;
+    }
+
+    NumericMetaFileHeader header;
+    header.numBaseColumns = numBaseColumns;
+    header.numNumericColumns =
+        static_cast<std::int32_t>(params.size());
+    header.vectorCount = vectorCount;
+    header.tagColumnCount = tagColumnCount;
+    header.generationFingerprint =
+        generationFingerprint;
+    header.contentFingerprint =
+        ComputeNumericMetaContentFingerprint(
+            numBaseColumns, vectorCount,
+            tagColumnCount, generationFingerprint,
+            params);
+    if (contentFingerprint != nullptr) {
+        *contentFingerprint =
+            header.contentFingerprint;
+    }
+
+    const std::string temporary = path + ".tmp";
+    FILE* file = std::fopen(temporary.c_str(), "wb");
+    if (file == nullptr) return false;
+    bool ok =
+        std::fwrite(&header, sizeof(header), 1, file) ==
+            1 &&
+        std::fwrite(
+            params.data(), sizeof(params[0]),
+            params.size(), file) == params.size();
+    if (std::fclose(file) != 0) ok = false;
+    if (!ok ||
+        !SPTAG::Helper::AtomicReplaceFile(
+            temporary, path)) {
+        std::remove(temporary.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool LoadNumericMetaFile(
+    const std::string& path,
+    NumericMetaDiskData& metadata)
+{
+    metadata = NumericMetaDiskData();
+    std::ifstream input(path, std::ios::binary);
+    if (!input.good()) return false;
+    input.seekg(0, std::ios::end);
+    const std::streamoff fileBytes = input.tellg();
+    input.seekg(0, std::ios::beg);
+    std::uint32_t magic = 0;
+    input.read(
+        reinterpret_cast<char*>(&magic), sizeof(magic));
+    if (!input.good()) return false;
+    input.seekg(0, std::ios::beg);
+
+    if (magic == kNumericMetaMagic) {
+        NumericMetaFileHeader header;
+        input.read(
+            reinterpret_cast<char*>(&header),
+            sizeof(header));
+        const std::int64_t totalColumns =
+            static_cast<std::int64_t>(
+                header.numBaseColumns) +
+            static_cast<std::int64_t>(
+                header.numNumericColumns);
+        if (!input.good() ||
+            header.version != kNumericMetaVersion ||
+            header.numBaseColumns < 0 ||
+            header.numNumericColumns <= 0 ||
+            header.vectorCount <= 0 ||
+            header.tagColumnCount <=
+                header.numBaseColumns ||
+            totalColumns !=
+                header.tagColumnCount) {
+            return false;
+        }
+        const std::uint64_t expectedBytes =
+            sizeof(header) +
+            static_cast<std::uint64_t>(
+                header.numNumericColumns) *
+                sizeof(
+                    SPTAG::Cache::NumQuantParam);
+        if (fileBytes < 0 ||
+            static_cast<std::uint64_t>(fileBytes) !=
+                expectedBytes) {
+            return false;
+        }
+        metadata.params.resize(
+            static_cast<size_t>(
+                header.numNumericColumns));
+        input.read(
+            reinterpret_cast<char*>(
+                metadata.params.data()),
+            static_cast<std::streamsize>(
+                metadata.params.size() *
+                sizeof(metadata.params[0])));
+        if (!input.good() ||
+            header.contentFingerprint !=
+                NumericMetaFingerprint(
+                    header, metadata.params)) {
+            return false;
+        }
+        for (const auto& param : metadata.params) {
+            if (param.lo > param.hi) return false;
+        }
+        metadata.numBaseColumns =
+            header.numBaseColumns;
+        metadata.vectorCount = header.vectorCount;
+        metadata.tagColumnCount =
+            header.tagColumnCount;
+        metadata.generationFingerprint =
+            header.generationFingerprint;
+        metadata.contentFingerprint =
+            header.contentFingerprint;
+        metadata.generationBound = true;
+        return true;
+    }
+
+    if (magic != kLegacyNumericMetaMagic) {
+        return false;
+    }
+    std::array<std::int32_t, 3> legacyHeader{};
+    input.read(
+        reinterpret_cast<char*>(legacyHeader.data()),
+        static_cast<std::streamsize>(
+            sizeof(legacyHeader)));
+    if (!input.good() ||
+        legacyHeader[1] < 0 ||
+        legacyHeader[2] <= 0) {
+        return false;
+    }
+    const std::uint64_t expectedBytes =
+        sizeof(legacyHeader) +
+        static_cast<std::uint64_t>(legacyHeader[2]) *
+            sizeof(SPTAG::Cache::NumQuantParam);
+    if (fileBytes < 0 ||
+        static_cast<std::uint64_t>(fileBytes) !=
+            expectedBytes) {
+        return false;
+    }
+    const std::int64_t legacyTagColumns =
+        static_cast<std::int64_t>(
+            legacyHeader[1]) +
+        static_cast<std::int64_t>(
+            legacyHeader[2]);
+    if (legacyTagColumns >
+        (std::numeric_limits<int>::max)()) {
+        return false;
+    }
+    metadata.params.resize(
+        static_cast<size_t>(legacyHeader[2]));
+    input.read(
+        reinterpret_cast<char*>(
+            metadata.params.data()),
+        static_cast<std::streamsize>(
+            metadata.params.size() *
+            sizeof(metadata.params[0])));
+    if (!input.good()) return false;
+    for (const auto& param : metadata.params) {
+        if (param.lo > param.hi) return false;
+    }
+    metadata.numBaseColumns = legacyHeader[1];
+    metadata.tagColumnCount =
+        static_cast<int>(legacyTagColumns);
+    return true;
+}
+
+bool IsSafeArtifactFileName(
+    const std::string& p_name)
+{
+    if (p_name.empty()) return false;
+    const std::filesystem::path path(p_name);
+    return !path.is_absolute() &&
+        !path.has_root_path() &&
+        !path.has_parent_path() &&
+        path.filename() == path &&
+        path != "." &&
+        path != "..";
+}
 
 std::uint64_t MakeTagRoutingKey(
     std::uint32_t column,
@@ -177,14 +466,11 @@ bool LoadTagRoutingStatsFile(
                       static_cast<std::uint64_t>(
                           sizeof(TagRoutingStatRecord))
             : 0;
+        std::uint64_t fileBytes = 0;
         ok = ok &&
-            std::fseek(file, 0, SEEK_END) == 0;
-        const long fileBytes = ok
-            ? std::ftell(file)
-            : -1;
-        ok = ok && fileBytes >= 0 &&
-            static_cast<std::uint64_t>(
-                fileBytes) == expectedBytes &&
+            SPTAG::Helper::GetOpenFileSize(
+                file, fileBytes) &&
+            fileBytes == expectedBytes &&
             std::fseek(
                 file,
                 static_cast<long>(sizeof(header)),
@@ -279,15 +565,13 @@ bool LoadHybridRoutingStatsHeader(
                     (4ULL +
                      static_cast<std::uint64_t>(
                          header.m_maskCount)),
-                sizeof(double)) &&
-            std::fseek(file, 0, SEEK_END) == 0;
+                sizeof(double));
     }
-    const long fileBytes = ok
-        ? std::ftell(file)
-        : -1;
-    ok = ok && fileBytes >= 0 &&
-        static_cast<std::uint64_t>(fileBytes) ==
-            expectedBytes;
+    std::uint64_t fileBytes = 0;
+    ok = ok &&
+        SPTAG::Helper::GetOpenFileSize(
+            file, fileBytes) &&
+        fileBytes == expectedBytes;
     std::fclose(file);
     return ok;
 }
@@ -437,7 +721,20 @@ bool BuildStaticPostingHierMasks(const std::string& p_snapshotPath,
                                  const SPTAG::Cache::HierWidthTable& p_hierWidths,
                                  std::vector<SPTAG::Cache::HierarchicalPostingMask>& p_masks,
                                  std::unordered_map<std::uint64_t, int>*
-                                     p_tagPostingCounts = nullptr)
+                                     p_tagPostingCounts = nullptr,
+                                 std::vector<SPTAG::Cache::PostingBitmask>*
+                                     p_pureMasks = nullptr,
+                                 std::vector<SPTAG::Cache::PostingBitmask>*
+                                     p_tailMasks = nullptr,
+                                 const std::vector<
+                                     SPTAG::Cache::NumQuantParam>*
+                                     p_quantParams = nullptr,
+                                 std::vector<std::uint64_t>*
+                                     p_pureNumericMasks = nullptr,
+                                 std::vector<std::uint64_t>*
+                                     p_tailNumericMasks = nullptr,
+                                 std::uint64_t
+                                     p_expectedGeneration = 0)
 {
     constexpr std::uint32_t kStaticMetadataMagic = 0x314D5453U; // "STM1"
     constexpr int kHeaderV1IntCount = 9;
@@ -462,7 +759,9 @@ bool BuildStaticPostingHierMasks(const std::string& p_snapshotPath,
     const int listCount = header[2];
     const int recordBytes = header[5];
     const int tagCount = header[6];
-    if (version == 2 &&
+    const bool generationHeader =
+        version == 2 || version == 3;
+    if (generationHeader &&
         !input.read(
             reinterpret_cast<char*>(
                 header + kHeaderV1IntCount),
@@ -476,23 +775,47 @@ bool BuildStaticPostingHierMasks(const std::string& p_snapshotPath,
         return false;
     }
     const int listPageOffset =
-        version == 2 ? header[10] : header[8];
+        generationHeader ? header[10] : header[8];
+    const std::uint64_t generation =
+        generationHeader
+            ? static_cast<std::uint64_t>(
+                  static_cast<std::uint32_t>(
+                      header[8])) |
+                  (static_cast<std::uint64_t>(
+                       static_cast<std::uint32_t>(
+                           header[9]))
+                   << 32)
+            : 0;
     const int metadataBytes = static_cast<int>(sizeof(std::int32_t) +
                                                static_cast<size_t>(tagCount) * sizeof(std::uint32_t));
     if (magic != kStaticMetadataMagic ||
-        (version != 1 && version != 2) ||
+        (version != 1 && version != 2 &&
+         version != 3) ||
         listCount != p_expectedHeadCount ||
         tagCount != p_expectedTagCount || tagCount <= 0 || recordBytes < metadataBytes ||
-        listPageOffset < 0) {
+        listPageOffset < 0 ||
+        (p_expectedGeneration != 0 &&
+         generation != p_expectedGeneration)) {
         fprintf(stderr,
                 "[ERROR] Invalid STM1 header for posting masks: magic=%u version=%d lists=%d expected=%d "
-                "record=%d tags=%d expectedTags=%d pages=%d\n",
+                "record=%d tags=%d expectedTags=%d pages=%d generation=%llu expectedGeneration=%llu\n",
                 magic, version, listCount, p_expectedHeadCount, recordBytes, tagCount,
-                p_expectedTagCount, listPageOffset);
+                p_expectedTagCount, listPageOffset,
+                static_cast<unsigned long long>(
+                    generation),
+                static_cast<unsigned long long>(
+                    p_expectedGeneration));
         return false;
     }
     const int aclTagCount = p_aclTagCount > 0 ? p_aclTagCount : tagCount;
-    if (aclTagCount > tagCount) {
+    const int numericColumnCount =
+        p_quantParams == nullptr
+            ? 0
+            : static_cast<int>(
+                  p_quantParams->size());
+    if (aclTagCount > tagCount ||
+        numericColumnCount >
+            tagCount - aclTagCount) {
         fprintf(stderr, "[ERROR] STM1 ACL tag count %d exceeds record tag count %d in %s\n",
                 aclTagCount, tagCount, p_snapshotPath.c_str());
         return false;
@@ -539,6 +862,37 @@ bool BuildStaticPostingHierMasks(const std::string& p_snapshotPath,
     }
 
     p_masks.assign(static_cast<size_t>(listCount), SPTAG::Cache::HierarchicalPostingMask());
+    if (p_pureMasks != nullptr) {
+        p_pureMasks->assign(
+            static_cast<size_t>(listCount),
+            SPTAG::Cache::PostingBitmask());
+    }
+    if (p_tailMasks != nullptr) {
+        p_tailMasks->assign(
+            static_cast<size_t>(listCount),
+            SPTAG::Cache::PostingBitmask());
+    }
+    const size_t numericWordsPerPosting =
+        static_cast<size_t>(
+            numericColumnCount) *
+        SPTAG::Cache::NUM_QUANT_WORDS;
+    if (numericColumnCount > 0 &&
+        static_cast<size_t>(listCount) >
+            (std::numeric_limits<size_t>::max)() /
+                numericWordsPerPosting) {
+        return false;
+    }
+    const size_t numericWordCount =
+        static_cast<size_t>(listCount) *
+        numericWordsPerPosting;
+    if (p_pureNumericMasks != nullptr) {
+        p_pureNumericMasks->assign(
+            numericWordCount, 0);
+    }
+    if (p_tailNumericMasks != nullptr) {
+        p_tailNumericMasks->assign(
+            numericWordCount, 0);
+    }
     if (p_tagPostingCounts != nullptr) {
         p_tagPostingCounts->clear();
     }
@@ -546,7 +900,7 @@ bool BuildStaticPostingHierMasks(const std::string& p_snapshotPath,
     postingOrder.reserve(static_cast<size_t>(listCount));
     for (std::uint32_t postingId = 0; postingId < static_cast<std::uint32_t>(listCount);
          ++postingId) {
-        if (lists[postingId].pureCount > 0) postingOrder.push_back(postingId);
+        if (lists[postingId].elementCount > 0) postingOrder.push_back(postingId);
     }
     const auto recordOffsetFor = [&lists, listPageOffset](std::uint32_t postingId) {
         const auto& list = lists[postingId];
@@ -575,7 +929,7 @@ bool BuildStaticPostingHierMasks(const std::string& p_snapshotPath,
             const auto& list = lists[postingId];
             const std::uint64_t recordOffset = recordOffsetFor(postingId);
             const std::uint64_t listBytes =
-                static_cast<std::uint64_t>(list.pureCount) * static_cast<std::uint64_t>(recordBytes);
+                static_cast<std::uint64_t>(list.elementCount) * static_cast<std::uint64_t>(recordBytes);
             if (recordOffset < batchStart || listBytes > std::numeric_limits<uint64_t>::max() - recordOffset) {
                 fprintf(stderr, "[ERROR] Invalid STM1 physical-order range in %s\n",
                         p_snapshotPath.c_str());
@@ -607,17 +961,27 @@ bool BuildStaticPostingHierMasks(const std::string& p_snapshotPath,
                     static_cast<size_t>(list.pureCount) *
                     static_cast<size_t>(aclTagCount));
             }
-            for (int i = 0; i < list.pureCount; ++i) {
+            for (int i = 0; i < list.elementCount; ++i) {
                 const char* record = records + static_cast<size_t>(i) * static_cast<size_t>(recordBytes);
                 for (int tagColumn = 0; tagColumn < aclTagCount; ++tagColumn) {
                     std::uint32_t tag = 0;
                     std::memcpy(&tag, record + sizeof(std::int32_t) +
                                       static_cast<size_t>(tagColumn) * sizeof(tag),
                                 sizeof(tag));
-                    mask.Insert(
-                        tagColumn, tag,
-                        p_hierWidths);
-                    if (p_tagPostingCounts != nullptr) {
+                    if (i < list.pureCount) {
+                        mask.Insert(
+                            tagColumn, tag,
+                            p_hierWidths);
+                        if (p_pureMasks != nullptr) {
+                            (*p_pureMasks)[postingId]
+                                .Insert(tag);
+                        }
+                    } else if (p_tailMasks != nullptr) {
+                        (*p_tailMasks)[postingId]
+                            .Insert(tag);
+                    }
+                    if (i < list.pureCount &&
+                        p_tagPostingCounts != nullptr) {
                         postingTags.push_back(
                             MakeTagRoutingKey(
                                 static_cast<std::uint32_t>(
@@ -627,6 +991,40 @@ bool BuildStaticPostingHierMasks(const std::string& p_snapshotPath,
                             MakeTagRoutingKey(
                                 kLegacyRoutingColumn,
                                 tag));
+                    }
+                }
+                for (int numericColumn = 0;
+                     numericColumn <
+                         numericColumnCount;
+                     ++numericColumn) {
+                    std::uint32_t value = 0;
+                    std::memcpy(
+                        &value,
+                        record +
+                            sizeof(std::int32_t) +
+                            static_cast<size_t>(
+                                aclTagCount +
+                                numericColumn) *
+                                sizeof(value),
+                        sizeof(value));
+                    const int bucket =
+                        SPTAG::Cache::NumQuantBucket(
+                            (*p_quantParams)[
+                                static_cast<size_t>(
+                                    numericColumn)],
+                            value);
+                    std::vector<std::uint64_t>*
+                        numericMasks =
+                            i < list.pureCount
+                            ? p_pureNumericMasks
+                            : p_tailNumericMasks;
+                    if (numericMasks != nullptr) {
+                        SPTAG::Cache::NumQuantInsert(
+                            numericMasks->data() +
+                                static_cast<size_t>(
+                                    postingId) *
+                                    numericWordsPerPosting,
+                            numericColumn, bucket);
                     }
                 }
             }
@@ -1147,9 +1545,483 @@ bool TryGetAncestorTag(uint32_t tag,
 
 } // namespace
 
+namespace {
+
+enum class DNFBlobEncoding
+{
+    Legacy,
+    Version2,
+    Version3
+};
+
+bool ParseDNFBlob(
+    ByteArray p_blob,
+    SPTAG::Cache::DNFPredicate& p_predicate,
+    DNFBlobEncoding& p_encoding,
+    std::string& p_error)
+{
+    constexpr std::uint32_t kDNF2Magic = 0x444E4632U;
+    constexpr std::uint32_t kDNF3Magic = 0x444E4633U;
+    p_predicate.Clear();
+    p_encoding = DNFBlobEncoding::Legacy;
+    p_error.clear();
+    if (p_blob.Data() == nullptr || p_blob.Length() == 0 ||
+        p_blob.Length() % sizeof(std::uint32_t) != 0)
+    {
+        p_error = "DNF blob is empty, null, or not word-aligned";
+        return false;
+    }
+    const size_t wordCount =
+        p_blob.Length() / sizeof(std::uint32_t);
+    const auto readWord =
+        [&p_blob](size_t p_index) {
+            std::uint32_t value = 0;
+            std::memcpy(
+                &value,
+                p_blob.Data() +
+                    p_index * sizeof(std::uint32_t),
+                sizeof(value));
+            return value;
+        };
+
+    size_t position = 0;
+    const std::uint32_t first = readWord(0);
+    if (first == kDNF3Magic)
+    {
+        p_encoding = DNFBlobEncoding::Version3;
+        ++position;
+    }
+    else if (first == kDNF2Magic)
+    {
+        p_encoding = DNFBlobEncoding::Version2;
+        ++position;
+    }
+    if (position >= wordCount)
+    {
+        p_error = "DNF blob has no clause count";
+        return false;
+    }
+    const std::uint32_t clauseCount =
+        readWord(position++);
+    if (clauseCount == 0 ||
+        clauseCount > wordCount - position)
+    {
+        p_error = "DNF blob has an invalid clause count";
+        return false;
+    }
+
+    const size_t literalWords =
+        p_encoding == DNFBlobEncoding::Version3
+        ? 4
+        : (p_encoding == DNFBlobEncoding::Version2
+               ? 3
+               : 2);
+    p_predicate.clauses.reserve(clauseCount);
+    for (std::uint32_t clauseIndex = 0;
+         clauseIndex < clauseCount; ++clauseIndex)
+    {
+        if (position >= wordCount)
+        {
+            p_error = "DNF blob is truncated before a clause";
+            p_predicate.Clear();
+            return false;
+        }
+        const std::uint32_t literalCount =
+            readWord(position++);
+        if (literalCount == 0 ||
+            literalCount >
+                (wordCount - position) / literalWords)
+        {
+            p_error =
+                "DNF blob has an invalid literal count";
+            p_predicate.Clear();
+            return false;
+        }
+
+        SPTAG::Cache::DNFClause clause;
+        clause.lits.reserve(literalCount);
+        for (std::uint32_t literalIndex = 0;
+             literalIndex < literalCount; ++literalIndex)
+        {
+            std::uint32_t kind = 0;
+            if (p_encoding == DNFBlobEncoding::Version3)
+            {
+                kind = readWord(position++);
+                if (kind > 1)
+                {
+                    p_error =
+                        "DNF3 literal has an invalid kind";
+                    p_predicate.Clear();
+                    return false;
+                }
+            }
+            const std::uint32_t column =
+                readWord(position++);
+            std::uint32_t operation =
+                SPTAG::Cache::DNF_EQ;
+            if (p_encoding != DNFBlobEncoding::Legacy)
+            {
+                operation = readWord(position++);
+                if (operation >
+                    SPTAG::Cache::DNF_GE)
+                {
+                    p_error =
+                        "DNF literal has an invalid operation";
+                    p_predicate.Clear();
+                    return false;
+                }
+            }
+            const std::uint32_t value =
+                readWord(position++);
+            clause.lits.push_back({
+                column,
+                value,
+                static_cast<std::uint8_t>(operation),
+                static_cast<std::uint8_t>(kind)});
+        }
+        p_predicate.clauses.push_back(
+            std::move(clause));
+    }
+    if (position != wordCount)
+    {
+        p_error = "DNF blob has trailing words";
+        p_predicate.Clear();
+        return false;
+    }
+    return true;
+}
+
+bool ValidateDNFColumns(
+    SPTAG::Cache::DNFPredicate& p_predicate,
+    DNFBlobEncoding p_encoding,
+    int p_attributeCount,
+    int p_categoricalColumns,
+    std::string& p_error)
+{
+    if (p_attributeCount <= 0 ||
+        p_categoricalColumns <= 0 ||
+        p_categoricalColumns > p_attributeCount)
+    {
+        p_error = "loaded index has invalid attribute metadata";
+        return false;
+    }
+    for (auto& clause : p_predicate.clauses)
+    {
+        for (auto& literal : clause.lits)
+        {
+            if (literal.col >=
+                static_cast<std::uint32_t>(
+                    p_attributeCount))
+            {
+                p_error =
+                    "DNF literal column is outside the index schema";
+                return false;
+            }
+            const std::uint8_t expectedKind =
+                literal.col <
+                    static_cast<std::uint32_t>(
+                        p_categoricalColumns)
+                ? 0
+                : 1;
+            if (p_encoding == DNFBlobEncoding::Version3)
+            {
+                if (literal.kind != expectedKind)
+                {
+                    p_error =
+                        "DNF3 literal kind does not match its schema column";
+                    return false;
+                }
+            }
+            else
+            {
+                literal.kind = expectedKind;
+            }
+            if (literal.kind == 0 &&
+                literal.op != SPTAG::Cache::DNF_EQ)
+            {
+                p_error =
+                    "categorical DNF literals support equality only";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool SearchExtremeSparseTagStore(
+    const SPTAG::Cache::ExtremeSparseTagStore& p_store,
+    const std::shared_ptr<SPTAG::VectorIndex>& p_index,
+    ByteArray p_queryVector,
+    int p_resultNum,
+    const std::vector<std::uint32_t>& p_sparseTags,
+    const std::uint32_t* p_flatTags,
+    int p_flatTagCount,
+    int p_categoricalColumns,
+    const SPTAG::Cache::DNFPredicate* p_dnf,
+    std::shared_ptr<QueryResult>& p_result,
+    std::string& p_error)
+{
+    p_result.reset();
+    if (p_index == nullptr || p_queryVector.Data() == nullptr ||
+        p_resultNum <= 0 || p_sparseTags.empty())
+    {
+        p_error =
+            "invalid extreme-sparse search parameters";
+        return false;
+    }
+    std::vector<std::uint8_t> records;
+    std::uint64_t recordCount = 0;
+    if (!p_store.Read(
+            p_sparseTags, records, recordCount, &p_error))
+    {
+        return false;
+    }
+    const size_t recordBytes = p_store.RecordBytes();
+    const size_t attributeBytes =
+        static_cast<size_t>(p_store.AttributeCount()) *
+        sizeof(std::uint32_t);
+    const size_t vectorOffset =
+        sizeof(std::int32_t) + attributeBytes;
+    if (recordBytes !=
+            vectorOffset + p_store.VectorBytes() ||
+        recordCount >
+            (std::numeric_limits<size_t>::max)() /
+                recordBytes ||
+        records.size() !=
+            static_cast<size_t>(recordCount) *
+                recordBytes)
+    {
+        p_error =
+            "invalid extreme-sparse query record layout";
+        return false;
+    }
+
+    using Candidate =
+        std::pair<float, SPTAG::SizeType>;
+    std::priority_queue<Candidate> top;
+    std::vector<std::uint32_t> attributes(
+        p_store.AttributeCount());
+    std::vector<std::uint32_t> vectorStorage(
+        (p_store.VectorBytes() +
+         sizeof(std::uint32_t) - 1) /
+        sizeof(std::uint32_t));
+    int distanceComputations = 0;
+    for (std::uint64_t record = 0;
+         record < recordCount; ++record)
+    {
+        const std::uint8_t* row =
+            records.data() +
+            static_cast<size_t>(record) * recordBytes;
+        std::int32_t vectorID = -1;
+        std::memcpy(
+            &vectorID, row, sizeof(vectorID));
+        if (vectorID < 0 ||
+            !p_index->ContainSample(vectorID))
+        {
+            continue;
+        }
+        std::memcpy(
+            attributes.data(),
+            row + sizeof(vectorID),
+            attributeBytes);
+        bool matches = true;
+        if (p_dnf != nullptr && !p_dnf->Empty())
+        {
+            matches = p_dnf->Matches(
+                attributes.data(),
+                static_cast<int>(
+                    p_store.AttributeCount()));
+        }
+        else if (p_flatTags != nullptr &&
+                 p_flatTagCount > 0)
+        {
+            matches = false;
+            const int columns =
+                (std::max)(
+                    0,
+                    (std::min)(
+                        p_categoricalColumns,
+                        static_cast<int>(
+                            p_store.AttributeCount())));
+            for (int column = 0;
+                 column < columns && !matches;
+                 ++column)
+            {
+                for (int query = 0;
+                     query < p_flatTagCount;
+                     ++query)
+                {
+                    if (attributes[
+                            static_cast<size_t>(
+                                column)] ==
+                        p_flatTags[query])
+                    {
+                        matches = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!matches) continue;
+
+        std::memcpy(
+            vectorStorage.data(),
+            row + vectorOffset,
+            p_store.VectorBytes());
+        float distance = p_index->ComputeDistance(
+            p_queryVector.Data(),
+            vectorStorage.data());
+        if (p_index->GetDistCalcMethod() ==
+            SPTAG::DistCalcMethod::Cosine)
+        {
+            float base = 1.0f;
+            switch (p_index->GetVectorValueType())
+            {
+            case SPTAG::VectorValueType::Int8:
+                base = static_cast<float>(
+                    (std::numeric_limits<
+                         std::int8_t>::max)());
+                break;
+            case SPTAG::VectorValueType::UInt8:
+                base = static_cast<float>(
+                    (std::numeric_limits<
+                         std::uint8_t>::max)());
+                break;
+            case SPTAG::VectorValueType::Int16:
+                base = static_cast<float>(
+                    (std::numeric_limits<
+                         std::int16_t>::max)());
+                break;
+            default:
+                break;
+            }
+            distance = p_index->AccurateDistance(
+                p_queryVector.Data(),
+                vectorStorage.data()) *
+                base * base;
+        }
+        ++distanceComputations;
+        const Candidate candidate(
+            distance,
+            static_cast<SPTAG::SizeType>(
+                vectorID));
+        if (static_cast<int>(top.size()) <
+            p_resultNum)
+        {
+            top.push(candidate);
+        }
+        else if (candidate < top.top())
+        {
+            top.pop();
+            top.push(candidate);
+        }
+    }
+
+    std::vector<Candidate> ordered;
+    ordered.reserve(top.size());
+    while (!top.empty())
+    {
+        ordered.push_back(top.top());
+        top.pop();
+    }
+    std::sort(ordered.begin(), ordered.end());
+    p_result = std::make_shared<QueryResult>(
+        p_queryVector.Data(), p_resultNum, false);
+    p_result->Reset();
+    for (size_t result = 0;
+         result < ordered.size(); ++result)
+    {
+        p_result->SetResult(
+            static_cast<int>(result),
+            ordered[result].second,
+            ordered[result].first);
+    }
+    p_result->SetScanned(distanceComputations);
+    SPTAG::VectorIndex::ResetThreadLocalPostingScanStats();
+    return true;
+}
+
+std::shared_ptr<QueryResult> MergeQueryResults(
+    ByteArray p_queryVector,
+    int p_resultNum,
+    const std::shared_ptr<QueryResult>& p_left,
+    const std::shared_ptr<QueryResult>& p_right)
+{
+    if (p_left == nullptr) return p_right;
+    if (p_right == nullptr) return p_left;
+    std::unordered_map<SPTAG::SizeType, float> best;
+    best.reserve(
+        static_cast<size_t>(p_resultNum) * 4 + 1);
+    const auto collect =
+        [&best](const std::shared_ptr<QueryResult>& p_source) {
+            for (int index = 0;
+                 index < p_source->GetResultNum();
+                 ++index)
+            {
+                const auto* result =
+                    p_source->GetResult(index);
+                if (result == nullptr || result->VID < 0 ||
+                    !std::isfinite(result->Dist))
+                {
+                    continue;
+                }
+                const auto found = best.find(result->VID);
+                if (found == best.end() ||
+                    result->Dist < found->second)
+                {
+                    best[result->VID] = result->Dist;
+                }
+            }
+        };
+    collect(p_left);
+    collect(p_right);
+    std::vector<std::pair<float, SPTAG::SizeType>>
+        ordered;
+    ordered.reserve(best.size());
+    for (const auto& entry : best)
+    {
+        ordered.emplace_back(
+            entry.second, entry.first);
+    }
+    std::sort(ordered.begin(), ordered.end());
+    if (ordered.size() >
+        static_cast<size_t>(p_resultNum))
+    {
+        ordered.resize(
+            static_cast<size_t>(p_resultNum));
+    }
+    auto merged = std::make_shared<QueryResult>(
+        p_queryVector.Data(), p_resultNum, false);
+    merged->Reset();
+    for (size_t index = 0;
+         index < ordered.size(); ++index)
+    {
+        merged->SetResult(
+            static_cast<int>(index),
+            ordered[index].second,
+            ordered[index].first);
+    }
+    merged->SetScanned(
+        (std::max)(0, p_left->GetScanned()) +
+        (std::max)(0, p_right->GetScanned()));
+    return merged;
+}
+
+} // namespace
+
 constexpr int32_t kHeadNodeMetaVersion = 3;       // base: categorical only
 constexpr int32_t kHeadNodeMetaVersionV4 = 4;     // V3 + quantized numeric block
 constexpr int32_t kHeadNodeMetaVersionV5 = 5;     // V4 + per-column hier mask widths
+constexpr int32_t kHeadNodeMetaVersionV6 = 6;     // V5 + self-contained-tail signature
+constexpr int32_t kHeadNodeMetaVersionV7 = 7;     // V6 + numeric-domain fingerprint
+constexpr int32_t kHeadNodeMetaVersionV8 = 8;     // V7 + generation/content binding
+constexpr std::uint32_t kHeadNodeMetaOwnTagsAvailable = 1U << 0;
+constexpr std::uint32_t kHeadNodeMetaPostingHierMasksAvailable = 1U << 1;
+constexpr std::uint32_t kHeadNodeMetaTailSignaturesAvailable = 1U << 2;
+constexpr std::uint32_t kHeadNodeMetaKnownFlags =
+    kHeadNodeMetaOwnTagsAvailable |
+    kHeadNodeMetaPostingHierMasksAvailable |
+    kHeadNodeMetaTailSignaturesAvailable;
 
 struct HeadNodeMetaFileHeader {
     int32_t version;
@@ -1158,8 +2030,56 @@ struct HeadNodeMetaFileHeader {
     int32_t stride;
 };
 
-// V5 appends HIER_LEVELS int32 per-column mask widths after the base header.
+// V5+ append HIER_LEVELS int32 per-column mask widths after the base header.
+// V7 appends the numeric-domain fingerprint shared with numeric_meta.bin. V8
+// then stores availability flags, posting generation, and a full-file content
+// fingerprint before the metadata blob.
 // V3/V4 files carry no widths and load with the uniform default.
+
+void UpdateHeadNodeMetaFingerprint(
+    std::uint64_t& p_hash,
+    const void* p_data,
+    size_t p_bytes)
+{
+    constexpr std::uint64_t prime =
+        1099511628211ULL;
+    const auto* bytes =
+        static_cast<const std::uint8_t*>(p_data);
+    for (size_t index = 0; index < p_bytes; ++index) {
+        p_hash ^= bytes[index];
+        p_hash *= prime;
+    }
+}
+
+std::uint64_t ComputeHeadNodeMetaContentFingerprint(
+    const HeadNodeMetaFileHeader& p_header,
+    const std::int32_t* p_widths,
+    std::uint32_t p_flags,
+    std::uint64_t p_numericDomainFingerprint,
+    std::uint64_t p_generationFingerprint,
+    const std::vector<std::uint8_t>& p_blob)
+{
+    std::uint64_t hash = 1469598103934665603ULL;
+    UpdateHeadNodeMetaFingerprint(
+        hash, &p_header, sizeof(p_header));
+    UpdateHeadNodeMetaFingerprint(
+        hash, p_widths,
+        sizeof(std::int32_t) *
+            SPTAG::Cache::HIER_LEVELS);
+    UpdateHeadNodeMetaFingerprint(
+        hash, &p_flags, sizeof(p_flags));
+    UpdateHeadNodeMetaFingerprint(
+        hash, &p_numericDomainFingerprint,
+        sizeof(p_numericDomainFingerprint));
+    UpdateHeadNodeMetaFingerprint(
+        hash, &p_generationFingerprint,
+        sizeof(p_generationFingerprint));
+    if (!p_blob.empty()) {
+        UpdateHeadNodeMetaFingerprint(
+            hash, p_blob.data(), p_blob.size());
+    }
+    return hash;
+}
 
 // Parse SPTAG_HIER_LEVEL_WIDTHS (comma-separated per-column bit widths, e.g.
 // "256,64,64,128,64") into a build-local layout.
@@ -1200,47 +2120,144 @@ std::shared_ptr<SPTAG::VectorIndex> GetMemoryIndexForInternal(const std::shared_
     return spannInternalIdx->GetMemoryIndex();
 }
 
-bool SaveHeadNodeMetaFile(const std::string& workDir, const std::shared_ptr<SPTAG::VectorIndex>& headIndex)
+bool GetHeadNodeMetaExpectedGeneration(
+    const std::shared_ptr<SPTAG::VectorIndex>& p_internalIndex,
+    std::uint64_t& p_generation,
+    bool& p_generationRequired)
+{
+    p_generation = 0;
+    p_generationRequired = false;
+    auto* spann = dynamic_cast<
+        SPTAG::SPANN::ISPANNIndex*>(
+            p_internalIndex.get());
+    if (spann == nullptr) return false;
+    const auto* options = spann->GetOptions();
+    if (options == nullptr) return false;
+    const std::string* generationText = nullptr;
+    if (options->m_enableLimitedTagPosting) {
+        generationText =
+            &options
+                 ->m_limitedTagGenerationFingerprint;
+    } else if (options->m_enableHybridDistance) {
+        generationText =
+            &options
+                 ->m_hybridGenerationFingerprint;
+    }
+    p_generationRequired = generationText != nullptr;
+    if (!p_generationRequired) return true;
+    return SPTAG::Helper::Convert::
+               ConvertStringTo<std::uint64_t>(
+                   generationText->c_str(),
+                   p_generation) &&
+        p_generation != 0;
+}
+
+bool SaveHeadNodeMetaFile(
+    const std::string& workDir,
+    const std::shared_ptr<SPTAG::VectorIndex>& headIndex,
+    std::uint64_t generationFingerprint)
 {
     if (headIndex == nullptr || !headIndex->HasHeadNodeMeta()) return false;
+    if (headIndex->HasHeadNodeTailPS() &&
+        generationFingerprint == 0) {
+        return false;
+    }
 
-    std::string metaPath = HeadNodeMetaPath(workDir);
-    FILE* f = fopen(metaPath.c_str(), "wb");
+    const std::string metaPath =
+        HeadNodeMetaPath(workDir);
+    const std::string temporary =
+        metaPath + ".tmp";
+    FILE* f = fopen(temporary.c_str(), "wb");
     if (!f) return false;
 
     HeadNodeMetaFileHeader header{};
     int32_t quantCols = headIndex->GetHeadNodeNumQuantCols();
 
-    // Persist per-column hier mask widths only when they are non-uniform; a
-    // uniform table reproduces the legacy V3/V4 layout exactly, so keep emitting
-    // V3/V4 for those (older readers stay compatible).
     const auto& widths =
         headIndex->GetHeadNodeHierWidths();
-    bool nonUniformWidths = false;
-    for (int l = 0; l < SPTAG::Cache::HIER_LEVELS; ++l)
-        if (widths.bits[l] != SPTAG::Cache::HIER_LEVEL_BITS) { nonUniformWidths = true; break; }
 
-    header.version = nonUniformWidths ? kHeadNodeMetaVersionV5
-                                      : (quantCols > 0 ? kHeadNodeMetaVersionV4 : kHeadNodeMetaVersion);
+    const std::uint64_t numericDomainFingerprint =
+        headIndex
+            ->GetHeadNodeNumericDomainFingerprint();
+    header.version = kHeadNodeMetaVersionV8;
     header.numSamples = headIndex->GetHeadNodeMetaSampleCount();
     header.numTagsPerSample = quantCols;  // V4/V5: quantized numeric column count
     header.stride = static_cast<int32_t>(headIndex->GetHeadNodeMetaStride());
 
     const auto& blob = headIndex->GetHeadNodeMetaBlob();
-    bool ok = fwrite(&header, sizeof(header), 1, f) == 1;
-    if (ok && header.version == kHeadNodeMetaVersionV5) {
-        int32_t wbits[SPTAG::Cache::HIER_LEVELS];
-        for (int l = 0; l < SPTAG::Cache::HIER_LEVELS; ++l) wbits[l] = widths.bits[l];
-        ok = fwrite(wbits, sizeof(int32_t), SPTAG::Cache::HIER_LEVELS, f) == (size_t)SPTAG::Cache::HIER_LEVELS;
+    int32_t wbits[SPTAG::Cache::HIER_LEVELS];
+    for (int level = 0;
+         level < SPTAG::Cache::HIER_LEVELS;
+         ++level) {
+        wbits[level] = widths.bits[level];
     }
+    std::uint32_t flags = 0;
+    if (headIndex->HasHeadNodeOwnTags()) {
+        flags |= kHeadNodeMetaOwnTagsAvailable;
+    }
+    if (headIndex->HasHeadNodePostingHierMasks()) {
+        flags |=
+            kHeadNodeMetaPostingHierMasksAvailable;
+    }
+    if (headIndex->HasHeadNodeTailPS()) {
+        flags |=
+            kHeadNodeMetaTailSignaturesAvailable;
+    }
+    const std::uint64_t contentFingerprint =
+        ComputeHeadNodeMetaContentFingerprint(
+            header, wbits, flags,
+            numericDomainFingerprint,
+            generationFingerprint, blob);
+    bool ok = fwrite(&header, sizeof(header), 1, f) == 1;
+    ok = ok &&
+        fwrite(
+            wbits, sizeof(int32_t),
+            SPTAG::Cache::HIER_LEVELS, f) ==
+            static_cast<size_t>(
+                SPTAG::Cache::HIER_LEVELS);
+    ok = ok &&
+        fwrite(&flags, sizeof(flags), 1, f) == 1 &&
+        fwrite(
+            &numericDomainFingerprint,
+            sizeof(numericDomainFingerprint),
+            1, f) == 1 &&
+        fwrite(
+            &generationFingerprint,
+            sizeof(generationFingerprint),
+            1, f) == 1 &&
+        fwrite(
+            &contentFingerprint,
+            sizeof(contentFingerprint),
+            1, f) == 1;
     ok = ok && fwrite(blob.data(), 1, blob.size(), f) == blob.size();
-    fclose(f);
-    return ok;
+    if (fclose(f) != 0) ok = false;
+    if (!ok ||
+        !SPTAG::Helper::AtomicReplaceFile(
+            temporary, metaPath)) {
+        std::remove(temporary.c_str());
+        return false;
+    }
+    return true;
 }
 
-bool LoadHeadNodeMetaFile(const std::string& workDir, const std::shared_ptr<SPTAG::VectorIndex>& headIndex)
+bool LoadHeadNodeMetaFile(
+    const std::string& workDir,
+    const std::shared_ptr<SPTAG::VectorIndex>& internalIndex)
 {
+    auto headIndex =
+        GetMemoryIndexForInternal(internalIndex);
     if (headIndex == nullptr) return false;
+    auto* spannInternalIdx = dynamic_cast<
+        SPTAG::SPANN::ISPANNIndex*>(
+            internalIndex.get());
+    if (spannInternalIdx == nullptr) return false;
+    std::uint64_t expectedGeneration = 0;
+    bool generationRequired = false;
+    if (!GetHeadNodeMetaExpectedGeneration(
+            internalIndex, expectedGeneration,
+            generationRequired)) {
+        return false;
+    }
 
     std::string metaPath = HeadNodeMetaPath(workDir);
     FILE* f = fopen(metaPath.c_str(), "rb");
@@ -1259,24 +2276,45 @@ bool LoadHeadNodeMetaFile(const std::string& workDir, const std::shared_ptr<SPTA
         return false;
     }
 
-    // Version check. Accept V3 (categorical only), V4 (with quantized numeric
-    // block) and V5 (V4 + per-column hier mask widths).
+    // V3-V7 remain readable for unconstrained legacy indexes, but only V8 is
+    // generation/content authenticated and may expose hard-pruning masks.
     if (header.version != kHeadNodeMetaVersion &&
         header.version != kHeadNodeMetaVersionV4 &&
-        header.version != kHeadNodeMetaVersionV5) {
-        fprintf(stderr, "[ERROR] head_node_meta.bin version mismatch: file has version %d, expected version %d, %d or %d. "
+        header.version != kHeadNodeMetaVersionV5 &&
+        header.version != kHeadNodeMetaVersionV6 &&
+        header.version != kHeadNodeMetaVersionV7 &&
+        header.version != kHeadNodeMetaVersionV8) {
+        fprintf(stderr, "[ERROR] head_node_meta.bin version mismatch: file has version %d, expected version %d, %d, %d, %d, %d or %d. "
                         "Please rebuild the index to use the new hierarchical mask format.\n",
-                header.version, kHeadNodeMetaVersion, kHeadNodeMetaVersionV4, kHeadNodeMetaVersionV5);
+                header.version, kHeadNodeMetaVersion, kHeadNodeMetaVersionV4,
+                kHeadNodeMetaVersionV5, kHeadNodeMetaVersionV6,
+                kHeadNodeMetaVersionV7,
+                kHeadNodeMetaVersionV8);
+        fclose(f);
+        return false;
+    }
+    if (generationRequired &&
+        header.version != kHeadNodeMetaVersionV8) {
         fclose(f);
         return false;
     }
     const std::uint64_t prefixBytes =
         static_cast<std::uint64_t>(
             sizeof(header)) +
-        (header.version == kHeadNodeMetaVersionV5
+        (header.version == kHeadNodeMetaVersionV5 ||
+         header.version == kHeadNodeMetaVersionV6 ||
+         header.version == kHeadNodeMetaVersionV7 ||
+         header.version == kHeadNodeMetaVersionV8
              ? static_cast<std::uint64_t>(
                    sizeof(int32_t)) *
                    SPTAG::Cache::HIER_LEVELS
+             : 0) +
+        (header.version == kHeadNodeMetaVersionV7
+             ? sizeof(std::uint64_t)
+             : 0) +
+        (header.version == kHeadNodeMetaVersionV8
+             ? sizeof(std::uint32_t) +
+                   sizeof(std::uint64_t) * 3
              : 0);
     const std::uint64_t sampleCount =
         static_cast<std::uint64_t>(
@@ -1284,30 +2322,31 @@ bool LoadHeadNodeMetaFile(const std::string& workDir, const std::shared_ptr<SPTA
     const std::uint64_t stride =
         static_cast<std::uint64_t>(
             header.stride);
+    std::uint64_t fileBytes = 0;
     const bool sizeSafe =
         sampleCount <=
             ((std::numeric_limits<
                   std::uint64_t>::max)() -
              prefixBytes) /
                 stride &&
-        fseek(f, 0, SEEK_END) == 0;
-    const long fileBytes = sizeSafe
-        ? ftell(f)
-        : -1;
+        SPTAG::Helper::GetOpenFileSize(
+            f, fileBytes);
     const std::uint64_t expectedBytes =
         sizeSafe
         ? prefixBytes + sampleCount * stride
         : 0;
-    if (!sizeSafe || fileBytes < 0 ||
-        static_cast<std::uint64_t>(fileBytes) !=
-            expectedBytes ||
+    if (!sizeSafe || fileBytes != expectedBytes ||
         fseek(
             f, static_cast<long>(sizeof(header)),
             SEEK_SET) != 0) {
         fclose(f);
         return false;
     }
-    int quantCols = (header.version == kHeadNodeMetaVersionV4 || header.version == kHeadNodeMetaVersionV5)
+    int quantCols = (header.version == kHeadNodeMetaVersionV4 ||
+                     header.version == kHeadNodeMetaVersionV5 ||
+                     header.version == kHeadNodeMetaVersionV6 ||
+                     header.version == kHeadNodeMetaVersionV7 ||
+                     header.version == kHeadNodeMetaVersionV8)
                     ? header.numTagsPerSample : 0;
     if (quantCols < 0) {
         fclose(f);
@@ -1315,7 +2354,10 @@ bool LoadHeadNodeMetaFile(const std::string& workDir, const std::shared_ptr<SPTA
     }
 
     SPTAG::Cache::HierWidthTable hierWidths;
-    if (header.version == kHeadNodeMetaVersionV5) {
+    if (header.version == kHeadNodeMetaVersionV5 ||
+        header.version == kHeadNodeMetaVersionV6 ||
+        header.version == kHeadNodeMetaVersionV7 ||
+        header.version == kHeadNodeMetaVersionV8) {
         int32_t wbits[SPTAG::Cache::HIER_LEVELS];
         if (fread(wbits, sizeof(int32_t), SPTAG::Cache::HIER_LEVELS, f) != (size_t)SPTAG::Cache::HIER_LEVELS) {
             fclose(f);
@@ -1327,11 +2369,58 @@ bool LoadHeadNodeMetaFile(const std::string& workDir, const std::shared_ptr<SPTA
             widths,
             SPTAG::Cache::HIER_LEVELS);
     }
+    std::uint32_t flags = 0;
+    if (header.version == kHeadNodeMetaVersionV8 &&
+        (fread(&flags, sizeof(flags), 1, f) != 1 ||
+         (flags & ~kHeadNodeMetaKnownFlags) != 0)) {
+        fclose(f);
+        return false;
+    }
+    std::uint64_t numericDomainFingerprint = 0;
+    if (header.version == kHeadNodeMetaVersionV7 ||
+        header.version == kHeadNodeMetaVersionV8) {
+        if (fread(
+                &numericDomainFingerprint,
+                sizeof(numericDomainFingerprint),
+                1, f) != 1 ||
+            (quantCols > 0 &&
+             numericDomainFingerprint == 0)) {
+            fclose(f);
+            return false;
+        }
+    }
+    std::uint64_t generationFingerprint = 0;
+    std::uint64_t contentFingerprint = 0;
+    if (header.version == kHeadNodeMetaVersionV8 &&
+        (fread(
+             &generationFingerprint,
+             sizeof(generationFingerprint),
+             1, f) != 1 ||
+         fread(
+             &contentFingerprint,
+             sizeof(contentFingerprint),
+             1, f) != 1 ||
+         contentFingerprint == 0 ||
+         (generationRequired &&
+          generationFingerprint !=
+              expectedGeneration) ||
+         (!generationRequired &&
+          generationFingerprint != 0))) {
+        fclose(f);
+        return false;
+    }
 
     size_t expectedStride = 0;
+    const bool hasTailPS =
+        header.version == kHeadNodeMetaVersionV6 ||
+        header.version == kHeadNodeMetaVersionV7 ||
+        (header.version == kHeadNodeMetaVersionV8 &&
+         (flags &
+          kHeadNodeMetaTailSignaturesAvailable) != 0);
     const bool validLayout =
         SPTAG::VectorIndex::TryComputeHeadNodeMetaStride(
             quantCols, hierWidths,
+            hasTailPS,
             expectedStride) &&
         expectedStride <=
             static_cast<size_t>(
@@ -1352,7 +2441,9 @@ bool LoadHeadNodeMetaFile(const std::string& workDir, const std::shared_ptr<SPTA
     }
     headIndex->InitializeHeadNodeMeta(
         header.numSamples, quantCols,
-        hierWidths);
+        hierWidths, hasTailPS);
+    headIndex->SetHeadNodeNumericDomainFingerprint(
+        numericDomainFingerprint);
     if (headIndex->GetHeadNodeMetaStride() !=
             expectedStride ||
         headIndex->GetHeadNodeMetaBlob().size() !=
@@ -1369,6 +2460,61 @@ bool LoadHeadNodeMetaFile(const std::string& workDir, const std::shared_ptr<SPTA
         headIndex->ClearHeadNodeMeta();
         return false;
     }
+    if (header.version == kHeadNodeMetaVersionV8) {
+        int32_t wbits[SPTAG::Cache::HIER_LEVELS];
+        for (int level = 0;
+             level < SPTAG::Cache::HIER_LEVELS;
+             ++level) {
+            wbits[level] = hierWidths.bits[level];
+        }
+        if (ComputeHeadNodeMetaContentFingerprint(
+                header, wbits, flags,
+                numericDomainFingerprint,
+                generationFingerprint, blob) !=
+            contentFingerprint) {
+            headIndex->ClearHeadNodeMeta();
+            return false;
+        }
+        headIndex->SetHeadNodeOwnTagsAvailable(
+            (flags &
+             kHeadNodeMetaOwnTagsAvailable) != 0);
+        headIndex
+            ->SetHeadNodePostingHierMasksAvailable(
+                (flags &
+                 kHeadNodeMetaPostingHierMasksAvailable) !=
+                0);
+    }
+
+    std::vector<SizeType> persistedVIDs;
+    if (header.version == kHeadNodeMetaVersionV8) {
+        persistedVIDs.resize(
+            static_cast<size_t>(
+                header.numSamples));
+        for (SizeType head = 0;
+             head < header.numSamples; ++head) {
+            persistedVIDs[
+                static_cast<size_t>(head)] =
+                headIndex->GetHeadNodeGlobalVID(
+                    head);
+        }
+    }
+    if (!spannInternalIdx
+             ->PopulateHeadNodeGlobalVIDsFromBundles()) {
+        headIndex->ClearHeadNodeMeta();
+        return false;
+    }
+    if (!persistedVIDs.empty()) {
+        for (SizeType head = 0;
+             head < header.numSamples; ++head) {
+            if (persistedVIDs[
+                    static_cast<size_t>(head)] !=
+                headIndex->GetHeadNodeGlobalVID(
+                    head)) {
+                headIndex->ClearHeadNodeMeta();
+                return false;
+            }
+        }
+    }
     return true;
 }
 
@@ -1381,20 +2527,63 @@ bool LoadPostingSignaturesIntoHeadIndex(const std::string& workDir,
     auto* spannInternalIdx = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(internalIndex.get());
     if (headIndex == nullptr || spannInternalIdx == nullptr) return false;
 
+    std::uint64_t expectedGeneration = 0;
+    const auto* options =
+        spannInternalIdx->GetOptions();
+    if (options != nullptr) {
+        const std::string& generationText =
+            options->m_enableLimitedTagPosting
+            ? options
+                  ->m_limitedTagGenerationFingerprint
+            : options
+                  ->m_hybridGenerationFingerprint;
+        SPTAG::Helper::Convert::
+            ConvertStringTo<std::uint64_t>(
+                generationText.c_str(),
+                expectedGeneration);
+    }
     SPTAG::Cache::TenantBitmaskPS sigs;
     std::string sigPath = workDir + "/signatures_bitmask.bin";
-    if (!sigs.Load(sigPath)) return false;
+    if (!sigs.Load(
+            sigPath, expectedGeneration)) {
+        return false;
+    }
 
-    const SizeType numHeadSamples = headIndex->GetNumSamples();
-    if (!headIndex->HasHeadNodeMeta()) {
-        headIndex->InitializeHeadNodeMeta(numHeadSamples);
+    if (sigs.num_postings <= 0 ||
+        sigs.num_postings >
+            (std::numeric_limits<
+                 SizeType>::max)() ||
+        sigs.ps.size() !=
+            static_cast<size_t>(
+                sigs.num_postings) ||
+        (sigs.has_tail_signatures &&
+         sigs.tail_ps.size() !=
+             static_cast<size_t>(
+                 sigs.num_postings))) {
+        return false;
+    }
+    const SizeType numHeadSamples =
+        static_cast<SizeType>(
+            sigs.num_postings);
+    headIndex->InitializeHeadNodeMeta(
+        numHeadSamples, 0,
+        SPTAG::Cache::HierWidths(),
+        sigs.has_tail_signatures);
+    if (!spannInternalIdx
+             ->PopulateHeadNodeGlobalVIDsFromBundles()) {
+        headIndex->ClearHeadNodeMeta();
+        return false;
     }
 
     for (SizeType hid = 0; hid < numHeadSamples; ++hid) {
-        SizeType globalVID = spannInternalIdx->GetGlobalVID(hid);
-        headIndex->SetHeadNodeGlobalVID(hid, globalVID);
-        if (hid < sigs.num_postings) {
-            headIndex->SetHeadNodePS(hid, sigs.ps[hid]);
+        headIndex->SetHeadNodePS(
+            hid,
+            sigs.ps[static_cast<size_t>(hid)]);
+        if (sigs.has_tail_signatures) {
+            headIndex->SetHeadNodeTailPS(
+                hid,
+                sigs.tail_ps[
+                    static_cast<size_t>(hid)]);
         }
     }
     return true;
@@ -1405,7 +2594,10 @@ bool EnsureHeadNodeMetaLoaded(const std::string& workDir, const std::shared_ptr<
     auto headIndex = GetMemoryIndexForInternal(internalIndex);
     if (headIndex == nullptr) return false;
     if (headIndex->HasHeadNodeMeta()) return true;
-    if (LoadHeadNodeMetaFile(workDir, headIndex)) return true;
+    if (LoadHeadNodeMetaFile(
+            workDir, internalIndex)) {
+        return true;
+    }
     return LoadPostingSignaturesIntoHeadIndex(workDir, internalIndex);
 }
 
@@ -2524,6 +3716,18 @@ void AnnIndex::SetVectorTags(const uint32_t* tags, int numVecs, int numTagsPerVe
     }
 }
 
+void AnnIndex::SetVectorTagsView(
+    const uint32_t* tags, int numVecs, int numTagsPerVec)
+{
+    if (!m_index) return;
+    auto* spannIdx =
+        dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(m_index.get());
+    if (spannIdx) {
+        spannIdx->SetVectorTagsView(
+            tags, numVecs, numTagsPerVec);
+    }
+}
+
 void AnnIndex::SetNodeVectorAssignments(const std::vector<std::vector<int>>& nodeVectorAssignments)
 {
     if (!m_index) return;
@@ -2975,42 +4179,78 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
     m_tenantVectorCounts.clear();
     m_tenantSpannWorkDirs.clear();
     m_tenantTagRoutingStats.clear();
+    m_tenantSparseIdx.clear();
+    m_tenantExtremeSparseTagStores.clear();
+    m_tenantTagPurePostings.clear();
+    m_tenantTagPureKV.clear();
+    m_tenantTagLevelOffsets.clear();
+    m_tenantNumericMeta.clear();
     m_tenantPivotLevels.clear();
     m_tenantPivotNodeCounts.clear();
     m_tenantNodePivotTags.clear();
     m_tenantTagToNodes.clear();
     m_tenantHeadNodeToNode.clear();
+    m_tenantGlobalIndices.clear();
+
+    const bool singleTenantBulk = m_buildSingleTenantId >= 0;
+    if (singleTenantBulk &&
+        (m_buildSingleTenantId != 0 || p_metadata.Length() != 0 ||
+         p_withMetaIndex))
+    {
+        fprintf(stderr,
+                "[ERROR] Single-tenant bulk build requires tenant 0 and no "
+                "line metadata or metadata index\n");
+        return false;
+    }
 
     std::map<int, std::vector<std::pair<const uint8_t*, size_t>>> tenantVectorRanges;
     std::map<int, std::vector<std::string>> tenantMetadataLines;
 
-    const char* metaPtr = reinterpret_cast<const char*>(p_metadata.Data());
-    const char* metaEnd = metaPtr + p_metadata.Length();
-    const uint8_t* vectorPtr = p_vectors.Data();
-
-    SizeType globalIdx = 0;
-    while (metaPtr < metaEnd && globalIdx < p_vectorNum)
+    if (singleTenantBulk)
     {
-        const char* lineEnd = metaPtr;
-        while (lineEnd < metaEnd && *lineEnd != '\n')
+        if (RegisterTenantId("0") != 0)
         {
-            lineEnd++;
-        }
-
-        if (lineEnd == metaPtr)
-        {
+            fprintf(stderr,
+                    "[ERROR] Single-tenant bulk build could not reserve "
+                    "internal tenant ID 0\n");
             return false;
         }
+        tenantVectorRanges[0].push_back(
+            {p_vectors.Data(), p_vectors.Length()});
+    }
+    else
+    {
+        const char* metaPtr =
+            reinterpret_cast<const char*>(p_metadata.Data());
+        const char* metaEnd = metaPtr + p_metadata.Length();
+        const uint8_t* vectorPtr = p_vectors.Data();
 
-        std::string metaLine(metaPtr, lineEnd - metaPtr);
-        int tenantId = RegisterTenantId(metaLine.c_str());
+        SizeType globalIdx = 0;
+        while (metaPtr < metaEnd && globalIdx < p_vectorNum)
+        {
+            const char* lineEnd = metaPtr;
+            while (lineEnd < metaEnd && *lineEnd != '\n')
+            {
+                lineEnd++;
+            }
 
-        tenantVectorRanges[tenantId].push_back({vectorPtr, m_inputVectorSize});
-        tenantMetadataLines[tenantId].push_back(metaLine);
-        m_tenantGlobalIndices[tenantId].push_back(globalIdx);
-        vectorPtr += m_inputVectorSize;
-        metaPtr = (lineEnd < metaEnd) ? (lineEnd + 1) : lineEnd;
-        globalIdx++;
+            if (lineEnd == metaPtr)
+            {
+                return false;
+            }
+
+            std::string metaLine(metaPtr, lineEnd - metaPtr);
+            int tenantId = RegisterTenantId(metaLine.c_str());
+
+            tenantVectorRanges[tenantId].push_back(
+                {vectorPtr, m_inputVectorSize});
+            tenantMetadataLines[tenantId].push_back(metaLine);
+            m_tenantGlobalIndices[tenantId].push_back(globalIdx);
+            vectorPtr += m_inputVectorSize;
+            metaPtr =
+                (lineEnd < metaEnd) ? (lineEnd + 1) : lineEnd;
+            globalIdx++;
+        }
     }
 
     std::string algoTypeStr = SPTAG::Helper::Convert::ConvertToString(m_algoType);
@@ -3037,7 +4277,12 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             continue;
         }
 
-        size_t totalVectorSize = vectorRanges.size() * m_inputVectorSize;
+        const SizeType tenantVecCount =
+            singleTenantBulk
+                ? p_vectorNum
+                : static_cast<SizeType>(vectorRanges.size());
+        const size_t totalVectorSize =
+            static_cast<size_t>(tenantVecCount) * m_inputVectorSize;
 
         // Zero-copy fast path (SPTAG_BUILD_SHARE_OWNERSHIP=1): when this tenant's
         // vectors are already a contiguous slice of the caller-provided p_vectors
@@ -3052,7 +4297,13 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             const char* e = std::getenv("SPTAG_BUILD_SHARE_OWNERSHIP");
             return e != nullptr && e[0] != '\0' && e[0] != '0';
         }();
-        bool contiguous = kShareOwnership;
+        const bool buildMayMutateVectors =
+            !p_normalized &&
+            SPTAG::Helper::StrUtils::StrEqualIgnoreCase(
+                distMethod.c_str(), "Cosine");
+        bool contiguous =
+            (singleTenantBulk && !buildMayMutateVectors) ||
+            kShareOwnership;
         for (size_t i = 1; contiguous && i < vectorRanges.size(); ++i) {
             if (vectorRanges[i].first != vectorRanges[i - 1].first + m_inputVectorSize) {
                 contiguous = false;
@@ -3079,36 +4330,55 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             tenantVectors = ByteArray(tenantVectorBuffer, totalVectorSize, true);
         }
 
-        std::string metaStr;
-        for (size_t i = 0; i < tenantMetadataLines[tenantId].size(); ++i)
+        ByteArray tenantMetadata;
+        if (!singleTenantBulk)
         {
-            if (i > 0) metaStr.push_back('\n');
-            metaStr += tenantMetadataLines[tenantId][i];
-        }
-        metaStr.push_back('\n');
+            std::string metaStr;
+            for (size_t i = 0;
+                 i < tenantMetadataLines[tenantId].size(); ++i)
+            {
+                if (i > 0) metaStr.push_back('\n');
+                metaStr += tenantMetadataLines[tenantId][i];
+            }
+            metaStr.push_back('\n');
 
-        uint8_t* metaBuffer = new uint8_t[metaStr.size()];
-        memcpy(metaBuffer, metaStr.data(), metaStr.size());
-        ByteArray tenantMetadata(metaBuffer, metaStr.size(), true);
+            uint8_t* metaBuffer = new uint8_t[metaStr.size()];
+            memcpy(metaBuffer, metaStr.data(), metaStr.size());
+            tenantMetadata =
+                ByteArray(metaBuffer, metaStr.size(), true);
+        }
 
         auto tenantIndex = std::make_shared<AnnIndex>(algoTypeStr.c_str(), valueTypeStr.c_str(), m_dimension);
         bool buildOk = false;
-        SizeType tenantVecCount = static_cast<SizeType>(vectorRanges.size());
-        std::vector<uint32_t> tenantLocalTags;
+        std::vector<uint32_t> tenantLocalTagStorage;
+        const uint32_t* tenantLocalTags = nullptr;
+        size_t tenantLocalTagCount = 0;
 
         if (m_buildNumTagsPerVec > 0 && m_buildTags.Data() != nullptr) {
             const uint32_t* globalTags = reinterpret_cast<const uint32_t*>(m_buildTags.Data());
-            auto gidIt = m_tenantGlobalIndices.find(tenantId);
-            if (gidIt != m_tenantGlobalIndices.end()) {
+            if (singleTenantBulk) {
+                tenantLocalTags = globalTags;
+                tenantLocalTagCount =
+                    static_cast<size_t>(tenantVecCount) *
+                    static_cast<size_t>(m_buildNumTagsPerVec);
+            } else {
+                auto gidIt = m_tenantGlobalIndices.find(tenantId);
+                if (gidIt == m_tenantGlobalIndices.end()) {
+                    return false;
+                }
                 const auto& gids = gidIt->second;
-                tenantLocalTags.resize(static_cast<size_t>(tenantVecCount) * static_cast<size_t>(m_buildNumTagsPerVec));
+                tenantLocalTagStorage.resize(
+                    static_cast<size_t>(tenantVecCount) *
+                    static_cast<size_t>(m_buildNumTagsPerVec));
                 for (int i = 0; i < tenantVecCount && i < static_cast<int>(gids.size()); ++i) {
                     int gid = gids[i];
                     for (int t = 0; t < m_buildNumTagsPerVec; ++t) {
-                        tenantLocalTags[static_cast<size_t>(i) * static_cast<size_t>(m_buildNumTagsPerVec) + static_cast<size_t>(t)] =
+                        tenantLocalTagStorage[static_cast<size_t>(i) * static_cast<size_t>(m_buildNumTagsPerVec) + static_cast<size_t>(t)] =
                             globalTags[static_cast<size_t>(gid) * static_cast<size_t>(m_buildNumTagsPerVec) + static_cast<size_t>(t)];
                     }
                 }
+                tenantLocalTags = tenantLocalTagStorage.data();
+                tenantLocalTagCount = tenantLocalTagStorage.size();
             }
         }
 
@@ -3120,6 +4390,8 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
         {
             bool hybridDistanceEnabled = false;
             bool limitedTagPostingEnabled = false;
+            bool limitedTagColumnValid = true;
+            int limitedTagColumn = 0;
             for (const auto& parameter :
                  m_extraSSDBuildParams) {
                 if (SPTAG::Helper::StrUtils::
@@ -3138,6 +4410,15 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                         ConvertStringTo<bool>(
                             parameter.second.c_str(),
                             limitedTagPostingEnabled);
+                } else if (SPTAG::Helper::StrUtils::
+                               StrEqualIgnoreCase(
+                                   parameter.first.c_str(),
+                                   "LimitedTagColumn")) {
+                    limitedTagColumnValid =
+                        SPTAG::Helper::Convert::
+                            ConvertStringTo<int>(
+                                parameter.second.c_str(),
+                                limitedTagColumn);
                 }
             }
             const char* skipPivotEnv = std::getenv("SPTAG_DISABLE_PIVOT_ESTIMATOR");
@@ -3172,9 +4453,10 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                 auto& tagToNodes =
                     m_tenantTagToNodes[tenantId];
                 tagToNodes.clear();
-                for (std::uint32_t tag :
-                     tenantLocalTags) {
-                    tagToNodes[tag] = {0};
+                for (size_t tagIndex = 0;
+                     tagIndex < tenantLocalTagCount;
+                     ++tagIndex) {
+                    tagToNodes[tenantLocalTags[tagIndex]] = {0};
                 }
                 fprintf(
                     stderr,
@@ -3183,6 +4465,23 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                     "partitioning is disabled\n",
                     tenantId, tenantVecCount);
             } else if (limitedTagPostingEnabled) {
+                const size_t expectedTagCount =
+                    static_cast<size_t>(tenantVecCount) *
+                    static_cast<size_t>(m_buildNumTagsPerVec);
+                if (!limitedTagColumnValid ||
+                    limitedTagColumn < 0 ||
+                    limitedTagColumn >= m_buildNumTagsPerVec ||
+                    tenantLocalTagCount != expectedTagCount) {
+                    fprintf(
+                        stderr,
+                        "[ERROR] Tenant %d: invalid LimitedTagColumn=%d "
+                        "for %d attributes (%zu/%zu tag values loaded)\n",
+                        tenantId, limitedTagColumn,
+                        m_buildNumTagsPerVec,
+                        tenantLocalTagCount,
+                        expectedTagCount);
+                    return false;
+                }
                 m_tenantPivotLevels[tenantId] = -1;
                 m_tenantPivotNodeCounts[tenantId] = 1;
                 m_tenantNodePivotTags[tenantId] = {
@@ -3190,17 +4489,25 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                 auto& tagToNodes =
                     m_tenantTagToNodes[tenantId];
                 tagToNodes.clear();
-                for (std::uint32_t tag :
-                     tenantLocalTags) {
+                for (SizeType vectorId = 0;
+                     vectorId < tenantVecCount;
+                     ++vectorId) {
+                    const std::uint32_t tag =
+                        tenantLocalTags[
+                            static_cast<size_t>(vectorId) *
+                                static_cast<size_t>(
+                                    m_buildNumTagsPerVec) +
+                            static_cast<size_t>(
+                                limitedTagColumn)];
                     tagToNodes[tag] = {0};
                 }
                 fprintf(
                     stderr,
                     "[INFO] Tenant %d: limited-tag posting uses one global "
-                    "head graph with self-plus-one support; attribute pivot "
-                    "partitioning is disabled\n",
-                    tenantId);
-            } else if (!skipPivot && !tenantLocalTags.empty()) {
+                    "head graph with self-plus-one support from column %d; "
+                    "attribute pivot partitioning is disabled\n",
+                    tenantId, limitedTagColumn);
+            } else if (!skipPivot && tenantLocalTagCount != 0) {
                 // Routing/bundle planning must consider only the CATEGORICAL tag
                 // columns. Numeric attributes are inlined as the last
                 // SPTAG_NUMERIC_COLS columns (raw, high-cardinality values); if
@@ -3256,7 +4563,7 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                     for (int t = 0; t < numRoutingCols; ++t) routingCols.push_back(t);
                 }
 
-                const uint32_t* planTags = tenantLocalTags.data();
+                const uint32_t* planTags = tenantLocalTags;
                 int planNumTags = m_buildNumTagsPerVec;
                 std::vector<uint32_t> catOnlyTags;
                 const int numRoutingCols = static_cast<int>(routingCols.size());
@@ -3527,10 +4834,14 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                 const bool isHeadSection =
                     SPTAG::Helper::StrUtils::StrEqualIgnoreCase(section.c_str(), "SelectHead")
                     || SPTAG::Helper::StrUtils::StrEqualIgnoreCase(section.c_str(), "BuildHead");
-                const bool isHeadAlgorithm =
+                const bool isBaseBuildParameter =
                     SPTAG::Helper::StrUtils::StrEqualIgnoreCase(section.c_str(), "Base")
-                    && SPTAG::Helper::StrUtils::StrEqualIgnoreCase(name.c_str(), "IndexAlgoType");
-                if (!isHeadSection && !isHeadAlgorithm) {
+                    && (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(
+                            name.c_str(), "IndexAlgoType")
+                        || SPTAG::Helper::StrUtils::StrEqualIgnoreCase(
+                            name.c_str(), "SSDIndex"));
+                if (!isHeadSection &&
+                    !isBaseBuildParameter) {
                     continue;
                 }
                 tenantIndex->SetBuildParam(name.c_str(), value.c_str(), section.c_str());
@@ -3539,9 +4850,19 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             }
 
             // Set per-vector tags to embed in posting metadata (if available from BuildFromDataWithTags)
-            if (!tenantLocalTags.empty()) {
+            if (tenantLocalTagCount != 0) {
                 tenantIndex->SetBuildParam("NumTagsPerVec", std::to_string(m_buildNumTagsPerVec).c_str(), "BuildSSDIndex");
-                tenantIndex->SetVectorTags(tenantLocalTags.data(), tenantVecCount, m_buildNumTagsPerVec);
+                if (singleTenantBulk &&
+                    limitedTagPostingEnabled &&
+                    !hybridDistanceEnabled) {
+                    tenantIndex->SetVectorTagsView(
+                        tenantLocalTags, tenantVecCount,
+                        m_buildNumTagsPerVec);
+                } else {
+                    tenantIndex->SetVectorTags(
+                        tenantLocalTags, tenantVecCount,
+                        m_buildNumTagsPerVec);
+                }
             }
             if (hasNodeAwarePlan) {
                 tenantIndex->SetNodeVectorAssignments(planIt->second);
@@ -3604,7 +4925,8 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             }
         }
 
-        m_tenantVectorCounts[tenantId] = static_cast<int>(vectorRanges.size());
+        m_tenantVectorCounts[tenantId] =
+            static_cast<int>(tenantVecCount);
 
         // For SPANN: save the index to its work dir right away, then release the
         // AnnIndex object.  This closes the SSD file descriptor and frees the
@@ -3614,7 +4936,8 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             std::string workDir = m_tenantSpannWorkDirs[tenantId];
             tenantIndex->Save(workDir.c_str());
             fprintf(stderr, "[INFO] Tenant %d: built & released (%d vectors, dir=%s)\n",
-                tenantId, (int)vectorRanges.size(), workDir.c_str());
+                tenantId, static_cast<int>(tenantVecCount),
+                workDir.c_str());
             tenantIndex.reset();
             continue;
         }
@@ -3710,8 +5033,11 @@ bool TenantIndexManager::BuildFromDataWithTags(ByteArray p_vectors, ByteArray p_
     m_buildNumTagsPerVec = p_numTagsPerVec;
 
     // Build SPANN indexes — tags will be embedded in postings via SetVectorTags
-    if (!BuildFromData(p_vectors, p_metadata, p_vectorNum, p_withMetaIndex, p_normalized))
+    if (!BuildFromData(p_vectors, p_metadata, p_vectorNum, p_withMetaIndex, p_normalized)) {
+        m_buildTags = ByteArray();
+        m_buildNumTagsPerVec = 0;
         return false;
+    }
 
     m_buildTags = ByteArray();  // release reference
     m_buildNumTagsPerVec = 0;
@@ -3721,6 +5047,54 @@ bool TenantIndexManager::BuildFromDataWithTags(ByteArray p_vectors, ByteArray p_
     // tenant, and callers such as spannbuilder already invoke BuildSignatures
     // exactly once with their zero-copy tag view.
     fprintf(stderr, "[INFO] BuildFromDataWithTags: tags embedded in postings; signatures pending explicit build\n");
+    return true;
+}
+
+bool TenantIndexManager::BuildFromDataSingleTenant(
+    ByteArray p_vectors, int p_tenantId, SizeType p_vectorNum,
+    bool p_withMetaIndex, bool p_normalized)
+{
+    m_buildSingleTenantId = p_tenantId;
+    const bool built = BuildFromData(
+        p_vectors, ByteArray(), p_vectorNum, p_withMetaIndex,
+        p_normalized);
+    m_buildSingleTenantId = -1;
+    return built;
+}
+
+bool TenantIndexManager::BuildFromDataWithTagsSingleTenant(
+    ByteArray p_vectors, int p_tenantId, SizeType p_vectorNum,
+    ByteArray p_tags, int p_numTagsPerVec,
+    bool p_withMetaIndex, bool p_normalized)
+{
+    if (p_numTagsPerVec <= 0 ||
+        p_tags.Length() !=
+            static_cast<size_t>(p_vectorNum) *
+                static_cast<size_t>(p_numTagsPerVec) *
+                sizeof(std::uint32_t))
+    {
+        fprintf(stderr,
+                "[ERROR] Invalid tag buffer for single-tenant bulk build\n");
+        return false;
+    }
+
+    m_buildTags = p_tags;
+    m_buildNumTagsPerVec = p_numTagsPerVec;
+    m_buildSingleTenantId = p_tenantId;
+    const bool built = BuildFromData(
+        p_vectors, ByteArray(), p_vectorNum, p_withMetaIndex,
+        p_normalized);
+    m_buildSingleTenantId = -1;
+    m_buildTags = ByteArray();
+    m_buildNumTagsPerVec = 0;
+    if (!built)
+    {
+        return false;
+    }
+
+    fprintf(stderr,
+            "[INFO] BuildFromDataWithTagsSingleTenant: tags embedded in "
+            "postings; signatures pending explicit build\n");
     return true;
 }
 
@@ -4296,9 +5670,32 @@ bool TenantIndexManager::LoadAll(const char* p_baseDir)
         }
         if (!LoadTenantTagRoutingStats()) return false;
         LoadTenantSparseIndices();
+        if (!LoadTenantExtremeSparseTagStores()) return false;
         LoadTenantTagPureIndices();
         return true;
     }
+}
+
+bool TenantIndexManager::LoadAllForSignatureRepair(
+    const char* p_baseDir)
+{
+    const bool previous =
+        m_allowExtremeSparseTagRepairLoad;
+    m_allowExtremeSparseTagRepairLoad = true;
+    bool loaded = false;
+    try
+    {
+        loaded = LoadAll(p_baseDir);
+    }
+    catch (...)
+    {
+        m_allowExtremeSparseTagRepairLoad =
+            previous;
+        throw;
+    }
+    m_allowExtremeSparseTagRepairLoad =
+        previous;
+    return loaded;
 }
 
 bool TenantIndexManager::LoadTenantTagRoutingStats()
@@ -4426,28 +5823,186 @@ void TenantIndexManager::LoadTenantSparseIndices()
         int tenantId = kv.first;
         if (m_tenantNumericMeta.count(tenantId)) continue;
         const std::string nmPath = kv.second + "/numeric_meta.bin";
-        FILE* nf = fopen(nmPath.c_str(), "rb");
-        if (!nf) continue;
-        int32_t magic = 0, base = 0, ncols = 0;
-        if (fread(&magic, sizeof(int32_t), 1, nf) == 1 && magic == 0x54454d4e &&
-            fread(&base, sizeof(int32_t), 1, nf) == 1 &&
-            fread(&ncols, sizeof(int32_t), 1, nf) == 1 && ncols > 0 && ncols < 4096) {
-            NumericMeta nm;
-            nm.numBaseCols = base;
-            nm.params.resize(static_cast<size_t>(ncols));
-            bool ok = true;
-            for (int c = 0; c < ncols; ++c) {
-                if (fread(&nm.params[c].lo, sizeof(uint32_t), 1, nf) != 1 ||
-                    fread(&nm.params[c].hi, sizeof(uint32_t), 1, nf) != 1) { ok = false; break; }
-            }
-            if (ok) {
-                m_tenantNumericMeta[tenantId] = std::move(nm);
-                fprintf(stderr, "[INFO] Tenant %d: loaded numeric_meta.bin (base=%d numeric=%d)\n",
-                        tenantId, base, ncols);
-            }
+        NumericMetaDiskData diskMetadata;
+        if (LoadNumericMetaFile(nmPath, diskMetadata)) {
+            NumericMeta metadata;
+            metadata.numBaseCols =
+                diskMetadata.numBaseColumns;
+            metadata.vectorCount =
+                diskMetadata.vectorCount;
+            metadata.tagColumnCount =
+                diskMetadata.tagColumnCount;
+            metadata.generationFingerprint =
+                diskMetadata.generationFingerprint;
+            metadata.contentFingerprint =
+                diskMetadata.contentFingerprint;
+            metadata.generationBound =
+                diskMetadata.generationBound;
+            metadata.params =
+                std::move(diskMetadata.params);
+            fprintf(
+                stderr,
+                "[INFO] Tenant %d: loaded numeric_meta.bin "
+                "(base=%d numeric=%zu bound=%d)\n",
+                tenantId, metadata.numBaseCols,
+                metadata.params.size(),
+                metadata.generationBound ? 1 : 0);
+            m_tenantNumericMeta[tenantId] =
+                std::move(metadata);
+        } else if (std::ifstream(
+                       nmPath, std::ios::binary)
+                       .good()) {
+            fprintf(
+                stderr,
+                "[WARN] Tenant %d: ignoring invalid %s; "
+                "numeric posting pruning is disabled\n",
+                tenantId, nmPath.c_str());
         }
-        fclose(nf);
     }
+}
+
+bool TenantIndexManager::LoadTenantExtremeSparseTagStores()
+{
+    for (const auto& entry : m_tenantSpannWorkDirs)
+    {
+        const int tenantId = entry.first;
+        const std::string iniPath =
+            entry.second + "/indexloader.ini";
+        bool enabled = false;
+        const std::string enabledText =
+            ReadBuildSSDIndexValue(
+                iniPath, "EnableExtremeSparseTag");
+        if (!enabledText.empty() &&
+            !SPTAG::Helper::Convert::ConvertStringTo<bool>(
+                enabledText.c_str(), enabled))
+        {
+            fprintf(
+                stderr,
+                "[ERROR] Tenant %d: invalid EnableExtremeSparseTag=%s\n",
+                tenantId, enabledText.c_str());
+            return false;
+        }
+        if (!enabled)
+        {
+            m_tenantExtremeSparseTagStores.erase(
+                tenantId);
+            continue;
+        }
+
+        std::string fileName =
+            ReadBuildSSDIndexValue(
+                iniPath, "ExtremeSparseTagFile");
+        if (fileName.empty() ||
+            fileName == "Undefined!")
+        {
+            fileName = "extreme_sparse_tags.bin";
+        }
+        if (!IsSafeArtifactFileName(fileName))
+        {
+            fprintf(
+                stderr,
+                "[ERROR] Tenant %d: unsafe ExtremeSparseTagFile=%s\n",
+                tenantId, fileName.c_str());
+            return false;
+        }
+        int keyColumn = 0;
+        int attributeCount = 0;
+        std::uint64_t generationFingerprint = 0;
+        double maxSelectivity = 0.0;
+        const std::string keyColumnText =
+            ReadBuildSSDIndexValue(
+                iniPath, "LimitedTagColumn");
+        const std::string attributeCountText =
+            ReadBuildSSDIndexValue(
+                iniPath, "NumTagsPerVec");
+        const std::string generationText =
+            ReadBuildSSDIndexValue(
+                iniPath,
+                "LimitedTagGenerationFingerprint");
+        const std::string maxSelectivityText =
+            ReadBuildSSDIndexValue(
+                iniPath,
+                "ExtremeSparseTagMaxSelectivity");
+        if ((!keyColumnText.empty() &&
+             !SPTAG::Helper::Convert::ConvertStringTo<int>(
+                 keyColumnText.c_str(), keyColumn)) ||
+            attributeCountText.empty() ||
+            !SPTAG::Helper::Convert::ConvertStringTo<int>(
+                attributeCountText.c_str(),
+                attributeCount) ||
+            generationText.empty() ||
+            !SPTAG::Helper::Convert::
+                ConvertStringTo<std::uint64_t>(
+                   generationText.c_str(),
+                   generationFingerprint) ||
+            maxSelectivityText.empty() ||
+            !SPTAG::Helper::Convert::ConvertStringTo<double>(
+                maxSelectivityText.c_str(),
+                maxSelectivity) ||
+            keyColumn < 0 || attributeCount <= 0 ||
+            keyColumn >= attributeCount ||
+            generationFingerprint == 0 ||
+            !std::isfinite(maxSelectivity) ||
+            maxSelectivity <= 0.0 ||
+            maxSelectivity > 1.0)
+        {
+            fprintf(
+                stderr,
+                "[ERROR] Tenant %d: invalid extreme-sparse attribute layout\n",
+                tenantId);
+            return false;
+        }
+        const auto vectorCount =
+            m_tenantVectorCounts.find(tenantId);
+        if (vectorCount ==
+                m_tenantVectorCounts.end() ||
+            vectorCount->second <= 0)
+        {
+            return false;
+        }
+        const std::string path =
+            entry.second + "/" + fileName;
+        auto store = std::make_shared<
+            SPTAG::Cache::ExtremeSparseTagStore>();
+        std::string error;
+        if (!store->Load(path, &error) ||
+            !store->ValidateExpected(
+                m_valueType,
+                static_cast<std::uint32_t>(
+                    m_dimension),
+                static_cast<std::uint32_t>(
+                    attributeCount),
+                static_cast<std::uint32_t>(
+                    keyColumn),
+                static_cast<std::uint64_t>(
+                    vectorCount->second),
+                generationFingerprint,
+                maxSelectivity,
+                &error))
+        {
+            if (m_allowExtremeSparseTagRepairLoad)
+            {
+                m_tenantExtremeSparseTagStores.erase(
+                   tenantId);
+                fprintf(
+                   stderr,
+                   "[WARN] Tenant %d: deferring invalid extreme-sparse "
+                   "tag store repair for %s: %s\n",
+                   tenantId, path.c_str(),
+                   error.c_str());
+                continue;
+            }
+            fprintf(
+                stderr,
+                "[ERROR] Tenant %d: cannot load %s: %s\n",
+                tenantId, path.c_str(),
+                error.c_str());
+            return false;
+        }
+        m_tenantExtremeSparseTagStores[
+            tenantId] = std::move(store);
+    }
+    return true;
 }
 
 void TenantIndexManager::LoadTenantTagPureIndices()
@@ -4647,6 +6202,7 @@ bool TenantIndexManager::LoadUnifiedStorage(const char* p_baseDir)
 
     if (!LoadTenantTagRoutingStats()) return false;
     LoadTenantSparseIndices();
+    if (!LoadTenantExtremeSparseTagStores()) return false;
     LoadTenantTagPureIndices();
 
     return true;
@@ -5097,9 +6653,36 @@ void TenantIndexManager::EvictIfNeeded()
 // ACL / Tag Filtered Search — Two-Level Signature Implementation
 // ============================================================================
 
-bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p_numVectors, int p_numTagsPerVec)
+bool TenantIndexManager::BuildSignatures(
+    int p_tenantId, ByteArray p_tags,
+    int p_numVectors, int p_numTagsPerVec)
+{
+    return BuildSignaturesWithVectors(
+        p_tenantId, p_tags, p_numVectors,
+        p_numTagsPerVec, ByteArray());
+}
+
+bool TenantIndexManager::BuildSignaturesWithVectors(
+    int p_tenantId, ByteArray p_tags, int p_numVectors,
+    int p_numTagsPerVec, ByteArray p_vectors)
 {
     const uint32_t* p_tagsPtr = reinterpret_cast<const uint32_t*>(p_tags.Data());
+    if (p_tagsPtr == nullptr || p_numVectors <= 0 ||
+        p_numTagsPerVec <= 0 ||
+        static_cast<std::uint64_t>(p_numVectors) *
+                static_cast<std::uint64_t>(p_numTagsPerVec) >
+            (std::numeric_limits<size_t>::max)() /
+                sizeof(std::uint32_t) ||
+        p_tags.Length() !=
+            static_cast<size_t>(p_numVectors) *
+                static_cast<size_t>(p_numTagsPerVec) *
+                sizeof(std::uint32_t)) {
+        fprintf(
+            stderr,
+            "[ERROR] Tenant %d: invalid BuildSignatures attribute matrix\n",
+            p_tenantId);
+        return false;
+    }
 
     auto wdIt = m_tenantSpannWorkDirs.find(p_tenantId);
     if (wdIt == m_tenantSpannWorkDirs.end()) return false;
@@ -5112,6 +6695,16 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
     int directSparseMaxPostings = 320;
     bool hybridDistanceEnabled = false;
     bool staticStorage = false;
+    bool limitedTagEnabled = false;
+    bool extremeSparseTagEnabled = false;
+    bool logExtremeSparseTagRoute = false;
+    int limitedTagColumn = 0;
+    int staticACLTagCols = p_numTagsPerVec;
+    double extremeSparseTagMaxSelectivity = 0.00001;
+    std::uint64_t limitedTagGenerationFingerprint = 0;
+    std::uint64_t signatureGenerationFingerprint = 0;
+    std::string extremeSparseTagFile =
+        "extreme_sparse_tags.bin";
     std::string primaryPostingFile =
         "SPTAGFullList.bin";
     if (!EnsureTenantLoaded(p_tenantId)) return false;
@@ -5151,13 +6744,132 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                         options != nullptr &&
                         options->m_storage ==
                             SPTAG::Storage::STATIC;
+                    limitedTagEnabled =
+                        options != nullptr &&
+                        options->m_enableLimitedTagPosting;
+                    extremeSparseTagEnabled =
+                        options != nullptr &&
+                        options->m_enableExtremeSparseTag;
+                    logExtremeSparseTagRoute =
+                        options != nullptr &&
+                        options->m_logExtremeSparseTagRoute;
+                    if (options != nullptr) {
+                        limitedTagColumn =
+                            options->m_limitedTagColumn;
+                        staticACLTagCols =
+                            options->m_staticACLTagCols > 0
+                            ? options->m_staticACLTagCols
+                            : p_numTagsPerVec;
+                        extremeSparseTagMaxSelectivity =
+                            options
+                                ->m_extremeSparseTagMaxSelectivity;
+                        SPTAG::Helper::Convert::
+                            ConvertStringTo<std::uint64_t>(
+                                options
+                                    ->m_limitedTagGenerationFingerprint
+                                    .c_str(),
+                                limitedTagGenerationFingerprint);
+                        if (limitedTagEnabled) {
+                            signatureGenerationFingerprint =
+                                limitedTagGenerationFingerprint;
+                        } else if (hybridDistanceEnabled) {
+                            SPTAG::Helper::Convert::
+                                ConvertStringTo<std::uint64_t>(
+                                    options
+                                        ->m_hybridGenerationFingerprint
+                                        .c_str(),
+                                    signatureGenerationFingerprint);
+                        }
+                        if (!options
+                                 ->m_extremeSparseTagFile
+                                 .empty()) {
+                            extremeSparseTagFile =
+                                options
+                                    ->m_extremeSparseTagFile;
+                        }
+                    }
                     if (options != nullptr &&
                         !options->m_ssdIndex.empty()) {
                         primaryPostingFile =
                             options->m_ssdIndex;
                     }
                 }
+                if (limitedTagEnabled &&
+                    (limitedTagColumn < 0 ||
+                     limitedTagColumn >= staticACLTagCols ||
+                     staticACLTagCols <= 0 ||
+                     staticACLTagCols > p_numTagsPerVec)) {
+                    fprintf(
+                        stderr,
+                        "[ERROR] Tenant %d: LimitedTagColumn=%d / StaticACLTagCols=%d "
+                        "is invalid for %d attributes\n",
+                        p_tenantId, limitedTagColumn,
+                        staticACLTagCols, p_numTagsPerVec);
+                    return false;
+                }
+                if (extremeSparseTagEnabled &&
+                    (!limitedTagEnabled || !staticStorage ||
+                     p_vectors.Data() == nullptr ||
+                     p_vectors.Length() !=
+                         static_cast<size_t>(p_numVectors) *
+                             m_inputVectorSize ||
+                     !std::isfinite(
+                         extremeSparseTagMaxSelectivity) ||
+                     extremeSparseTagMaxSelectivity <= 0.0 ||
+                     extremeSparseTagMaxSelectivity > 1.0 ||
+                     limitedTagGenerationFingerprint == 0 ||
+                     !IsSafeArtifactFileName(
+                         extremeSparseTagFile))) {
+                    fprintf(
+                        stderr,
+                        "[ERROR] Tenant %d: extreme-sparse tag build requires the complete "
+                        "raw vector matrix and valid native limited-tag options\n",
+                        p_tenantId);
+                    return false;
+                }
+                (void)logExtremeSparseTagRoute;
             }
+        }
+    }
+
+    if (staticACLTagCols <= 0 ||
+        staticACLTagCols > p_numTagsPerVec) {
+        fprintf(
+            stderr,
+            "[ERROR] Tenant %d: StaticACLTagCols=%d is invalid for %d "
+            "attribute columns\n",
+            p_tenantId, staticACLTagCols,
+            p_numTagsPerVec);
+        return false;
+    }
+    const int signatureNumericColumns =
+        p_numTagsPerVec - staticACLTagCols;
+    std::vector<SPTAG::Cache::NumQuantParam>
+        signatureNumericParams(
+            static_cast<size_t>(
+                signatureNumericColumns));
+    for (auto& parameter : signatureNumericParams) {
+        parameter.lo =
+            (std::numeric_limits<std::uint32_t>::max)();
+        parameter.hi = 0;
+    }
+    for (int vector = 0; vector < p_numVectors;
+         ++vector) {
+        for (int column = 0;
+             column < signatureNumericColumns;
+             ++column) {
+            const std::uint32_t value =
+                p_tagsPtr[
+                    static_cast<size_t>(vector) *
+                        p_numTagsPerVec +
+                    staticACLTagCols + column];
+            auto& parameter =
+                signatureNumericParams[
+                    static_cast<size_t>(column)];
+            parameter.lo =
+                (std::min)(parameter.lo, value);
+            parameter.hi =
+                (std::max)(parameter.hi, value);
         }
     }
 
@@ -5175,6 +6887,8 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
         const std::string tagPurePath = workDir + "/tagpure_meta.bin";
         const std::string routeStatsPath =
             workDir + "/tag_routing_stats.bin";
+        const std::string extremeSparsePath =
+            workDir + "/" + extremeSparseTagFile;
         const std::string headMetaPath =
             workDir + "/HeadIndex/head_node_meta.bin";
         bool sigOk     = stat(sigPath.c_str(),     &st) == 0;
@@ -5182,35 +6896,176 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
         bool tagPureOk = stat(tagPurePath.c_str(), &st) == 0;
         bool routeStatsOk =
             stat(routeStatsPath.c_str(), &st) == 0;
+        if (!staticStorage && sigOk) {
+            SPTAG::Cache::TenantBitmaskPS
+                existingSignatures;
+            sigOk = existingSignatures.Load(
+                sigPath,
+                signatureGenerationFingerprint);
+        }
+        bool extremeSparseOk =
+            !extremeSparseTagEnabled;
+        if (extremeSparseTagEnabled &&
+            stat(extremeSparsePath.c_str(), &st) == 0)
+        {
+            SPTAG::Cache::ExtremeSparseTagStore
+                existingStore;
+            std::string existingStoreError;
+            extremeSparseOk =
+                existingStore.Load(
+                    extremeSparsePath,
+                    &existingStoreError) &&
+                existingStore.ValidateExpected(
+                    m_valueType,
+                    static_cast<std::uint32_t>(
+                        m_dimension),
+                    static_cast<std::uint32_t>(
+                        p_numTagsPerVec),
+                    static_cast<std::uint32_t>(
+                        limitedTagColumn),
+                    static_cast<std::uint64_t>(
+                        p_numVectors),
+                    limitedTagGenerationFingerprint,
+                    extremeSparseTagMaxSelectivity,
+                    &existingStoreError);
+            if (!extremeSparseOk)
+            {
+                fprintf(
+                    stderr,
+                    "[INFO] Tenant %d: rebuilding stale extreme-sparse "
+                    "tag store: %s\n",
+                    p_tenantId,
+                    existingStoreError.c_str());
+            }
+        }
         bool headMetaOk =
             stat(headMetaPath.c_str(), &st) == 0;
         const bool baseArtifactsOk = staticStorage
             ? headMetaOk
             : (sigOk && sparseOk && tagPureOk);
+        bool numericMetadataValid =
+            signatureNumericColumns == 0;
+        std::uint64_t numericContentFingerprint =
+            0;
+        if (signatureNumericColumns > 0) {
+            NumericMetaDiskData existingNumeric;
+            const std::uint64_t expectedContentFingerprint =
+                ComputeNumericMetaContentFingerprint(
+                    staticACLTagCols,
+                    p_numVectors,
+                    p_numTagsPerVec,
+                    signatureGenerationFingerprint,
+                    signatureNumericParams);
+            numericMetadataValid =
+                LoadNumericMetaFile(
+                    workDir +
+                        "/numeric_meta.bin",
+                    existingNumeric) &&
+                existingNumeric.generationBound &&
+                existingNumeric.numBaseColumns ==
+                    staticACLTagCols &&
+                existingNumeric.vectorCount ==
+                    p_numVectors &&
+                existingNumeric.tagColumnCount ==
+                    p_numTagsPerVec &&
+                existingNumeric.params.size() ==
+                    signatureNumericParams.size() &&
+                existingNumeric.contentFingerprint ==
+                    expectedContentFingerprint;
+            if (numericMetadataValid &&
+                (hybridDistanceEnabled ||
+                 limitedTagEnabled)) {
+                numericMetadataValid =
+                    signatureGenerationFingerprint !=
+                        0 &&
+                    existingNumeric
+                            .generationFingerprint ==
+                        signatureGenerationFingerprint;
+            }
+            if (numericMetadataValid) {
+                for (size_t column = 0;
+                     column <
+                         signatureNumericParams.size();
+                     ++column) {
+                    if (existingNumeric.params[column].lo !=
+                            signatureNumericParams[column].lo ||
+                        existingNumeric.params[column].hi !=
+                            signatureNumericParams[column].hi) {
+                        numericMetadataValid = false;
+                        break;
+                    }
+                }
+                if (numericMetadataValid) {
+                    numericContentFingerprint =
+                        existingNumeric
+                            .contentFingerprint;
+                }
+            }
+        }
         if (baseArtifactsOk &&
-            (!hybridDistanceEnabled || routeStatsOk)) {
+            (!hybridDistanceEnabled || routeStatsOk) &&
+            extremeSparseOk &&
+            numericMetadataValid) {
             // Make sure the PS signatures are attached to the head index.
-            EnsureTenantLoaded(p_tenantId);
+            if (!EnsureTenantLoaded(p_tenantId)) {
+                return false;
+            }
             bool headMetadataValid =
                 !staticStorage;
+            std::shared_ptr<SPTAG::VectorIndex>
+                loadedMemoryIndex;
             {
                 std::shared_lock<std::shared_mutex> rlock(m_tenantIndicesMutex);
                 auto it = m_tenantIndices.find(p_tenantId);
                 if (it != m_tenantIndices.end()) {
                     const auto internalIndex =
                         it->second->GetInternalIndex();
-                    headMetadataValid = staticStorage
-                        ? LoadHeadNodeMetaFile(
-                              workDir,
-                              GetMemoryIndexForInternal(
-                                  internalIndex))
-                        : EnsureHeadNodeMetaLoaded(
-                              workDir, internalIndex);
+                    if (staticStorage) {
+                        loadedMemoryIndex =
+                            GetMemoryIndexForInternal(
+                                internalIndex);
+                        headMetadataValid =
+                            LoadHeadNodeMetaFile(
+                                workDir,
+                                internalIndex);
+                        const int expectedNumericCols =
+                            p_numTagsPerVec -
+                            staticACLTagCols;
+                        if (headMetadataValid &&
+                            (loadedMemoryIndex == nullptr ||
+                             loadedMemoryIndex
+                                     ->GetHeadNodeNumQuantCols() !=
+                                 expectedNumericCols ||
+                             loadedMemoryIndex
+                                    ->HasHeadNodeTailPS() !=
+                                 (hybridDistanceEnabled ||
+                                  limitedTagEnabled))) {
+                            headMetadataValid = false;
+                        }
+                    } else {
+                        headMetadataValid =
+                            EnsureHeadNodeMetaLoaded(
+                                workDir, internalIndex);
+                        loadedMemoryIndex =
+                            GetMemoryIndexForInternal(
+                                internalIndex);
+                    }
                 }
+            }
+            if (headMetadataValid &&
+                signatureNumericColumns > 0 &&
+                (loadedMemoryIndex == nullptr ||
+                 loadedMemoryIndex
+                         ->GetHeadNodeNumericDomainFingerprint() !=
+                     numericContentFingerprint)) {
+                headMetadataValid = false;
             }
             // tag-pure + sparse metadata is loaded by LoadAll; touch the
             // loaders again for safety (idempotent — skips already-loaded).
             LoadTenantSparseIndices();
+            if (!LoadTenantExtremeSparseTagStores()) {
+                return false;
+            }
             LoadTenantTagPureIndices();
             if (!LoadTenantTagRoutingStats()) {
                 return false;
@@ -5226,15 +7081,17 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                 fprintf(stderr,
                         "[INFO] Tenant %d: BuildSignatures short-circuit "
                         "(static=%d headmeta=%d sig=%d sparse=%d tagpure=%d "
-                        "routeStats=%d on disk)\n",
+                        "routeStats=%d extremeSparse=%d on disk)\n",
                         p_tenantId, (int)staticStorage, (int)headMetaOk,
                         (int)sigOk, (int)sparseOk,
-                        (int)tagPureOk, (int)routeStatsOk);
+                        (int)tagPureOk, (int)routeStatsOk,
+                        (int)extremeSparseOk);
                 return true;
             }
             fprintf(stderr,
                     "[INFO] Tenant %d: rebuilding signatures because persisted "
-                    "head metadata or hybrid routing stats are invalid\n",
+                    "head metadata, numeric metadata, or hybrid routing stats "
+                    "are invalid\n",
                     p_tenantId);
         }
     }
@@ -5255,6 +7112,31 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
 
     const auto hierWidths =
         HierWidthsFromEnv();
+
+    if (limitedTagEnabled) {
+        m_tenantPivotLevels[p_tenantId] = -1;
+        m_tenantPivotNodeCounts[p_tenantId] = 1;
+        m_tenantNodePivotTags[p_tenantId] = {
+            std::vector<std::uint32_t>()};
+        auto& tagToNodes =
+            m_tenantTagToNodes[p_tenantId];
+        tagToNodes.clear();
+        tagToNodes.reserve(256);
+        for (int vector = 0;
+             vector < p_numVectors;
+             ++vector) {
+            const std::uint32_t tag =
+                p_tagsPtr[
+                    static_cast<size_t>(vector) *
+                        p_numTagsPerVec +
+                    static_cast<size_t>(
+                        limitedTagColumn)];
+            if (tagToNodes.find(tag) ==
+                tagToNodes.end()) {
+                tagToNodes[tag] = {0};
+            }
+        }
+    }
 
     // ── Routing-only fast path (SPTAG_ROUTING_ONLY=1) ───────────────────────
     // Regenerate ONLY the query-time routing sidecar (tag_node_index.bin) from
@@ -5291,9 +7173,53 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
         if (!preserveHeadNodeMeta) {
             memoryIndex->InitializeHeadNodeMeta(
                 numHeadSamples, 0,
-                hierWidths);
+                hierWidths,
+                hybridDistanceEnabled ||
+                    limitedTagEnabled);
         }
         spannInternalIdx->PopulateHeadNodeGlobalVIDsFromBundles();
+
+        if (limitedTagEnabled) {
+            std::vector<int> headNodeToNode(
+                static_cast<size_t>(
+                    numHeadSamples),
+                0);
+            m_tenantHeadNodeToNode[
+                p_tenantId] =
+                headNodeToNode;
+            for (SizeType hid = 0;
+                 hid < numHeadSamples;
+                 ++hid) {
+                memoryIndex
+                    ->SetHeadNodeBundleNodeId(
+                        hid, 0);
+            }
+            const bool routingOk =
+                SaveHeadNodeRoutingIndexFile(
+                    workDir, -1,
+                    m_tenantNodePivotTags[
+                        p_tenantId],
+                    m_tenantTagToNodes[
+                        p_tenantId],
+                    headNodeToNode);
+            bool metaOk = true;
+            if (preserveHeadNodeMeta) {
+                metaOk = SaveHeadNodeMetaFile(
+                    workDir, memoryIndex,
+                    signatureGenerationFingerprint);
+            }
+            const bool ok = routingOk && metaOk;
+            fprintf(
+                stderr,
+                "[INFO] Tenant %d: ROUTING_ONLY wrote single-node "
+                "limited-tag routing (heads=%zu tagMappings=%zu ok=%d)\n",
+                p_tenantId,
+                headNodeToNode.size(),
+                m_tenantTagToNodes[
+                    p_tenantId].size(),
+                static_cast<int>(ok));
+            return ok;
+        }
 
         // Reproduce the build-time routing-column projection so the recomputed
         // pivot partition (and thus node numbering) matches the physical layout.
@@ -5381,7 +7307,9 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                     : static_cast<int16_t>(-1);
                 memoryIndex->SetHeadNodeBundleNodeId(hid, nodeId);
             }
-            metaOk = SaveHeadNodeMetaFile(workDir, memoryIndex);
+            metaOk = SaveHeadNodeMetaFile(
+                workDir, memoryIndex,
+                signatureGenerationFingerprint);
         }
         const bool ok = routingOk && metaOk;
         fprintf(stderr,
@@ -5434,6 +7362,22 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
             }
             SizeType numHeadSamples = memoryIndex->GetNumSamples();
             if (numHeadSamples < (SizeType)numHeads) numHeadSamples = (SizeType)numHeads;
+            const int numNumericCols =
+                signatureNumericColumns;
+            std::vector<
+                SPTAG::Cache::NumQuantParam>
+                quantParams =
+                    signatureNumericParams;
+            const std::uint64_t
+                numericContentFingerprint =
+                    numNumericCols > 0
+                    ? ComputeNumericMetaContentFingerprint(
+                          staticACLTagCols,
+                          p_numVectors,
+                          p_numTagsPerVec,
+                          signatureGenerationFingerprint,
+                          quantParams)
+                    : 0;
 
             // tag_level_offsets.bin covers categorical hierarchy columns only.
             // Numeric columns are range-filter attributes, not hierarchy levels.
@@ -5462,7 +7406,8 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                 p_numTagsPerVec;
             std::vector<std::uint32_t>
                 categoricalTags;
-            if (staticACLTagCols <
+            if (!limitedTagEnabled &&
+                staticACLTagCols <
                 p_numTagsPerVec) {
                 categoricalTags.resize(
                     static_cast<size_t>(
@@ -5490,6 +7435,7 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
             PivotEstimatorComputation pivotComputation;
             const PivotEstimatorCandidate* pivotCandidate = nullptr;
             if (!hybridDistanceEnabled &&
+                !limitedTagEnabled &&
                 BuildPivotEstimatorComputation(
                     routingTags, p_numVectors,
                     routingTagCount,
@@ -5505,8 +7451,10 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
             }
 
             memoryIndex->InitializeHeadNodeMeta(
-                numHeadSamples, 0,
-                hierWidths);
+                numHeadSamples, numNumericCols,
+                hierWidths,
+                hybridDistanceEnabled ||
+                    limitedTagEnabled);
             // Monolithic roots resolve through their head-ID map; metadata-only
             // roots fall back to the bundle structures.
             spannInternalIdx->PopulateHeadNodeGlobalVIDsFromBundles();
@@ -5518,22 +7466,46 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
             // them in opq_slim.bin. Never leave an empty mask attached to a static
             // snapshot: that would turn an enabled pre-filter into false negatives.
             std::vector<SPTAG::Cache::HierarchicalPostingMask> postingHierMasks;
+            std::vector<SPTAG::Cache::PostingBitmask>
+                postingPureMasks;
+            std::vector<SPTAG::Cache::PostingBitmask>
+                postingTailMasks;
+            std::vector<std::uint64_t>
+                postingPureNumericMasks;
+            std::vector<std::uint64_t>
+                postingTailNumericMasks;
             std::unordered_map<std::uint64_t, int>
                 tagPostingCounts;
             {
                 const std::string slimBinPath = workDir + "/opq_slim.bin";
                 const std::string slimIdxPath = workDir + "/opq_slim.idx";
-                const std::string staticSnapshotPath = workDir + "/SPTAGFullList.bin";
+                const std::string staticSnapshotPath =
+                    workDir + "/" +
+                    primaryPostingFile;
                 struct stat staticSnapshotStat {};
                 if (stat(staticSnapshotPath.c_str(), &staticSnapshotStat) == 0) {
                     if (!BuildStaticPostingHierMasks(staticSnapshotPath, numHeads, p_numTagsPerVec,
                                                       staticACLTagCols, hierWidths,
                                                       postingHierMasks,
-                                                      &tagPostingCounts)) {
+                                                      &tagPostingCounts,
+                                                      &postingPureMasks,
+                                                      &postingTailMasks,
+                                                      &quantParams,
+                                                      &postingPureNumericMasks,
+                                                      &postingTailNumericMasks,
+                                                      signatureGenerationFingerprint)) {
                         return false;
                     }
                     fprintf(stderr, "[INFO] Tenant %d: built posting hier masks for %zu STM1 postings.\n",
                             p_tenantId, postingHierMasks.size());
+                } else if (staticStorage) {
+                    fprintf(
+                        stderr,
+                        "[ERROR] Tenant %d: configured STATIC posting snapshot "
+                        "%s is missing; refusing to publish empty signatures\n",
+                        p_tenantId,
+                        staticSnapshotPath.c_str());
+                    return false;
                 } else {
                     std::ifstream idxIn(slimIdxPath, std::ios::binary);
                     std::ifstream binIn(slimBinPath, std::ios::binary);
@@ -5580,86 +7552,6 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                                 "posting pre-filter will be empty.\n", p_tenantId);
                     }
                 }
-            }
-
-            const int numNumericCols =
-                p_numTagsPerVec - staticACLTagCols;
-            if (numNumericCols > 0) {
-                std::vector<SPTAG::Cache::NumQuantParam>
-                    quantParams(
-                        static_cast<size_t>(
-                            numNumericCols));
-                for (auto& parameter : quantParams) {
-                    parameter.lo =
-                        (std::numeric_limits<
-                            std::uint32_t>::max)();
-                    parameter.hi = 0;
-                }
-                for (int vid = 0; vid < p_numVectors; ++vid) {
-                    for (int column = 0;
-                         column < numNumericCols;
-                         ++column) {
-                        const std::uint32_t value =
-                            p_tagsPtr[
-                                static_cast<size_t>(vid) *
-                                    p_numTagsPerVec +
-                                staticACLTagCols +
-                                column];
-                        auto& parameter =
-                            quantParams[
-                                static_cast<size_t>(
-                                    column)];
-                        parameter.lo =
-                            (std::min)(
-                                parameter.lo, value);
-                        parameter.hi =
-                            (std::max)(
-                                parameter.hi, value);
-                    }
-                }
-                const std::string numericPath =
-                    workDir + "/numeric_meta.bin";
-                FILE* numericFile =
-                    fopen(numericPath.c_str(), "wb");
-                if (numericFile == nullptr) {
-                    return false;
-                }
-                const std::int32_t magic =
-                    0x54454d4e;
-                const std::int32_t base =
-                    staticACLTagCols;
-                const std::int32_t count =
-                    numNumericCols;
-                bool numericOk =
-                    fwrite(
-                        &magic, sizeof(magic), 1,
-                        numericFile) == 1 &&
-                    fwrite(
-                        &base, sizeof(base), 1,
-                        numericFile) == 1 &&
-                    fwrite(
-                        &count, sizeof(count), 1,
-                        numericFile) == 1;
-                for (const auto& parameter :
-                     quantParams) {
-                    numericOk =
-                        numericOk &&
-                        fwrite(
-                            &parameter.lo,
-                            sizeof(parameter.lo), 1,
-                            numericFile) == 1 &&
-                        fwrite(
-                            &parameter.hi,
-                            sizeof(parameter.hi), 1,
-                            numericFile) == 1;
-                }
-                numericOk =
-                    fclose(numericFile) == 0 &&
-                    numericOk;
-                if (!numericOk) return false;
-                m_tenantNumericMeta[p_tenantId] = {
-                    staticACLTagCols,
-                    std::move(quantParams)};
             }
 
             std::unordered_map<std::uint64_t, int>
@@ -5755,6 +7647,77 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                 // pre-filter; set it independently of the head's own resolved VID.
                 if ((size_t)hid < postingHierMasks.size())
                     memoryIndex->SetHeadNodePostingHierMask(hid, postingHierMasks[hid]);
+                if ((size_t)hid <
+                    postingPureMasks.size()) {
+                    memoryIndex->SetHeadNodePS(
+                        hid,
+                        postingPureMasks[
+                            static_cast<size_t>(
+                                hid)]);
+                }
+                if ((size_t)hid <
+                    postingTailMasks.size()) {
+                    memoryIndex->SetHeadNodeTailPS(
+                        hid,
+                        postingTailMasks[
+                            static_cast<size_t>(
+                                hid)]);
+                }
+                const size_t numericWords =
+                    static_cast<size_t>(
+                        numNumericCols) *
+                    SPTAG::Cache::
+                        NUM_QUANT_WORDS;
+                const size_t numericOffset =
+                    static_cast<size_t>(
+                        hid) *
+                    numericWords;
+                if (numericWords > 0 &&
+                    numericOffset <=
+                        postingPureNumericMasks
+                            .size() &&
+                    numericWords <=
+                        postingPureNumericMasks
+                            .size() -
+                            numericOffset) {
+                    auto* numeric =
+                        memoryIndex
+                            ->GetHeadNodeNumQuantMutable(
+                                hid);
+                    if (numeric != nullptr) {
+                        std::memcpy(
+                            numeric,
+                            postingPureNumericMasks
+                                .data() +
+                                numericOffset,
+                            numericWords *
+                                sizeof(
+                                    std::uint64_t));
+                    }
+                }
+                if (numericWords > 0 &&
+                    numericOffset <=
+                        postingTailNumericMasks
+                            .size() &&
+                    numericWords <=
+                        postingTailNumericMasks
+                            .size() -
+                            numericOffset) {
+                    auto* numeric =
+                        memoryIndex
+                            ->GetHeadNodeTailNumQuantMutable(
+                                hid);
+                    if (numeric != nullptr) {
+                        std::memcpy(
+                            numeric,
+                            postingTailNumericMasks
+                                .data() +
+                                numericOffset,
+                            numericWords *
+                                sizeof(
+                                    std::uint64_t));
+                    }
+                }
                 if (globalVID == SPTAG::MaxSize || globalVID >= (SizeType)p_numVectors) continue;
                 ++resolved;
                 SPTAG::Cache::HierarchicalOwnTags ownMask;
@@ -5780,31 +7743,39 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                 SaveHeadNodeRoutingIndexFile(workDir, pivotCandidate->pivotLevel,
                                              pivotCandidate->nodePivotTags,
                                              m_tenantTagToNodes[p_tenantId], headNodeToNode);
-            } else if (hybridDistanceEnabled) {
+            } else if (hybridDistanceEnabled ||
+                       limitedTagEnabled) {
                 std::vector<int> headNodeToNode(
                     static_cast<size_t>(
                         numHeadSamples),
                     0);
-                m_tenantPivotLevels[p_tenantId] =
-                    -1;
-                m_tenantPivotNodeCounts[p_tenantId] =
-                    1;
-                m_tenantNodePivotTags[p_tenantId] = {
-                    std::vector<std::uint32_t>()};
                 auto& tagToNodes =
                     m_tenantTagToNodes[p_tenantId];
-                tagToNodes.clear();
-                for (int vid = 0;
-                     vid < p_numVectors; ++vid) {
-                    for (int column = 0;
-                         column < staticACLTagCols;
-                         ++column) {
-                        tagToNodes[
-                            p_tagsPtr[
-                                static_cast<size_t>(
-                                    vid) *
-                                    p_numTagsPerVec +
-                                column]] = {0};
+                if (hybridDistanceEnabled) {
+                    m_tenantPivotLevels[
+                        p_tenantId] = -1;
+                    m_tenantPivotNodeCounts[
+                        p_tenantId] = 1;
+                    m_tenantNodePivotTags[
+                        p_tenantId] = {
+                            std::vector<
+                                std::uint32_t>()};
+                    tagToNodes.clear();
+                    for (int vid = 0;
+                         vid < p_numVectors;
+                         ++vid) {
+                        for (int column = 0;
+                             column <
+                                 staticACLTagCols;
+                             ++column) {
+                            tagToNodes[
+                                p_tagsPtr[
+                                    static_cast<
+                                        size_t>(
+                                        vid) *
+                                        p_numTagsPerVec +
+                                    column]] = {0};
+                        }
                     }
                 }
                 m_tenantHeadNodeToNode[
@@ -5824,7 +7795,97 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                     tagToNodes,
                     headNodeToNode);
             }
-            SaveHeadNodeMetaFile(workDir, memoryIndex);
+            memoryIndex
+                ->SetHeadNodeNumericDomainFingerprint(
+                    numericContentFingerprint);
+            if (!SaveHeadNodeMetaFile(
+                    workDir, memoryIndex,
+                    signatureGenerationFingerprint)) {
+                return false;
+            }
+            if (numNumericCols > 0) {
+                const std::string numericPath =
+                    workDir + "/numeric_meta.bin";
+                std::uint64_t savedContentFingerprint =
+                    0;
+                if (!SaveNumericMetaFile(
+                        numericPath,
+                        staticACLTagCols,
+                        p_numVectors,
+                        p_numTagsPerVec,
+                        signatureGenerationFingerprint,
+                        quantParams,
+                        &savedContentFingerprint) ||
+                    savedContentFingerprint !=
+                        numericContentFingerprint) {
+                    return false;
+                }
+                NumericMeta metadata;
+                metadata.numBaseCols =
+                    staticACLTagCols;
+                metadata.vectorCount =
+                    p_numVectors;
+                metadata.tagColumnCount =
+                    p_numTagsPerVec;
+                metadata.generationFingerprint =
+                    signatureGenerationFingerprint;
+                metadata.contentFingerprint =
+                    numericContentFingerprint;
+                metadata.generationBound = true;
+                metadata.params =
+                    std::move(quantParams);
+                m_tenantNumericMeta[p_tenantId] =
+                    std::move(metadata);
+            }
+            const std::string extremeSparsePath =
+                workDir + "/" +
+                extremeSparseTagFile;
+            if (extremeSparseTagEnabled) {
+                auto store = std::make_shared<
+                    SPTAG::Cache::ExtremeSparseTagStore>();
+                std::string error;
+                if (!store->Build(
+                        extremeSparsePath,
+                        p_tagsPtr,
+                        static_cast<std::uint64_t>(
+                            p_numVectors),
+                        static_cast<std::uint32_t>(
+                            p_numTagsPerVec),
+                        static_cast<std::uint32_t>(
+                            limitedTagColumn),
+                        p_vectors.Data(),
+                        p_vectors.Length(),
+                        static_cast<std::uint32_t>(
+                            m_inputVectorSize),
+                        m_valueType,
+                        static_cast<std::uint32_t>(
+                            m_dimension),
+                        extremeSparseTagMaxSelectivity,
+                        limitedTagGenerationFingerprint,
+                        &error)) {
+                    fprintf(
+                        stderr,
+                        "[ERROR] Tenant %d: cannot build %s: %s\n",
+                        p_tenantId,
+                        extremeSparsePath.c_str(),
+                        error.c_str());
+                    return false;
+                }
+                fprintf(
+                    stderr,
+                    "[INFO] Tenant %d: built extreme-sparse tag store "
+                    "(column=%d records=%llu max_selectivity=%.9g)\n",
+                    p_tenantId, limitedTagColumn,
+                    static_cast<unsigned long long>(
+                        store->StoredRecordCount()),
+                    static_cast<double>(
+                        extremeSparseTagMaxSelectivity));
+                m_tenantExtremeSparseTagStores[
+                    p_tenantId] = std::move(store);
+            } else {
+                m_tenantExtremeSparseTagStores.erase(
+                    p_tenantId);
+            }
             fprintf(stderr, "[INFO] Tenant %d: head_node_meta generated for %d heads "
                     "(%d resolved) [non-FILEIO].\n",
                     p_tenantId, (int)numHeadSamples, resolved);
@@ -5919,6 +7980,14 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
 
     // 4. For each posting, read its blocks and extract vector IDs
     std::vector<std::vector<uint32_t>> posting_tags(numHeads);
+    const bool hasSelfContainedGlobalTail =
+        hybridDistanceEnabled ||
+        limitedTagEnabled;
+    std::vector<std::vector<uint32_t>>
+        tail_posting_tags(
+            hasSelfContainedGlobalTail
+                ? static_cast<size_t>(numHeads)
+                : 0);
     std::vector<SPTAG::Cache::HierarchicalPostingMask> posting_hier_masks(numHeads);
     std::unordered_map<std::uint64_t, int>
         routingPostingCounts;
@@ -5939,40 +8008,30 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
     // is stored inline per vector (read by the exact filter) and a quantized
     // bucket is OR-ed into the per-posting numeric signature for range pruning.
     // numNumericCols=0 => pure categorical (layout/behavior unchanged).
-    int numNumericCols = 0;
-    if (const char* e = std::getenv("SPTAG_NUMERIC_COLS")) numNumericCols = atoi(e);
-    if (numNumericCols < 0) numNumericCols = 0;
-    if (numNumericCols > p_numTagsPerVec) numNumericCols = p_numTagsPerVec;
-    const int numBaseCols = p_numTagsPerVec - numNumericCols;
-    std::vector<SPTAG::Cache::NumQuantParam> quantParams(numNumericCols);
-    if (numNumericCols > 0) {
-        for (int c = 0; c < numNumericCols; ++c) { quantParams[c].lo = UINT32_MAX; quantParams[c].hi = 0; }
-        for (int vid = 0; vid < p_numVectors; ++vid)
-            for (int c = 0; c < numNumericCols; ++c) {
-                uint32_t v = p_tagsPtr[(size_t)vid * p_numTagsPerVec + numBaseCols + c];
-                if (v < quantParams[c].lo) quantParams[c].lo = v;
-                if (v > quantParams[c].hi) quantParams[c].hi = v;
-            }
-        // Persist quant metadata so query processes can reconstruct the mapping.
-        const std::string nmPath = workDir + "/numeric_meta.bin";
-        if (FILE* nf = fopen(nmPath.c_str(), "wb")) {
-            int32_t magic = 0x54454d4e;  // 'NMET'
-            int32_t base = numBaseCols, ncols = numNumericCols;
-            fwrite(&magic, sizeof(int32_t), 1, nf);
-            fwrite(&base, sizeof(int32_t), 1, nf);
-            fwrite(&ncols, sizeof(int32_t), 1, nf);
-            for (int c = 0; c < numNumericCols; ++c) {
-                fwrite(&quantParams[c].lo, sizeof(uint32_t), 1, nf);
-                fwrite(&quantParams[c].hi, sizeof(uint32_t), 1, nf);
-            }
-            fclose(nf);
-            fprintf(stderr, "[INFO] Tenant %d: wrote numeric_meta.bin (base=%d numeric=%d)\n",
-                    p_tenantId, numBaseCols, numNumericCols);
-        }
-        m_tenantNumericMeta[p_tenantId] = {numBaseCols, quantParams};
-    }
+    const int numNumericCols =
+        signatureNumericColumns;
+    const int numBaseCols = staticACLTagCols;
+    std::vector<SPTAG::Cache::NumQuantParam>
+        quantParams = signatureNumericParams;
+    const std::uint64_t numericContentFingerprint =
+        numNumericCols > 0
+        ? ComputeNumericMetaContentFingerprint(
+              numBaseCols, p_numVectors,
+              p_numTagsPerVec,
+              signatureGenerationFingerprint,
+              quantParams)
+        : 0;
     std::vector<uint64_t> posting_num_quant(
         (size_t)numHeads * (size_t)numNumericCols * SPTAG::Cache::NUM_QUANT_WORDS, 0);
+    std::vector<uint64_t>
+        tail_posting_num_quant(
+            hasSelfContainedGlobalTail
+                ? (size_t)numHeads *
+                      (size_t)numNumericCols *
+                      SPTAG::Cache::
+                          NUM_QUANT_WORDS
+                : 0,
+            0);
 
     // Tag-pure path: collect first-occurrence vector data per VID so we can
     // materialize per-tag dense lists for very-sparse tags after the loop.
@@ -6019,8 +8078,9 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
             int32_t vid;
             memcpy(&vid, raw.data() + offset, sizeof(int32_t));
             if (vid < 0 || vid >= p_numVectors) continue;
-            // Only the pure prefix drives the filter sidecars. Unfilter-tail
-            // vectors (j >= nPure) must not pollute the per-head tag masks.
+            // Pure and global-tail signatures are intentionally separate.
+            // The constrained suffix is a complete original posting and may
+            // overlap the pure prefix across this boundary.
             if (j < nPure) {
                 // Categorical tags (cols 0..numBaseCols-1) -> Bloom + hier mask.
                 for (int t = 0; t < numBaseCols; t++) {
@@ -6048,6 +8108,34 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                         c, b);
                 }
                 totalAssignments++;
+            } else if (hasSelfContainedGlobalTail) {
+                for (int t = 0; t < numBaseCols; ++t) {
+                    tail_posting_tags[pid].push_back(
+                        p_tagsPtr[
+                            vid * p_numTagsPerVec +
+                            t]);
+                }
+                for (int c = 0;
+                     c < numNumericCols; ++c) {
+                    const uint32_t value =
+                        p_tagsPtr[
+                            vid * p_numTagsPerVec +
+                            numBaseCols + c];
+                    const int bucket =
+                        SPTAG::Cache::
+                            NumQuantBucket(
+                                quantParams[c],
+                                value);
+                    SPTAG::Cache::
+                        NumQuantInsert(
+                            tail_posting_num_quant
+                                    .data() +
+                                (size_t)pid *
+                                    numNumericCols *
+                                    SPTAG::Cache::
+                                        NUM_QUANT_WORDS,
+                            c, bucket);
+                }
             }
 
             // First-occurrence capture of vector payload for tag-pure path.
@@ -6076,10 +8164,20 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
     fclose(postF);
 
     auto sigs = std::make_shared<SPTAG::Cache::TenantBitmaskPS>();
-    sigs->Build(numHeads, posting_tags);
+    if (hasSelfContainedGlobalTail) {
+        sigs->Build(
+            numHeads, posting_tags,
+            tail_posting_tags);
+    } else {
+        sigs->Build(numHeads, posting_tags);
+    }
 
     std::string sigPath = workDir + "/signatures_bitmask.bin";
-    sigs->Save(sigPath);
+    if (!sigs->Save(
+            sigPath,
+            signatureGenerationFingerprint)) {
+        return false;
+    }
 
     // Compute hierarchy-level tag offsets from categorical columns only. Numeric
     // attributes may have low values (including zero) and must not be treated as
@@ -6210,11 +8308,103 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
     constexpr double kPivotEstimatorDefaultLambdaRecall = 10.0;
     constexpr double kPivotEstimatorDefaultEstimatedRecall = 1.0;
 
+    const std::uint32_t* routingTags = p_tagsPtr;
+    int routingTagCount = p_numTagsPerVec;
+    std::vector<std::uint32_t> categoricalRoutingTags;
+    if (!limitedTagEnabled) {
+        std::vector<int> routingCols;
+        if (const char* configured =
+                std::getenv("SPTAG_ACL_COLS")) {
+            const char* cursor = configured;
+            while (*cursor != '\0') {
+                const int column = std::atoi(cursor);
+                if (column >= 0 && column < numBaseCols &&
+                    std::find(
+                        routingCols.begin(),
+                        routingCols.end(),
+                        column) == routingCols.end()) {
+                    routingCols.push_back(column);
+                }
+                const char* comma =
+                    std::strchr(cursor, ',');
+                if (comma == nullptr) break;
+                cursor = comma + 1;
+            }
+        }
+        if (routingCols.empty()) {
+            int leadingColumns = numBaseCols;
+            if (const char* configured =
+                    std::getenv("SPTAG_ROUTING_COLS")) {
+                const int requested =
+                    std::atoi(configured);
+                if (requested > 0) {
+                    leadingColumns =
+                        (std::min)(
+                            requested, numBaseCols);
+                }
+            }
+            for (int column = 0;
+                 column < leadingColumns;
+                 ++column) {
+                routingCols.push_back(column);
+            }
+        }
+
+        routingTagCount =
+            static_cast<int>(routingCols.size());
+        bool identityProjection =
+            routingTagCount == p_numTagsPerVec;
+        if (identityProjection) {
+            for (int column = 0;
+                 column < routingTagCount;
+                 ++column) {
+                if (routingCols[
+                        static_cast<size_t>(column)] !=
+                    column) {
+                    identityProjection = false;
+                    break;
+                }
+            }
+        }
+        if (routingTagCount > 0 &&
+            !identityProjection) {
+            categoricalRoutingTags.resize(
+                static_cast<size_t>(p_numVectors) *
+                static_cast<size_t>(routingTagCount));
+            for (int vector = 0;
+                 vector < p_numVectors; ++vector) {
+                for (int column = 0;
+                     column < routingTagCount;
+                     ++column) {
+                    categoricalRoutingTags[
+                        static_cast<size_t>(vector) *
+                            static_cast<size_t>(
+                                routingTagCount) +
+                        static_cast<size_t>(column)] =
+                        p_tagsPtr[
+                            static_cast<size_t>(vector) *
+                                static_cast<size_t>(
+                                    p_numTagsPerVec) +
+                            static_cast<size_t>(
+                                routingCols[
+                                    static_cast<size_t>(
+                                        column)])];
+                }
+            }
+            routingTags =
+                categoricalRoutingTags.data();
+        } else if (routingTagCount == 0) {
+            routingTags = nullptr;
+        }
+    }
+
     PivotEstimatorComputation pivotComputation;
     const PivotEstimatorCandidate* pivotCandidate = nullptr;
-    if (BuildPivotEstimatorComputation(p_tagsPtr,
+    if (!limitedTagEnabled &&
+        routingTagCount > 0 &&
+        BuildPivotEstimatorComputation(routingTags,
                                        p_numVectors,
-                                       p_numTagsPerVec,
+                                       routingTagCount,
                                        kPivotEstimatorDefaultMaxNodes,
                                        kPivotEstimatorDefaultRecallTarget,
                                        kPivotEstimatorDefaultLambdaRecall,
@@ -6231,12 +8421,6 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
         BuildTagToNodeIndexForCandidate(*pivotCandidate,
                                         pivotComputation.levelData,
                                         m_tenantTagToNodes[p_tenantId]);
-    } else {
-        m_tenantPivotLevels.erase(p_tenantId);
-        m_tenantPivotNodeCounts.erase(p_tenantId);
-        m_tenantNodePivotTags.erase(p_tenantId);
-        m_tenantTagToNodes.erase(p_tenantId);
-        m_tenantHeadNodeToNode.erase(p_tenantId);
     }
 
     // Build head tag table: VIDs NOT found in any posting are head vectors.
@@ -6276,7 +8460,9 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
 
     // Store per-head-node metadata on the inner head index (if loaded).
     // First ensure the tenant is loaded.
-    EnsureTenantLoaded(p_tenantId);
+    if (!EnsureTenantLoaded(p_tenantId)) {
+        return false;
+    }
     std::shared_ptr<AnnIndex> idxPtr;
     {
         std::shared_lock<std::shared_mutex> rlock(m_tenantIndicesMutex);
@@ -6284,6 +8470,7 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
         if (it != m_tenantIndices.end()) idxPtr = it->second;
     }
     int headTagCount = 0;
+    bool headMetadataSaved = false;
     if (idxPtr) {
         auto internalIdx = idxPtr->GetInternalIndex();
         auto memoryIndex = GetMemoryIndexForInternal(internalIdx);
@@ -6292,12 +8479,22 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
             const SizeType numHeadSamples = memoryIndex->GetNumSamples();
             memoryIndex->InitializeHeadNodeMeta(
                 numHeadSamples, numNumericCols,
-                hierWidths);
+                hierWidths,
+                hasSelfContainedGlobalTail);
             for (SizeType hid = 0; hid < numHeadSamples; ++hid) {
                 SizeType globalVID = spannInternalIdx->GetGlobalVID(hid);
                 memoryIndex->SetHeadNodeGlobalVID(hid, globalVID);
                 if (hid < sigs->num_postings) {
                     memoryIndex->SetHeadNodePS(hid, sigs->ps[hid]);
+                    if (sigs->has_tail_signatures &&
+                        static_cast<size_t>(hid) <
+                            sigs->tail_ps.size()) {
+                        memoryIndex->SetHeadNodeTailPS(
+                            hid,
+                            sigs->tail_ps[
+                                static_cast<size_t>(
+                                    hid)]);
+                    }
                 }
 
                 // Posting-content mask: union of all member-vector tags in the
@@ -6319,6 +8516,27 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                         std::memcpy(dst,
                             posting_num_quant.data() + (size_t)hid * numNumericCols * SPTAG::Cache::NUM_QUANT_WORDS,
                             (size_t)numNumericCols * SPTAG::Cache::NUM_QUANT_WORDS * sizeof(std::uint64_t));
+                    }
+                    std::uint64_t* tailDst =
+                        memoryIndex
+                            ->GetHeadNodeTailNumQuantMutable(
+                                hid);
+                    if (tailDst != nullptr &&
+                        !tail_posting_num_quant
+                             .empty()) {
+                        std::memcpy(
+                            tailDst,
+                            tail_posting_num_quant
+                                    .data() +
+                                (size_t)hid *
+                                    numNumericCols *
+                                    SPTAG::Cache::
+                                        NUM_QUANT_WORDS,
+                            (size_t)numNumericCols *
+                                SPTAG::Cache::
+                                    NUM_QUANT_WORDS *
+                                sizeof(
+                                    std::uint64_t));
                     }
                 }
 
@@ -6366,9 +8584,9 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
             if (pivotCandidate != nullptr) {
                 std::vector<int> headNodeToNode;
                 BuildHeadNodeToNodeIndexForCandidate(*pivotCandidate,
-                                                     p_tagsPtr,
+                                                     routingTags,
                                                      p_numVectors,
-                                                     p_numTagsPerVec,
+                                                     routingTagCount,
                                                      memoryIndex,
                                                      spannInternalIdx,
                                                      headNodeToNode);
@@ -6386,10 +8604,77 @@ bool TenantIndexManager::BuildSignatures(int p_tenantId, ByteArray p_tags, int p
                                              pivotCandidate->nodePivotTags,
                                              m_tenantTagToNodes[p_tenantId],
                                              headNodeToNode);
+            } else if (limitedTagEnabled) {
+                std::vector<int> headNodeToNode(
+                    static_cast<size_t>(
+                        numHeadSamples),
+                    0);
+                m_tenantHeadNodeToNode[
+                    p_tenantId] =
+                    headNodeToNode;
+                for (SizeType hid = 0;
+                     hid < numHeadSamples;
+                     ++hid) {
+                    memoryIndex
+                        ->SetHeadNodeBundleNodeId(
+                            hid, 0);
+                }
+                SaveHeadNodeRoutingIndexFile(
+                    workDir, -1,
+                    m_tenantNodePivotTags[
+                        p_tenantId],
+                    m_tenantTagToNodes[
+                        p_tenantId],
+                    headNodeToNode);
             }
             // Save meta file AFTER bundleNodeId is populated
-            SaveHeadNodeMetaFile(workDir, memoryIndex);
+            memoryIndex
+                ->SetHeadNodeNumericDomainFingerprint(
+                    numericContentFingerprint);
+            if (!SaveHeadNodeMetaFile(
+                    workDir, memoryIndex,
+                    signatureGenerationFingerprint)) {
+                return false;
+            }
+            headMetadataSaved = true;
         }
+    }
+
+    if (!headMetadataSaved) return false;
+
+    if (numNumericCols > 0) {
+        const std::string numericPath =
+            workDir + "/numeric_meta.bin";
+        std::uint64_t savedContentFingerprint = 0;
+        if (!SaveNumericMetaFile(
+                numericPath, numBaseCols,
+                p_numVectors, p_numTagsPerVec,
+                signatureGenerationFingerprint,
+                quantParams,
+                &savedContentFingerprint) ||
+            savedContentFingerprint !=
+                numericContentFingerprint) {
+            return false;
+        }
+        fprintf(
+            stderr,
+            "[INFO] Tenant %d: wrote numeric_meta.bin "
+            "(base=%d numeric=%d)\n",
+            p_tenantId, numBaseCols,
+            numNumericCols);
+        NumericMeta metadata;
+        metadata.numBaseCols = numBaseCols;
+        metadata.vectorCount = p_numVectors;
+        metadata.tagColumnCount =
+            p_numTagsPerVec;
+        metadata.generationFingerprint =
+            signatureGenerationFingerprint;
+        metadata.contentFingerprint =
+            numericContentFingerprint;
+        metadata.generationBound = true;
+        metadata.params = quantParams;
+        m_tenantNumericMeta[p_tenantId] =
+            std::move(metadata);
     }
 
     if (pivotCandidate != nullptr) {
@@ -6643,69 +8928,47 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
     static const bool s_wrapperTime = (std::getenv("SPTAG_LOG_WRAPPER_TIME") != nullptr);
     auto _wrTotal0 = s_wrapperTime ? std::chrono::high_resolution_clock::now()
                                    : std::chrono::high_resolution_clock::time_point{};
-    const uint32_t* queryTagsPtr = reinterpret_cast<const uint32_t*>(p_queryTags.Data());
+    const uint32_t* queryTagsPtr =
+        reinterpret_cast<const uint32_t*>(
+            p_queryTags.Data());
     // ── DNF predicate mode ──────────────────────────────────────────────
     // Sentinel: p_numTags < 0 means p_queryTags is a self-describing DNF blob
     // (uint32 words): [numClauses]{ [numLits] [col,val]xN }... encoding
     // OR-of-AND-clauses. Otherwise p_queryTags is the legacy flat OR/IN list of
-    // p_numTags tag values. DNF mode routes only through the dense path; its
-    // union of literal values drives the coarse masks/selectivity while the
-    // exact per-vector DNF eval runs in the posting scan.
+    // p_numTags tag values. EST may answer anchored extreme-sparse clauses;
+    // the remaining categorical values drive dense masks/selectivity while
+    // exact per-vector DNF evaluation runs in every selected posting.
     bool dnfMode = (p_numTags < 0);
     SPTAG::Cache::DNFPredicate dnf;
+    DNFBlobEncoding dnfEncoding =
+        DNFBlobEncoding::Legacy;
     std::vector<uint32_t> dnfValues;
-    if (dnfMode && queryTagsPtr != nullptr) {
-        const uint32_t* w = queryTagsPtr;
-        const size_t nWords = p_queryTags.Length() / sizeof(uint32_t);
-        size_t pos = 0;
-        // Versioned blob. Magic word selects the literal encoding:
-        //   0x444E4633 ("DNF3") -> each literal is [kind, col, op, val] (4 words).
-        //       kind 0 = categorical tag, kind 1 = numeric (post-filter only).
-        //   0x444E4632 ("DNF2") -> each literal is [col, op, val] (3 words).
-        //   (no magic)          -> legacy [col, val] (2 words), all equality, tag.
-        // Only categorical (kind==0) equality values feed dnfValues (the coarse
-        // mask/selectivity union); numeric literals are evaluated purely at the
-        // exact per-vector post-filter and never drive retrieval.
-        bool dnf3 = (nWords >= 1 && w[0] == 0x444E4633u);
-        bool extended = (nWords >= 1 && w[0] == 0x444E4632u);
-        if (dnf3 || extended) pos = 1;
-        if (nWords > pos) {
-            uint32_t numClauses = w[pos++];
-            for (uint32_t ci = 0; ci < numClauses && pos < nWords; ++ci) {
-                uint32_t numLits = w[pos++];
-                SPTAG::Cache::DNFClause clause;
-                for (uint32_t li = 0; li < numLits; ++li) {
-                    if (dnf3) {
-                        if (pos + 3 >= nWords) break;
-                        uint32_t kind = w[pos++];
-                        uint32_t col  = w[pos++];
-                        uint8_t  op   = (uint8_t)w[pos++];
-                        uint32_t val  = w[pos++];
-                        clause.lits.push_back({col, val, op, (uint8_t)kind});
-                        if (kind == 0 && op == SPTAG::Cache::DNF_EQ) dnfValues.push_back(val);
-                    } else if (extended) {
-                        if (pos + 2 >= nWords) break;
-                        uint32_t col = w[pos++];
-                        uint8_t  op  = (uint8_t)w[pos++];
-                        uint32_t val = w[pos++];
-                        clause.lits.push_back({col, val, op, (uint8_t)0});
-                        if (op == SPTAG::Cache::DNF_EQ) dnfValues.push_back(val);
-                    } else {
-                        if (pos + 1 >= nWords) break;
-                        uint32_t col = w[pos++];
-                        uint32_t val = w[pos++];
-                        clause.lits.push_back({col, val});
-                        dnfValues.push_back(val);
-                    }
-                }
-                if (!clause.lits.empty()) dnf.clauses.push_back(std::move(clause));
-            }
-        }
+    std::vector<uint32_t> denseFlatTags;
+    const uint32_t* effTagsPtr = nullptr;
+    int effNumTags = 0;
+    std::string dnfError;
+    if (p_numTags > 0 &&
+        (queryTagsPtr == nullptr ||
+         static_cast<std::uint64_t>(p_numTags) >
+             (std::numeric_limits<size_t>::max)() /
+                 sizeof(std::uint32_t) ||
+         p_queryTags.Length() !=
+             static_cast<size_t>(p_numTags) *
+                 sizeof(std::uint32_t)))
+    {
+        fprintf(stderr, "[ERROR] Invalid flat ACL tag buffer\n");
+        return nullptr;
     }
-    // Effective flat tag view used by the dense-path mask/selectivity builders.
-    // In DNF mode this is the union of all literal values.
-    const uint32_t* effTagsPtr = dnfMode ? (dnfValues.empty() ? nullptr : dnfValues.data()) : queryTagsPtr;
-    const int effNumTags = dnfMode ? (int)dnfValues.size() : p_numTags;
+    if (dnfMode &&
+        !ParseDNFBlob(
+            p_queryTags, dnf, dnfEncoding, dnfError))
+    {
+        fprintf(
+            stderr,
+            "[ERROR] Invalid DNF predicate: %s\n",
+            dnfError.c_str());
+        return nullptr;
+    }
     auto _ck_a = s_wrapperTime ? std::chrono::high_resolution_clock::now()
                                : std::chrono::high_resolution_clock::time_point{};
     if (!EnsureTenantLoaded(p_tenantId)) return nullptr;
@@ -6740,6 +9003,9 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
     bool adaptiveFilteredNprobeEnabled = false;
     bool hybridDistanceEnabled = false;
     bool secondLevelRoutingEnabled = false;
+    const SPTAG::SPANN::Options*
+        spannSearchOptions = nullptr;
+    int categoricalColumns = 0;
     float filteredSearchNprobeSafety = 1.0f;
     if (internalIdx != nullptr) {
         const std::string forceDenseParam = internalIdx->GetParameter("ForceDenseTagSearch", "BuildSSDIndex");
@@ -6758,6 +9024,14 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
 
         auto* spannIndex = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(internalIdx.get());
         const auto* searchOptions = spannIndex != nullptr ? spannIndex->GetOptions() : nullptr;
+        spannSearchOptions = searchOptions;
+        if (searchOptions != nullptr)
+        {
+            categoricalColumns =
+                searchOptions->m_staticACLTagCols > 0
+                ? searchOptions->m_staticACLTagCols
+                : searchOptions->m_numTagsPerVec;
+        }
         adaptiveFilteredNprobeEnabled =
             searchOptions != nullptr && searchOptions->m_enableAdaptiveFilteredNprobe;
         secondLevelRoutingEnabled =
@@ -6781,6 +9055,23 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
             // Selectivity decides H2 versus H1 inside SPANN. Wrapper-local
             // tag-pure/sparse returns would bypass that policy entirely.
             forceDenseTagSearch = true;
+        }
+    }
+
+    if (dnfMode)
+    {
+        if (spannSearchOptions == nullptr ||
+            !ValidateDNFColumns(
+                dnf, dnfEncoding,
+                spannSearchOptions->m_numTagsPerVec,
+                categoricalColumns,
+                dnfError))
+        {
+            fprintf(
+                stderr,
+                "[ERROR] Tenant %d: invalid DNF predicate: %s\n",
+                p_tenantId, dnfError.c_str());
+            return nullptr;
         }
     }
 
@@ -6869,6 +9160,381 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
             "INI before serving filtered queries\n",
             p_tenantId);
         return nullptr;
+    }
+
+    std::shared_ptr<QueryResult>
+        extremeSparseResult;
+    if (spannSearchOptions != nullptr &&
+        spannSearchOptions->m_enableExtremeSparseTag)
+    {
+        const auto storeEntry =
+            m_tenantExtremeSparseTagStores.find(
+                p_tenantId);
+        if (storeEntry ==
+                m_tenantExtremeSparseTagStores.end() ||
+            storeEntry->second == nullptr)
+        {
+            fprintf(
+                stderr,
+                "[ERROR] Tenant %d: extreme-sparse tag routing is enabled "
+                "but its validated sidecar is not loaded\n",
+                p_tenantId);
+            return nullptr;
+        }
+        const auto& store = *storeEntry->second;
+        std::string storeError;
+        SPTAG::Cache::DNFPredicate denseFallbackDNF;
+        const auto tenantVectorCountEntry =
+            m_tenantVectorCounts.find(p_tenantId);
+        const auto tenantHeadCountEntry =
+            m_tenantHeadCounts.find(p_tenantId);
+        if (tenantVectorCountEntry ==
+                m_tenantVectorCounts.end() ||
+            tenantVectorCountEntry->second <= 0 ||
+            tenantHeadCountEntry ==
+                m_tenantHeadCounts.end() ||
+            tenantHeadCountEntry->second <= 0)
+        {
+            return nullptr;
+        }
+        const int tenantVectorCount =
+            tenantVectorCountEntry->second;
+        const int tenantHeadCount =
+            tenantHeadCountEntry->second;
+        if (!store.ValidateExpected(
+                m_valueType,
+                static_cast<std::uint32_t>(
+                    m_dimension),
+                static_cast<std::uint32_t>(
+                    spannSearchOptions
+                        ->m_numTagsPerVec),
+                static_cast<std::uint32_t>(
+                    spannSearchOptions
+                        ->m_limitedTagColumn),
+                static_cast<std::uint64_t>(
+                    tenantVectorCount),
+                store.GenerationFingerprint(),
+                store.MaxSelectivity(),
+                &storeError))
+        {
+            fprintf(
+                stderr,
+                "[ERROR] Tenant %d: %s\n",
+                p_tenantId, storeError.c_str());
+            return nullptr;
+        }
+
+        std::vector<std::uint32_t> sparseTags;
+        bool allClausesCovered = true;
+        if (dnfMode && !dnf.Empty())
+        {
+            for (const auto& clause : dnf.clauses)
+            {
+                bool found = false;
+                bool conflicting = false;
+                std::uint32_t value = 0;
+                for (const auto& literal :
+                     clause.lits)
+                {
+                    if (literal.kind != 0 ||
+                        literal.op !=
+                            SPTAG::Cache::DNF_EQ ||
+                        literal.col !=
+                            static_cast<std::uint32_t>(
+                                spannSearchOptions
+                                    ->m_limitedTagColumn))
+                    {
+                        continue;
+                    }
+                    if (!found)
+                    {
+                        found = true;
+                        value = literal.val;
+                    }
+                    else if (value != literal.val)
+                    {
+                        conflicting = true;
+                    }
+                }
+                if (conflicting)
+                {
+                    continue;
+                }
+                if (!found || store.Find(value) == nullptr)
+                {
+                    allClausesCovered = false;
+                    denseFallbackDNF.clauses.push_back(
+                        clause);
+                    continue;
+                }
+                sparseTags.push_back(value);
+            }
+        }
+        else if (p_numTags > 0 &&
+                 queryTagsPtr != nullptr &&
+                 categoricalColumns == 1 &&
+                 spannSearchOptions
+                         ->m_limitedTagColumn == 0)
+        {
+            for (int query = 0;
+                 query < p_numTags; ++query)
+            {
+                if (store.Find(queryTagsPtr[query]) ==
+                    nullptr)
+                {
+                    allClausesCovered = false;
+                    denseFlatTags.push_back(
+                        queryTagsPtr[query]);
+                    continue;
+                }
+                sparseTags.push_back(
+                    queryTagsPtr[query]);
+            }
+        }
+        else
+        {
+            allClausesCovered = false;
+        }
+        std::sort(
+            sparseTags.begin(), sparseTags.end());
+        sparseTags.erase(
+            std::unique(
+                sparseTags.begin(), sparseTags.end()),
+            sparseTags.end());
+
+        std::uint64_t sparseCandidateCount = 0;
+        for (std::uint32_t tag : sparseTags)
+        {
+            const auto* directory =
+                store.Find(tag);
+            if (directory != nullptr)
+            {
+                sparseCandidateCount +=
+                    directory->m_count;
+            }
+        }
+        if (sparseCandidateCount > 0)
+        {
+            const double vectorCount =
+                static_cast<double>(
+                    (std::max)(
+                        1,
+                        tenantVectorCount));
+            const double headCount =
+                static_cast<double>(
+                    (std::max)(
+                        1,
+                        tenantHeadCount));
+            const double averagePostingRecords =
+                vectorCount *
+                static_cast<double>(
+                    (std::max)(
+                        1,
+                        spannSearchOptions
+                            ->m_replicaCount)) /
+                headCount;
+            const int nprobe =
+                (std::max)(
+                    p_resultNum,
+                    spannSearchOptions
+                        ->m_searchInternalResultNum);
+            const double sparseSelectivity =
+                static_cast<double>(
+                    sparseCandidateCount) /
+                vectorCount;
+            const double expectedDenseMatches =
+                static_cast<double>(nprobe) *
+                averagePostingRecords *
+                sparseSelectivity;
+            const double desiredMatches =
+                static_cast<double>(
+                    (std::min<std::uint64_t>)(
+                        sparseCandidateCount,
+                        static_cast<std::uint64_t>(
+                            p_resultNum))) *
+                std::clamp(
+                    static_cast<double>(
+                        spannSearchOptions
+                            ->m_filteredSearchTargetRecall),
+                    0.0, 1.0);
+            const bool coverageRisk =
+                expectedDenseMatches <
+                desiredMatches;
+            const std::uint64_t sparseBytes =
+                sparseCandidateCount *
+                store.RecordBytes();
+            const std::uint64_t sparsePages =
+                (sparseBytes + SPTAG::PageSize - 1) /
+                    SPTAG::PageSize +
+                sparseTags.size();
+            const std::uint64_t postingRecordBytes =
+                sizeof(std::int32_t) +
+                static_cast<std::uint64_t>(
+                    spannSearchOptions
+                        ->m_numTagsPerVec) *
+                    sizeof(std::uint32_t) +
+                m_inputVectorSize;
+            const std::uint64_t averagePostingPages =
+                (std::max<std::uint64_t>)(
+                    1,
+                    static_cast<std::uint64_t>(
+                        std::ceil(
+                            averagePostingRecords *
+                            postingRecordBytes /
+                            static_cast<double>(
+                                SPTAG::PageSize))));
+            const std::uint64_t densePages =
+                static_cast<std::uint64_t>(
+                    nprobe) *
+                (std::min<std::uint64_t>)(
+                    averagePostingPages,
+                    static_cast<std::uint64_t>(
+                        (std::max)(
+                            1,
+                            spannSearchOptions
+                                ->m_searchPostingPageLimit)));
+            const double sparseCost =
+                static_cast<double>(sparsePages) *
+                    SPTAG::PageSize +
+                static_cast<double>(
+                    sparseCandidateCount) *
+                    m_inputVectorSize;
+            const double denseCost =
+                static_cast<double>(densePages) *
+                    SPTAG::PageSize +
+                static_cast<double>(nprobe) *
+                    averagePostingRecords *
+                    m_inputVectorSize;
+            const bool useSparse =
+                coverageRisk ||
+                sparseCost <= denseCost;
+            if (spannSearchOptions
+                    ->m_logExtremeSparseTagRoute)
+            {
+                fprintf(
+                    stdout,
+                    "ExtremeSparseRoute: tags=%zu candidates=%llu "
+                    "sparsePages=%llu densePages=%llu "
+                    "expectedMatches=%.6g desired=%.6g "
+                    "allClauses=%d route=%s\n",
+                    sparseTags.size(),
+                    static_cast<unsigned long long>(
+                        sparseCandidateCount),
+                    static_cast<unsigned long long>(
+                        sparsePages),
+                    static_cast<unsigned long long>(
+                        densePages),
+                    expectedDenseMatches,
+                    desiredMatches,
+                    allClausesCovered ? 1 : 0,
+                    useSparse
+                        ? (allClausesCovered
+                               ? "sparse-only"
+                               : "sparse+dense")
+                        : "dense");
+            }
+            if (useSparse)
+            {
+                if (!SearchExtremeSparseTagStore(
+                        store, internalIdx,
+                        p_queryVector, p_resultNum,
+                        sparseTags,
+                        dnfMode ? nullptr
+                                : queryTagsPtr,
+                        dnfMode ? 0 : p_numTags,
+                        categoricalColumns,
+                        dnfMode ? &dnf : nullptr,
+                        extremeSparseResult,
+                        storeError))
+                {
+                    fprintf(
+                        stderr,
+                        "[ERROR] Tenant %d: extreme-sparse tag search failed: %s\n",
+                        p_tenantId,
+                        storeError.c_str());
+                    return nullptr;
+                }
+                if (allClausesCovered)
+                {
+                    return extremeSparseResult;
+                }
+                // EST has evaluated every clause/tag it owns exactly. Retain
+                // only the uncovered predicate for dense routing so an
+                // extreme tag excluded from H2 signatures cannot force the
+                // remaining medium tag back to H1.
+                if (dnfMode)
+                {
+                    dnf = std::move(denseFallbackDNF);
+                }
+                else
+                {
+                    std::sort(
+                        denseFlatTags.begin(),
+                        denseFlatTags.end());
+                    denseFlatTags.erase(
+                        std::unique(
+                            denseFlatTags.begin(),
+                            denseFlatTags.end()),
+                        denseFlatTags.end());
+                    queryTagsPtr = denseFlatTags.data();
+                    p_numTags = static_cast<int>(
+                        denseFlatTags.size());
+                }
+                forceDenseTagSearch = true;
+            }
+        }
+    }
+
+    // Effective categorical view used by dense signatures, selectivity, and
+    // routing. Numeric literals remain in the exact DNF predicate only.
+    if (dnfMode)
+    {
+        dnfValues = dnf.AllValues();
+        effTagsPtr =
+            dnfValues.empty() ? nullptr : dnfValues.data();
+        effNumTags =
+            static_cast<int>(dnfValues.size());
+    }
+    else
+    {
+        effTagsPtr = queryTagsPtr;
+        effNumTags = p_numTags;
+    }
+
+    std::vector<std::uint32_t>
+        limitedTagQueryValues;
+    bool limitedTagRouteEligible = false;
+    if (spannSearchOptions != nullptr &&
+        spannSearchOptions->m_enableLimitedTagPosting)
+    {
+        const int keyColumn =
+            spannSearchOptions->m_limitedTagColumn;
+        if (dnfMode && !dnf.Empty())
+        {
+            limitedTagRouteEligible =
+                dnf.TryGetEqualityAnchors(
+                    static_cast<std::uint32_t>(
+                        keyColumn),
+                    limitedTagQueryValues);
+        }
+        else if (p_numTags > 0 &&
+                 queryTagsPtr != nullptr &&
+                 categoricalColumns == 1 &&
+                 keyColumn == 0)
+        {
+            limitedTagRouteEligible = true;
+            limitedTagQueryValues.assign(
+                queryTagsPtr,
+                queryTagsPtr + p_numTags);
+            std::sort(
+                limitedTagQueryValues.begin(),
+                limitedTagQueryValues.end());
+            limitedTagQueryValues.erase(
+                std::unique(
+                    limitedTagQueryValues.begin(),
+                    limitedTagQueryValues.end()),
+                limitedTagQueryValues.end());
+        }
     }
 
     auto _ck_routingStart = s_wrapperTime ? std::chrono::high_resolution_clock::now()
@@ -6973,7 +9639,9 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
                     auto result = std::make_shared<SPTAG::COMMON::QueryResultSet<float>>(
                         reinterpret_cast<const float*>(p_queryVector.Data()), p_resultNum);
                     if (disk->OPQTagPureSearch(*result, queryTagsPtr[0])) {
-                        return result;
+                        return MergeQueryResults(
+                            p_queryVector, p_resultNum,
+                            extremeSparseResult, result);
                     }
                 }
             }
@@ -7134,6 +9802,10 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
     if (dnfMode && !dnf.Empty()) {
         searchContext.m_dnf = dnf;
     }
+    searchContext.m_limitedTagRouteEligible =
+        limitedTagRouteEligible;
+    searchContext.m_limitedTagQueryValues =
+        limitedTagQueryValues;
     // Plumb the data-driven tag-level offsets so the SPANN search path maps tag
     // values to hierarchical levels identically to build (column index = level),
     // instead of the stale legacy thresholds in TagLevelFromId.
@@ -7156,11 +9828,16 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
             // at every level. MayIntersect is a no-false-negative test, so it is
             // safe as a pre-filter (false positives only let extra postings through).
             const bool dnfHasNum = !dnf.Empty() && dnf.HasNumericLiteral();
-            const TenantIndexManager::NumericMeta* numMeta = nullptr;
+            TenantIndexManager::NumericMeta numMeta;
+            bool loadedNumericMeta = false;
             {
                 auto nmIt = m_tenantNumericMeta.find(p_tenantId);
-                if (nmIt != m_tenantNumericMeta.end()) numMeta = &nmIt->second;
+                if (nmIt != m_tenantNumericMeta.end()) {
+                    numMeta = nmIt->second;
+                    loadedNumericMeta = true;
+                }
             }
+            bool hasNumericMeta = false;
             if (memoryIndex != nullptr && memoryIndex->HasHeadNodeMeta() && (effNumTags > 0 || dnfHasNum)) {
                 // Physical posting signatures are an optional I/O hint, not a
                 // default candidate gate: exact inline filtering after
@@ -7169,16 +9846,109 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
                     dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(internalIdx.get());
                 auto* searchOptions =
                     spannInternalIdx != nullptr ? spannInternalIdx->GetOptions() : nullptr;
+                const int quantCols =
+                    memoryIndex
+                        ->GetHeadNodeNumQuantCols();
+                std::uint64_t expectedGeneration = 0;
+                if (searchOptions != nullptr) {
+                    const std::string& generationText =
+                        searchOptions
+                                ->m_enableLimitedTagPosting
+                            ? searchOptions
+                                  ->m_limitedTagGenerationFingerprint
+                            : searchOptions
+                                  ->m_hybridGenerationFingerprint;
+                    SPTAG::Helper::Convert::
+                        ConvertStringTo<std::uint64_t>(
+                            generationText.c_str(),
+                            expectedGeneration);
+                }
+                int expectedVectorCount = 0;
+                const auto vectorCountIt =
+                    m_tenantVectorCounts.find(
+                        p_tenantId);
+                if (vectorCountIt !=
+                    m_tenantVectorCounts.end()) {
+                    expectedVectorCount =
+                        vectorCountIt->second;
+                }
+                const int expectedTagColumns =
+                    searchOptions != nullptr
+                        ? searchOptions
+                              ->m_numTagsPerVec
+                        : 0;
+                bool numericMetaCompatible =
+                    loadedNumericMeta &&
+                    numMeta.generationBound &&
+                    numMeta.numBaseCols ==
+                        categoricalColumns &&
+                    numMeta.vectorCount ==
+                        expectedVectorCount &&
+                    numMeta.tagColumnCount ==
+                        expectedTagColumns &&
+                    numMeta.params.size() ==
+                        static_cast<size_t>(
+                            quantCols) &&
+                    numMeta.contentFingerprint != 0 &&
+                    memoryIndex
+                            ->GetHeadNodeNumericDomainFingerprint() ==
+                        numMeta.contentFingerprint;
+                if (numericMetaCompatible &&
+                    memoryIndex->HasHeadNodeTailPS()) {
+                    numericMetaCompatible =
+                        expectedGeneration != 0 &&
+                        numMeta
+                                .generationFingerprint ==
+                            expectedGeneration;
+                }
+                bool warnNumericMetadata = false;
+                if (dnfHasNum && quantCols > 0 &&
+                    !numericMetaCompatible) {
+                    std::unique_lock<
+                        std::shared_mutex> lock(
+                        m_tenantIndicesMutex);
+                    warnNumericMetadata =
+                        m_warnedInvalidNumericMetaTenants
+                            .insert(p_tenantId)
+                            .second;
+                }
+                if (warnNumericMetadata) {
+                    fprintf(
+                        stderr,
+                        "[WARN] Tenant %d: numeric metadata does not match "
+                        "the loaded head metadata/schema/generation; "
+                        "numeric posting pruning is disabled\n",
+                        p_tenantId);
+                }
+                hasNumericMeta =
+                    numericMetaCompatible;
+                auto quantParams =
+                    numericMetaCompatible
+                        ? std::make_shared<std::vector<
+                              SPTAG::Cache::
+                                  NumQuantParam>>(
+                              numMeta.params)
+                        : nullptr;
+                const SPTAG::Cache::NumQuantParam* qp =
+                    quantParams != nullptr
+                        ? quantParams->data()
+                        : nullptr;
+                const int numQuantParams =
+                    quantParams != nullptr
+                        ? static_cast<int>(
+                              quantParams->size())
+                        : 0;
+                const int numBase =
+                    numericMetaCompatible
+                        ? numMeta.numBaseCols
+                        : categoricalColumns;
                 if (searchOptions != nullptr &&
                     searchOptions->m_enableHierPostingFilter &&
                     !searchOptions->m_enableLimitedTagPosting) {
-                const int quantCols = memoryIndex->GetHeadNodeNumQuantCols();
-                const SPTAG::Cache::NumQuantParam* qp =
-                    (numMeta != nullptr && !numMeta->params.empty()) ? numMeta->params.data() : nullptr;
-                const int numBase = (numMeta != nullptr) ? numMeta->numBaseCols : 0;
                 searchContext.m_postingFilter =
                     [memIdx = memoryIndex.get(), queryHierMask, queryHierWidths,
-                     dnf, dnfHasNum, quantCols, qp, numBase](int localHid) {
+                     dnf, dnfHasNum, quantCols, quantParams, qp,
+                     numQuantParams, numBase](int localHid) {
                         // Use the per-posting multi-membership mask (union of all
                         // member-vector tags). MayIntersect / MayMatchHier are
                         // no-false-negative so they are safe as a pre-filter; the
@@ -7194,7 +9964,9 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
                                 if (quant != nullptr)
                                     return dnf.MayMatchHierQuant(
                                         *hierMask, quant,
-                                        quantCols, qp, numBase,
+                                        quantCols, qp,
+                                        numQuantParams,
+                                        numBase,
                                         queryHierWidths);
                             }
                             return dnf.MayMatchHier(
@@ -7205,6 +9977,43 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
                             queryHierMask,
                             queryHierWidths);
                     };
+                }
+                if (searchOptions != nullptr &&
+                    searchOptions
+                        ->m_enableHierPostingFilter &&
+                    (effNumTags > 0 ||
+                     dnfHasNum) &&
+                    memoryIndex
+                        ->HasHeadNodeTailPS()) {
+                    searchContext
+                        .m_tailPostingFilter =
+                        [memIdx = memoryIndex.get(),
+                         queryMask, dnf,
+                         quantCols, quantParams, qp,
+                         numQuantParams,
+                         numBase](int localHid) {
+                            const auto* tailMask =
+                                memIdx
+                                    ->GetHeadNodeTailPS(
+                                        localHid);
+                            if (tailMask == nullptr) {
+                                return true;
+                            }
+                            if (!dnf.Empty()) {
+                                return dnf
+                                    .MayMatchCoarseQuant(
+                                        *tailMask,
+                                        memIdx
+                                            ->GetHeadNodeTailNumQuant(
+                                                localHid),
+                                        quantCols, qp,
+                                        numQuantParams,
+                                        numBase);
+                            }
+                            return tailMask
+                                ->MayIntersect(
+                                    queryMask);
+                        };
                 }
             }
             // Bundle-node routing (multi-bundle graph search) is separate from the
@@ -7227,15 +10036,15 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
                     ? static_cast<int>(
                           levelOffsets->size())
                     : -1,
-                numMeta != nullptr
-                    ? numMeta->numBaseCols
+                hasNumericMeta
+                    ? numMeta.numBaseCols
                     : 0,
-                numMeta != nullptr &&
-                        !numMeta->params.empty()
-                    ? numMeta->params.data()
+                hasNumericMeta &&
+                        !numMeta.params.empty()
+                    ? numMeta.params.data()
                     : nullptr,
-                numMeta != nullptr
-                    ? numMeta->params.size()
+                hasNumericMeta
+                    ? numMeta.params.size()
                     : 0);
             searchContext.m_routeSelectivity = vectorSel;
             searchContext.m_filterSelectivity = std::clamp(
@@ -7308,7 +10117,9 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
         fflush(stdout);
     }
 
-    return result;
+    return MergeQueryResults(
+        p_queryVector, p_resultNum,
+        extremeSparseResult, result);
 }
 
 bool TenantIndexManager::EnsureTenantCached(int p_tenantId)

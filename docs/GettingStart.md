@@ -175,165 +175,75 @@ SearchPostingPageLimit=3
 
 ```
 
-#### **SIFT1B with attributes (raw STATIC STM1)**
+#### **SIFT1B with categorical and numeric attributes**
 
-For SIFT1B with four categorical attributes (`org`, `dept`, `team`, and
-`project`) plus one numeric attribute (`price`), use the native sectioned INI
-below. The tracked copy is
-`Tools/benchmarks/build_spann_attr_sift1b_raw_static_tail_capped_distance_order.ini`.
-The INI is the single source of truth for build and search parameters; do not
-override them with `SPTAG_*` environment variables.
+The current SIFT1B limited-tag input has exactly two row-major `uint32`
+columns: `[categorical tag, numeric]`. It replaces the historical four-level
+ACL hierarchy and does not use a `tags5` merge or a PerTagBKT routing-key file.
+Generate it in bounded-memory chunks with:
 
-The tag file is headerless row-major `uint32`, with five values per vector in
-the order `[org, dept, team, project, price]`. The group-tag file contains the
-`org` value for each vector, one integer per line.
-
-```ini
-[Base]
-VectorPath=sift1b/sift1b_base.u8bin
-VectorOffset=8
-VectorCount=1000000000
-Dim=128
-VectorType=UInt8
-DistCalcMethod=L2
-IndexAlgoType=BKT
-IndexDirectory=sift1b/sift1b_spann_raw_static_tail_capped_distance_order
-
-[Tags]
-TagFile=sift1b/sift1b_build/sift1b_tags5.u32
-TagOffset=0
-NumTagsPerVec=5
-Tenant=0
-
-[Build]
-BuildSignatures=true
-WithMetaIndex=false
-ShareBuildOwnership=true
-
-[SelectHead]
-isExecute=true
-SelectHeadType=PerTagBKT
-TreeNumber=1
-BKTKmeansK=32
-BKTLeafSize=8
-SamplesNumber=1000
-SaveBKT=false
-Ratio=0.12
-BKTLambdaFactor=1.0
-ParallelBKTBuild=true
-NumberOfThreads=45
-SelectThreshold=10
-SplitFactor=6
-SplitThreshold=25
-
-[BuildHead]
-isExecute=true
-NumberOfThreads=45
-TPTNumber=32
-TPTLeafSize=2000
-NeighborhoodSize=32
-MaxCheckForRefineGraph=16324
-MaxCheck=16324
-RefineIterations=3
-BKTLambdaFactor=-1.0
-
-[BuildSSDIndex]
-isExecute=true
-BuildSsdIndex=true
-Storage=STATIC
-NumberOfThreads=45
-InternalResultNum=64
-PostingPageLimit=6
-PostingVectorLimit=118
-ReplicaCount=8
-MaxCheck=16324
-TailReplicaCount=8
-UnfilterTailBufferLength=6
-CrossEdges=1
-CrossExtraEdges=10
-OutputEmptyReplicaID=false
-EnableDeltaEncoding=false
-EnablePostingListRearrange=false
-EnableOrderedPageStart=false
-EnableDataCompression=false
-SSDIndexFileNum=1
-UseDirectIO=false
-Batches=1
-AsyncMergeInSearch=false
-PostingQuantizer=None
-Rerank=0
-RerankL=0
-EnableHierPostingFilter=false
-StaticACLTagCols=4
-TmpDir=sift1b/sift1b_spann_raw_static_tail_capped_distance_order_tmp
-
-[SearchSSDIndex]
-isExecute=true
-BuildSsdIndex=false
-InternalResultNum=96
-NumberOfThreads=1
-HashTableExponent=4
-ResultNum=10
-MaxCheck=1024
-MaxDistRatio=8.0
-SearchPostingPageLimit=3
-UnifiedNprobeBudget=true
-MultiNodeBudgetKeepRatio=0.60
-DisableCrossEdges=false
-FilterKeepCross=false
-DisableCrossSubgraph=false
-LogUExtra=false
-LogCrossStats=false
-LogPathStats=false
-DumpHeads=0
-FilterKeepUExtra=false
-EnableUnfilterTail=true
-AblateUExtra=false
-AblateTail=false
-UnfilterPurePages=false
-UnfilterExtraTailPages=0
-UnfilterPureDistanceScanPercent=100
-EnableHierPostingFilter=true
-
-[MultiTenant]
-ACLCols=0,1,2,3
-HierLevelWidths=4,16,64,256
-NumericCols=1
-PerVectorTagsFile=sift1b/sift1b_build/sift1b_group_tags.txt
-PivotForceNodeCount=4
-InPlaceBuild=1
-PersistSelectHead=1
-ResumeBuild=1
-DualPoolAugment=0
-DualPoolExtraRatio=0
+```bash
+Tools/benchmarks/prep_sift1b_inputs.sh
 ```
 
+The categorical column contains 200 Zipf-distributed regular values and one
+extreme value. Its count is `floor(vector_count * 0.00001)`, which is exactly
+10,000 for SIFT1B. The generator writes both the headerless SPTAG input
+`sift1b_zipf200_sparse10000_numeric_attrs.u32` and a shape-preserving NumPy
+copy, plus exact counts and a hash-bound manifest.
+The prep script and tracked INI use
+`/mnt/nvme/baotonglu/mocheng/datasets/sift1b` by default; when the dataset is
+elsewhere, set `SIFT1B_ROOT` for generation and update the native INI paths to
+the same root. The native builder consumes the files as a tenant-0 bulk view,
+so it does not synthesize per-vector metadata/routing objects or copy the
+mapped two-column attribute table before STATIC construction. Limited-tag
+STATIC placement also retains only emitted RNG edges for both `H` and `O`
+instead of allocating fixed `N * ReplicaCount` arrays.
+
+Use the native configuration
+`Tools/benchmarks/build_spann_attr_sift1b_zipf200_limited_tag.ini`:
+
+```ini
+[Tags]
+TagFile=sift1b/sift1b_build/sift1b_zipf200_sparse10000_numeric_attrs.u32
+NumTagsPerVec=2
+
+[BuildSSDIndex]
+Storage=STATIC
+StaticACLTagCols=1
+EnableLimitedTagPosting=true
+LimitedTagColumn=0
+EnableExtremeSparseTag=true
+ExtremeSparseTagMaxSelectivity=0.00001
+
+[MultiTenant]
+ACLCols=0
+HierLevelWidths=201,64,64,64,64
+NumericCols=1
+PivotForceNodeCount=1
+```
+
+The complete INI keeps the documented SIFT1B BKT construction and search
+budgets while using one global BKT graph, constrained `H | O` postings, H2,
+numeric posting signatures, and EST3 for the measured `1e-5` extreme tag.
 Build it with:
 
 ```bash
 Tools/benchmarks/run_spann_attr_build.sh \
-  Tools/benchmarks/build_spann_attr_sift1b_raw_static_tail_capped_distance_order.ini
+  Tools/benchmarks/build_spann_attr_sift1b_zipf200_limited_tag.ini
 ```
 
-Each STATIC posting record stores the original 128-byte UInt8 vector, a
-4-byte vector ID, and five inline `uint32` tags (152 bytes total). With
-`Ratio=0.12` and `ReplicaCount=8`, the full index requires multi-terabyte
-storage; this profile intentionally uses no posting quantizer or rerank file.
-`PostingPageLimit=6` caps each pure prefix at 161 records. The matching
-`UnfilterTailBufferLength=6` permits at most six additional physical tail
-pages beyond the pages occupied by that pure prefix; tail records may also
-fill slack in the final pure page. A posting therefore occupies at most
-`purePages + 6`, or 12 physical pages when the pure prefix reaches its
-six-page limit.
-With `EnableOrderedPageStart=false`, pure records preserve build selection
-order `(head distance, VID)` and tail records retain their separate
-`(head distance, VID)` order. The pure/tail boundary remains contiguous so
-filtered queries can exclude tail replicas without per-record role metadata.
+The raw STATIC profile stores the original 128-byte UInt8 vector, a 4-byte
+vector ID, and two inline `uint32` attributes per posting record. Pure and
+tail records retain separate `(head distance, VID)` order. The persisted pure
+boundary lets filtered queries scan only `H`, while unfiltered and exact
+fallback routes read the self-contained `O` suffix directly.
 
 `SearchPostingPageLimit` is retained for compatibility and explicit capped
 benchmarks. Normal STATIC filtered queries read the complete pure prefix
-reported by posting metadata, and unfiltered queries read the complete posting,
-including the unfilter tail. `UseDirectIO=false` selects buffered I/O. To match
+reported by posting metadata. In constrained `H | O` snapshots, unfiltered and
+fallback queries start at the persisted pure boundary and read the complete
+self-contained `O` suffix. `UseDirectIO=false` selects buffered I/O. To match
 the SIFT1B paper protocol, warm the complete query set and then measure the same
 query set so its posting working set can reside in the Linux page cache.
 

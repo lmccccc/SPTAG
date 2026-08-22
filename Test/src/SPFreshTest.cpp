@@ -10,9 +10,11 @@
 #include "inc/Core/SPANN/ExtraDynamicSearcher.h"
 #include "inc/Core/SPANN/LimitedTagSupport.h"
 #include "inc/Core/SPANN/SPANNResultIterator.h"
+#include "inc/Core/Cache/ExtremeSparseTagStore.h"
 #include "inc/Core/VectorIndex.h"
 #include "inc/Core/Common/IQuantizer.h"
 #include "inc/Core/Common/PQQuantizer.h"
+#include "inc/Helper/AtomicFile.h"
 #include "inc/Helper/DiskIO.h"
 #include "inc/Helper/HeadCrossEdges.h"
 #include "inc/Helper/SimpleIniReader.h"
@@ -1777,7 +1779,7 @@ BOOST_AUTO_TEST_CASE(StaticHybridBuildRouteAndReload)
             static_cast<std::uint32_t>(
                 header[0]),
             0x314d5453U);
-        BOOST_REQUIRE_EQUAL(header[1], 2);
+        BOOST_REQUIRE_EQUAL(header[1], 3);
         BOOST_REQUIRE_GT(header[5], 0);
         struct ListLayout {
             std::int32_t page = 0;
@@ -1846,7 +1848,7 @@ BOOST_AUTO_TEST_CASE(StaticHybridBuildRouteAndReload)
             std::unordered_set<std::int32_t>
                 pureVIDs;
             std::unordered_set<std::int32_t>
-                allVIDs;
+                tailVIDs;
             const SizeType headVectorID =
                 typed->GetGlobalVID(
                     static_cast<SizeType>(head));
@@ -1864,8 +1866,6 @@ BOOST_AUTO_TEST_CASE(StaticHybridBuildRouteAndReload)
                             static_cast<size_t>(
                                 header[5]),
                     sizeof(vectorID));
-                BOOST_CHECK(
-                    allVIDs.insert(vectorID).second);
                 if (record < layout.pure) {
                     ++pureRecords;
                     BOOST_CHECK(
@@ -1874,10 +1874,10 @@ BOOST_AUTO_TEST_CASE(StaticHybridBuildRouteAndReload)
                             .second);
                 } else {
                     ++tailRecords;
-                    BOOST_CHECK_EQUAL(
-                        pureVIDs.count(
-                            vectorID),
-                        0);
+                    BOOST_CHECK(
+                        tailVIDs
+                            .insert(vectorID)
+                            .second);
                 }
                 float vectorDistance = 0.0f;
                 for (DimensionType dim = 0;
@@ -2671,7 +2671,7 @@ BOOST_AUTO_TEST_CASE(LimitedTagSupportPersistenceValidation)
     std::filesystem::remove(path);
     SPANN::LimitedTagSupport support;
     BOOST_REQUIRE(support.Initialize(
-        4, 2, 2, 2,
+        4, 2, 2, 2, 0, 1,
         0x123456789abcdef0ULL));
     BOOST_REQUIRE(support.SetHeadTags(
         0, {10U, 20U}));
@@ -2681,6 +2681,17 @@ BOOST_AUTO_TEST_CASE(LimitedTagSupportPersistenceValidation)
         2, {20U, 30U}));
     BOOST_REQUIRE(support.SetHeadTags(
         3, {10U}));
+    BOOST_REQUIRE(support.SetTagVectorCounts(
+        10, {{10U, 4}, {20U, 3}, {30U, 3}}));
+    const std::array<std::uint32_t, 4> ownTags = {
+        10U, 10U, 20U, 10U};
+    for (SizeType head = 0;
+         head < static_cast<SizeType>(ownTags.size());
+         ++head)
+    {
+        BOOST_REQUIRE(support.SetHeadAttributes(
+            head, &ownTags[static_cast<size_t>(head)], 1));
+    }
     BOOST_CHECK(!support.SetHeadTags(
         3, {10U, 10U}));
     std::string error;
@@ -2689,12 +2700,155 @@ BOOST_AUTO_TEST_CASE(LimitedTagSupportPersistenceValidation)
     SPANN::LimitedTagSupport loaded;
     BOOST_REQUIRE(loaded.Load(
         path, 4, 2, 2, 2,
+        0, 1,
         0x123456789abcdef0ULL, &error));
     BOOST_CHECK_EQUAL(
         loaded.OwnTag(0), 10U);
     BOOST_CHECK(loaded.Supports(0, 10U));
     BOOST_CHECK(loaded.Supports(0, 20U));
     BOOST_CHECK(!loaded.Supports(0, 30U));
+    BOOST_CHECK(loaded.HasTagVectorCounts());
+    BOOST_CHECK_EQUAL(loaded.VectorCount(), 10U);
+    BOOST_CHECK_EQUAL(loaded.TagVectorCount(10U), 4U);
+    BOOST_CHECK(loaded.TagSelectivityInRange(
+        20U, 0.29f, 0.30f));
+    BOOST_CHECK(!loaded.TagSelectivityInRange(
+        20U, 0.30f, 1.0f));
+    BOOST_REQUIRE(loaded.HeadAttributes(2) != nullptr);
+    BOOST_CHECK_EQUAL(loaded.HeadAttributes(2)[0], 20U);
+
+    const std::string legacyPath =
+        "limited_tag_support_v1_validation.bin";
+    std::filesystem::remove(legacyPath);
+    {
+        const std::vector<std::uint32_t> legacyTags = {
+            10U, 20U,
+            10U, 30U,
+            20U, 30U,
+            10U, SPANN::LimitedTagSupport::EmptyTag};
+        SPANN::LimitedTagSupport::HeaderV1 header;
+        header.m_headCount = 4;
+        header.m_slotsPerHead = 2;
+        header.m_voteHeadCount = 2;
+        header.m_minHeadCount = 2;
+        header.m_tagCount = 3;
+        header.m_generationFingerprint =
+            0x123456789abcdef0ULL;
+        std::uint64_t fingerprint =
+            1469598103934665603ULL;
+        const auto* bytes =
+            reinterpret_cast<const std::uint8_t*>(
+                legacyTags.data());
+        for (size_t byte = 0;
+             byte < legacyTags.size() *
+                        sizeof(std::uint32_t);
+             ++byte)
+        {
+            fingerprint ^= bytes[byte];
+            fingerprint *= 1099511628211ULL;
+        }
+        header.m_bodyFingerprint = fingerprint;
+        std::ofstream output(
+            legacyPath,
+            std::ios::binary | std::ios::trunc);
+        BOOST_REQUIRE(output.good());
+        output.write(
+            reinterpret_cast<const char*>(&header),
+            sizeof(header));
+        output.write(
+            reinterpret_cast<const char*>(
+                legacyTags.data()),
+            static_cast<std::streamsize>(
+                legacyTags.size() *
+                sizeof(std::uint32_t)));
+        output.close();
+        BOOST_REQUIRE(output.good());
+    }
+    SPANN::LimitedTagSupport legacy;
+    BOOST_REQUIRE(legacy.Load(
+        legacyPath, 4, 2, 2, 2, 0, 1,
+        0x123456789abcdef0ULL, &error));
+    for (SizeType head = 0; head < 4; ++head)
+    {
+        BOOST_REQUIRE(
+            legacy.HeadAttributes(head) != nullptr);
+        BOOST_CHECK_EQUAL(
+            legacy.HeadAttributes(head)[0],
+            legacy.OwnTag(head));
+    }
+    std::filesystem::remove(legacyPath);
+
+    const std::string legacyV2Path =
+        "limited_tag_support_v2_validation.bin";
+    std::filesystem::remove(legacyV2Path);
+    {
+        const std::vector<std::uint32_t> legacyTags = {
+            10U, 20U,
+            10U, 30U,
+            20U, 30U,
+            10U, SPANN::LimitedTagSupport::EmptyTag};
+        const std::vector<std::uint32_t> legacyAttributes(
+            ownTags.begin(), ownTags.end());
+        SPANN::LimitedTagSupport::HeaderV2 header;
+        header.m_headCount = 4;
+        header.m_slotsPerHead = 2;
+        header.m_voteHeadCount = 2;
+        header.m_minHeadCount = 2;
+        header.m_tagCount = 3;
+        header.m_keyColumn = 0;
+        header.m_attributeCount = 1;
+        header.m_generationFingerprint =
+            0x123456789abcdef0ULL;
+        std::uint64_t fingerprint =
+            1469598103934665603ULL;
+        const auto appendFingerprint =
+            [&](const std::vector<std::uint32_t>& values) {
+                const auto* bytes =
+                    reinterpret_cast<
+                        const std::uint8_t*>(
+                        values.data());
+                for (size_t byte = 0;
+                     byte < values.size() *
+                                sizeof(std::uint32_t);
+                     ++byte)
+                {
+                    fingerprint ^= bytes[byte];
+                    fingerprint *= 1099511628211ULL;
+                }
+            };
+        appendFingerprint(legacyTags);
+        appendFingerprint(legacyAttributes);
+        header.m_bodyFingerprint = fingerprint;
+        std::ofstream output(
+            legacyV2Path,
+            std::ios::binary | std::ios::trunc);
+        BOOST_REQUIRE(output.good());
+        output.write(
+            reinterpret_cast<const char*>(&header),
+            sizeof(header));
+        output.write(
+            reinterpret_cast<const char*>(
+                legacyTags.data()),
+            static_cast<std::streamsize>(
+                legacyTags.size() *
+                sizeof(std::uint32_t)));
+        output.write(
+            reinterpret_cast<const char*>(
+                legacyAttributes.data()),
+            static_cast<std::streamsize>(
+                legacyAttributes.size() *
+                sizeof(std::uint32_t)));
+        output.close();
+        BOOST_REQUIRE(output.good());
+    }
+    SPANN::LimitedTagSupport legacyV2;
+    BOOST_REQUIRE(legacyV2.Load(
+        legacyV2Path, 4, 2, 2, 2, 0, 1,
+        0x123456789abcdef0ULL, &error));
+    BOOST_CHECK(!legacyV2.HasTagVectorCounts());
+    BOOST_CHECK_EQUAL(
+        legacyV2.HeadAttributes(2)[0], 20U);
+    std::filesystem::remove(legacyV2Path);
 
     const auto rejects =
         [&](SizeType heads, int slots,
@@ -2704,7 +2858,7 @@ BOOST_AUTO_TEST_CASE(LimitedTagSupportPersistenceValidation)
             std::string rejectedError;
             return !rejected.Load(
                 path, heads, slots, votes,
-                minimum, generation,
+                minimum, 0, 1, generation,
                 &rejectedError);
         };
     BOOST_CHECK(rejects(
@@ -2745,6 +2899,32 @@ BOOST_AUTO_TEST_CASE(LimitedTagSupportPersistenceValidation)
     SPANN::LimitedTagSupport invalidTagCount;
     BOOST_CHECK(!invalidTagCount.Load(
         path, 4, 2, 2, 2,
+        0, 1,
+        0x123456789abcdef0ULL, &error));
+    BOOST_REQUIRE(support.Save(path, &error));
+
+    {
+        std::fstream output(
+            path,
+            std::ios::binary |
+                std::ios::in |
+                std::ios::out);
+        BOOST_REQUIRE(output.good());
+        output.seekp(
+            static_cast<std::streamoff>(
+                sizeof(SPANN::LimitedTagSupport::Header) +
+                8 * sizeof(std::uint32_t)),
+            std::ios::beg);
+        const std::uint32_t invalidOwnAttribute = 99U;
+        output.write(
+            reinterpret_cast<const char*>(
+                &invalidOwnAttribute),
+            sizeof(invalidOwnAttribute));
+        BOOST_REQUIRE(output.good());
+    }
+    SPANN::LimitedTagSupport invalidAttribute;
+    BOOST_CHECK(!invalidAttribute.Load(
+        path, 4, 2, 2, 2, 0, 1,
         0x123456789abcdef0ULL, &error));
     BOOST_REQUIRE(support.Save(path, &error));
 
@@ -2765,8 +2945,286 @@ BOOST_AUTO_TEST_CASE(LimitedTagSupportPersistenceValidation)
     SPANN::LimitedTagSupport invalidMagic;
     BOOST_CHECK(!invalidMagic.Load(
         path, 4, 2, 2, 2,
+        0, 1,
         0x123456789abcdef0ULL, &error));
     std::filesystem::remove(path);
+}
+
+BOOST_AUTO_TEST_CASE(ExtremeSparseTagStoreLifecycle)
+{
+    using Store = Cache::ExtremeSparseTagStore;
+    const std::string path =
+        "extreme_sparse_tag_store_validation.bin";
+    std::filesystem::remove(path);
+    std::filesystem::remove(path + ".tmp");
+
+    constexpr std::uint32_t dimension = 2;
+    constexpr std::uint32_t attributeCount = 2;
+    const std::array<std::uint32_t, 12> attributes = {
+        10U, 100U,
+        20U, 200U,
+        10U, 300U,
+        30U, 400U,
+        30U, 500U,
+        30U, 600U};
+    const std::array<float, 12> vectors = {
+        0.0f, 0.5f,
+        1.0f, 1.5f,
+        2.0f, 2.5f,
+        3.0f, 3.5f,
+        4.0f, 4.5f,
+        5.0f, 5.5f};
+    constexpr std::uint64_t generation =
+        0x123456789abcdef0ULL;
+
+    Store store;
+    std::string error;
+    BOOST_REQUIRE(store.Build(
+        path, attributes.data(), 6,
+        attributeCount, 0,
+        reinterpret_cast<const std::uint8_t*>(
+            vectors.data()),
+        sizeof(vectors),
+        dimension * sizeof(float),
+        VectorValueType::Float,
+        dimension, 0.34, generation, &error));
+    BOOST_REQUIRE(store.Find(10U) != nullptr);
+    BOOST_REQUIRE(store.Find(20U) != nullptr);
+    BOOST_CHECK(store.Find(30U) == nullptr);
+    BOOST_CHECK_EQUAL(store.Find(10U)->m_count, 2);
+    BOOST_CHECK_EQUAL(store.Find(20U)->m_count, 1);
+    BOOST_CHECK_EQUAL(store.StoredRecordCount(), 3);
+    BOOST_CHECK(store.ValidateExpected(
+        VectorValueType::Float, dimension,
+        attributeCount, 0, 6, generation, 0.34,
+        &error));
+    BOOST_CHECK(!store.ValidateExpected(
+        VectorValueType::UInt8, dimension,
+        attributeCount, 0, 6, generation, 0.34,
+        &error));
+    BOOST_CHECK(!store.ValidateExpected(
+        VectorValueType::Float, dimension,
+        attributeCount, 0, 6, generation + 1,
+        0.34, &error));
+    BOOST_CHECK(!store.ValidateExpected(
+        VectorValueType::Float, dimension,
+        attributeCount, 0, 6, generation,
+        0.35, &error));
+
+    const std::string boundaryPath = path + ".boundary";
+    const std::array<std::uint32_t, 10>
+        boundaryAttributes = {
+            40U, 40U, 40U,
+            50U, 50U, 50U, 50U, 50U, 50U, 50U};
+    const std::array<float, 20> boundaryVectors{};
+    Store boundary;
+    BOOST_REQUIRE(boundary.Build(
+        boundaryPath, boundaryAttributes.data(),
+        boundaryAttributes.size(), 1, 0,
+        reinterpret_cast<const std::uint8_t*>(
+            boundaryVectors.data()),
+        sizeof(boundaryVectors),
+        dimension * sizeof(float),
+        VectorValueType::Float, dimension, 0.3,
+        generation + 1, &error));
+    BOOST_REQUIRE(boundary.Find(40U) != nullptr);
+    BOOST_CHECK_EQUAL(
+        boundary.Find(40U)->m_count, 3);
+    BOOST_CHECK(boundary.Find(50U) == nullptr);
+    boundary.Reset();
+    std::filesystem::remove(boundaryPath);
+
+    std::vector<std::uint8_t> records;
+    std::uint64_t recordCount = 0;
+    BOOST_REQUIRE(store.Read(
+        {20U, 10U, 20U},
+        records, recordCount, &error));
+    BOOST_CHECK_EQUAL(recordCount, 3);
+    const size_t recordBytes = store.RecordBytes();
+    const std::array<std::int32_t, 3> expectedIDs = {
+        0, 2, 1};
+    for (size_t record = 0;
+         record < expectedIDs.size(); ++record)
+    {
+        const auto* row =
+            records.data() + record * recordBytes;
+        std::int32_t vectorID = -1;
+        std::memcpy(
+            &vectorID, row, sizeof(vectorID));
+        BOOST_CHECK_EQUAL(
+            vectorID, expectedIDs[record]);
+        std::array<std::uint32_t, 2> rowAttributes{};
+        std::memcpy(
+            rowAttributes.data(),
+            row + sizeof(vectorID),
+            sizeof(rowAttributes));
+        BOOST_CHECK_EQUAL(
+            rowAttributes[0],
+            attributes[
+                static_cast<size_t>(vectorID) *
+                attributeCount]);
+        std::array<float, 2> rowVector{};
+        std::memcpy(
+            rowVector.data(),
+            row + sizeof(vectorID) +
+                sizeof(rowAttributes),
+            sizeof(rowVector));
+        BOOST_CHECK_EQUAL(
+            rowVector[0],
+            vectors[
+                static_cast<size_t>(vectorID) *
+                dimension]);
+    }
+
+    std::atomic<bool> concurrentReadOK(true);
+    std::vector<std::thread> readers;
+    for (int thread = 0; thread < 4; ++thread)
+    {
+        readers.emplace_back([&]() {
+            for (int iteration = 0;
+                 iteration < 100; ++iteration)
+            {
+                std::vector<std::uint8_t> localRecords;
+                std::uint64_t localCount = 0;
+                std::string localError;
+                if (!store.Read(
+                        {10U, 20U},
+                        localRecords, localCount,
+                        &localError) ||
+                    localCount != 3)
+                {
+                    concurrentReadOK.store(false);
+                    return;
+                }
+            }
+        });
+    }
+    for (auto& reader : readers) reader.join();
+    BOOST_CHECK(concurrentReadOK.load());
+
+    store.Reset();
+    Store loaded;
+    BOOST_REQUIRE(loaded.Load(path, &error));
+    {
+        const std::string replacementPath =
+            path + ".replacement";
+        std::filesystem::remove(replacementPath);
+        std::filesystem::remove(
+            replacementPath + ".tmp");
+        std::array<float, 12> replacementVectors;
+        replacementVectors.fill(9.0f);
+        Store replacement;
+        BOOST_REQUIRE(replacement.Build(
+            replacementPath, attributes.data(), 6,
+            attributeCount, 0,
+            reinterpret_cast<const std::uint8_t*>(
+                replacementVectors.data()),
+            sizeof(replacementVectors),
+            dimension * sizeof(float),
+            VectorValueType::Float,
+            dimension, 0.34, generation, &error));
+        BOOST_REQUIRE(
+            Helper::AtomicReplaceFile(
+                replacementPath, path));
+
+        std::vector<std::uint8_t> retainedRecords;
+        std::uint64_t retainedCount = 0;
+        BOOST_REQUIRE(loaded.Read(
+            {10U, 20U}, retainedRecords,
+            retainedCount, &error));
+        BOOST_REQUIRE_EQUAL(retainedCount, 3);
+        float retainedValue = -1.0f;
+        std::memcpy(
+            &retainedValue,
+            retainedRecords.data() +
+                sizeof(std::int32_t) +
+                attributeCount *
+                    sizeof(std::uint32_t),
+            sizeof(retainedValue));
+        BOOST_CHECK_EQUAL(retainedValue, 0.0f);
+
+        Store replacementLoad;
+        BOOST_REQUIRE(
+            replacementLoad.Load(path, &error));
+        std::vector<std::uint8_t> replacementRecords;
+        std::uint64_t replacementCount = 0;
+        BOOST_REQUIRE(replacementLoad.Read(
+            {10U, 20U}, replacementRecords,
+            replacementCount, &error));
+        BOOST_REQUIRE_EQUAL(replacementCount, 3);
+        float replacementValue = -1.0f;
+        std::memcpy(
+            &replacementValue,
+            replacementRecords.data() +
+                sizeof(std::int32_t) +
+                attributeCount *
+                    sizeof(std::uint32_t),
+            sizeof(replacementValue));
+        BOOST_CHECK_EQUAL(replacementValue, 9.0f);
+    }
+    BOOST_REQUIRE(loaded.Build(
+        path, attributes.data(), 6,
+        attributeCount, 0,
+        reinterpret_cast<const std::uint8_t*>(
+            vectors.data()),
+        sizeof(vectors),
+        dimension * sizeof(float),
+        VectorValueType::Float,
+        dimension, 0.34, generation, &error));
+    loaded.Reset();
+    {
+        std::fstream output(
+            path,
+            std::ios::binary |
+                std::ios::in |
+                std::ios::out);
+        BOOST_REQUIRE(output.good());
+        output.seekp(
+            static_cast<std::streamoff>(
+                offsetof(Store::Header,
+                         m_maxSelectivity)),
+            std::ios::beg);
+        const double changedThreshold = 0.2;
+        output.write(
+            reinterpret_cast<const char*>(
+                &changedThreshold),
+            sizeof(changedThreshold));
+        BOOST_REQUIRE(output.good());
+    }
+    Store corruptedHeader;
+    BOOST_CHECK(!corruptedHeader.Load(path, &error));
+
+    BOOST_REQUIRE(loaded.Build(
+        path, attributes.data(), 6,
+        attributeCount, 0,
+        reinterpret_cast<const std::uint8_t*>(
+            vectors.data()),
+        sizeof(vectors),
+        dimension * sizeof(float),
+        VectorValueType::Float,
+        dimension, 0.34, generation, &error));
+    loaded.Reset();
+    {
+        std::fstream output(
+            path,
+            std::ios::binary |
+                std::ios::in |
+                std::ios::out);
+        BOOST_REQUIRE(output.good());
+        output.seekg(-1, std::ios::end);
+        char byte = 0;
+        output.read(&byte, 1);
+        output.clear();
+        output.seekp(-1, std::ios::end);
+        byte ^= 1;
+        output.write(&byte, 1);
+        BOOST_REQUIRE(output.good());
+    }
+    Store corruptedBody;
+    BOOST_CHECK(!corruptedBody.Load(path, &error));
+
+    std::filesystem::remove(path);
+    std::filesystem::remove(path + ".tmp");
 }
 
 BOOST_AUTO_TEST_CASE(SecondLevelPostingSignaturesPersistAndFilter)
@@ -2793,13 +3251,13 @@ BOOST_AUTO_TEST_CASE(SecondLevelPostingSignaturesPersistAndFilter)
     std::vector<Signature> signatures(2);
     signatures[0].Insert(7);
     signatures[0].Insert(8);
-    signatures[1].Insert(9);
 
     Postings postings;
     std::string error;
     BOOST_REQUIRE(postings.Initialize(
         4, 2, 1, firstIDFingerprint,
-        supportFingerprint, secondToFirst,
+        supportFingerprint, 0.001, 0.02,
+        secondToFirst,
         {0, 2, 4}, {0, 1, 2, 3},
         signatures, &error));
     Cache::PostingBitmask query;
@@ -2819,15 +3277,184 @@ BOOST_AUTO_TEST_CASE(SecondLevelPostingSignaturesPersistAndFilter)
     Postings loaded;
     BOOST_REQUIRE(loaded.Load(
         path, 4, 2, 1, firstIDFingerprint,
-        supportFingerprint,
+        supportFingerprint, 0.001, 0.02,
         postings.GenerationFingerprint(),
         secondToFirst, &error));
+    BOOST_CHECK_EQUAL(
+        loaded.SignatureMinSelectivity(), 0.001);
+    BOOST_CHECK_EQUAL(
+        loaded.SignatureMaxSelectivity(), 0.02);
     BOOST_CHECK(
         loaded.SignatureAt(0)
             ->MayIntersect(query));
     BOOST_CHECK(
         !loaded.SignatureAt(1)
              ->MayIntersect(query));
+    Postings mismatchedRange;
+    BOOST_CHECK(!mismatchedRange.Load(
+        path, 4, 2, 1, firstIDFingerprint,
+        supportFingerprint, 0.002f, 0.02f,
+        postings.GenerationFingerprint(),
+        secondToFirst, &error));
+
+    const std::string legacyPath = path + ".v2";
+    Postings fullRange;
+    BOOST_REQUIRE(fullRange.Initialize(
+        4, 2, 1, firstIDFingerprint,
+        supportFingerprint, 0.0, 1.0,
+        secondToFirst,
+        {0, 2, 4}, {0, 1, 2, 3},
+        signatures, &error));
+    BOOST_REQUIRE(fullRange.Save(legacyPath, &error));
+    Postings::Header fullRangeHeader;
+    std::vector<char> legacyBody;
+    {
+        std::ifstream input(
+            legacyPath,
+            std::ios::binary | std::ios::ate);
+        BOOST_REQUIRE(input.good());
+        const auto bytes = input.tellg();
+        BOOST_REQUIRE_GT(
+            bytes,
+            static_cast<std::streamoff>(
+                sizeof(fullRangeHeader)));
+        legacyBody.resize(
+            static_cast<size_t>(
+                bytes -
+                static_cast<std::streamoff>(
+                    sizeof(fullRangeHeader))));
+        input.seekg(0);
+        input.read(
+            reinterpret_cast<char*>(
+                &fullRangeHeader),
+            sizeof(fullRangeHeader));
+        input.read(
+            legacyBody.data(),
+            static_cast<std::streamsize>(
+                legacyBody.size()));
+        BOOST_REQUIRE(input.good());
+    }
+    Postings::HeaderV2 legacyHeader;
+    legacyHeader.m_firstLevelHeadCount =
+        fullRangeHeader.m_firstLevelHeadCount;
+    legacyHeader.m_secondLevelHeadCount =
+        fullRangeHeader.m_secondLevelHeadCount;
+    legacyHeader.m_replicaCount =
+        fullRangeHeader.m_replicaCount;
+    legacyHeader.m_memberBytes =
+        fullRangeHeader.m_memberBytes;
+    legacyHeader.m_signatureBytes =
+        fullRangeHeader.m_signatureBytes;
+    legacyHeader.m_memberCount =
+        fullRangeHeader.m_memberCount;
+    legacyHeader.m_firstLevelIDFingerprint =
+        fullRangeHeader
+            .m_firstLevelIDFingerprint;
+    legacyHeader.m_secondLevelIDFingerprint =
+        fullRangeHeader
+            .m_secondLevelIDFingerprint;
+    legacyHeader.m_limitedTagSupportFingerprint =
+        fullRangeHeader
+            .m_limitedTagSupportFingerprint;
+    legacyHeader.m_bodyFingerprint =
+        fullRangeHeader.m_bodyFingerprint;
+    const auto hashBytes = [](
+        std::uint64_t hash,
+        const void* data,
+        size_t bytes) {
+        const auto* begin =
+            static_cast<const std::uint8_t*>(data);
+        for (size_t offset = 0;
+             offset < bytes; ++offset)
+        {
+            hash ^= begin[offset];
+            hash *= 1099511628211ULL;
+        }
+        return hash;
+    };
+    std::uint64_t legacyGeneration =
+        1469598103934665603ULL;
+    legacyGeneration = hashBytes(
+        legacyGeneration,
+        &legacyHeader.m_firstLevelHeadCount,
+        sizeof(legacyHeader.m_firstLevelHeadCount));
+    legacyGeneration = hashBytes(
+        legacyGeneration,
+        &legacyHeader.m_secondLevelHeadCount,
+        sizeof(legacyHeader.m_secondLevelHeadCount));
+    legacyGeneration = hashBytes(
+        legacyGeneration,
+        &legacyHeader.m_replicaCount,
+        sizeof(legacyHeader.m_replicaCount));
+    legacyGeneration = hashBytes(
+        legacyGeneration,
+        &legacyHeader.m_signatureBytes,
+        sizeof(legacyHeader.m_signatureBytes));
+    legacyGeneration = hashBytes(
+        legacyGeneration,
+        &legacyHeader.m_memberCount,
+        sizeof(legacyHeader.m_memberCount));
+    legacyGeneration = hashBytes(
+        legacyGeneration,
+        &legacyHeader.m_firstLevelIDFingerprint,
+        sizeof(
+            legacyHeader
+                .m_firstLevelIDFingerprint));
+    legacyGeneration = hashBytes(
+        legacyGeneration,
+        &legacyHeader.m_secondLevelIDFingerprint,
+        sizeof(
+            legacyHeader
+                .m_secondLevelIDFingerprint));
+    legacyGeneration = hashBytes(
+        legacyGeneration,
+        &legacyHeader
+             .m_limitedTagSupportFingerprint,
+        sizeof(
+            legacyHeader
+                .m_limitedTagSupportFingerprint));
+    legacyGeneration = hashBytes(
+        legacyGeneration,
+        &legacyHeader.m_bodyFingerprint,
+        sizeof(legacyHeader.m_bodyFingerprint));
+    legacyHeader.m_generationFingerprint =
+        legacyGeneration;
+    {
+        std::ofstream output(
+            legacyPath,
+            std::ios::binary | std::ios::trunc);
+        BOOST_REQUIRE(output.good());
+        output.write(
+            reinterpret_cast<const char*>(
+                &legacyHeader),
+            sizeof(legacyHeader));
+        output.write(
+            legacyBody.data(),
+            static_cast<std::streamsize>(
+                legacyBody.size()));
+        BOOST_REQUIRE(output.good());
+    }
+    Postings loadedLegacy;
+    BOOST_REQUIRE(loadedLegacy.Load(
+        legacyPath, 4, 2, 1,
+        firstIDFingerprint,
+        supportFingerprint, 0.0, 1.0,
+        legacyGeneration, secondToFirst,
+        &error));
+    BOOST_CHECK_EQUAL(
+        loadedLegacy.SignatureMinSelectivity(),
+        0.0);
+    BOOST_CHECK_EQUAL(
+        loadedLegacy.SignatureMaxSelectivity(),
+        1.0);
+    Postings legacyRangeMismatch;
+    BOOST_CHECK(!legacyRangeMismatch.Load(
+        legacyPath, 4, 2, 1,
+        firstIDFingerprint,
+        supportFingerprint, 0.001, 0.02,
+        legacyGeneration, secondToFirst,
+        &error));
+    std::filesystem::remove(legacyPath);
 
     {
         std::fstream corrupt(
@@ -2854,7 +3481,7 @@ BOOST_AUTO_TEST_CASE(SecondLevelPostingSignaturesPersistAndFilter)
     Postings invalidCount;
     BOOST_CHECK(!invalidCount.Load(
         path, 4, 2, 1, firstIDFingerprint,
-        supportFingerprint,
+        supportFingerprint, 0.001f, 0.02f,
         postings.GenerationFingerprint(),
         secondToFirst, &error));
 
@@ -2878,7 +3505,7 @@ BOOST_AUTO_TEST_CASE(SecondLevelPostingSignaturesPersistAndFilter)
     Postings invalidSignature;
     BOOST_CHECK(!invalidSignature.Load(
         path, 4, 2, 1, firstIDFingerprint,
-        supportFingerprint,
+        supportFingerprint, 0.001f, 0.02f,
         postings.GenerationFingerprint(),
         secondToFirst, &error));
     std::filesystem::remove(path);
@@ -3174,7 +3801,7 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
             set("BuildSSDIndex", "ExcludeHead", "true");
             set("BuildSSDIndex", "NumTagsPerVec", "1");
             set("BuildSSDIndex",
-                "StaticACLTagCols", "1");
+                "StaticACLTagCols", "0");
             set("BuildSSDIndex",
                 "EnableHybridDistance", "false");
             set("BuildSSDIndex",
@@ -3564,6 +4191,7 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
                 indexDirectory +
                     "/limited_tag_support.bin",
                 defaultHeadCount, 2, 2, 8,
+                0, 1,
                 defaultGeneration,
                 &defaultSupportError));
         for (SizeType head = 0;
@@ -3596,6 +4224,14 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
         BOOST_CHECK(
             defaultConfig.find(
                 "SecondLevelRouteSelectivityThreshold=") !=
+            std::string::npos);
+        BOOST_CHECK(
+            defaultConfig.find(
+                "SecondLevelSignatureMinSelectivity=0") !=
+            std::string::npos);
+        BOOST_CHECK(
+            defaultConfig.find(
+                "SecondLevelSignatureMaxSelectivity=1") !=
             std::string::npos);
         BOOST_CHECK(
             defaultConfig.find(
@@ -3719,6 +4355,16 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
             ErrorCode::FailedParseValue);
         BOOST_REQUIRE(
             rejected->SetParameter(
+                "SSDIndex", "./aliased.bin.",
+                "Base") ==
+            ErrorCode::Success);
+        BOOST_CHECK(
+            rejected->BuildIndex(
+                vectors, nullptr, true, false,
+                false) ==
+            ErrorCode::FailedParseValue);
+        BOOST_REQUIRE(
+            rejected->SetParameter(
                 "SecondLevelPostingFile",
                 "head_select_state.bin",
                 "SelectHead") ==
@@ -3785,7 +4431,49 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
     rejectConfiguration(
         "SecondLevelRouteSelectivityThreshold", "1.01");
     rejectConfiguration(
+        "SecondLevelSignatureMinSelectivity", "-0.01");
+    rejectConfiguration(
+        "SecondLevelSignatureMaxSelectivity", "1.01");
+    rejectConfiguration(
+        "SecondLevelSignatureMinSelectivity", "1");
+    rejectConfiguration(
+        "SecondLevelSignatureMaxSelectivity", "0");
+    rejectConfiguration(
         "SecondLevelMaxCheck", "0");
+    rejectConfiguration(
+        "LimitedTagSupportFile",
+        "SPTAGFullList.bin.");
+    for (const char* reservedFile : {
+             "tag_routing_stats.bin",
+             "signatures_bitmask.bin"}) {
+        auto rejected =
+            VectorIndex::CreateInstance(
+                IndexAlgoType::SPANN,
+                VectorValueType::Float);
+        BOOST_REQUIRE(rejected != nullptr);
+        configure(rejected);
+        BOOST_REQUIRE(
+            rejected->SetParameter(
+                "EnableExtremeSparseTag", "true",
+                "BuildSSDIndex") ==
+            ErrorCode::Success);
+        BOOST_REQUIRE(
+            rejected->SetParameter(
+                "ExtremeSparseTagFile", reservedFile,
+                "BuildSSDIndex") ==
+            ErrorCode::Success);
+        auto* rejectedSPANN =
+            dynamic_cast<SPANN::ISPANNIndex*>(
+                rejected.get());
+        BOOST_REQUIRE(rejectedSPANN != nullptr);
+        rejectedSPANN->SetVectorTags(
+            tags.data(), baseCount, 1);
+        BOOST_CHECK(
+            rejected->BuildIndex(
+                vectors, nullptr, true, false,
+                false) ==
+            ErrorCode::FailedParseValue);
+    }
 
     auto index = VectorIndex::CreateInstance(
         IndexAlgoType::SPANN,
@@ -3806,6 +4494,16 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
         index->SetParameter(
             "LimitedTagSlotsPerHead", "4",
             "BuildSSDIndex") ==
+        ErrorCode::Success);
+    BOOST_REQUIRE(
+        index->SetParameter(
+            "SecondLevelSignatureMinSelectivity",
+            "0.24", "BuildSSDIndex") ==
+        ErrorCode::Success);
+    BOOST_REQUIRE(
+        index->SetParameter(
+            "SecondLevelSignatureMaxSelectivity",
+            "0.26", "BuildSSDIndex") ==
         ErrorCode::Success);
     auto* spann =
         dynamic_cast<SPANN::ISPANNIndex*>(
@@ -3863,6 +4561,101 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
             ->GetPostingAvgRecords(true),
         static_cast<double>(
             recordsPerBuildPage));
+    const std::string staticPostingPath =
+        indexDirectory + "/SPTAGFullList.bin";
+    {
+        std::ifstream postingInput(
+            staticPostingPath, std::ios::binary);
+        BOOST_REQUIRE(postingInput.good());
+        std::array<std::int32_t, 11> header{};
+        postingInput.read(
+            reinterpret_cast<char*>(header.data()),
+            static_cast<std::streamsize>(
+                sizeof(header)));
+        BOOST_REQUIRE(postingInput.good());
+        BOOST_CHECK_EQUAL(
+            static_cast<std::uint32_t>(header[0]),
+            0x314D5453U);
+        BOOST_CHECK_EQUAL(header[1], 3);
+        BOOST_REQUIRE_EQUAL(
+            header[2],
+            typed->GetDiskIndex()
+                ->GetPostingCount());
+        const int recordBytes = header[5];
+        BOOST_REQUIRE_GT(recordBytes, 0);
+        double tailRecords = 0.0;
+        double tailPages = 0.0;
+        for (int list = 0; list < header[2];
+             ++list) {
+            std::int32_t pageNum = 0;
+            std::uint16_t pageOffset = 0;
+            std::int32_t elementCount = 0;
+            std::uint16_t pageCount = 0;
+            std::int32_t pureCount = 0;
+            postingInput.read(
+                reinterpret_cast<char*>(&pageNum),
+                sizeof(pageNum));
+            postingInput.read(
+                reinterpret_cast<char*>(&pageOffset),
+                sizeof(pageOffset));
+            postingInput.read(
+                reinterpret_cast<char*>(&elementCount),
+                sizeof(elementCount));
+            postingInput.read(
+                reinterpret_cast<char*>(&pageCount),
+                sizeof(pageCount));
+            postingInput.read(
+                reinterpret_cast<char*>(&pureCount),
+                sizeof(pureCount));
+            BOOST_REQUIRE(postingInput.good());
+            BOOST_REQUIRE_GE(pageNum, 0);
+            BOOST_REQUIRE_GE(elementCount, pureCount);
+            (void)pageCount;
+            const int tailCount =
+                elementCount - pureCount;
+            tailRecords += tailCount;
+            if (tailCount > 0) {
+                const std::uint64_t beginBytes =
+                    static_cast<std::uint64_t>(
+                        pageOffset) +
+                    static_cast<std::uint64_t>(
+                        pureCount) *
+                        static_cast<std::uint64_t>(
+                            recordBytes);
+                const std::uint64_t endBytes =
+                    static_cast<std::uint64_t>(
+                        pageOffset) +
+                    static_cast<std::uint64_t>(
+                        elementCount) *
+                        static_cast<std::uint64_t>(
+                            recordBytes);
+                tailPages +=
+                    static_cast<double>(
+                        (endBytes + PageSize - 1) /
+                            PageSize -
+                        beginBytes / PageSize);
+            }
+        }
+        const double listCount =
+            static_cast<double>(header[2]);
+        BOOST_CHECK_SMALL(
+            typed->GetDiskIndex()
+                    ->GetPostingAvgRecords(false) -
+                tailRecords / listCount,
+            1e-9);
+        BOOST_CHECK_SMALL(
+            typed->GetDiskIndex()
+                    ->GetPostingAvgPages(false) -
+                tailPages / listCount,
+            1e-9);
+        BOOST_CHECK_SMALL(
+            typed->GetDiskIndex()
+                    ->GetPostingAvgBytes(false) -
+                tailRecords *
+                    static_cast<double>(recordBytes) /
+                    listCount,
+            1e-9);
+    }
     const SizeType headCount =
         spann->GetMemoryIndex()->GetNumSamples();
     std::uint64_t generation = 0;
@@ -3881,6 +4674,7 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
     BOOST_REQUIRE(
         support.Load(
             supportPath, headCount, 4, 2, 8,
+            0, 1,
             generation, &supportError));
     {
         using Postings =
@@ -3895,7 +4689,7 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
             reinterpret_cast<char*>(&header),
             sizeof(header));
         BOOST_REQUIRE(postingInput.good());
-        BOOST_CHECK_EQUAL(header.m_version, 2);
+        BOOST_CHECK_EQUAL(header.m_version, 3);
         BOOST_CHECK_EQUAL(
             header.m_signatureBytes,
             sizeof(Postings::Signature));
@@ -3903,6 +4697,12 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
             header
                 .m_limitedTagSupportFingerprint,
             support.ContentFingerprint());
+        BOOST_CHECK_EQUAL(
+            header.m_signatureMinSelectivity,
+            0.24);
+        BOOST_CHECK_EQUAL(
+            header.m_signatureMaxSelectivity,
+            0.26);
 
         std::vector<std::uint64_t> offsets(
             static_cast<size_t>(
@@ -3970,7 +4770,9 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
                         support.TagAt(first, slot);
                     if (tag !=
                         SPANN::LimitedTagSupport::
-                            EmptyTag) {
+                            EmptyTag &&
+                        support.TagSelectivityInRange(
+                            tag, 0.24, 0.26)) {
                         expected.Insert(tag);
                     }
                 }
@@ -4252,8 +5054,14 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
     searchCompound(index, true);
     const auto h1BeforeReload =
         searchFiltered(index, 3, 0.25f);
-    const auto h2BeforeReload =
+    const auto excludedNarrowBeforeReload =
         searchFiltered(index, 3, 0.01f);
+    BOOST_CHECK_EQUAL_COLLECTIONS(
+        h1BeforeReload.begin(), h1BeforeReload.end(),
+        excludedNarrowBeforeReload.begin(),
+        excludedNarrowBeforeReload.end());
+    const auto h2BeforeReload =
+        searchFiltered(index, 0, 0.01f);
     COMMON::QueryResultSet<float> unfilteredBefore(
         data, 10);
     BOOST_REQUIRE(
@@ -4277,8 +5085,14 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
     searchCompound(reloaded, true);
     const auto h1AfterReload =
         searchFiltered(reloaded, 3, 0.25f);
-    const auto h2AfterReload =
+    const auto excludedNarrowAfterReload =
         searchFiltered(reloaded, 3, 0.01f);
+    BOOST_CHECK_EQUAL_COLLECTIONS(
+        h1AfterReload.begin(), h1AfterReload.end(),
+        excludedNarrowAfterReload.begin(),
+        excludedNarrowAfterReload.end());
+    const auto h2AfterReload =
+        searchFiltered(reloaded, 0, 0.01f);
     BOOST_CHECK_EQUAL_COLLECTIONS(
         h1BeforeReload.begin(), h1BeforeReload.end(),
         h1AfterReload.begin(), h1AfterReload.end());
@@ -4297,6 +5111,284 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
                 static_cast<size_t>(rank)]);
     }
     reloaded.reset();
+
+    {
+        std::fstream posting(
+            staticPostingPath,
+            std::ios::binary |
+                std::ios::in |
+                std::ios::out);
+        BOOST_REQUIRE(posting.good());
+        const std::int32_t legacyVersion = 2;
+        posting.seekp(sizeof(std::int32_t));
+        posting.write(
+            reinterpret_cast<const char*>(
+                &legacyVersion),
+            sizeof(legacyVersion));
+        BOOST_REQUIRE(posting.good());
+    }
+    std::shared_ptr<VectorIndex> legacyTailReload;
+    BOOST_CHECK(
+        VectorIndex::LoadIndex(
+            indexDirectory,
+            legacyTailReload) !=
+        ErrorCode::Success);
+    {
+        std::fstream posting(
+            staticPostingPath,
+            std::ios::binary |
+                std::ios::in |
+                std::ios::out);
+        BOOST_REQUIRE(posting.good());
+        const std::int32_t currentVersion = 3;
+        posting.seekp(sizeof(std::int32_t));
+        posting.write(
+            reinterpret_cast<const char*>(
+                &currentVersion),
+            sizeof(currentVersion));
+        BOOST_REQUIRE(posting.good());
+    }
+
+    const std::string staticPostingBackup =
+        staticPostingPath + ".backup";
+    std::filesystem::copy_file(
+        staticPostingPath, staticPostingBackup,
+        std::filesystem::copy_options::
+            overwrite_existing);
+    {
+        constexpr std::streamoff headerBytes =
+            11 * sizeof(std::int32_t);
+        constexpr std::streamoff pageCountOffset =
+            headerBytes +
+            sizeof(std::int32_t) +
+            sizeof(std::uint16_t) +
+            sizeof(std::int32_t);
+        std::fstream corrupt(
+            staticPostingPath,
+            std::ios::binary |
+                std::ios::in |
+                std::ios::out);
+        BOOST_REQUIRE(corrupt.good());
+        corrupt.seekp(pageCountOffset);
+        const std::uint16_t impossiblePageCount =
+            (std::numeric_limits<
+                 std::uint16_t>::max)();
+        corrupt.write(
+            reinterpret_cast<const char*>(
+                &impossiblePageCount),
+            sizeof(impossiblePageCount));
+        BOOST_REQUIRE(corrupt.good());
+    }
+    std::shared_ptr<VectorIndex>
+        invalidStaticDirectory;
+    BOOST_CHECK(
+        VectorIndex::LoadIndex(
+            indexDirectory,
+            invalidStaticDirectory) !=
+        ErrorCode::Success);
+    invalidStaticDirectory.reset();
+    std::filesystem::copy_file(
+        staticPostingBackup, staticPostingPath,
+        std::filesystem::copy_options::
+            overwrite_existing);
+
+    struct StaticDirectoryEntry {
+        std::streamoff offset = 0;
+        std::int32_t pageNum = 0;
+        std::uint16_t pageOffset = 0;
+        std::int32_t elementCount = 0;
+        std::uint16_t pageCount = 0;
+    };
+    std::array<std::int32_t, 11>
+        staticHeader{};
+    std::vector<StaticDirectoryEntry>
+        staticEntries;
+    {
+        std::ifstream posting(
+            staticPostingPath,
+            std::ios::binary);
+        BOOST_REQUIRE(posting.good());
+        posting.read(
+            reinterpret_cast<char*>(
+                staticHeader.data()),
+            sizeof(staticHeader));
+        BOOST_REQUIRE(posting.good());
+        staticEntries.reserve(
+            static_cast<size_t>(
+                staticHeader[2]));
+        for (std::int32_t list = 0;
+             list < staticHeader[2]; ++list) {
+            StaticDirectoryEntry entry;
+            entry.offset =
+                static_cast<std::streamoff>(
+                    posting.tellg());
+            std::int32_t pureCount = 0;
+            posting.read(
+                reinterpret_cast<char*>(
+                    &entry.pageNum),
+                sizeof(entry.pageNum));
+            posting.read(
+                reinterpret_cast<char*>(
+                    &entry.pageOffset),
+                sizeof(entry.pageOffset));
+            posting.read(
+                reinterpret_cast<char*>(
+                    &entry.elementCount),
+                sizeof(entry.elementCount));
+            posting.read(
+                reinterpret_cast<char*>(
+                    &entry.pageCount),
+                sizeof(entry.pageCount));
+            posting.read(
+                reinterpret_cast<char*>(
+                    &pureCount),
+                sizeof(pureCount));
+            BOOST_REQUIRE(posting.good());
+            staticEntries.push_back(entry);
+        }
+    }
+    const std::uint64_t staticDataOffset =
+        static_cast<std::uint64_t>(
+            staticHeader[10]) *
+        PageSize;
+    const std::uint64_t staticFileBytes =
+        std::filesystem::file_size(
+            staticPostingPath);
+    size_t overlapSource =
+        staticEntries.size();
+    size_t overlapTarget =
+        staticEntries.size();
+    std::uint16_t overlapPageCount = 0;
+    for (size_t target = 0;
+         target < staticEntries.size() &&
+         overlapTarget == staticEntries.size();
+         ++target) {
+        const auto& targetEntry =
+            staticEntries[target];
+        const std::uint64_t targetEnd =
+            staticDataOffset +
+            static_cast<std::uint64_t>(
+                targetEntry.pageNum +
+                targetEntry.pageCount) *
+                PageSize;
+        if (targetEntry.elementCount <= 0 ||
+            targetEnd == staticFileBytes) {
+            continue;
+        }
+        for (size_t source = 0;
+             source < staticEntries.size();
+             ++source) {
+            const auto& sourceEntry =
+                staticEntries[source];
+            if (source == target ||
+                sourceEntry.elementCount <= 0) {
+                continue;
+            }
+            const std::uint64_t payloadBytes =
+                static_cast<std::uint64_t>(
+                    targetEntry.elementCount) *
+                static_cast<std::uint64_t>(
+                    staticHeader[5]);
+            const std::uint64_t occupiedBytes =
+                sourceEntry.pageOffset +
+                payloadBytes;
+            const std::uint64_t pageCount =
+                (occupiedBytes + PageSize - 1) /
+                PageSize;
+            const std::uint64_t extentEnd =
+                staticDataOffset +
+                (static_cast<std::uint64_t>(
+                     sourceEntry.pageNum) +
+                 pageCount) *
+                    PageSize;
+            if (pageCount == 0 ||
+                pageCount >
+                    (std::numeric_limits<
+                         std::uint16_t>::max)() ||
+                extentEnd > staticFileBytes) {
+                continue;
+            }
+            overlapSource = source;
+            overlapTarget = target;
+            overlapPageCount =
+                static_cast<std::uint16_t>(
+                    pageCount);
+            break;
+        }
+    }
+    BOOST_REQUIRE_LT(
+        overlapSource, staticEntries.size());
+    BOOST_REQUIRE_LT(
+        overlapTarget, staticEntries.size());
+    {
+        std::fstream corrupt(
+            staticPostingPath,
+            std::ios::binary |
+                std::ios::in |
+                std::ios::out);
+        BOOST_REQUIRE(corrupt.good());
+        const auto& source =
+            staticEntries[overlapSource];
+        const auto& target =
+            staticEntries[overlapTarget];
+        corrupt.seekp(target.offset);
+        corrupt.write(
+            reinterpret_cast<const char*>(
+                &source.pageNum),
+            sizeof(source.pageNum));
+        corrupt.write(
+            reinterpret_cast<const char*>(
+                &source.pageOffset),
+            sizeof(source.pageOffset));
+        corrupt.seekp(
+            target.offset +
+            static_cast<std::streamoff>(
+                sizeof(std::int32_t) +
+                sizeof(std::uint16_t) +
+                sizeof(std::int32_t)));
+        corrupt.write(
+            reinterpret_cast<const char*>(
+                &overlapPageCount),
+            sizeof(overlapPageCount));
+        BOOST_REQUIRE(corrupt.good());
+    }
+    std::shared_ptr<VectorIndex>
+        overlappingStaticPosting;
+    BOOST_CHECK(
+        VectorIndex::LoadIndex(
+            indexDirectory,
+            overlappingStaticPosting) !=
+        ErrorCode::Success);
+    overlappingStaticPosting.reset();
+    std::filesystem::copy_file(
+        staticPostingBackup, staticPostingPath,
+        std::filesystem::copy_options::
+            overwrite_existing);
+
+    const auto validStaticBytes =
+        std::filesystem::file_size(
+            staticPostingPath);
+    BOOST_REQUIRE_GT(
+        validStaticBytes,
+        static_cast<std::uintmax_t>(
+            PageSize));
+    std::filesystem::resize_file(
+        staticPostingPath,
+        validStaticBytes - PageSize);
+    std::shared_ptr<VectorIndex>
+        truncatedStaticPosting;
+    BOOST_CHECK(
+        VectorIndex::LoadIndex(
+            indexDirectory,
+            truncatedStaticPosting) !=
+        ErrorCode::Success);
+    truncatedStaticPosting.reset();
+    std::filesystem::copy_file(
+        staticPostingBackup, staticPostingPath,
+        std::filesystem::copy_options::
+            overwrite_existing);
+    std::filesystem::remove(
+        staticPostingBackup);
 
     const std::string loaderPath =
         indexDirectory + "/indexloader.ini";
@@ -4457,7 +5549,7 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
     std::filesystem::remove_all(indexDirectory);
 }
 
-BOOST_AUTO_TEST_CASE(StaticHybridSinglePostingPreservesOriginalUnion)
+BOOST_AUTO_TEST_CASE(StaticHybridSinglePostingRetainsSelfContainedOriginalTail)
 {
     const auto edge =
         [](SizeType node, float distance,
@@ -4505,11 +5597,13 @@ BOOST_AUTO_TEST_CASE(StaticHybridSinglePostingPreservesOriginalUnion)
             hybridPureSizes, original,
             originalPostingSizes));
 
-    const std::array<SizeType, 7> expectedVIDs = {
-        10, 40, 30, 20, 50, 70, 60,
+    const std::array<SizeType, 9> expectedVIDs = {
+        10, 40, 10, 30, 20,
+        50, 70, 50, 60,
     };
-    const std::array<SizeType, 7> expectedHeads = {
-        0, 0, 0, 0, 1, 1, 1,
+    const std::array<SizeType, 9> expectedHeads = {
+        0, 0, 0, 0, 0,
+        1, 1, 1, 1,
     };
     BOOST_REQUIRE_EQUAL(
         hybrid.m_selections.size(),
@@ -4523,8 +5617,8 @@ BOOST_AUTO_TEST_CASE(StaticHybridSinglePostingPreservesOriginalUnion)
             hybrid.m_selections[record].tonode,
             expectedVIDs[record]);
     }
-    BOOST_CHECK_EQUAL(postingSizes[0].load(), 4);
-    BOOST_CHECK_EQUAL(postingSizes[1].load(), 3);
+    BOOST_CHECK_EQUAL(postingSizes[0].load(), 5);
+    BOOST_CHECK_EQUAL(postingSizes[1].load(), 4);
     BOOST_CHECK_EQUAL(hybrid.m_start, 0);
     BOOST_CHECK_EQUAL(
         hybrid.m_end,
@@ -4532,6 +5626,28 @@ BOOST_AUTO_TEST_CASE(StaticHybridSinglePostingPreservesOriginalUnion)
     BOOST_CHECK_EQUAL(
         hybrid.m_totalsize,
         hybrid.m_selections.size());
+}
+
+BOOST_AUTO_TEST_CASE(StaticGlobalTailRangeStartsAtPureBoundary)
+{
+    SPANN::ExtraWorkSpace::PostingReadRange
+        range;
+    range.SetContiguousRecordRange(
+        128, 300, 600, 20);
+
+    BOOST_CHECK_EQUAL(range.m_scanBegin, 300);
+    BOOST_CHECK_EQUAL(range.m_scanEnd, 600);
+    BOOST_CHECK_EQUAL(range.ScanCount(), 300);
+    BOOST_CHECK_EQUAL(range.m_readStartPage, 1);
+    BOOST_CHECK_EQUAL(range.m_readPageCount, 2);
+
+    int begin = -1;
+    int end = -1;
+    BOOST_CHECK(range.GetScanRange(0, begin, end));
+    BOOST_CHECK_EQUAL(begin, 300);
+    BOOST_CHECK_EQUAL(end, 600);
+    BOOST_CHECK(
+        !range.GetScanRange(1, begin, end));
 }
 
 BOOST_AUTO_TEST_CASE(StaticHybridWorkspaceResetAndOptionDefaults)

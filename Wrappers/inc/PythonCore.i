@@ -33,6 +33,11 @@
 
 %include "PythonCommon.i"
 
+%ignore TenantIndexManager::LoadAllForSignatureRepair;
+%ignore TenantIndexManager::BuildFromDataSingleTenant;
+%ignore TenantIndexManager::BuildFromDataWithTagsSingleTenant;
+%ignore AnnIndex::SetVectorTagsView;
+
 %{
 #define SWIG_FILE_WITH_INIT
 %}
