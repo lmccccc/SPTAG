@@ -216,6 +216,8 @@ Storage=STATIC
 StaticACLTagCols=1
 EnableLimitedTagPosting=true
 LimitedTagColumn=0
+TailReplicaCount=0
+UnfilterTailBufferLength=0
 EnableExtremeSparseTag=true
 ExtremeSparseTagMinCount=10
 
@@ -241,10 +243,15 @@ Tools/benchmarks/run_spann_attr_build.sh \
 ```
 
 The raw STATIC profile stores the original 128-byte UInt8 vector, a 4-byte
-vector ID, and two inline `uint32` attributes per posting record. Pure and
-tail records retain separate `(head distance, VID)` order. The persisted pure
-boundary lets filtered queries scan only `H`, while unfiltered and exact
-fallback routes read the self-contained `O` suffix directly.
+vector ID, and two inline `uint32` attributes per posting record. The original
+SPANN placement is built first, and its raw top-K head candidates are reused
+for limited-tag support votes before RNG pruning. This removes the separate
+nearest-head vote search; K must not exceed build-time `InternalResultNum`, so
+the original search itself is unchanged. `H` and `O` retain separate
+`(head distance, VID)` order. The persisted boundary lets filtered queries scan
+only `H`, while unfiltered and exact fallback routes read the self-contained
+original `O` suffix directly. Limited-tag mode sets `TailReplicaCount=0` because
+it does not append supplemental unfilter-tail replicas.
 
 `SearchPostingPageLimit` is retained for compatibility and explicit capped
 benchmarks. Normal STATIC filtered queries read the complete pure prefix

@@ -1069,11 +1069,11 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseTagRouteMergeAndReload)
     builder.SetSSDBuildParam(
         "ReplicaCount", "3");
     builder.SetSSDBuildParam(
-        "TailReplicaCount", "2");
+        "TailReplicaCount", "0");
     builder.SetSSDBuildParam(
         "EnableUnfilterTail", "true");
     builder.SetSSDBuildParam(
-        "UnfilterTailBufferLength", "-1");
+        "UnfilterTailBufferLength", "0");
     builder.SetSSDBuildParam("CrossEdges", "0");
     builder.SetSSDBuildParam(
         "ExcludeHead", "true");
@@ -1766,11 +1766,11 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseIntegerCosineMergeUsesNativeScale)
     builder.SetSSDBuildParam(
         "ReplicaCount", "2");
     builder.SetSSDBuildParam(
-        "TailReplicaCount", "1");
+        "TailReplicaCount", "0");
     builder.SetSSDBuildParam(
         "EnableUnfilterTail", "true");
     builder.SetSSDBuildParam(
-        "UnfilterTailBufferLength", "-1");
+        "UnfilterTailBufferLength", "0");
     builder.SetSSDBuildParam("CrossEdges", "0");
     builder.SetSSDBuildParam(
         "ExcludeHead", "true");

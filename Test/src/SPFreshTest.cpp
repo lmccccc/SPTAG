@@ -3718,11 +3718,11 @@ BOOST_AUTO_TEST_CASE(SecondLevelResumeRebuildsPartialGraph)
             set("BuildSSDIndex", "ReplicaCount", "2");
             set("BuildSSDIndex", "RNGFactor", "100");
             set("BuildSSDIndex",
-                "TailReplicaCount", "1");
+                "TailReplicaCount", "0");
             set("BuildSSDIndex",
                 "EnableUnfilterTail", "true");
             set("BuildSSDIndex",
-                "UnfilterTailBufferLength", "-1");
+                "UnfilterTailBufferLength", "0");
             set("BuildSSDIndex", "CrossEdges", "0");
             set("BuildSSDIndex", "ExcludeHead",
                 "true");
@@ -3902,11 +3902,11 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
             set("BuildSSDIndex", "SSDIndexFileNum", "1");
             set("BuildSSDIndex", "ReplicaCount", "8");
             set("BuildSSDIndex", "RNGFactor", "100");
-            set("BuildSSDIndex", "TailReplicaCount", "2");
+            set("BuildSSDIndex", "TailReplicaCount", "0");
             set("BuildSSDIndex",
                 "EnableUnfilterTail", "true");
             set("BuildSSDIndex",
-                "UnfilterTailBufferLength", "-1");
+                "UnfilterTailBufferLength", "0");
             set("BuildSSDIndex", "CrossEdges", "0");
             set("BuildSSDIndex", "ExcludeHead", "true");
             set("BuildSSDIndex", "NumTagsPerVec", "1");
@@ -4660,6 +4660,10 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
     rejectConfiguration(
         "LimitedTagSlotsPerHead", "-1");
     rejectConfiguration(
+        "LimitedTagVoteHeadCount", "33");
+    rejectConfiguration(
+        "TailReplicaCount", "1");
+    rejectConfiguration(
         "SecondLevelRouteSelectivityThreshold", "-0.01");
     rejectConfiguration(
         "SecondLevelRouteSelectivityThreshold", "1.01");
@@ -4816,8 +4820,8 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
                 ->GetPostingCount());
         const int recordBytes = header[5];
         BOOST_REQUIRE_GT(recordBytes, 0);
-        double tailRecords = 0.0;
-        double tailPages = 0.0;
+        double originalRecords = 0.0;
+        double originalPages = 0.0;
         for (int list = 0; list < header[2];
              ++list) {
             std::int32_t pageNum = 0;
@@ -4844,10 +4848,10 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
             BOOST_REQUIRE_GE(pageNum, 0);
             BOOST_REQUIRE_GE(elementCount, pureCount);
             (void)pageCount;
-            const int tailCount =
+            const int originalCount =
                 elementCount - pureCount;
-            tailRecords += tailCount;
-            if (tailCount > 0) {
+            originalRecords += originalCount;
+            if (originalCount > 0) {
                 const std::uint64_t beginBytes =
                     static_cast<std::uint64_t>(
                         pageOffset) +
@@ -4862,7 +4866,7 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
                         elementCount) *
                         static_cast<std::uint64_t>(
                             recordBytes);
-                tailPages +=
+                originalPages +=
                     static_cast<double>(
                         (endBytes + PageSize - 1) /
                             PageSize -
@@ -4871,20 +4875,21 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
         }
         const double listCount =
             static_cast<double>(header[2]);
+        BOOST_CHECK_GT(originalRecords, 0.0);
         BOOST_CHECK_SMALL(
             typed->GetDiskIndex()
                     ->GetPostingAvgRecords(false) -
-                tailRecords / listCount,
+                originalRecords / listCount,
             1e-9);
         BOOST_CHECK_SMALL(
             typed->GetDiskIndex()
                     ->GetPostingAvgPages(false) -
-                tailPages / listCount,
+                originalPages / listCount,
             1e-9);
         BOOST_CHECK_SMALL(
             typed->GetDiskIndex()
                     ->GetPostingAvgBytes(false) -
-                tailRecords *
+                originalRecords *
                     static_cast<double>(recordBytes) /
                     listCount,
             1e-9);

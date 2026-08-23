@@ -1228,6 +1228,14 @@ namespace SPTAG
                 return true;
             }
 
+            struct LimitedTagVote
+            {
+                SizeType m_head = MaxSize;
+                std::uint32_t m_tag =
+                    LimitedTagSupport::EmptyTag;
+                float m_distance = MaxDist;
+            };
+
             bool BuildCompactOriginalSelections(
                 Selection& p_selections,
                 std::vector<std::atomic<std::uint8_t>>&
@@ -1240,7 +1248,9 @@ namespace SPTAG
                 std::shared_ptr<VectorIndex> p_headIndex,
                 SizeType p_fullCount,
                 int p_candidateCount,
-                const Options& p_opt)
+                const Options& p_opt,
+                std::vector<LimitedTagVote>& p_votes,
+                std::uint64_t& p_voteChecked)
             {
                 const SizeType headCount =
                     p_headIndex == nullptr
@@ -1260,6 +1270,9 @@ namespace SPTAG
                     p_opt.m_replicaCount >
                         (std::numeric_limits<
                             std::uint8_t>::max)() ||
+                    p_opt.m_limitedTagVoteHeadCount <= 0 ||
+                    p_opt.m_limitedTagVoteHeadCount >
+                        p_candidateCount ||
                     p_candidateCount <
                         p_opt.m_replicaCount) {
                     SPTAGLIB_LOG(
@@ -1269,6 +1282,23 @@ namespace SPTAG
                     return false;
                 }
 
+                const int voteCount =
+                    (std::min)(
+                        p_opt.m_limitedTagVoteHeadCount,
+                        static_cast<int>(headCount));
+                if (static_cast<size_t>(p_fullCount) >
+                    (std::numeric_limits<size_t>::max)() /
+                        static_cast<size_t>(voteCount)) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Compact original vote dimensions overflow.\n");
+                    return false;
+                }
+                p_votes.assign(
+                    static_cast<size_t>(p_fullCount) *
+                        static_cast<size_t>(voteCount),
+                    LimitedTagVote());
+                p_voteChecked = 0;
                 const int threadCount =
                     (std::max)(
                         1, p_opt.m_iSSDNumberOfThreads);
@@ -1281,6 +1311,7 @@ namespace SPTAG
                 std::atomic<int> failedStatus(
                     static_cast<int>(ErrorCode::Success));
                 std::atomic<std::uint64_t> rngRejected(0);
+                std::atomic<std::uint64_t> voteChecked(0);
                 std::vector<std::thread> threads;
                 threads.reserve(
                     static_cast<size_t>(threadCount));
@@ -1364,10 +1395,40 @@ namespace SPTAG
                                 return;
                             }
 
+                            voteChecked.fetch_add(
+                                static_cast<std::uint64_t>(
+                                    (std::max)(
+                                        0, results.GetScanned())),
+                                std::memory_order_relaxed);
+                            const size_t voteOffset =
+                                static_cast<size_t>(vectorID) *
+                                static_cast<size_t>(voteCount);
+                            const std::uint32_t tag =
+                                StaticBuildTagsData()[
+                                    static_cast<size_t>(vectorID) *
+                                        static_cast<size_t>(
+                                            m_staticNumTagsPerVec) +
+                                    static_cast<size_t>(
+                                        p_opt.m_limitedTagColumn)];
+                            for (int rank = 0;
+                                 rank < voteCount; ++rank) {
+                                const BasicResult* result =
+                                    results.GetResult(rank);
+                                if (result == nullptr ||
+                                    result->VID < 0) {
+                                    break;
+                                }
+                                p_votes[
+                                    voteOffset +
+                                    static_cast<size_t>(rank)] = {
+                                        result->VID, tag,
+                                        result->Dist};
+                            }
+
                             selected.clear();
                             for (int rank = 0;
-                                 rank <
-                                     results.GetResultNum() &&
+                                 rank < p_candidateCount &&
+                                 rank < results.GetResultNum() &&
                                  selected.size() <
                                      static_cast<size_t>(
                                          p_opt
@@ -1440,6 +1501,9 @@ namespace SPTAG
                         failedStatus.load());
                     return false;
                 }
+                p_voteChecked =
+                    voteChecked.load(
+                        std::memory_order_relaxed);
 
                 size_t selectionCount = 0;
                 for (const auto& emitted :
@@ -1473,13 +1537,17 @@ namespace SPTAG
                     Helper::LogLevel::LL_Info,
                     "Compact original placement retained %zu "
                     "RNG edges (rejected=%llu) instead of "
-                    "initializing %zu slots.\n",
+                    "initializing %zu slots; reused the same searches for "
+                    "top-%d limited-tag votes (checked=%llu).\n",
                     selectionCount,
                     static_cast<unsigned long long>(
                         rngRejected.load()),
                     static_cast<size_t>(p_fullCount) *
                         static_cast<size_t>(
-                            p_opt.m_replicaCount));
+                            p_opt.m_replicaCount),
+                    voteCount,
+                    static_cast<unsigned long long>(
+                        p_voteChecked));
                 return true;
             }
 
@@ -1492,15 +1560,10 @@ namespace SPTAG
                 SizeType p_fullCount,
                 int p_postingSizeLimit,
                 const Options& p_opt,
+                std::vector<LimitedTagVote>& p_votes,
+                std::uint64_t p_voteChecked,
                 LimitedTagSupport& p_support)
             {
-                struct Vote
-                {
-                    SizeType m_head = MaxSize;
-                    std::uint32_t m_tag =
-                        LimitedTagSupport::EmptyTag;
-                    float m_distance = MaxDist;
-                };
                 struct SupportChoice
                 {
                     std::uint32_t m_tag =
@@ -1606,6 +1669,17 @@ namespace SPTAG
                     (std::min)(
                         p_opt.m_limitedTagVoteHeadCount,
                         static_cast<int>(headCount));
+                if (static_cast<size_t>(p_fullCount) >
+                        (std::numeric_limits<size_t>::max)() /
+                            static_cast<size_t>(voteCount) ||
+                    p_votes.size() !=
+                        static_cast<size_t>(p_fullCount) *
+                            static_cast<size_t>(voteCount)) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Limited-tag placement is missing the original O-search votes.\n");
+                    return false;
+                }
                 if (headCount <
                     p_opt.m_limitedTagMinHeadCount) {
                     SPTAGLIB_LOG(
@@ -1665,82 +1739,20 @@ namespace SPTAG
                         "Limited-tag placement is missing one or more head source tags.\n");
                     return false;
                 }
-                const size_t voteCapacity =
-                    static_cast<size_t>(p_fullCount) *
-                    static_cast<size_t>(voteCount);
-                std::vector<Vote> votes(voteCapacity);
-                std::atomic<SizeType> nextVector(0);
-                std::atomic_bool failed(false);
-                std::atomic<std::uint64_t> voteChecked(0);
-                const int threadCount =
-                    (std::max)(1, p_opt.m_iSSDNumberOfThreads);
-                std::vector<std::thread> threads;
-                threads.reserve(static_cast<size_t>(threadCount));
-                for (int thread = 0; thread < threadCount; ++thread) {
-                    threads.emplace_back([&]() {
-                        while (!failed.load()) {
-                            const SizeType vectorID =
-                                nextVector.fetch_add(1);
-                            if (vectorID >= p_fullCount) return;
-                            if (p_headVectorIDs.count(vectorID) != 0) {
-                                continue;
-                            }
-                            COMMON::QueryResultSet<ValueType> results(
-                                static_cast<const ValueType*>(
-                                    p_fullVectors->GetVector(vectorID)),
-                                voteCount);
-                            if (p_headIndex->SearchIndex(results) !=
-                                ErrorCode::Success) {
-                                failed.store(true);
-                                return;
-                            }
-                            voteChecked.fetch_add(
-                                static_cast<std::uint64_t>(
-                                    (std::max)(
-                                        0, results.GetScanned())),
-                                std::memory_order_relaxed);
-                            const size_t offset =
-                                static_cast<size_t>(vectorID) *
-                                static_cast<size_t>(voteCount);
-                            for (int rank = 0;
-                                 rank < voteCount; ++rank) {
-                                const BasicResult* result =
-                                    results.GetResult(rank);
-                                if (result == nullptr ||
-                                    result->VID < 0) {
-                                    break;
-                                }
-                                votes[offset +
-                                      static_cast<size_t>(rank)] = {
-                                    result->VID,
-                                    keyTagAt(vectorID),
-                                    result->Dist};
-                            }
-                        }
-                    });
-                }
-                for (auto& thread : threads) thread.join();
-                if (failed.load()) {
-                    SPTAGLIB_LOG(
-                        Helper::LogLevel::LL_Error,
-                        "Limited-tag nearest-head vote search failed.\n");
-                    return false;
-                }
-
-                votes.erase(
+                p_votes.erase(
                     std::remove_if(
-                        votes.begin(), votes.end(),
-                        [headCount](const Vote& p_vote) {
+                        p_votes.begin(), p_votes.end(),
+                        [headCount](const LimitedTagVote& p_vote) {
                             return p_vote.m_head < 0 ||
                                 p_vote.m_head >= headCount ||
                                 p_vote.m_tag ==
                                     LimitedTagSupport::EmptyTag;
                         }),
-                    votes.end());
+                    p_votes.end());
                 std::sort(
-                    votes.begin(), votes.end(),
-                    [](const Vote& p_left,
-                       const Vote& p_right) {
+                    p_votes.begin(), p_votes.end(),
+                    [](const LimitedTagVote& p_left,
+                       const LimitedTagVote& p_right) {
                         if (p_left.m_head != p_right.m_head)
                             return p_left.m_head < p_right.m_head;
                         if (p_left.m_tag != p_right.m_tag)
@@ -1755,22 +1767,22 @@ namespace SPTAG
                 // Deduplicate in place so the full N*voteCount buffer is not
                 // duplicated while support choices are derived.
                 size_t compactVoteCount = 0;
-                for (size_t vote = 0; vote < votes.size();) {
+                for (size_t vote = 0; vote < p_votes.size();) {
                     if (compactVoteCount != vote) {
-                        votes[compactVoteCount] =
-                            votes[vote];
+                        p_votes[compactVoteCount] =
+                            p_votes[vote];
                     }
                     ++compactVoteCount;
-                    const SizeType head = votes[vote].m_head;
-                    const std::uint32_t tag = votes[vote].m_tag;
+                    const SizeType head = p_votes[vote].m_head;
+                    const std::uint32_t tag = p_votes[vote].m_tag;
                     do {
                         ++vote;
                     } while (
-                        vote < votes.size() &&
-                        votes[vote].m_head == head &&
-                        votes[vote].m_tag == tag);
+                        vote < p_votes.size() &&
+                        p_votes[vote].m_head == head &&
+                        p_votes[vote].m_tag == tag);
                 }
-                votes.resize(compactVoteCount);
+                p_votes.resize(compactVoteCount);
 
                 const size_t supportTarget =
                     static_cast<size_t>(
@@ -1871,8 +1883,8 @@ namespace SPTAG
                      head < headCount; ++head) {
                     const size_t begin = cursor;
                     while (cursor <
-                               votes.size() &&
-                           votes[cursor].m_head ==
+                               p_votes.size() &&
+                           p_votes[cursor].m_head ==
                                head) {
                         ++cursor;
                     }
@@ -1880,7 +1892,7 @@ namespace SPTAG
                     candidates.reserve(cursor - begin);
                     for (size_t vote = begin;
                          vote < cursor; ++vote) {
-                        if (votes[vote]
+                        if (p_votes[vote]
                                 .m_tag ==
                             headOwnTags[
                                 static_cast<size_t>(
@@ -1888,8 +1900,8 @@ namespace SPTAG
                             continue;
                         }
                         candidates.push_back({
-                            votes[vote].m_tag,
-                            votes[vote]
+                            p_votes[vote].m_tag,
+                            p_votes[vote]
                                 .m_distance,
                             false});
                     }
@@ -2088,7 +2100,7 @@ namespace SPTAG
                         }
                     }
                 }
-                for (const Vote& vote : votes) {
+                for (const LimitedTagVote& vote : p_votes) {
                     if (coverage[vote.m_tag] <
                         p_opt.m_limitedTagMinHeadCount) {
                         tagCandidates[vote.m_tag]
@@ -2279,7 +2291,8 @@ namespace SPTAG
                     }
                     return headsByTag;
                 }();
-                std::vector<Vote>().swap(votes);
+                std::vector<LimitedTagVote>().swap(
+                    p_votes);
                 tagCandidates.clear();
                 tagCandidates.rehash(0);
                 std::vector<SupportChoice>().swap(
@@ -2299,6 +2312,9 @@ namespace SPTAG
                     static_cast<size_t>(headCount));
                 std::vector<std::uint8_t> desiredReplicas(
                     static_cast<size_t>(p_fullCount), 0);
+                const int threadCount =
+                    (std::max)(
+                        1, p_opt.m_iSSDNumberOfThreads);
                 // Keep only emitted RNG edges. The previous fixed
                 // N*ReplicaCount array initialized tens of gigabytes of
                 // unused slots at billion scale.
@@ -2306,8 +2322,8 @@ namespace SPTAG
                     threadSelections(
                         static_cast<size_t>(threadCount));
                 for (auto& size : postingListSize) size = 0;
-                nextVector.store(0);
-                failed.store(false);
+                std::atomic<SizeType> nextVector(0);
+                std::atomic_bool failed(false);
                 std::atomic<SizeType> failedVector(MaxSize);
                 std::atomic<std::uint32_t> failedTag(
                     LimitedTagSupport::EmptyTag);
@@ -2318,7 +2334,9 @@ namespace SPTAG
                 std::atomic<std::uint64_t>
                     exactFallbackDistanceChecks(0);
                 std::atomic<std::uint64_t> placementChecked(0);
-                threads.clear();
+                std::vector<std::thread> threads;
+                threads.reserve(
+                    static_cast<size_t>(threadCount));
                 for (int thread = 0; thread < threadCount; ++thread) {
                     threads.emplace_back([&, thread]() {
                         auto& emitted =
@@ -2665,7 +2683,7 @@ namespace SPTAG
                     static_cast<unsigned long long>(
                         assignmentCount),
                     static_cast<unsigned long long>(
-                        voteChecked.load()),
+                       p_voteChecked),
                     static_cast<unsigned long long>(
                         placementChecked.load()),
                     static_cast<unsigned long long>(
@@ -2803,7 +2821,10 @@ namespace SPTAG
                 if (constrainedPurePostings &&
                     (!m_staticHasMetadata ||
                      m_indexFiles.size() != 1 ||
-                     p_opt.m_tailReplicaCount <= 0 ||
+                     (p_opt.m_enableHybridDistance &&
+                      p_opt.m_tailReplicaCount <= 0) ||
+                     (p_opt.m_enableLimitedTagPosting &&
+                      p_opt.m_tailReplicaCount < 0) ||
                      p_opt.m_enableOrderedPageStart ||
                      m_staticAttributeOrdered ||
                      p_opt.m_unfilterPureDistanceScanPercent !=
@@ -4322,11 +4343,14 @@ namespace SPTAG
                     const int originalCount =
                         p_originalPostingSizes[
                             static_cast<size_t>(head)];
-                    if (originalRead - originalBegin !=
+                    // Phase 3 applies posting cut by reducing the authoritative
+                    // count; its sorted scratch buffer may still contain the
+                    // rejected suffix.
+                    if (originalRead - originalBegin <
                         static_cast<size_t>(originalCount)) {
                         SPTAGLIB_LOG(
                             Helper::LogLevel::LL_Error,
-                            "Original posting %d contains %zu/%d records.\n",
+                            "Original posting %d contains only %zu/%d records.\n",
                             head, originalRead - originalBegin,
                             originalCount);
                         return false;
@@ -4926,6 +4950,9 @@ namespace SPTAG
                 }
                 const bool compactOriginalPlacement =
                     p_opt.m_enableLimitedTagPosting;
+                std::vector<LimitedTagVote>
+                    limitedTagVotes;
+                std::uint64_t limitedTagVoteChecked = 0;
                 Selection selections(
                     compactOriginalPlacement
                         ? 0
@@ -5150,7 +5177,9 @@ namespace SPTAG
                                 p_headIndex,
                                 fullCount,
                                 candidateNum,
-                                p_opt)) {
+                                p_opt,
+                                limitedTagVotes,
+                                limitedTagVoteChecked)) {
                             return false;
                         }
                     } else {
@@ -5385,29 +5414,42 @@ namespace SPTAG
                 bool unfilterTailBuilt = false;
                 if (p_opt.m_enableHybridDistance ||
                     p_opt.m_enableLimitedTagPosting) {
-                    if (p_opt.m_tailReplicaCount <= 0 ||
+                    if ((p_opt.m_enableHybridDistance &&
+                         p_opt.m_tailReplicaCount <= 0) ||
+                        (p_opt.m_enableLimitedTagPosting &&
+                         p_opt.m_tailReplicaCount != 0) ||
                         p_opt.m_enableOrderedPageStart ||
                         p_opt.m_ssdIndexFileNum != 1 ||
                         p_opt.m_unfilterPureDistanceScanPercent !=
                             100) {
                         SPTAGLIB_LOG(
                             Helper::LogLevel::LL_Error,
-                            "Constrained single-posting build requires a positive "
-                            "TailReplicaCount, EnableOrderedPageStart=false, SSDIndexFileNum=1, "
+                            "Constrained single-posting build requires "
+                            "TailReplicaCount>0 for hybrid mode or "
+                            "TailReplicaCount=0 for limited-tag mode, "
+                            "EnableOrderedPageStart=false, SSDIndexFileNum=1, "
                             "and UnfilterPureDistanceScanPercent=100.\n");
                         return false;
                     }
-                    std::vector<int> originalPureCountPerHead;
-                    if (!AppendUnfilterTail(
-                            selections,
-                            postingListSize,
-                            headVectorIDS,
-                            fullVectors,
-                            p_headIndex,
-                            fullCount,
-                            p_opt,
-                            originalPureCountPerHead)) {
-                        return false;
+                    if (p_opt.m_enableHybridDistance) {
+                        std::vector<int>
+                            originalPureCountPerHead;
+                        if (!AppendUnfilterTail(
+                                selections,
+                                postingListSize,
+                                headVectorIDS,
+                                fullVectors,
+                                p_headIndex,
+                                fullCount,
+                                p_opt,
+                                originalPureCountPerHead)) {
+                            return false;
+                        }
+                    } else {
+                        SPTAGLIB_LOG(
+                            Helper::LogLevel::LL_Info,
+                            "Limited-tag O suffix uses the complete original "
+                            "SPANN placement without supplemental tail replicas.\n");
                     }
                     originalPostingSizes.resize(
                         postingListSize.size());
@@ -5456,6 +5498,8 @@ namespace SPTAG
                                 fullCount,
                                 postingSizeLimit,
                                 p_opt,
+                                limitedTagVotes,
+                                limitedTagVoteChecked,
                                 limitedTagSupport)) {
                             return false;
                         }

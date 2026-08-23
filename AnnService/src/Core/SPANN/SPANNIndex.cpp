@@ -8735,9 +8735,11 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
          !LimitedTagSupport::IsSupportedSlotCount(
              m_options.m_limitedTagSlotsPerHead) ||
          m_options.m_limitedTagVoteHeadCount <= 0 ||
+         m_options.m_limitedTagVoteHeadCount >
+             m_options.m_internalResultNum ||
          m_options.m_limitedTagMinHeadCount <= 0 ||
          m_options.m_replicaCount <= 0 ||
-         m_options.m_tailReplicaCount <= 0 ||
+         m_options.m_tailReplicaCount != 0 ||
          m_options.m_batches != 1 ||
          m_options.m_ssdIndexFileNum != 1 ||
          m_options.m_enableDataCompression ||
@@ -8754,7 +8756,8 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
             "a valid categorical LimitedTagColumn, "
             "ExcludeHead=true, a positive support-slot count "
             "(self plus zero or more external tags), "
-            "positive replica/tail/support parameters, "
+            "positive replica/support parameters with "
+            "LimitedTagVoteHeadCount<=InternalResultNum, TailReplicaCount=0, "
             "one batch/file, and no compression, rearrangement, ordered pages, "
             "or posting quantizer.\n");
         return ErrorCode::FailedParseValue;

@@ -116,11 +116,18 @@ The canonical INI sets `LimitedTagSlotsPerHead=2` explicitly. Use
 `build_spann_attr_sift1m_zipf200_limited_tag4.ini` for the isolated four-slot
 experiment.
 
-Non-head vectors are assigned only to heads supporting their attribute, using
-the normal BKT candidate search and RNG pruning for up to eight replicas. The
-single STM1 v3 posting is `H | O`: limited-tag queries scan `H`, while
-unfiltered and exact-filter fallback queries navigate the original graph and
-read only the complete `O` suffix. Cross-region overlap is intentional.
+The normal BKT candidate search first builds the complete original SPANN
+placement `O`. Its raw top-`LimitedTagVoteHeadCount` candidates are reused as
+support votes before RNG pruning, so support construction does not run a second
+nearest-head search. The vote count must not exceed `InternalResultNum`, keeping
+the vote window inside the unchanged original search. Non-head vectors are then
+assigned only to heads supporting their attribute, using constrained BKT search
+and RNG pruning for up to eight `H` replicas. The single STM1 v3 posting is
+`H | O`: limited-tag queries scan `H`, while unfiltered and exact-filter fallback
+queries navigate the original graph and read only the complete `O` suffix.
+Cross-region overlap is intentional. Limited-tag builds require
+`TailReplicaCount=0`; `O` is already self-contained, so no supplemental
+unfilter-tail replicas are built.
 With `EnableHierPostingFilter=true`, V8 head metadata stores separate
 categorical and quantized-numeric signatures for `H` and `O`; the selected
 route consults only its matching signature before I/O. Numeric signatures use
