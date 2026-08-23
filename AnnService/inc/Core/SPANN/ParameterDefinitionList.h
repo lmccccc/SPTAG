@@ -101,7 +101,7 @@ DefineSSDParameter(m_limitedTagSlotsPerHead, int, 2, "LimitedTagSlotsPerHead")
 DefineSSDParameter(m_limitedTagVoteHeadCount, int, 2, "LimitedTagVoteHeadCount")
 DefineSSDParameter(m_limitedTagMinHeadCount, int, 8, "LimitedTagMinHeadCount")
 DefineSSDParameter(m_enableExtremeSparseTag, bool, false, "EnableExtremeSparseTag")
-DefineSSDParameter(m_extremeSparseTagMaxSelectivity, double, 0.00001, "ExtremeSparseTagMaxSelectivity")
+DefineSSDParameter(m_extremeSparseTagMinCount, int, 10, "ExtremeSparseTagMinCount")
 DefineSSDParameter(m_extremeSparseTagFile, std::string, std::string("extreme_sparse_tags.bin"), "ExtremeSparseTagFile")
 DefineSSDParameter(m_logExtremeSparseTagRoute, bool, false, "LogExtremeSparseTagRoute")
 DefineSSDParameter(m_secondLevelRouteSelectivityThreshold, float, 0.02f, "SecondLevelRouteSelectivityThreshold") // Mutable

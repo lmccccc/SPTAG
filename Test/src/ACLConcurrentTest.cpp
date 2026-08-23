@@ -1092,7 +1092,7 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseTagRouteMergeAndReload)
     builder.SetSSDBuildParam(
         "EnableExtremeSparseTag", "true");
     builder.SetSSDBuildParam(
-        "ExtremeSparseTagMaxSelectivity", "0.04");
+        "ExtremeSparseTagMinCount", "10");
     builder.SetSSDBuildParam(
         "ExtremeSparseTagFile",
         "extreme_sparse_tags.bin");
@@ -1172,6 +1172,27 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseTagRouteMergeAndReload)
         saveDir.path +
         "/tenant_0/extreme_sparse_tags.bin";
     BOOST_REQUIRE(PathExists(sparsePath));
+    SPTAG::Cache::ExtremeSparseTagStore::Header
+        sparseHeader;
+    {
+        std::ifstream sparseInput(
+            sparsePath, std::ios::binary);
+        BOOST_REQUIRE(sparseInput.good());
+        sparseInput.read(
+            reinterpret_cast<char*>(&sparseHeader),
+            sizeof(sparseHeader));
+        BOOST_REQUIRE(sparseInput.good());
+        BOOST_CHECK_EQUAL(sparseHeader.m_version, 4U);
+        BOOST_CHECK_EQUAL(
+            sparseHeader.m_headerBytes,
+            sizeof(sparseHeader));
+        BOOST_CHECK_EQUAL(
+            sparseHeader.m_minTagCount, 10U);
+        BOOST_CHECK_EQUAL(
+            sparseHeader.m_slotsPerHead, 2U);
+        BOOST_CHECK_GE(
+            sparseHeader.m_coverageTarget, 16U);
+    }
     const std::string numericMetadataPath =
         saveDir.path +
         "/tenant_0/numeric_meta.bin";
@@ -1262,6 +1283,63 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseTagRouteMergeAndReload)
                         kDim),
                 kDim * sizeof(float), false);
         };
+    std::uint64_t commonCount = 0;
+    for (int vector = 0;
+         vector < kNumVectors; ++vector) {
+        if (attributes[
+                static_cast<size_t>(vector) *
+                kNumAttributes] == kCommonTag) {
+            ++commonCount;
+        }
+    }
+    const std::uint32_t commonCoverageTarget =
+        static_cast<std::uint32_t>(
+            commonCount *
+                sparseHeader.m_headCount *
+                sparseHeader.m_slotsPerHead /
+                kNumVectors +
+            1);
+    BOOST_REQUIRE_LE(
+        commonCoverageTarget,
+        sparseHeader.m_coverageTarget);
+    loaded.SetSearchParam(
+        "InternalResultNum",
+        std::to_string(commonCoverageTarget).c_str(),
+        "SearchSSDIndex");
+    std::uint32_t commonTag = kCommonTag;
+    auto coverageQualified = loaded.SearchWithACL(
+        query(7), 0, kResultNum,
+        ByteArray(
+            reinterpret_cast<std::uint8_t*>(
+                &commonTag),
+            sizeof(commonTag), false),
+        1);
+    BOOST_REQUIRE(coverageQualified != nullptr);
+    BOOST_CHECK_EQUAL(
+        coverageQualified->GetScanned(),
+        commonCount);
+    loaded.SetSearchParam(
+        "InternalResultNum", "16",
+        "SearchSSDIndex");
+
+    loaded.SetSearchParam(
+        "InternalResultNum",
+        std::to_string(
+            sparseHeader.m_coverageTarget + 1)
+            .c_str(),
+        "SearchSSDIndex");
+    BOOST_CHECK(
+        loaded.SearchWithACL(
+            query(7), 0, kResultNum,
+            ByteArray(
+                reinterpret_cast<std::uint8_t*>(
+                           &commonTag),
+                sizeof(commonTag), false),
+            1) == nullptr);
+    loaded.SetSearchParam(
+        "InternalResultNum", "16",
+        "SearchSSDIndex");
+
     std::uint32_t sparseTag = kSparseTag;
     auto sparseOnly = loaded.SearchWithACL(
         query(kNumVectors - 1), 0, kResultNum,
@@ -1469,6 +1547,33 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseTagRouteMergeAndReload)
     checkNumericFailOpen();
     writeNumericMetadata(validNumericMetadata);
 
+    const std::string loaderPath =
+        saveDir.path +
+        "/tenant_0/indexloader.ini";
+    {
+        std::ifstream input(loaderPath);
+        BOOST_REQUIRE(input.good());
+        std::string migratedConfig;
+        std::string line;
+        while (std::getline(input, line)) {
+            if (line.rfind(
+                    "ExtremeSparseTagMinCount=",
+                    0) == 0) {
+                continue;
+            }
+            migratedConfig += line + "\n";
+        }
+        BOOST_REQUIRE(input.eof());
+        BOOST_CHECK(
+            migratedConfig.find(
+                "ExtremeSparseTagMinCount=") ==
+            std::string::npos);
+        std::ofstream output(
+            loaderPath, std::ios::trunc);
+        BOOST_REQUIRE(output.good());
+        output << migratedConfig;
+        BOOST_REQUIRE(output.good());
+    }
     {
         std::fstream output(
             sparsePath,
@@ -1476,14 +1581,18 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseTagRouteMergeAndReload)
                 std::ios::in |
                 std::ios::out);
         BOOST_REQUIRE(output.good());
-        output.seekg(-1, std::ios::end);
-        char byte = 0;
-        output.read(&byte, 1);
-        BOOST_REQUIRE(output.good());
-        output.clear();
-        output.seekp(-1, std::ios::end);
-        byte ^= 1;
-        output.write(&byte, 1);
+        output.seekp(
+            static_cast<std::streamoff>(
+                offsetof(
+                    SPTAG::Cache::
+                        ExtremeSparseTagStore::Header,
+                    m_version)),
+            std::ios::beg);
+        const std::uint32_t oldVersion = 3;
+        output.write(
+            reinterpret_cast<const char*>(
+                &oldVersion),
+            sizeof(oldVersion));
         BOOST_REQUIRE(output.good());
     }
     TenantIndexManager corrupted(
@@ -1492,9 +1601,23 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseTagRouteMergeAndReload)
         !corrupted.LoadAll(saveDir.path.c_str()));
     TenantIndexManager repair(
         kDim, "SPANN", "Float");
+    repair.SetSSDBuildParam(
+        "ExtremeSparseTagMinCount", "11");
     BOOST_REQUIRE(
         repair.LoadAllForSignatureRepair(
             saveDir.path.c_str()));
+    {
+        std::ifstream input(loaderPath);
+        BOOST_REQUIRE(input.good());
+        const std::string migratedConfig(
+            (std::istreambuf_iterator<char>(
+                 input)),
+            std::istreambuf_iterator<char>());
+        BOOST_CHECK(
+            migratedConfig.find(
+                "ExtremeSparseTagMinCount=11") !=
+            std::string::npos);
+    }
     BOOST_REQUIRE(
         repair.BuildSignaturesWithVectors(
             0, attributeBytes, kNumVectors,
@@ -1503,6 +1626,22 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseTagRouteMergeAndReload)
         kDim, "SPANN", "Float");
     BOOST_REQUIRE(
         repaired.LoadAll(saveDir.path.c_str()));
+    {
+        SPTAG::Cache::ExtremeSparseTagStore::Header
+            repairedHeader;
+        std::ifstream input(
+            sparsePath, std::ios::binary);
+        BOOST_REQUIRE(input.good());
+        input.read(
+            reinterpret_cast<char*>(
+                &repairedHeader),
+            sizeof(repairedHeader));
+        BOOST_REQUIRE(input.good());
+        BOOST_CHECK_EQUAL(
+            repairedHeader.m_version, 4U);
+        BOOST_CHECK_EQUAL(
+            repairedHeader.m_minTagCount, 11U);
+    }
     auto repairedSparse = repaired.SearchWithACL(
         query(kNumVectors - 1), 0, kResultNum,
         ByteArray(
@@ -1650,8 +1789,7 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseIntegerCosineMergeUsesNativeScale)
     builder.SetSSDBuildParam(
         "EnableExtremeSparseTag", "true");
     builder.SetSSDBuildParam(
-        "ExtremeSparseTagMaxSelectivity",
-        "0.004");
+        "ExtremeSparseTagMinCount", "10");
     builder.SetSSDBuildParam(
         "EnableHierPostingFilter", "false");
 

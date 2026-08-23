@@ -187,10 +187,13 @@ Tools/benchmarks/prep_sift1b_inputs.sh
 ```
 
 The categorical column contains 200 Zipf-distributed regular values and one
-extreme value. Its count is `floor(vector_count * 0.00001)`, which is exactly
-10,000 for SIFT1B. The generator writes both the headerless SPTAG input
-`sift1b_zipf200_sparse10000_numeric_attrs.u32` and a shape-preserving NumPy
-copy, plus exact counts and a hash-bound manifest.
+extreme value. The generator reads the native INI and computes the largest
+strict EST count as
+`max(MinCount-1, ceil(L/(SelectHead.Ratio*Slots))-1)`. The canonical
+`.12` ratio, two slots, `L=96`, and minimum count 10 produce 399 vectors.
+The generator writes both the headerless SPTAG input
+`sift1b_zipf200_sparse399_numeric_attrs.u32` and a shape-preserving NumPy copy,
+plus exact counts, the policy inputs, and a hash-bound manifest.
 The prep script and tracked INI use
 `/mnt/nvme/baotonglu/mocheng/datasets/sift1b` by default; when the dataset is
 elsewhere, set `SIFT1B_ROOT` for generation and update the native INI paths to
@@ -205,7 +208,7 @@ Use the native configuration
 
 ```ini
 [Tags]
-TagFile=sift1b/sift1b_build/sift1b_zipf200_sparse10000_numeric_attrs.u32
+TagFile=sift1b/sift1b_build/sift1b_zipf200_sparse399_numeric_attrs.u32
 NumTagsPerVec=2
 
 [BuildSSDIndex]
@@ -214,7 +217,7 @@ StaticACLTagCols=1
 EnableLimitedTagPosting=true
 LimitedTagColumn=0
 EnableExtremeSparseTag=true
-ExtremeSparseTagMaxSelectivity=0.00001
+ExtremeSparseTagMinCount=10
 
 [MultiTenant]
 ACLCols=0
@@ -225,7 +228,11 @@ PivotForceNodeCount=1
 
 The complete INI keeps the documented SIFT1B BKT construction and search
 budgets while using one global BKT graph, constrained `H | O` postings, H2,
-numeric posting signatures, and EST3 for the measured `1e-5` extreme tag.
+numeric posting signatures, and EST4. At runtime EST uses the actual `N` and
+`H`: `tagCount < 10` or `tagCount*H*slots < InternalResultNum*N`; otherwise
+the tag follows normal limited-tag/H2 routing. The sidecar stores candidates
+through the build-time `max(SearchInternalResultNum, MaxCheck)` ceiling so
+native nprobe sweeps can re-evaluate the rule without rebuilding.
 Build it with:
 
 ```bash

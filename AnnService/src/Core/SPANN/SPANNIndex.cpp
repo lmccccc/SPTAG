@@ -2449,7 +2449,7 @@ ErrorCode Index<T>::LoadLimitedTagSupport(
         m_options.m_limitedTagSupportFile.empty()) {
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
-            "Enabled limited-tag mode has no valid 2/4-slot constrained "
+            "Enabled limited-tag mode has no valid positive-slot constrained "
             "static posting layout.\n");
         return ErrorCode::Fail;
     }
@@ -8752,8 +8752,8 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
             Helper::LogLevel::LL_Error,
             "Limited-tag posting requires raw multi-attribute STATIC BKT with "
             "a valid categorical LimitedTagColumn, "
-            "ExcludeHead=true, two or four support slots "
-            "(self plus one or three external), "
+            "ExcludeHead=true, a positive support-slot count "
+            "(self plus zero or more external tags), "
             "positive replica/tail/support parameters, "
             "one batch/file, and no compression, rearrangement, ordered pages, "
             "or posting quantizer.\n");
@@ -8761,15 +8761,12 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
     }
     if (m_options.m_enableExtremeSparseTag &&
         (!m_options.m_enableLimitedTagPosting ||
-         m_options.m_extremeSparseTagFile.empty() ||
-         !std::isfinite(
-             m_options.m_extremeSparseTagMaxSelectivity) ||
-         m_options.m_extremeSparseTagMaxSelectivity <= 0.0f ||
-         m_options.m_extremeSparseTagMaxSelectivity > 1.0f)) {
+        m_options.m_extremeSparseTagFile.empty() ||
+        m_options.m_extremeSparseTagMinCount <= 0)) {
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
             "Extreme-sparse tag routing requires limited-tag mode, a file name, "
-            "and ExtremeSparseTagMaxSelectivity in (0,1].\n");
+            "and a positive ExtremeSparseTagMinCount.\n");
         return ErrorCode::FailedParseValue;
     }
     if (m_options.m_enableHybridDistance &&

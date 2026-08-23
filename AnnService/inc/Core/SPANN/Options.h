@@ -112,7 +112,7 @@ namespace SPTAG {
             int m_limitedTagVoteHeadCount;
             int m_limitedTagMinHeadCount;
             bool m_enableExtremeSparseTag;
-            double m_extremeSparseTagMaxSelectivity;
+            int m_extremeSparseTagMinCount;
             std::string m_extremeSparseTagFile;
             bool m_logExtremeSparseTagRoute;
             float m_hybridVectorWeight;

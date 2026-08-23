@@ -9,38 +9,24 @@ import os
 import struct
 import time
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import numpy as np
 
 from generate_tenant_tag_scenario import zipf_counts
+from extreme_sparse_policy import (
+    coverage_boundary_count,
+    read_extreme_tag_policy,
+)
 
 
 DEFAULT_ROOT = Path("/mnt/nvme/baotonglu/mocheng/datasets/sift1b")
-DEFAULT_EXTREME_TAG_RATIO = Decimal("0.00001")
+DEFAULT_CONFIG = Path(__file__).with_name(
+    "build_spann_attr_sift1b_zipf200_limited_tag.ini"
+)
 DEFAULT_ATTRIBUTE_CARDINALITY = 200
 MAX_CATEGORICAL_VALUES = 256
 NUMERIC_MULTIPLIER = 2654435761
-
-
-def parse_ratio(value: str) -> Decimal:
-    try:
-        ratio = Decimal(value)
-    except InvalidOperation as error:
-        raise argparse.ArgumentTypeError(f"invalid ratio: {value}") from error
-    if not ratio.is_finite():
-        raise argparse.ArgumentTypeError("ratio must be finite")
-    return ratio
-
-
-def count_from_ratio(vector_count: int, ratio: Decimal) -> int:
-    if ratio < 0 or ratio >= 1:
-        raise ValueError("extreme-tag-ratio must be in [0,1)")
-    count = int(Decimal(vector_count) * ratio)
-    if ratio and count == 0:
-        raise ValueError("extreme-tag-ratio selects fewer than one vector")
-    return count
 
 
 def u8bin_shape(path: Path) -> tuple[int, int]:
@@ -173,10 +159,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--zipf-exponent", type=float, default=1.0)
     parser.add_argument(
-        "--extreme-tag-ratio",
-        type=parse_ratio,
-        default=DEFAULT_EXTREME_TAG_RATIO,
-        help="Append a tag with floor(vector_count * ratio) members.",
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG,
+        help="Native SPANN INI that defines the EST coverage policy.",
     )
     parser.add_argument("--seed", type=int, default=20260817)
     parser.add_argument("--numeric-seed", type=int, default=20260821)
@@ -200,6 +186,10 @@ def main() -> None:
     )
     if not base_file.is_file():
         raise FileNotFoundError(base_file)
+    config_path = args.config.resolve()
+    if not config_path.is_file():
+        raise FileNotFoundError(config_path)
+    policy = read_extreme_tag_policy(config_path)
     source_count, dimension = u8bin_shape(base_file)
     if dimension != 128:
         raise ValueError(f"expected SIFT dimension 128, got {dimension}")
@@ -210,13 +200,20 @@ def main() -> None:
         )
     if args.chunk_size <= 0:
         raise ValueError("chunk-size must be positive")
+    if args.vector_count == 0 and (
+        policy.vector_count != vector_count
+    ):
+        raise ValueError(
+            f"{config_path}: VectorCount={policy.vector_count} "
+            f"does not match base count {vector_count}"
+        )
     if args.attribute_cardinality <= 0:
         raise ValueError("attribute-cardinality must be positive")
     if not np.isfinite(args.zipf_exponent) or args.zipf_exponent <= 0:
         raise ValueError("zipf-exponent must be finite and positive")
 
-    extreme_tag_count = count_from_ratio(
-        vector_count, args.extreme_tag_ratio
+    extreme_tag_count = coverage_boundary_count(
+        vector_count, policy
     )
     categorical_values = (
         args.attribute_cardinality + int(extreme_tag_count > 0)
@@ -242,12 +239,28 @@ def main() -> None:
             "to the requested vector count"
         )
 
-    prefix = args.output_prefix
-    if not prefix:
-        prefix = f"sift1b_zipf{args.attribute_cardinality}"
-        if extreme_tag_count:
-            prefix += f"_sparse{extreme_tag_count}"
-        prefix += "_numeric"
+    expected_prefix = (
+        f"sift1b_zipf{args.attribute_cardinality}"
+        f"_sparse{extreme_tag_count}_numeric"
+    )
+    configured_name = Path(policy.tag_file).name
+    suffix = "_attrs.u32"
+    if not configured_name.endswith(suffix):
+        raise ValueError(
+            f"{config_path}: TagFile must end in {suffix}"
+        )
+    configured_prefix = configured_name[:-len(suffix)]
+    if configured_prefix != expected_prefix:
+        raise ValueError(
+            f"{config_path}: TagFile encodes {configured_prefix}, "
+            f"but its EST policy derives {expected_prefix}"
+        )
+    prefix = args.output_prefix or configured_prefix
+    if prefix != expected_prefix:
+        raise ValueError(
+            f"output prefix {prefix} does not match native EST policy "
+            f"({expected_prefix})"
+        )
     output_dir = (
         args.output_dir.resolve()
         if args.output_dir
@@ -349,7 +362,7 @@ def main() -> None:
                 )
 
         manifest = {
-            "schema_version": 3,
+            "schema_version": 4,
             "generated_at_utc": datetime.now(timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%SZ"
             ),
@@ -357,6 +370,11 @@ def main() -> None:
             "source_base_file": str(base_file),
             "source_vector_count": source_count,
             "vector_count": vector_count,
+            "native_config": {
+                "path": str(config_path),
+                "sha256": sha256(config_path),
+                "configured_vector_count": policy.vector_count,
+            },
             "dimension": dimension,
             "attribute_columns": 2,
             "categorical_columns": 1,
@@ -383,16 +401,29 @@ def main() -> None:
                 if extreme_tag_count
                 else None
             ),
-            "extreme_tag_ratio_requested": str(
-                args.extreme_tag_ratio
-            ),
             "extreme_tag_count": extreme_tag_count,
             "extreme_tag_selectivity": (
                 extreme_tag_count / vector_count
                 if extreme_tag_count
                 else 0.0
             ),
-            "extreme_tag_rounding": "floor(vector_count * ratio)",
+            "extreme_tag_policy": {
+                "formula": (
+                    "max(min_tag_count - 1, "
+                    "ceil(coverage_target / "
+                    "(expected_head_ratio * slots_per_head)) - 1)"
+                ),
+                "expected_head_ratio": str(
+                    policy.head_ratio
+                ),
+                "expected_head_count": str(
+                    vector_count * policy.head_ratio
+                ),
+                "slots_per_head": policy.slots_per_head,
+                "coverage_target": policy.coverage_target,
+                "min_tag_count": policy.min_tag_count,
+                "derived_max_tag_count": extreme_tag_count,
+            },
             "numeric_generation": {
                 "formula": "(vid * 2654435761 + seed) mod 2^32",
                 "seed": args.numeric_seed,

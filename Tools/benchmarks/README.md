@@ -98,14 +98,19 @@ The record schema is driven by native `NumTagsPerVec`, `ACLCols`,
 count. Limited-tag placement and H1/H2 routing use only categorical equality
 anchors on `LimitedTagColumn`; all categorical and numeric DNF3 literals are
 still evaluated exactly on posting records. Native
-`[BuildSSDIndex] LimitedTagSlotsPerHead` accepts `2` (the default) or `4`.
+`[BuildSSDIndex] LimitedTagSlotsPerHead` accepts any positive integer (`2` is
+the default).
 Each head persists exactly that many support values in generation-bound
 `limited_tag_support.bin`:
 
 ```text
 support[head][0] = source vector attribute
-support[head][1..N-1] = top-(N-1) external attributes, N in {2, 4}
+support[head][1..N-1] = top-(N-1) external attributes
 ```
+
+The requested count cannot exceed the number of distinct key-column tags,
+because every support value on a head is distinct. With one slot, a head
+supports only its source vector's tag.
 
 The canonical INI sets `LimitedTagSlotsPerHead=2` explicitly. Use
 `build_spann_attr_sift1m_zipf200_limited_tag4.ini` for the isolated four-slot
@@ -136,31 +141,38 @@ configured `InternalResultNum` heads, then applies the support predicate to
 those posting IDs before I/O. Tag support never participates in the H1 graph
 inner loop.
 
-Tags at or below `ExtremeSparseTagMaxSelectivity` additionally retain one
-contiguous EST3 copy of `[VID | all attributes | vector]`. EST is an exact
-tag-only route; the same vectors remain in ordinary postings for unfiltered,
-numeric-only, and other-attribute predicates. A partially covered DNF is split
-into an exact EST scan and a dense search of only its uncovered clauses, then
-deduplicated by VID. H2 posting signatures include only tags in
+EST4 classifies a tag by absolute expected head coverage, not selectivity. A
+tag uses the exact contiguous `[VID | all attributes | vector]` route when
+`tagCount < ExtremeSparseTagMinCount` or
+`tagCount * actualHeadCount * LimitedTagSlotsPerHead <
+SearchInternalResultNum * vectorCount`. The strict inequality makes the largest
+coverage-qualified count `ceil(L*N/(H*S))-1`. The same vectors remain in
+ordinary postings for unfiltered, numeric-only, and other-attribute predicates.
+The sidecar stores every tag eligible up to the build-time
+`max(SearchInternalResultNum, MaxCheck)` ceiling, then each query re-evaluates
+eligibility with its current `InternalResultNum`.
+A partially covered DNF is split into an exact EST scan and a dense search of
+only its uncovered clauses, then deduplicated by VID. H2 posting signatures
+include only tags in
 `(SecondLevelSignatureMinSelectivity, SecondLevelSignatureMaxSelectivity]`.
 H2 signatures are categorical only; numeric pruning applies to H1 posting
 selection and the self-contained `O` fallback route.
 Every dense DNF clause must have a signature-represented equality anchor before H2 is
 used; otherwise search falls back safely to H1 or complete ordinary postings.
-`--extreme-tag-ratio` derives the generated extreme-tag count as
-`floor(vector_count * ratio)`. The canonical `1e-5` ratio therefore yields
-10 vectors on SIFT1M and 10,000 vectors at 1B scale, matching
-`ExtremeSparseTagMaxSelectivity=0.00001`.
+The generators read this policy directly from the canonical native INI. Before
+heads exist they use `expectedHeadCount = VectorCount * SelectHead.Ratio`; the
+manifest records that assumption. SIFT1M therefore generates 193 extreme
+vectors from `Ratio=.16`, two slots, and `InternalResultNum=62`.
 
 Generate the reproducible Zipf-200 attribute and build with:
 
 ```bash
 python3 Tools/benchmarks/generate_sift1m_zipf_attribute.py \
   --output-dir /datadisk/yfcc_fast/sptag_sift1m_zipf200_sparse_numeric \
-  --extreme-tag-ratio 0.00001 --numeric-column \
-  --output-prefix sift1m_zipf200_sparse10_numeric
+  --extreme-tag-coverage --numeric-column \
+  --config Tools/benchmarks/build_spann_attr_sift1m_zipf200_limited_tag.ini
 python3 Tools/benchmarks/generate_sift1m_sparse_numeric_workloads.py \
-  --attributes /datadisk/yfcc_fast/sptag_sift1m_zipf200_sparse_numeric/sift1m_zipf200_sparse10_numeric_attrs.npy \
+  --attributes /datadisk/yfcc_fast/sptag_sift1m_zipf200_sparse_numeric/sift1m_zipf200_sparse193_numeric_attrs.npy \
   --output-dir /datadisk/yfcc_fast/sptag_sift1m_zipf200_sparse_numeric/query
 Release/spannbuilder \
   -c Tools/benchmarks/build_spann_attr_sift1m_zipf200_limited_tag.ini
@@ -173,8 +185,9 @@ two attributes: one Zipf-200 categorical tag and one deterministic numeric
 value. It writes the final row-major `uint32 [N,2]` SPTAG input directly in
 bounded-memory chunks; no `tags5` merge or per-vector routing-key text file is
 used. The categorical assignment is an exact affine permutation of the Zipf
-counts, so the `1e-5` extreme-tag ratio produces exactly 10,000 vectors at
-1B scale. `spannbuilder` uses its tenant-0 bulk path for these inputs: mapped
+counts. The generator reads the native INI and derives 399 extreme vectors from
+`Ratio=.12`, two support slots, `InternalResultNum=96`, and the strict EST
+coverage inequality. `spannbuilder` uses its tenant-0 bulk path for these inputs: mapped
 vectors and attributes are borrowed through the synchronous build instead of
 materializing one metadata string, pointer pair, and global ID per vector.
 Both original and constrained placement retain only emitted RNG edges rather
@@ -188,9 +201,10 @@ Tools/benchmarks/run_spann_attr_build.sh "$CFG"
 
 The canonical build uses one global BKT graph, `ACLCols=0`, `NumericCols=1`,
 `LimitedTagColumn=0`, and `HierLevelWidths=201,64,64,64,64` for the 201
-active values plus minimum-width inactive lanes. EST3 retains tags whose
-measured selectivity is at most `1e-5`; H2 covers the configured intermediate
-range. The historical four-ACL SIFT1B INIs remain only as reproduction
+active values plus minimum-width inactive lanes. EST4 binds the actual vector
+and head counts, slot width, coverage target, minimum count, and generation;
+H2 covers the configured intermediate range. The historical four-ACL SIFT1B
+INIs remain only as reproduction
 controls for archived `sift1b_tags5.u32` inputs and are not produced by the
 current generator.
 

@@ -1511,12 +1511,17 @@ namespace SPTAG
                 struct SupportRow
                 {
                     SupportChoice* m_data = nullptr;
-                    std::uint8_t* m_size = nullptr;
+                    std::uint8_t* m_compactSize = nullptr;
+                    std::uint32_t* m_wideSize = nullptr;
                     size_t m_capacity = 0;
 
                     size_t size() const
                     {
-                        return static_cast<size_t>(*m_size);
+                        return m_compactSize != nullptr
+                            ? static_cast<size_t>(
+                                  *m_compactSize)
+                            : static_cast<size_t>(
+                                  *m_wideSize);
                     }
                     SupportChoice* begin() const
                     {
@@ -1532,11 +1537,16 @@ namespace SPTAG
                     }
                     bool push_back(const SupportChoice& p_choice)
                     {
-                        if (size() >= m_capacity) {
+                        const size_t count = size();
+                        if (count >= m_capacity) {
                             return false;
                         }
-                        m_data[size()] = p_choice;
-                        ++(*m_size);
+                        m_data[count] = p_choice;
+                        if (m_compactSize != nullptr) {
+                            ++(*m_compactSize);
+                        } else {
+                            ++(*m_wideSize);
+                        }
                         return true;
                     }
                 };
@@ -1587,8 +1597,8 @@ namespace SPTAG
                         Helper::LogLevel::LL_Error,
                         "Limited-tag placement requires raw metadata with a valid "
                         "categorical LimitedTagColumn, "
-                        "unquantized BKT heads, one batch, two or four tag slots "
-                        "(self plus one or three external tags), and valid support/RNG parameters.\n");
+                        "unquantized BKT heads, one batch, a positive tag-slot count "
+                        "(self plus zero or more external tags), and valid support/RNG parameters.\n");
                     return false;
                 }
 
@@ -1765,11 +1775,65 @@ namespace SPTAG
                 const size_t supportTarget =
                     static_cast<size_t>(
                         p_opt.m_limitedTagSlotsPerHead);
+                std::vector<std::uint32_t> observedTags;
+                std::unordered_map<
+                    std::uint32_t,
+                    std::uint64_t> tagVectorCounts;
+                {
+                    std::unordered_set<std::uint32_t> unique;
+                    for (SizeType vectorID = 0;
+                         vectorID < p_fullCount;
+                         ++vectorID) {
+                        const std::uint32_t tag =
+                            keyTagAt(vectorID);
+                        if (tag ==
+                            LimitedTagSupport::EmptyTag) {
+                            SPTAGLIB_LOG(
+                                Helper::LogLevel::LL_Error,
+                                "Limited-tag input contains the reserved empty tag.\n");
+                            return false;
+                        }
+                        ++tagVectorCounts[tag];
+                        if (unique.insert(tag).second)
+                            observedTags.push_back(tag);
+                    }
+                }
+                std::sort(
+                    observedTags.begin(),
+                    observedTags.end());
+                if (observedTags.size() < supportTarget) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Limited-tag placement needs at least %zu distinct tags "
+                        "to fill every head (got %zu).\n",
+                        supportTarget, observedTags.size());
+                    return false;
+                }
+                if (supportTarget == 0 ||
+                    static_cast<size_t>(headCount) >
+                        (std::numeric_limits<size_t>::max)() /
+                            supportTarget) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Limited-tag support dimensions overflow.\n");
+                    return false;
+                }
                 std::vector<SupportChoice> headSupport(
                     static_cast<size_t>(headCount) *
                     supportTarget);
-                std::vector<std::uint8_t> headSupportCounts(
-                    static_cast<size_t>(headCount), 0);
+                std::vector<std::uint8_t>
+                    compactHeadSupportCounts;
+                std::vector<std::uint32_t>
+                    wideHeadSupportCounts;
+                if (supportTarget <=
+                    (std::numeric_limits<
+                         std::uint8_t>::max)()) {
+                    compactHeadSupportCounts.assign(
+                        static_cast<size_t>(headCount), 0);
+                } else {
+                    wideHeadSupportCounts.assign(
+                        static_cast<size_t>(headCount), 0);
+                }
                 const auto supportRow =
                     [&](SizeType p_head) {
                         const size_t head =
@@ -1777,7 +1841,12 @@ namespace SPTAG
                         return SupportRow{
                             headSupport.data() +
                                 head * supportTarget,
-                            &headSupportCounts[head],
+                            compactHeadSupportCounts.empty()
+                                ? nullptr
+                                : &compactHeadSupportCounts[head],
+                            wideHeadSupportCounts.empty()
+                                ? nullptr
+                                : &wideHeadSupportCounts[head],
                             supportTarget};
                     };
                 std::unordered_map<std::uint32_t, int> coverage;
@@ -1855,40 +1924,6 @@ namespace SPTAG
                     }
                 }
 
-                std::vector<std::uint32_t> observedTags;
-                std::unordered_map<
-                    std::uint32_t,
-                    std::uint64_t> tagVectorCounts;
-                {
-                    std::unordered_set<std::uint32_t> unique;
-                    for (SizeType vectorID = 0;
-                         vectorID < p_fullCount;
-                         ++vectorID) {
-                        const std::uint32_t tag =
-                            keyTagAt(vectorID);
-                        if (tag ==
-                            LimitedTagSupport::EmptyTag) {
-                            SPTAGLIB_LOG(
-                                Helper::LogLevel::LL_Error,
-                                "Limited-tag input contains the reserved empty tag.\n");
-                            return false;
-                        }
-                        ++tagVectorCounts[tag];
-                        if (unique.insert(tag).second)
-                            observedTags.push_back(tag);
-                    }
-                }
-                std::sort(
-                    observedTags.begin(),
-                    observedTags.end());
-                if (observedTags.size() < supportTarget) {
-                    SPTAGLIB_LOG(
-                        Helper::LogLevel::LL_Error,
-                        "Limited-tag placement needs at least %zu distinct tags "
-                        "to fill every head (got %zu).\n",
-                        supportTarget, observedTags.size());
-                    return false;
-                }
                 std::uint64_t centroidFallbackSupports = 0;
                 if (observedTags.size() > 1) {
                     const int fallbackResultCount =
@@ -2250,7 +2285,9 @@ namespace SPTAG
                 std::vector<SupportChoice>().swap(
                     headSupport);
                 std::vector<std::uint8_t>().swap(
-                    headSupportCounts);
+                    compactHeadSupportCounts);
+                std::vector<std::uint32_t>().swap(
+                    wideHeadSupportCounts);
                 std::vector<std::uint32_t>().swap(
                     headOwnTags);
                 std::vector<SizeType>().swap(

@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -41,8 +40,8 @@ public:
     struct Header
     {
         std::uint32_t m_magic = 0x31545345U; // EST1
-        std::uint32_t m_version = 3;
-        std::uint32_t m_headerBytes = 96;
+        std::uint32_t m_version = 4;
+        std::uint32_t m_headerBytes = 120;
         std::uint32_t m_directoryEntryBytes = 24;
         std::uint32_t m_valueType = 0;
         std::uint32_t m_dimension = 0;
@@ -56,7 +55,11 @@ public:
         std::uint64_t m_dataOffset = 0;
         std::uint64_t m_generationFingerprint = 0;
         std::uint64_t m_bodyFingerprint = 0;
-        double m_maxSelectivity = 0.0;
+        std::uint64_t m_minTagCount = 0;
+        std::uint64_t m_maxTagCount = 0;
+        std::uint64_t m_headCount = 0;
+        std::uint32_t m_slotsPerHead = 0;
+        std::uint32_t m_coverageTarget = 0;
     };
 
     struct DirectoryEntry
@@ -68,7 +71,7 @@ public:
     };
 #pragma pack(pop)
 
-    static_assert(sizeof(Header) == 96,
+    static_assert(sizeof(Header) == 120,
                   "ExtremeSparseTagStore header layout changed");
     static_assert(sizeof(DirectoryEntry) == 24,
                   "ExtremeSparseTagStore directory layout changed");
@@ -76,6 +79,40 @@ public:
     ExtremeSparseTagStore() = default;
     ExtremeSparseTagStore(const ExtremeSparseTagStore&) = delete;
     ExtremeSparseTagStore& operator=(const ExtremeSparseTagStore&) = delete;
+
+    static bool TryComputeMaxTagCount(
+        std::uint64_t p_vectorCount,
+        std::uint64_t p_headCount,
+        std::uint32_t p_slotsPerHead,
+        std::uint32_t p_coverageTarget,
+        std::uint64_t& p_maxTagCount)
+    {
+        p_maxTagCount = 0;
+        if (p_vectorCount == 0 || p_headCount == 0 ||
+            p_slotsPerHead == 0 ||
+            p_coverageTarget == 0 ||
+            p_headCount >
+                (std::numeric_limits<std::uint64_t>::max)() /
+                    p_slotsPerHead ||
+            p_vectorCount >
+                (std::numeric_limits<std::uint64_t>::max)() /
+                    p_coverageTarget)
+        {
+            return false;
+        }
+        const std::uint64_t denominator =
+            p_headCount * p_slotsPerHead;
+        const std::uint64_t numerator =
+            p_vectorCount * p_coverageTarget;
+        // Largest integer count whose expected supported-head coverage is
+        // strictly below the target:
+        //   count * H * slots < target * N.
+        p_maxTagCount =
+            (numerator - 1) / denominator;
+        p_maxTagCount =
+            (std::min)(p_maxTagCount, p_vectorCount);
+        return true;
+    }
 
     ~ExtremeSparseTagStore()
     {
@@ -114,7 +151,10 @@ public:
                std::uint32_t p_vectorBytes,
                VectorValueType p_valueType,
                std::uint32_t p_dimension,
-               double p_maxSelectivity,
+               std::uint64_t p_minTagCount,
+               std::uint64_t p_headCount,
+               std::uint32_t p_slotsPerHead,
+               std::uint32_t p_coverageTarget,
                std::uint64_t p_generationFingerprint,
                std::string* p_error = nullptr)
     {
@@ -126,8 +166,10 @@ public:
         if (p_path.empty() || p_attributes == nullptr || p_vectors == nullptr ||
             p_vectorCount == 0 || p_attributeCount == 0 ||
             p_keyColumn >= p_attributeCount || p_vectorBytes == 0 ||
-            p_dimension == 0 || !std::isfinite(p_maxSelectivity) ||
-            p_maxSelectivity <= 0.0 || p_maxSelectivity > 1.0 ||
+            p_dimension == 0 || p_minTagCount == 0 ||
+            p_headCount == 0 ||
+            p_slotsPerHead == 0 ||
+            p_coverageTarget == 0 ||
             p_generationFingerprint == 0)
         {
             return fail("invalid extreme-sparse tag build parameters");
@@ -155,6 +197,15 @@ public:
         {
             return fail("extreme-sparse vector buffer size mismatch");
         }
+        std::uint64_t maxTagCount = 0;
+        if (!TryComputeMaxTagCount(
+                p_vectorCount, p_headCount,
+                p_slotsPerHead, p_coverageTarget,
+                maxTagCount))
+        {
+            return fail(
+                "invalid extreme-sparse coverage parameters");
+        }
         const std::uint64_t attributeBytes =
             static_cast<std::uint64_t>(p_attributeCount) *
             sizeof(std::uint32_t);
@@ -180,10 +231,8 @@ public:
         m_directory.reserve(counts.size());
         for (const auto& entry : counts)
         {
-            const double selectivity =
-                static_cast<double>(entry.second) /
-                static_cast<double>(p_vectorCount);
-            if (selectivity <= p_maxSelectivity)
+            if (entry.second < p_minTagCount ||
+                entry.second <= maxTagCount)
             {
                 DirectoryEntry directoryEntry;
                 directoryEntry.m_tag = entry.first;
@@ -210,7 +259,11 @@ public:
         m_header.m_tagCount = m_directory.size();
         m_header.m_generationFingerprint =
             p_generationFingerprint;
-        m_header.m_maxSelectivity = p_maxSelectivity;
+        m_header.m_minTagCount = p_minTagCount;
+        m_header.m_maxTagCount = maxTagCount;
+        m_header.m_headCount = p_headCount;
+        m_header.m_slotsPerHead = p_slotsPerHead;
+        m_header.m_coverageTarget = p_coverageTarget;
         if (m_directory.size() >
             ((std::numeric_limits<std::uint64_t>::max)() -
              sizeof(Header)) /
@@ -418,9 +471,10 @@ public:
                         sizeof(std::uint32_t) +
                     m_header.m_vectorBytes ||
             m_header.m_generationFingerprint == 0 ||
-            !std::isfinite(m_header.m_maxSelectivity) ||
-            m_header.m_maxSelectivity <= 0.0 ||
-            m_header.m_maxSelectivity > 1.0)
+            m_header.m_minTagCount == 0 ||
+            m_header.m_headCount == 0 ||
+            m_header.m_slotsPerHead == 0 ||
+            m_header.m_coverageTarget == 0)
         {
             return fail("invalid extreme-sparse tag header");
         }
@@ -444,6 +498,19 @@ public:
         {
             return fail(
                 "invalid extreme-sparse vector layout");
+        }
+        std::uint64_t expectedMaxTagCount = 0;
+        if (!TryComputeMaxTagCount(
+                m_header.m_vectorCount,
+                m_header.m_headCount,
+                m_header.m_slotsPerHead,
+                m_header.m_coverageTarget,
+                expectedMaxTagCount) ||
+            m_header.m_maxTagCount !=
+                expectedMaxTagCount)
+        {
+            return fail(
+                "invalid extreme-sparse coverage policy");
         }
         const std::uint64_t maxDirectoryCount =
             ((std::numeric_limits<std::uint64_t>::max)() -
@@ -497,6 +564,10 @@ public:
             if ((hasPrevious && entry.m_tag <= previousTag) ||
                 entry.m_reserved != 0 ||
                 entry.m_count == 0 ||
+                !(entry.m_count <
+                      m_header.m_minTagCount ||
+                  entry.m_count <=
+                      m_header.m_maxTagCount) ||
                 entry.m_offset != expectedOffset ||
                 entry.m_count >
                     ((std::numeric_limits<std::uint64_t>::max)() -
@@ -541,7 +612,9 @@ public:
                           std::uint32_t p_keyColumn,
                           std::uint64_t p_vectorCount,
                           std::uint64_t p_generationFingerprint,
-                          double p_maxSelectivity,
+                          std::uint64_t p_minTagCount,
+                          std::uint64_t p_headCount,
+                          std::uint32_t p_slotsPerHead,
                           std::string* p_error = nullptr) const
     {
         if (m_path.empty() ||
@@ -553,7 +626,9 @@ public:
             m_header.m_vectorCount != p_vectorCount ||
             m_header.m_generationFingerprint !=
                 p_generationFingerprint ||
-            m_header.m_maxSelectivity != p_maxSelectivity)
+            m_header.m_minTagCount != p_minTagCount ||
+            m_header.m_headCount != p_headCount ||
+            m_header.m_slotsPerHead != p_slotsPerHead)
         {
             if (p_error != nullptr)
             {
@@ -565,14 +640,52 @@ public:
         return true;
     }
 
+    bool IsEligibleCount(
+        std::uint64_t p_tagCount,
+        std::uint32_t p_coverageTarget) const
+    {
+        if (p_tagCount == 0 || m_path.empty())
+            return false;
+        if (p_tagCount < m_header.m_minTagCount)
+            return true;
+        std::uint64_t maxTagCount = 0;
+        return TryComputeMaxTagCount(
+                   m_header.m_vectorCount,
+                   m_header.m_headCount,
+                   m_header.m_slotsPerHead,
+                   p_coverageTarget,
+                   maxTagCount) &&
+            p_tagCount <= maxTagCount;
+    }
+
     std::uint64_t GenerationFingerprint() const
     {
         return m_header.m_generationFingerprint;
     }
 
-    double MaxSelectivity() const
+    std::uint64_t MinTagCount() const
     {
-        return m_header.m_maxSelectivity;
+        return m_header.m_minTagCount;
+    }
+
+    std::uint64_t MaxTagCount() const
+    {
+        return m_header.m_maxTagCount;
+    }
+
+    std::uint64_t HeadCount() const
+    {
+        return m_header.m_headCount;
+    }
+
+    std::uint32_t SlotsPerHead() const
+    {
+        return m_header.m_slotsPerHead;
+    }
+
+    std::uint32_t CoverageTarget() const
+    {
+        return m_header.m_coverageTarget;
     }
 
     const DirectoryEntry* Find(std::uint32_t p_tag) const

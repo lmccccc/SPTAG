@@ -2976,6 +2976,10 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseTagStoreLifecycle)
         5.0f, 5.5f};
     constexpr std::uint64_t generation =
         0x123456789abcdef0ULL;
+    constexpr std::uint64_t minTagCount = 1;
+    constexpr std::uint64_t headCount = 3;
+    constexpr std::uint32_t slotsPerHead = 2;
+    constexpr std::uint32_t coverageTarget = 3;
 
     Store store;
     std::string error;
@@ -2987,7 +2991,9 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseTagStoreLifecycle)
         sizeof(vectors),
         dimension * sizeof(float),
         VectorValueType::Float,
-        dimension, 0.34, generation, &error));
+        dimension, minTagCount, headCount,
+        slotsPerHead, coverageTarget,
+        generation, &error));
     BOOST_REQUIRE(store.Find(10U) != nullptr);
     BOOST_REQUIRE(store.Find(20U) != nullptr);
     BOOST_CHECK(store.Find(30U) == nullptr);
@@ -2996,20 +3002,59 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseTagStoreLifecycle)
     BOOST_CHECK_EQUAL(store.StoredRecordCount(), 3);
     BOOST_CHECK(store.ValidateExpected(
         VectorValueType::Float, dimension,
-        attributeCount, 0, 6, generation, 0.34,
+        attributeCount, 0, 6, generation,
+        minTagCount, headCount, slotsPerHead,
         &error));
     BOOST_CHECK(!store.ValidateExpected(
         VectorValueType::UInt8, dimension,
-        attributeCount, 0, 6, generation, 0.34,
+        attributeCount, 0, 6, generation,
+        minTagCount, headCount, slotsPerHead,
         &error));
     BOOST_CHECK(!store.ValidateExpected(
         VectorValueType::Float, dimension,
         attributeCount, 0, 6, generation + 1,
-        0.34, &error));
+        minTagCount, headCount, slotsPerHead,
+        &error));
     BOOST_CHECK(!store.ValidateExpected(
         VectorValueType::Float, dimension,
         attributeCount, 0, 6, generation,
-        0.35, &error));
+        minTagCount, headCount + 1,
+        slotsPerHead, &error));
+    BOOST_CHECK_EQUAL(store.CoverageTarget(), coverageTarget);
+    BOOST_CHECK(store.IsEligibleCount(2, coverageTarget));
+    BOOST_CHECK(!store.IsEligibleCount(2, coverageTarget - 1));
+    BOOST_CHECK(store.IsEligibleCount(1, coverageTarget - 1));
+
+    std::uint64_t dynamicMax = 0;
+    BOOST_REQUIRE(Store::TryComputeMaxTagCount(
+        1000000000ULL, 100000000ULL,
+        1, 96, dynamicMax));
+    BOOST_CHECK_EQUAL(dynamicMax, 959);
+    BOOST_REQUIRE(Store::TryComputeMaxTagCount(
+        1000000000ULL, 100000000ULL,
+        2, 96, dynamicMax));
+    BOOST_CHECK_EQUAL(dynamicMax, 479);
+    BOOST_REQUIRE(Store::TryComputeMaxTagCount(
+        1000000000ULL, 100000000ULL,
+        3, 96, dynamicMax));
+    BOOST_CHECK_EQUAL(dynamicMax, 319);
+    BOOST_REQUIRE(Store::TryComputeMaxTagCount(
+        1000000000ULL, 100000000ULL,
+        4, 96, dynamicMax));
+    BOOST_CHECK_EQUAL(dynamicMax, 239);
+    BOOST_REQUIRE(Store::TryComputeMaxTagCount(
+        1000000000ULL, 100000000ULL,
+        8, 96, dynamicMax));
+    BOOST_CHECK_EQUAL(dynamicMax, 119);
+    BOOST_REQUIRE(Store::TryComputeMaxTagCount(
+        10, 5, 2, 3, dynamicMax));
+    BOOST_CHECK_EQUAL(dynamicMax, 2);
+    BOOST_REQUIRE(Store::TryComputeMaxTagCount(
+        10, 3, 2, 2, dynamicMax));
+    BOOST_CHECK_EQUAL(dynamicMax, 3);
+    BOOST_REQUIRE(Store::TryComputeMaxTagCount(
+        10, 10, 8, 1, dynamicMax));
+    BOOST_CHECK_EQUAL(dynamicMax, 0);
 
     const std::string boundaryPath = path + ".boundary";
     const std::array<std::uint32_t, 10>
@@ -3025,7 +3070,8 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseTagStoreLifecycle)
             boundaryVectors.data()),
         sizeof(boundaryVectors),
         dimension * sizeof(float),
-        VectorValueType::Float, dimension, 0.3,
+        VectorValueType::Float, dimension,
+        1, 3, 2, 2,
         generation + 1, &error));
     BOOST_REQUIRE(boundary.Find(40U) != nullptr);
     BOOST_CHECK_EQUAL(
@@ -3033,6 +3079,31 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseTagStoreLifecycle)
     BOOST_CHECK(boundary.Find(50U) == nullptr);
     boundary.Reset();
     std::filesystem::remove(boundaryPath);
+
+    const std::string minimumPath = path + ".minimum";
+    std::array<std::uint32_t, 20> minimumAttributes{};
+    std::fill_n(minimumAttributes.begin(), 9, 60U);
+    std::fill(
+        minimumAttributes.begin() + 9,
+        minimumAttributes.end(), 70U);
+    const std::array<float, 40> minimumVectors{};
+    Store minimum;
+    BOOST_REQUIRE(minimum.Build(
+        minimumPath, minimumAttributes.data(),
+        minimumAttributes.size(), 1, 0,
+        reinterpret_cast<const std::uint8_t*>(
+            minimumVectors.data()),
+        sizeof(minimumVectors),
+        dimension * sizeof(float),
+        VectorValueType::Float, dimension,
+        10, 20, 8, 1,
+        generation + 2, &error));
+    BOOST_REQUIRE(minimum.Find(60U) != nullptr);
+    BOOST_CHECK_EQUAL(
+        minimum.Find(60U)->m_count, 9);
+    BOOST_CHECK(minimum.Find(70U) == nullptr);
+    minimum.Reset();
+    std::filesystem::remove(minimumPath);
 
     std::vector<std::uint8_t> records;
     std::uint64_t recordCount = 0;
@@ -3122,7 +3193,9 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseTagStoreLifecycle)
             sizeof(replacementVectors),
             dimension * sizeof(float),
             VectorValueType::Float,
-            dimension, 0.34, generation, &error));
+            dimension, minTagCount, headCount,
+            slotsPerHead, coverageTarget,
+            generation, &error));
         BOOST_REQUIRE(
             Helper::AtomicReplaceFile(
                 replacementPath, path));
@@ -3170,7 +3243,42 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseTagStoreLifecycle)
         sizeof(vectors),
         dimension * sizeof(float),
         VectorValueType::Float,
-        dimension, 0.34, generation, &error));
+        dimension, minTagCount, headCount,
+        slotsPerHead, coverageTarget,
+        generation, &error));
+    loaded.Reset();
+    {
+        std::fstream output(
+            path,
+            std::ios::binary |
+                std::ios::in |
+                std::ios::out);
+        BOOST_REQUIRE(output.good());
+        output.seekp(
+            static_cast<std::streamoff>(
+                offsetof(Store::Header, m_version)),
+            std::ios::beg);
+        const std::uint32_t oldVersion = 3;
+        output.write(
+            reinterpret_cast<const char*>(
+                &oldVersion),
+            sizeof(oldVersion));
+        BOOST_REQUIRE(output.good());
+    }
+    Store oldFormat;
+    BOOST_CHECK(!oldFormat.Load(path, &error));
+
+    BOOST_REQUIRE(loaded.Build(
+        path, attributes.data(), 6,
+        attributeCount, 0,
+        reinterpret_cast<const std::uint8_t*>(
+            vectors.data()),
+        sizeof(vectors),
+        dimension * sizeof(float),
+        VectorValueType::Float,
+        dimension, minTagCount, headCount,
+        slotsPerHead, coverageTarget,
+        generation, &error));
     loaded.Reset();
     {
         std::fstream output(
@@ -3182,9 +3290,9 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseTagStoreLifecycle)
         output.seekp(
             static_cast<std::streamoff>(
                 offsetof(Store::Header,
-                         m_maxSelectivity)),
+                         m_maxTagCount)),
             std::ios::beg);
-        const double changedThreshold = 0.2;
+        const std::uint64_t changedThreshold = 1;
         output.write(
             reinterpret_cast<const char*>(
                 &changedThreshold),
@@ -3202,7 +3310,9 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseTagStoreLifecycle)
         sizeof(vectors),
         dimension * sizeof(float),
         VectorValueType::Float,
-        dimension, 0.34, generation, &error));
+        dimension, minTagCount, headCount,
+        slotsPerHead, coverageTarget,
+        generation, &error));
     loaded.Reset();
     {
         std::fstream output(
@@ -4267,6 +4377,131 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
     };
     verifyDefaultTwoSlots();
 
+    std::vector<std::uint32_t> eightSlotTags(
+        static_cast<size_t>(baseCount));
+    for (SizeType row = 0; row < baseCount; ++row) {
+        eightSlotTags[static_cast<size_t>(row)] =
+            static_cast<std::uint32_t>(row) % 8;
+    }
+    const auto verifySlots =
+        [&](int slotCount,
+            const std::vector<std::uint32_t>& slotTags,
+            int slotDistinctTags) {
+        auto slotIndex =
+            VectorIndex::CreateInstance(
+                IndexAlgoType::SPANN,
+                VectorValueType::Float);
+        BOOST_REQUIRE(slotIndex != nullptr);
+        configure(slotIndex);
+        BOOST_REQUIRE(
+            slotIndex->SetParameter(
+                "LimitedTagSlotsPerHead",
+                std::to_string(slotCount).c_str(),
+                "BuildSSDIndex") ==
+            ErrorCode::Success);
+        auto* slotSPANN =
+            dynamic_cast<SPANN::ISPANNIndex*>(
+                slotIndex.get());
+        auto* slotTyped =
+            dynamic_cast<SPANN::Index<float>*>(
+                slotIndex.get());
+        BOOST_REQUIRE(slotSPANN != nullptr);
+        BOOST_REQUIRE(slotTyped != nullptr);
+        slotSPANN->SetVectorTags(
+            slotTags.data(), baseCount, 1);
+        BOOST_REQUIRE(
+            slotIndex->BuildIndex(
+                vectors, nullptr, true, false,
+                false) == ErrorCode::Success);
+        BOOST_REQUIRE(
+            slotIndex->SaveIndex(
+                indexDirectory) ==
+            ErrorCode::Success);
+
+        std::uint64_t generation = 0;
+        BOOST_REQUIRE(
+            Helper::Convert::ConvertStringTo<
+                std::uint64_t>(
+                slotTyped->GetOptions()
+                    ->m_limitedTagGenerationFingerprint
+                    .c_str(),
+                generation));
+        SPANN::LimitedTagSupport support;
+        std::string supportError;
+        BOOST_REQUIRE(
+            support.Load(
+                indexDirectory +
+                    "/limited_tag_support.bin",
+                slotSPANN->GetMemoryIndex()
+                    ->GetNumSamples(),
+                slotCount, 2, 8, 0, 1,
+                generation, &supportError));
+        BOOST_CHECK_EQUAL(
+            support.SlotsPerHead(), slotCount);
+        for (SizeType head = 0;
+             head < support.HeadCount(); ++head) {
+            BOOST_CHECK_EQUAL(
+                support.HeadTags(head).size(),
+                static_cast<size_t>(slotCount));
+        }
+
+        const auto search = [&](const std::shared_ptr<
+                                    VectorIndex>& target) {
+            const std::uint32_t tag = slotTags.front();
+            VectorIndex::ThreadLocalSearchContext context;
+            context.m_active = true;
+            context.m_queryTags = {tag};
+            context.m_filterSelectivity =
+                1.0f / slotDistinctTags;
+            context.m_routeSelectivity =
+                context.m_filterSelectivity;
+            VectorIndex::ThreadLocalSearchContextGuard guard(
+                std::move(context));
+            COMMON::QueryResultSet<float> result(data, 10);
+            BOOST_REQUIRE(
+                target->SearchIndex(result) ==
+                ErrorCode::Success);
+            int resultCount = 0;
+            for (int rank = 0;
+                 rank < result.GetResultNum(); ++rank) {
+                const BasicResult* item =
+                    result.GetResult(rank);
+                if (item == nullptr || item->VID < 0)
+                    break;
+                BOOST_CHECK_EQUAL(
+                    slotTags[static_cast<size_t>(
+                        item->VID)],
+                    tag);
+                ++resultCount;
+            }
+            BOOST_CHECK_GT(resultCount, 0);
+        };
+        search(slotIndex);
+        slotIndex.reset();
+
+        std::shared_ptr<VectorIndex> reloaded;
+        BOOST_REQUIRE(
+            VectorIndex::LoadIndex(
+                indexDirectory, reloaded) ==
+            ErrorCode::Success);
+        auto* reloadedTyped =
+            dynamic_cast<SPANN::Index<float>*>(
+                reloaded.get());
+        BOOST_REQUIRE(reloadedTyped != nullptr);
+        BOOST_CHECK_EQUAL(
+            reloadedTyped->GetOptions()
+                ->m_limitedTagSlotsPerHead,
+            slotCount);
+        search(reloaded);
+        reloaded.reset();
+        std::filesystem::remove_all(indexDirectory);
+        std::filesystem::create_directories(
+            indexDirectory);
+    };
+    verifySlots(1, tags, distinctTags);
+    verifySlots(3, eightSlotTags, 8);
+    verifySlots(8, eightSlotTags, 8);
+
     {
         auto rejected =
             VectorIndex::CreateInstance(
@@ -4421,11 +4656,9 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
     rejectConfiguration(
         "EnableHybridDistance", "true");
     rejectConfiguration(
-        "LimitedTagSlotsPerHead", "1");
+        "LimitedTagSlotsPerHead", "0");
     rejectConfiguration(
-        "LimitedTagSlotsPerHead", "3");
-    rejectConfiguration(
-        "LimitedTagSlotsPerHead", "5");
+        "LimitedTagSlotsPerHead", "-1");
     rejectConfiguration(
         "SecondLevelRouteSelectivityThreshold", "-0.01");
     rejectConfiguration(

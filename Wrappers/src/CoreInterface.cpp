@@ -623,6 +623,126 @@ std::string ReadBuildSSDIndexValue(
     return std::string();
 }
 
+bool AddMissingBuildSSDIndexValue(
+    const std::string& path,
+    const std::string& key,
+    const std::string& value)
+{
+    std::ifstream input(path, std::ios::binary);
+    if (!input || key.empty() || value.empty()) return false;
+    const std::string content(
+        (std::istreambuf_iterator<char>(input)),
+        std::istreambuf_iterator<char>());
+    if (input.bad()) return false;
+    input.close();
+
+    const auto normalized = [](std::string text) {
+        const size_t begin =
+            text.find_first_not_of(" \t\r\n");
+        const size_t end =
+            text.find_last_not_of(" \t\r\n");
+        text = begin == std::string::npos
+            ? std::string()
+            : text.substr(begin, end - begin + 1);
+        std::transform(
+            text.begin(), text.end(), text.begin(),
+            [](unsigned char item) {
+                return static_cast<char>(
+                    std::tolower(item));
+            });
+        return text;
+    };
+    const std::string normalizedKey = normalized(key);
+    bool inBuildSSDIndex = false;
+    bool foundBuildSSDIndex = false;
+    size_t insertion = std::string::npos;
+    for (size_t begin = 0; begin <= content.size();)
+    {
+        const size_t newline = content.find('\n', begin);
+        const size_t end = newline == std::string::npos
+            ? content.size()
+            : newline;
+        std::string line =
+            content.substr(begin, end - begin);
+        const std::string trimmed = normalized(line);
+        if (!trimmed.empty() && trimmed.front() == '[')
+        {
+            const size_t close = trimmed.find(']');
+            const std::string section =
+                close == std::string::npos
+                ? std::string()
+                : trimmed.substr(1, close - 1);
+            if (inBuildSSDIndex)
+            {
+                insertion = begin;
+                break;
+            }
+            inBuildSSDIndex =
+                section == "buildssdindex";
+            foundBuildSSDIndex =
+                foundBuildSSDIndex ||
+                inBuildSSDIndex;
+        }
+        else if (inBuildSSDIndex &&
+                 !trimmed.empty() &&
+                 trimmed.front() != ';')
+        {
+            const size_t equal = trimmed.find('=');
+            if (equal != std::string::npos &&
+                normalized(
+                    trimmed.substr(0, equal)) ==
+                    normalizedKey)
+            {
+                return false;
+            }
+        }
+        if (newline == std::string::npos) break;
+        begin = newline + 1;
+    }
+    if (!foundBuildSSDIndex) return false;
+    if (insertion == std::string::npos)
+        insertion = content.size();
+
+    const std::string lineEnding =
+        content.find("\r\n") != std::string::npos
+        ? "\r\n"
+        : "\n";
+    std::string addition;
+    if (insertion == content.size() &&
+        !content.empty() &&
+        content.back() != '\n')
+    {
+        addition += lineEnding;
+    }
+    addition += key + "=" + value + lineEnding;
+
+    const std::string temporary = path + ".tmp";
+    std::ofstream output(
+        temporary,
+        std::ios::binary | std::ios::trunc);
+    if (!output) return false;
+    output.write(
+        content.data(),
+        static_cast<std::streamsize>(insertion));
+    output.write(
+        addition.data(),
+        static_cast<std::streamsize>(
+            addition.size()));
+    output.write(
+        content.data() + insertion,
+        static_cast<std::streamsize>(
+            content.size() - insertion));
+    output.close();
+    if (!output ||
+        !SPTAG::Helper::AtomicReplaceFile(
+            temporary, path))
+    {
+        std::remove(temporary.c_str());
+        return false;
+    }
+    return true;
+}
+
 bool IniEnablesHybridDistance(const std::string& path)
 {
     std::string value = ReadBuildSSDIndexValue(
@@ -5907,8 +6027,9 @@ bool TenantIndexManager::LoadTenantExtremeSparseTagStores()
         }
         int keyColumn = 0;
         int attributeCount = 0;
+        int slotsPerHead = 0;
+        int minTagCount = 0;
         std::uint64_t generationFingerprint = 0;
-        double maxSelectivity = 0.0;
         const std::string keyColumnText =
             ReadBuildSSDIndexValue(
                 iniPath, "LimitedTagColumn");
@@ -5919,10 +6040,65 @@ bool TenantIndexManager::LoadTenantExtremeSparseTagStores()
             ReadBuildSSDIndexValue(
                 iniPath,
                 "LimitedTagGenerationFingerprint");
-        const std::string maxSelectivityText =
+        const std::string slotsPerHeadText =
             ReadBuildSSDIndexValue(
                 iniPath,
-                "ExtremeSparseTagMaxSelectivity");
+                "LimitedTagSlotsPerHead");
+        std::string minTagCountText =
+            ReadBuildSSDIndexValue(
+                iniPath,
+                "ExtremeSparseTagMinCount");
+        if (minTagCountText.empty() &&
+            m_allowExtremeSparseTagRepairLoad)
+        {
+            bool hasRepairValue = false;
+            for (auto parameter =
+                     m_extraSSDBuildParams.rbegin();
+                 parameter !=
+                     m_extraSSDBuildParams.rend();
+                 ++parameter)
+            {
+                if (SPTAG::Helper::StrUtils::
+                        StrEqualIgnoreCase(
+                            parameter->first.c_str(),
+                            "ExtremeSparseTagMinCount"))
+                {
+                    minTagCountText =
+                        parameter->second;
+                    hasRepairValue = true;
+                    break;
+                }
+            }
+            if (!hasRepairValue)
+            {
+                minTagCountText = std::to_string(
+                    SPTAG::SPANN::Options()
+                        .m_extremeSparseTagMinCount);
+            }
+            int repairMinTagCount = 0;
+            if (!SPTAG::Helper::Convert::
+                    ConvertStringTo<int>(
+                        minTagCountText.c_str(),
+                        repairMinTagCount) ||
+                repairMinTagCount <= 0 ||
+                !AddMissingBuildSSDIndexValue(
+                    iniPath,
+                    "ExtremeSparseTagMinCount",
+                    minTagCountText))
+            {
+                fprintf(
+                    stderr,
+                    "[ERROR] Tenant %d: cannot migrate missing "
+                    "ExtremeSparseTagMinCount for EST repair\n",
+                    tenantId);
+                return false;
+            }
+            fprintf(
+                stderr,
+                "[WARN] Tenant %d: migrated legacy EST config "
+                "with ExtremeSparseTagMinCount=%d\n",
+                tenantId, repairMinTagCount);
+        }
         if ((!keyColumnText.empty() &&
              !SPTAG::Helper::Convert::ConvertStringTo<int>(
                  keyColumnText.c_str(), keyColumn)) ||
@@ -5935,16 +6111,20 @@ bool TenantIndexManager::LoadTenantExtremeSparseTagStores()
                 ConvertStringTo<std::uint64_t>(
                    generationText.c_str(),
                    generationFingerprint) ||
-            maxSelectivityText.empty() ||
-            !SPTAG::Helper::Convert::ConvertStringTo<double>(
-                maxSelectivityText.c_str(),
-                maxSelectivity) ||
+            slotsPerHeadText.empty() ||
+            !SPTAG::Helper::Convert::ConvertStringTo<int>(
+                slotsPerHeadText.c_str(),
+                slotsPerHead) ||
+            minTagCountText.empty() ||
+            !SPTAG::Helper::Convert::ConvertStringTo<int>(
+                minTagCountText.c_str(),
+                minTagCount) ||
             keyColumn < 0 || attributeCount <= 0 ||
             keyColumn >= attributeCount ||
             generationFingerprint == 0 ||
-            !std::isfinite(maxSelectivity) ||
-            maxSelectivity <= 0.0 ||
-            maxSelectivity > 1.0)
+            !SPTAG::SPANN::LimitedTagSupport::
+                IsSupportedSlotCount(slotsPerHead) ||
+            minTagCount <= 0)
         {
             fprintf(
                 stderr,
@@ -5954,9 +6134,13 @@ bool TenantIndexManager::LoadTenantExtremeSparseTagStores()
         }
         const auto vectorCount =
             m_tenantVectorCounts.find(tenantId);
+        const auto headCount =
+            m_tenantHeadCounts.find(tenantId);
         if (vectorCount ==
                 m_tenantVectorCounts.end() ||
-            vectorCount->second <= 0)
+            vectorCount->second <= 0 ||
+            headCount == m_tenantHeadCounts.end() ||
+            headCount->second <= 0)
         {
             return false;
         }
@@ -5977,7 +6161,12 @@ bool TenantIndexManager::LoadTenantExtremeSparseTagStores()
                 static_cast<std::uint64_t>(
                     vectorCount->second),
                 generationFingerprint,
-                maxSelectivity,
+                static_cast<std::uint64_t>(
+                    minTagCount),
+                static_cast<std::uint64_t>(
+                    headCount->second),
+                static_cast<std::uint32_t>(
+                    slotsPerHead),
                 &error))
         {
             if (m_allowExtremeSparseTagRepairLoad)
@@ -6699,8 +6888,10 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
     bool extremeSparseTagEnabled = false;
     bool logExtremeSparseTagRoute = false;
     int limitedTagColumn = 0;
+    int limitedTagSlotsPerHead = 2;
+    int extremeSparseTagMinCount = 10;
+    int extremeSparseTagStorageCoverageTarget = 4096;
     int staticACLTagCols = p_numTagsPerVec;
-    double extremeSparseTagMaxSelectivity = 0.00001;
     std::uint64_t limitedTagGenerationFingerprint = 0;
     std::uint64_t signatureGenerationFingerprint = 0;
     std::string extremeSparseTagFile =
@@ -6756,13 +6947,21 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                     if (options != nullptr) {
                         limitedTagColumn =
                             options->m_limitedTagColumn;
+                        limitedTagSlotsPerHead =
+                            options
+                                ->m_limitedTagSlotsPerHead;
+                        extremeSparseTagMinCount =
+                            options
+                                ->m_extremeSparseTagMinCount;
+                        extremeSparseTagStorageCoverageTarget =
+                            (std::max)(
+                                options
+                                    ->m_searchInternalResultNum,
+                                options->m_maxCheck);
                         staticACLTagCols =
                             options->m_staticACLTagCols > 0
                             ? options->m_staticACLTagCols
                             : p_numTagsPerVec;
-                        extremeSparseTagMaxSelectivity =
-                            options
-                                ->m_extremeSparseTagMaxSelectivity;
                         SPTAG::Helper::Convert::
                             ConvertStringTo<std::uint64_t>(
                                 options
@@ -6813,10 +7012,11 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                      p_vectors.Length() !=
                          static_cast<size_t>(p_numVectors) *
                              m_inputVectorSize ||
-                     !std::isfinite(
-                         extremeSparseTagMaxSelectivity) ||
-                     extremeSparseTagMaxSelectivity <= 0.0 ||
-                     extremeSparseTagMaxSelectivity > 1.0 ||
+                     !SPTAG::SPANN::LimitedTagSupport::
+                         IsSupportedSlotCount(
+                             limitedTagSlotsPerHead) ||
+                     extremeSparseTagMinCount <= 0 ||
+                     extremeSparseTagStorageCoverageTarget <= 0 ||
                      limitedTagGenerationFingerprint == 0 ||
                      !IsSafeArtifactFileName(
                          extremeSparseTagFile))) {
@@ -6908,10 +7108,15 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
         if (extremeSparseTagEnabled &&
             stat(extremeSparsePath.c_str(), &st) == 0)
         {
+            const auto expectedHeadCount =
+                m_tenantHeadCounts.find(p_tenantId);
             SPTAG::Cache::ExtremeSparseTagStore
                 existingStore;
             std::string existingStoreError;
             extremeSparseOk =
+                expectedHeadCount !=
+                    m_tenantHeadCounts.end() &&
+                expectedHeadCount->second > 0 &&
                 existingStore.Load(
                     extremeSparsePath,
                     &existingStoreError) &&
@@ -6926,8 +7131,16 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                     static_cast<std::uint64_t>(
                         p_numVectors),
                     limitedTagGenerationFingerprint,
-                    extremeSparseTagMaxSelectivity,
-                    &existingStoreError);
+                    static_cast<std::uint64_t>(
+                        extremeSparseTagMinCount),
+                    static_cast<std::uint64_t>(
+                        expectedHeadCount->second),
+                    static_cast<std::uint32_t>(
+                        limitedTagSlotsPerHead),
+                    &existingStoreError) &&
+                existingStore.CoverageTarget() ==
+                    static_cast<std::uint32_t>(
+                        extremeSparseTagStorageCoverageTarget);
             if (!extremeSparseOk)
             {
                 fprintf(
@@ -7860,7 +8073,14 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                         m_valueType,
                         static_cast<std::uint32_t>(
                             m_dimension),
-                        extremeSparseTagMaxSelectivity,
+                        static_cast<std::uint64_t>(
+                            extremeSparseTagMinCount),
+                        static_cast<std::uint64_t>(
+                            numHeads),
+                        static_cast<std::uint32_t>(
+                            limitedTagSlotsPerHead),
+                        static_cast<std::uint32_t>(
+                            extremeSparseTagStorageCoverageTarget),
                         limitedTagGenerationFingerprint,
                         &error)) {
                     fprintf(
@@ -7874,12 +8094,19 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                 fprintf(
                     stderr,
                     "[INFO] Tenant %d: built extreme-sparse tag store "
-                    "(column=%d records=%llu max_selectivity=%.9g)\n",
+                    "(column=%d records=%llu count_range=<%llu or <=%llu "
+                    "heads=%llu slots=%u storage_coverage_target=%u)\n",
                     p_tenantId, limitedTagColumn,
                     static_cast<unsigned long long>(
                         store->StoredRecordCount()),
-                    static_cast<double>(
-                        extremeSparseTagMaxSelectivity));
+                    static_cast<unsigned long long>(
+                        store->MinTagCount()),
+                    static_cast<unsigned long long>(
+                        store->MaxTagCount()),
+                    static_cast<unsigned long long>(
+                        store->HeadCount()),
+                    store->SlotsPerHead(),
+                    store->CoverageTarget());
                 m_tenantExtremeSparseTagStores[
                     p_tenantId] = std::move(store);
             } else {
@@ -9214,7 +9441,14 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
                 static_cast<std::uint64_t>(
                     tenantVectorCount),
                 store.GenerationFingerprint(),
-                store.MaxSelectivity(),
+                static_cast<std::uint64_t>(
+                    spannSearchOptions
+                        ->m_extremeSparseTagMinCount),
+                static_cast<std::uint64_t>(
+                    tenantHeadCount),
+                static_cast<std::uint32_t>(
+                    spannSearchOptions
+                        ->m_limitedTagSlotsPerHead),
                 &storeError))
         {
             fprintf(
@@ -9226,6 +9460,42 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
 
         std::vector<std::uint32_t> sparseTags;
         bool allClausesCovered = true;
+        if (spannSearchOptions
+                ->m_searchInternalResultNum <= 0)
+        {
+            fprintf(
+                stderr,
+                "[ERROR] Tenant %d: extreme-sparse routing requires "
+                "positive SearchInternalResultNum\n",
+                p_tenantId);
+            return nullptr;
+        }
+        const std::uint32_t runtimeCoverageTarget =
+            static_cast<std::uint32_t>(
+                spannSearchOptions
+                    ->m_searchInternalResultNum);
+        if (runtimeCoverageTarget > store.CoverageTarget())
+        {
+            fprintf(
+                stderr,
+                "[ERROR] Tenant %d: SearchInternalResultNum=%u exceeds "
+                "the EST4 storage coverage target %u; rebuild signatures "
+                "with at least this MaxCheck\n",
+                p_tenantId, runtimeCoverageTarget,
+                store.CoverageTarget());
+            return nullptr;
+        }
+        const auto eligibleEntry =
+            [&store, runtimeCoverageTarget](
+                std::uint32_t p_tag) {
+                const auto* entry = store.Find(p_tag);
+                return entry != nullptr &&
+                    store.IsEligibleCount(
+                        entry->m_count,
+                        runtimeCoverageTarget)
+                    ? entry
+                    : nullptr;
+            };
         if (dnfMode && !dnf.Empty())
         {
             for (const auto& clause : dnf.clauses)
@@ -9260,7 +9530,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
                 {
                     continue;
                 }
-                if (!found || store.Find(value) == nullptr)
+                if (!found || eligibleEntry(value) == nullptr)
                 {
                     allClausesCovered = false;
                     denseFallbackDNF.clauses.push_back(
@@ -9279,7 +9549,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
             for (int query = 0;
                  query < p_numTags; ++query)
             {
-                if (store.Find(queryTagsPtr[query]) ==
+                if (eligibleEntry(queryTagsPtr[query]) ==
                     nullptr)
                 {
                     allClausesCovered = false;
@@ -9315,173 +9585,84 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
         }
         if (sparseCandidateCount > 0)
         {
-            const double vectorCount =
-                static_cast<double>(
-                    (std::max)(
-                        1,
-                        tenantVectorCount));
-            const double headCount =
-                static_cast<double>(
-                    (std::max)(
-                        1,
-                        tenantHeadCount));
-            const double averagePostingRecords =
-                vectorCount *
-                static_cast<double>(
-                    (std::max)(
-                        1,
-                        spannSearchOptions
-                            ->m_replicaCount)) /
-                headCount;
-            const int nprobe =
-                (std::max)(
-                    p_resultNum,
-                    spannSearchOptions
-                        ->m_searchInternalResultNum);
-            const double sparseSelectivity =
-                static_cast<double>(
-                    sparseCandidateCount) /
-                vectorCount;
-            const double expectedDenseMatches =
-                static_cast<double>(nprobe) *
-                averagePostingRecords *
-                sparseSelectivity;
-            const double desiredMatches =
-                static_cast<double>(
-                    (std::min<std::uint64_t>)(
-                        sparseCandidateCount,
-                        static_cast<std::uint64_t>(
-                            p_resultNum))) *
-                std::clamp(
-                    static_cast<double>(
-                        spannSearchOptions
-                            ->m_filteredSearchTargetRecall),
-                    0.0, 1.0);
-            const bool coverageRisk =
-                expectedDenseMatches <
-                desiredMatches;
-            const std::uint64_t sparseBytes =
-                sparseCandidateCount *
-                store.RecordBytes();
-            const std::uint64_t sparsePages =
-                (sparseBytes + SPTAG::PageSize - 1) /
-                    SPTAG::PageSize +
-                sparseTags.size();
-            const std::uint64_t postingRecordBytes =
-                sizeof(std::int32_t) +
-                static_cast<std::uint64_t>(
-                    spannSearchOptions
-                        ->m_numTagsPerVec) *
-                    sizeof(std::uint32_t) +
-                m_inputVectorSize;
-            const std::uint64_t averagePostingPages =
-                (std::max<std::uint64_t>)(
-                    1,
-                    static_cast<std::uint64_t>(
-                        std::ceil(
-                            averagePostingRecords *
-                            postingRecordBytes /
-                            static_cast<double>(
-                                SPTAG::PageSize))));
-            const std::uint64_t densePages =
-                static_cast<std::uint64_t>(
-                    nprobe) *
-                (std::min<std::uint64_t>)(
-                    averagePostingPages,
-                    static_cast<std::uint64_t>(
-                        (std::max)(
-                            1,
-                            spannSearchOptions
-                                ->m_searchPostingPageLimit)));
-            const double sparseCost =
-                static_cast<double>(sparsePages) *
-                    SPTAG::PageSize +
-                static_cast<double>(
-                    sparseCandidateCount) *
-                    m_inputVectorSize;
-            const double denseCost =
-                static_cast<double>(densePages) *
-                    SPTAG::PageSize +
-                static_cast<double>(nprobe) *
-                    averagePostingRecords *
-                    m_inputVectorSize;
-            const bool useSparse =
-                coverageRisk ||
-                sparseCost <= denseCost;
             if (spannSearchOptions
                     ->m_logExtremeSparseTagRoute)
             {
+                std::uint64_t runtimeMaxTagCount = 0;
+                SPTAG::Cache::ExtremeSparseTagStore::
+                    TryComputeMaxTagCount(
+                        static_cast<std::uint64_t>(
+                            tenantVectorCount),
+                        static_cast<std::uint64_t>(
+                            tenantHeadCount),
+                        spannSearchOptions
+                            ->m_limitedTagSlotsPerHead,
+                        runtimeCoverageTarget,
+                        runtimeMaxTagCount);
                 fprintf(
                     stdout,
                     "ExtremeSparseRoute: tags=%zu candidates=%llu "
-                    "sparsePages=%llu densePages=%llu "
-                    "expectedMatches=%.6g desired=%.6g "
-                    "allClauses=%d route=%s\n",
+                    "minCount=%llu runtimeMaxCount=%llu "
+                    "coverageTarget=%u allClauses=%d route=%s\n",
                     sparseTags.size(),
                     static_cast<unsigned long long>(
                         sparseCandidateCount),
                     static_cast<unsigned long long>(
-                        sparsePages),
+                        store.MinTagCount()),
                     static_cast<unsigned long long>(
-                        densePages),
-                    expectedDenseMatches,
-                    desiredMatches,
+                        runtimeMaxTagCount),
+                    runtimeCoverageTarget,
                     allClausesCovered ? 1 : 0,
-                    useSparse
-                        ? (allClausesCovered
-                               ? "sparse-only"
-                               : "sparse+dense")
-                        : "dense");
+                    allClausesCovered
+                        ? "sparse-only"
+                        : "sparse+dense");
             }
-            if (useSparse)
+            if (!SearchExtremeSparseTagStore(
+                    store, internalIdx,
+                    p_queryVector, p_resultNum,
+                    sparseTags,
+                    dnfMode ? nullptr
+                            : queryTagsPtr,
+                    dnfMode ? 0 : p_numTags,
+                    categoricalColumns,
+                    dnfMode ? &dnf : nullptr,
+                    extremeSparseResult,
+                    storeError))
             {
-                if (!SearchExtremeSparseTagStore(
-                        store, internalIdx,
-                        p_queryVector, p_resultNum,
-                        sparseTags,
-                        dnfMode ? nullptr
-                                : queryTagsPtr,
-                        dnfMode ? 0 : p_numTags,
-                        categoricalColumns,
-                        dnfMode ? &dnf : nullptr,
-                        extremeSparseResult,
-                        storeError))
-                {
-                    fprintf(
-                        stderr,
-                        "[ERROR] Tenant %d: extreme-sparse tag search failed: %s\n",
-                        p_tenantId,
-                        storeError.c_str());
-                    return nullptr;
-                }
-                if (allClausesCovered)
-                {
-                    return extremeSparseResult;
-                }
-                // EST has evaluated every clause/tag it owns exactly. Retain
-                // only the uncovered predicate for dense routing so an
-                // extreme tag excluded from H2 signatures cannot force the
-                // remaining medium tag back to H1.
-                if (dnfMode)
-                {
-                    dnf = std::move(denseFallbackDNF);
-                }
-                else
-                {
-                    std::sort(
-                        denseFlatTags.begin(),
-                        denseFlatTags.end());
-                    denseFlatTags.erase(
-                        std::unique(
-                            denseFlatTags.begin(),
-                            denseFlatTags.end()),
-                        denseFlatTags.end());
-                    queryTagsPtr = denseFlatTags.data();
-                    p_numTags = static_cast<int>(
-                        denseFlatTags.size());
-                }
-                forceDenseTagSearch = true;
+                fprintf(
+                    stderr,
+                    "[ERROR] Tenant %d: extreme-sparse tag search failed: %s\n",
+                    p_tenantId,
+                    storeError.c_str());
+                return nullptr;
             }
+            if (allClausesCovered)
+            {
+                return extremeSparseResult;
+            }
+            // EST has evaluated every clause/tag it owns exactly. Retain
+            // only the uncovered predicate for dense routing so an
+            // extreme tag excluded from H2 signatures cannot force the
+            // remaining medium tag back to H1.
+            if (dnfMode)
+            {
+                dnf = std::move(denseFallbackDNF);
+            }
+            else
+            {
+                std::sort(
+                    denseFlatTags.begin(),
+                    denseFlatTags.end());
+                denseFlatTags.erase(
+                    std::unique(
+                        denseFlatTags.begin(),
+                        denseFlatTags.end()),
+                    denseFlatTags.end());
+                queryTagsPtr = denseFlatTags.data();
+                p_numTags = static_cast<int>(
+                    denseFlatTags.size());
+            }
+            forceDenseTagSearch = true;
         }
     }
 

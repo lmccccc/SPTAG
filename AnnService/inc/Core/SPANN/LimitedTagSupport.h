@@ -30,7 +30,7 @@ public:
 
     static constexpr bool IsSupportedSlotCount(int p_slots)
     {
-        return p_slots == 2 || p_slots == 4;
+        return p_slots > 0;
     }
 
 #pragma pack(push, 1)
@@ -117,7 +117,8 @@ public:
         std::uint64_t p_generationFingerprint)
     {
         Reset();
-        if (p_headCount <= 0 || p_slotsPerHead <= 0 ||
+        if (p_headCount <= 0 ||
+            !IsSupportedSlotCount(p_slotsPerHead) ||
             p_voteHeadCount <= 0 || p_minHeadCount <= 0 ||
             p_keyColumn < 0 || p_attributeCount <= 0 ||
             p_keyColumn >= p_attributeCount ||
@@ -364,6 +365,9 @@ public:
             m_header.m_headerBytes != sizeof(Header) ||
             m_header.m_headCount == 0 ||
             m_header.m_slotsPerHead == 0 ||
+            m_header.m_slotsPerHead >
+                static_cast<std::uint32_t>(
+                    (std::numeric_limits<int>::max)()) ||
             m_header.m_voteHeadCount == 0 ||
             m_header.m_minHeadCount == 0 ||
             m_header.m_tagCount == 0 ||
@@ -677,6 +681,8 @@ public:
             m_header.m_headerBytes != sizeof(Header) ||
             m_header.m_headCount !=
                 static_cast<std::uint32_t>(p_expectedHeadCount) ||
+            !IsSupportedSlotCount(
+                p_expectedSlotsPerHead) ||
             m_header.m_slotsPerHead !=
                 static_cast<std::uint32_t>(p_expectedSlotsPerHead) ||
             m_header.m_voteHeadCount !=
