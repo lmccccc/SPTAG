@@ -10,6 +10,7 @@
 #include "inc/Helper/ThreadPool.h"
 #include "inc/Helper/ConcurrentSet.h"
 #include "inc/Helper/AsyncFileReader.h"
+#include "inc/Helper/AtomicFile.h"
 #include "inc/Core/SPANN/Options.h"
 #include <cstdlib>
 #include <memory>
@@ -43,6 +44,7 @@ namespace SPTAG::SPANN {
             int m_batchSize = 64;
             int m_preIOCompleteCount = 0;
             int64_t m_preIOBytes = 0;
+            bool m_readOnly = false;
         public:
             bool m_disableCheckpoint = true;  // Default: skip checkpoint on shutdown (read-only mode)
 
@@ -109,19 +111,37 @@ namespace SPTAG::SPANN {
                 return (int)(m_totalAllocatedBlocks.load());
             }
 
-            ErrorCode Checkpoint(std::string prefix) {
+            ErrorCode Checkpoint(
+                std::string prefix,
+                bool p_recycleReserved) {
+                if (m_readOnly) {
+                    return ErrorCode::Undefined;
+                }
                 std::string filename = prefix + "_blockpool";
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "FileIO::BlockController::Checkpoint - Starting block pool save...\n");
+                if (!Helper::SyncFile(m_filePath)) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "FileIO::BlockController::Checkpoint - Failed to sync posting file: %s\n",
+                        m_filePath);
+                    return ErrorCode::DiskIOFail;
+                }
 
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "FileIO::BlockController::Checkpoint - Reload reserved blocks...\n");
                 AddressType currBlockAddress = 0;
                 int reloadCount = 0;
 
-                while (m_blockAddresses_reserve.try_pop(currBlockAddress)) {
-                    m_blockAddresses.push(currBlockAddress);
-                    ++reloadCount;
+                if (p_recycleReserved) {
+                    while (m_blockAddresses_reserve.try_pop(currBlockAddress)) {
+                        m_blockAddresses.push(currBlockAddress);
+                        ++reloadCount;
+                    }
                 }
                 AddressType blocks = RemainBlocks();
+                AddressType reservedBlocks =
+                    static_cast<AddressType>(
+                        m_blockAddresses_reserve
+                            .unsafe_size());
                 AddressType totalBlocks = m_totalAllocatedBlocks.load();
 
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "FileIO::BlockController::Checkpoint - Reloaded blocks: %d\n", reloadCount);
@@ -138,6 +158,27 @@ namespace SPTAG::SPANN {
                 IOBINARY(ptr, WriteBinary, sizeof(AddressType), reinterpret_cast<char*>(&totalBlocks));
                 for (auto it = m_blockAddresses.unsafe_begin(); it != m_blockAddresses.unsafe_end(); it++) {
                     IOBINARY(ptr, WriteBinary, sizeof(AddressType), reinterpret_cast<const char*>(&(*it)));
+                }
+                IOBINARY(
+                    ptr, WriteBinary,
+                    sizeof(AddressType),
+                    reinterpret_cast<const char*>(
+                        &reservedBlocks));
+                for (auto it = m_blockAddresses_reserve.unsafe_begin();
+                     it != m_blockAddresses_reserve.unsafe_end();
+                     ++it) {
+                    IOBINARY(
+                        ptr, WriteBinary,
+                        sizeof(AddressType),
+                        reinterpret_cast<const char*>(
+                            &(*it)));
+                }
+                if (!ptr->ShutDownAndCheck()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "FileIO::BlockController::Checkpoint - Failed to close file: %s\n",
+                        filename.c_str());
+                    return ErrorCode::DiskIOFail;
                 }
 
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "FileIO::BlockController::Checkpoint - Save Finish!\n");
@@ -171,6 +212,11 @@ namespace SPTAG::SPANN {
                     // Read block count
                     IOBINARY(ptr, ReadBinary, sizeof(AddressType), reinterpret_cast<char*>(&blocks));
                     IOBINARY(ptr, ReadBinary, sizeof(AddressType), reinterpret_cast<char*>(&totalAllocated));
+                    if (blocks < 0 ||
+                        totalAllocated < 0 ||
+                        blocks > totalAllocated) {
+                        return ErrorCode::Fail;
+                    }
 
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
                         "FileIO::BlockController::LoadBlockPool: reading %llu free blocks into pool (%.2f GB), total allocated: %llu blocks\n",
@@ -189,6 +235,43 @@ namespace SPTAG::SPANN {
                             continue;
                         }
                         m_blockAddresses.push(currBlockAddress);
+                    }
+
+                    AddressType reservedBlocks = 0;
+                    const std::uint64_t reservedHeaderBytes =
+                        ptr->ReadBinary(
+                            sizeof(AddressType),
+                            reinterpret_cast<char*>(
+                                &reservedBlocks));
+                    if (reservedHeaderBytes != 0 &&
+                        reservedHeaderBytes !=
+                            sizeof(AddressType)) {
+                        return ErrorCode::DiskIOFail;
+                    }
+                    if (reservedHeaderBytes ==
+                        sizeof(AddressType)) {
+                        if (reservedBlocks < 0 ||
+                            reservedBlocks >
+                                totalAllocated - blocks) {
+                            return ErrorCode::Fail;
+                        }
+                        for (AddressType i = 0;
+                             i < reservedBlocks; ++i) {
+                            IOBINARY(
+                                ptr, ReadBinary,
+                                sizeof(AddressType),
+                                reinterpret_cast<char*>(
+                                    &currBlockAddress));
+                            if (currBlockAddress < 0 ||
+                                currBlockAddress >=
+                                    totalAllocated ||
+                                !m_available.Insert(
+                                    currBlockAddress)) {
+                                return ErrorCode::Fail;
+                            }
+                            m_blockAddresses_reserve.push(
+                                currBlockAddress);
+                        }
                     }
 
                     m_totalAllocatedBlocks.store(totalAllocated);
@@ -530,13 +613,41 @@ namespace SPTAG::SPANN {
 
         bool m_disableCheckpoint = true;  // Skip mapping save + checkpoint on shutdown
         std::atomic<bool> m_dirty{false}; // Set by any write op; checkpoint only when dirty
+        bool m_readOnly = false;
+
+        bool RejectReadOnlyWrite(
+            const char* p_operation) const
+        {
+            if (!m_readOnly) {
+                return false;
+            }
+            SPTAGLIB_LOG(
+                Helper::LogLevel::LL_Error,
+                "FileIO: recovered limited-tag H/O store is read-only; rejecting %s.\n",
+                p_operation);
+            return true;
+        }
 
     public:
         FileIO(SPANN::Options& p_opt) {
             m_mappingPath = p_opt.m_indexDirectory + FolderSep + p_opt.m_ssdMappingFile;
-            m_blockLimit = max(p_opt.m_postingPageLimit, p_opt.m_searchPostingPageLimit) + p_opt.m_bufferLength + p_opt.m_unfilterTailBufferLength + 1;
+            const SizeType regionBlocks =
+                max(p_opt.m_postingPageLimit,
+                    p_opt.m_searchPostingPageLimit) +
+                p_opt.m_bufferLength +
+                p_opt.m_unfilterTailBufferLength;
+            m_blockLimit =
+                (p_opt.m_enableLimitedTagPosting
+                     ? regionBlocks * 2
+                     : regionBlocks) +
+                1;
             m_bufferLimit = 1024;
-            m_disableCheckpoint = p_opt.m_disableCheckpoint;
+            m_readOnly =
+                p_opt.m_recovery &&
+                p_opt.m_enableLimitedTagPosting;
+            m_disableCheckpoint =
+                p_opt.m_disableCheckpoint ||
+                m_readOnly;
             m_shutdownCalled = true;
 
             m_pShardedLRUCache = nullptr;
@@ -879,6 +990,9 @@ namespace SPTAG::SPANN {
         */
 
         ErrorCode Put(const SizeType key, const std::string& value, const std::chrono::microseconds& timeout, std::vector<Helper::AsyncReadRequest>* reqs, bool useCache) {
+            if (RejectReadOnlyWrite("Put")) {
+                return ErrorCode::Undefined;
+            }
             m_dirty.store(true, std::memory_order_relaxed);
             int blocks = (int)(((value.size() + PageSize - 1) >> PageSizeEx));
             if (blocks >= m_blockLimit) {
@@ -1030,6 +1144,10 @@ namespace SPTAG::SPANN {
         ErrorCode RewriteInPlace(const SizeType key, const std::string& value,
                                  const std::chrono::microseconds& timeout,
                                  std::vector<Helper::AsyncReadRequest>* reqs) {
+            if (RejectReadOnlyWrite(
+                    "RewriteInPlace")) {
+                return ErrorCode::Undefined;
+            }
             m_dirty.store(true, std::memory_order_relaxed);
             int blocks = (int)(((value.size() + PageSize - 1) >> PageSizeEx));
             if (blocks >= m_blockLimit) {
@@ -1135,6 +1253,9 @@ namespace SPTAG::SPANN {
                         std::vector<Helper::AsyncReadRequest> *reqs,
                         std::function<bool(const void *val, const int size)> checksum)
         {
+            if (RejectReadOnlyWrite("Merge")) {
+                return ErrorCode::Undefined;
+            }
             m_dirty.store(true, std::memory_order_relaxed);
             SizeType r = m_pBlockMapping.R();
             if (key >= r)
@@ -1258,6 +1379,9 @@ namespace SPTAG::SPANN {
 
 
         ErrorCode Delete(SizeType key) override {
+            if (RejectReadOnlyWrite("Delete")) {
+                return ErrorCode::Undefined;
+            }
             m_dirty.store(true, std::memory_order_relaxed);
             SizeType r = m_pBlockMapping.R();
             if (key >= r) return ErrorCode::Key_OverFlow;
@@ -1301,6 +1425,10 @@ namespace SPTAG::SPANN {
         }
 
         void ForceCompaction() {
+            if (RejectReadOnlyWrite(
+                    "ForceCompaction")) {
+                return;
+            }
             m_dirty.store(true, std::memory_order_relaxed);
             Save(m_mappingPath);
         }
@@ -1341,7 +1469,14 @@ namespace SPTAG::SPANN {
 
             m_pBlockMapping.Initialize(CR, 1, blockSize, capacity);
             for (int i = 0; i < CR; i++) {
-                At(i) = (uintptr_t)(new AddressType[m_blockLimit]);
+                auto* addresses =
+                    new AddressType[m_blockLimit];
+                std::fill_n(
+                    addresses, m_blockLimit,
+                    static_cast<AddressType>(-1));
+                At(i) =
+                    reinterpret_cast<uintptr_t>(
+                        addresses);
                 IOBINARY(ptr, ReadBinary, sizeof(AddressType) * mycols, (char*)At(i));
             }
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Load mapping (%d,%d) Finish!\n", CR, mycols);
@@ -1349,6 +1484,9 @@ namespace SPTAG::SPANN {
         }
         
         ErrorCode Save(std::string path) {
+            if (RejectReadOnlyWrite("Save")) {
+                return ErrorCode::Undefined;
+            }
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Save mapping To %s\n", path.c_str());
             if (m_pShardedLRUCache) {
                 if (!m_pShardedLRUCache->flush()) {
@@ -1373,6 +1511,13 @@ namespace SPTAG::SPANN {
                     IOBINARY(ptr, WriteBinary, sizeof(AddressType) * m_blockLimit, (char*)postingSize);
                 }
             }
+            if (!ptr->ShutDownAndCheck()) {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Error,
+                    "Failed to close mapping checkpoint %s\n",
+                    path.c_str());
+                return ErrorCode::DiskIOFail;
+            }
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Save mapping (%d,%d) Finish!\n", CR, m_blockLimit);
 	    /*
             for (int i = 0; i < 10; i++) {
@@ -1394,10 +1539,32 @@ namespace SPTAG::SPANN {
         }
 
         ErrorCode Checkpoint(std::string prefix) override {
+            if (RejectReadOnlyWrite(
+                    "Checkpoint")) {
+                return ErrorCode::Undefined;
+            }
             std::string filename = prefix + FolderSep + m_mappingPath.substr(m_mappingPath.find_last_of(FolderSep) + 1);
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "FileIO: saving block mapping to %s\n", filename.c_str());
-            Save(filename);
-            return m_pBlockController.Checkpoint(filename + "_postings");
+            const ErrorCode mappingStatus = Save(filename);
+            if (mappingStatus != ErrorCode::Success) {
+                return mappingStatus;
+            }
+            std::error_code pathError;
+            const bool liveMapping =
+                filename == m_mappingPath ||
+                std::filesystem::equivalent(
+                    filename, m_mappingPath,
+                    pathError);
+            const ErrorCode blockStatus =
+                m_pBlockController.Checkpoint(
+                filename + "_postings",
+                !liveMapping);
+            if (blockStatus == ErrorCode::Success) {
+                m_dirty.store(
+                    false,
+                    std::memory_order_release);
+            }
+            return blockStatus;
         }
 
         int64_t GetNumBlocks() override

@@ -193,6 +193,26 @@ public:
 
     virtual std::shared_ptr<std::vector<std::string>> GetIndexFiles() const = 0;
 
+    virtual ErrorCode PrepareIndexSave(const std::string&)
+    {
+        return ErrorCode::Success;
+    }
+    virtual ErrorCode CompleteIndexSave(const std::string&)
+    {
+        return ErrorCode::Success;
+    }
+    virtual ErrorCode AcquireIndexSaveLock(const std::string&)
+    {
+        return ErrorCode::Success;
+    }
+    virtual void ReleaseIndexSaveLock(const std::string&)
+    {
+    }
+    virtual bool SupportsNonDirectorySave() const
+    {
+        return true;
+    }
+
     virtual ErrorCode SaveConfig(std::shared_ptr<Helper::DiskIO> p_configout) = 0;
 
     virtual ErrorCode SaveIndexData(const std::vector<std::shared_ptr<Helper::DiskIO>>& p_indexStreams) = 0;

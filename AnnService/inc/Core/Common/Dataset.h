@@ -152,7 +152,14 @@ namespace SPTAG
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Save %s To %s\n", name.c_str(), sDataPointsFileName.c_str());
                 auto ptr = f_createIO();
                 if (ptr == nullptr || !ptr->Initialize(sDataPointsFileName.c_str(), std::ios::binary | std::ios::out)) return ErrorCode::FailedCreateFile;
-                return Save(ptr);
+                const ErrorCode ret = Save(ptr);
+                const bool closed =
+                    ptr->ShutDownAndCheck();
+                return ret != ErrorCode::Success
+                    ? ret
+                    : (closed
+                           ? ErrorCode::Success
+                           : ErrorCode::DiskIOFail);
             }
 
             ErrorCode Load(std::shared_ptr<Helper::DiskIO> pInput, SizeType blockSize, SizeType capacity)
@@ -427,7 +434,14 @@ namespace SPTAG
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Save %s To %s\n", name.c_str(), sDataPointsFileName.c_str());
                 auto ptr = f_createIO();
                 if (ptr == nullptr || !ptr->Initialize(sDataPointsFileName.c_str(), std::ios::binary | std::ios::out)) return ErrorCode::FailedCreateFile;
-                return Save(ptr);
+                const ErrorCode ret = Save(ptr);
+                const bool closed =
+                    ptr->ShutDownAndCheck();
+                return ret != ErrorCode::Success
+                    ? ret
+                    : (closed
+                           ? ErrorCode::Success
+                           : ErrorCode::DiskIOFail);
             }
 
             ErrorCode Load(std::shared_ptr<Helper::DiskIO> pInput, SizeType blockSize, SizeType capacity)

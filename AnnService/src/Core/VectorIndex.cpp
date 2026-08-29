@@ -1058,6 +1058,13 @@ ErrorCode VectorIndex::SaveIndex(std::string &p_config, const std::vector<ByteAr
 {
     if (!m_bReady || GetNumSamples() - GetNumDeleted() == 0)
         return ErrorCode::EmptyIndex;
+    if (!SupportsNonDirectorySave())
+    {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "Mutable limited-tag H/O indexes support directory SaveIndex only.\n");
+        return ErrorCode::Undefined;
+    }
 
     ErrorCode ret = ErrorCode::Success;
     {
@@ -1113,11 +1120,30 @@ ErrorCode VectorIndex::SaveIndex(const std::string &p_folderPath)
                  p_folderPath.c_str(), m_bReady, GetNumSamples(), GetNumDeleted());
     if (!m_bReady || GetNumSamples() - GetNumDeleted() == 0)
         return ErrorCode::EmptyIndex;
-
-    if (GetIndexAlgoType() == IndexAlgoType::SPANN && GetParameter("IndexDirectory", "Base") != p_folderPath)
+    const std::string configuredFolder =
+        GetParameter("IndexDirectory", "Base");
+    std::error_code pathError;
+    const bool sameFolder =
+        configuredFolder == p_folderPath ||
+        fs::equivalent(
+            configuredFolder, p_folderPath,
+            pathError);
+    if (GetIndexAlgoType() == IndexAlgoType::SPANN &&
+        !sameFolder)
     {
-        std::string oldFolder = GetParameter("IndexDirectory", "Base");
-        ErrorCode ret = SaveIndex(oldFolder);
+        ErrorCode ret =
+            PrepareIndexSave(p_folderPath);
+        if (ret != ErrorCode::Success)
+        {
+            return ret;
+        }
+        if (!direxists(p_folderPath.c_str()) &&
+            !fs::create_directories(p_folderPath))
+        {
+            return ErrorCode::FailedCreateFile;
+        }
+        std::string oldFolder = configuredFolder;
+        ret = SaveIndex(oldFolder);
         if (ret != ErrorCode::Success || !copydirectory(oldFolder, p_folderPath))
         {
             SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to copy index directory contents to %s!\n",
@@ -1129,7 +1155,15 @@ ErrorCode VectorIndex::SaveIndex(const std::string &p_folderPath)
         auto configFile = SPTAG::f_createIO();
         if (configFile == nullptr || !configFile->Initialize((p_folderPath + FolderSep + "indexloader.ini").c_str(), std::ios::out))
             return ErrorCode::FailedCreateFile;
-        if ((ret = SaveIndexConfig(configFile)) != ErrorCode::Success)
+        ret = SaveIndexConfig(configFile);
+        const bool configClosed =
+            configFile->ShutDownAndCheck();
+        if (ret != ErrorCode::Success)
+            return ret;
+        if (!configClosed)
+            return ErrorCode::DiskIOFail;
+        if ((ret = CompleteIndexSave(p_folderPath)) !=
+            ErrorCode::Success)
             return ret;
 
         return ErrorCode::Success;
@@ -1146,12 +1180,48 @@ ErrorCode VectorIndex::SaveIndex(const std::string &p_folderPath)
     }
 
     ErrorCode ret = ErrorCode::Success;
+    auto configFile = SPTAG::f_createIO();
+    if (configFile == nullptr)
     {
-        auto configFile = SPTAG::f_createIO();
-        if (configFile == nullptr || !configFile->Initialize((folderPath + "indexloader.ini").c_str(), std::ios::out))
+        return ErrorCode::FailedCreateFile;
+    }
+    if ((ret = AcquireIndexSaveLock(p_folderPath)) !=
+        ErrorCode::Success)
+    {
+        return ret;
+    }
+    bool saveLockHeld = true;
+    const auto releaseSaveLock = [&]()
+    {
+        if (!saveLockHeld) return;
+        ReleaseIndexSaveLock(p_folderPath);
+        saveLockHeld = false;
+    };
+    if ((ret = PrepareIndexSave(p_folderPath)) !=
+        ErrorCode::Success)
+    {
+        releaseSaveLock();
+        return ret;
+    }
+    {
+        if (!configFile->Initialize((folderPath + "indexloader.ini").c_str(), std::ios::out))
+        {
+            releaseSaveLock();
             return ErrorCode::FailedCreateFile;
-        if ((ret = SaveIndexConfig(configFile)) != ErrorCode::Success)
+        }
+        ret = SaveIndexConfig(configFile);
+        const bool configClosed =
+            configFile->ShutDownAndCheck();
+        if (ret != ErrorCode::Success)
+        {
+            releaseSaveLock();
             return ret;
+        }
+        if (!configClosed)
+        {
+            releaseSaveLock();
+            return ErrorCode::DiskIOFail;
+        }
     }
 
     std::shared_ptr<std::vector<std::string>> indexfiles = GetIndexFiles();
@@ -1173,7 +1243,10 @@ ErrorCode VectorIndex::SaveIndex(const std::string &p_folderPath)
 
         auto ptr = SPTAG::f_createIO();
         if (ptr == nullptr || !ptr->Initialize(newfile.c_str(), std::ios::binary | std::ios::out))
+        {
+            releaseSaveLock();
             return ErrorCode::FailedCreateFile;
+        }
         handles.push_back(std::move(ptr));
     }
 
@@ -1194,6 +1267,24 @@ ErrorCode VectorIndex::SaveIndex(const std::string &p_folderPath)
         if (ErrorCode::Success == ret)
             ret = SaveIndexData(handles);
     }
+    bool handlesClosed = true;
+    for (auto& handle : handles)
+    {
+        if (handle != nullptr &&
+            !handle->ShutDownAndCheck())
+            handlesClosed = false;
+    }
+    handles.clear();
+    if (ret == ErrorCode::Success &&
+        !handlesClosed)
+    {
+        ret = ErrorCode::DiskIOFail;
+    }
+    if (ret == ErrorCode::Success)
+    {
+        ret = CompleteIndexSave(p_folderPath);
+    }
+    releaseSaveLock();
     return ret;
 }
 
@@ -1201,6 +1292,13 @@ ErrorCode VectorIndex::SaveIndexToFile(const std::string &p_file, IAbortOperatio
 {
     if (!m_bReady || GetNumSamples() - GetNumDeleted() == 0)
         return ErrorCode::EmptyIndex;
+    if (!SupportsNonDirectorySave())
+    {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "Mutable limited-tag H/O indexes do not support SaveIndexToFile.\n");
+        return ErrorCode::Undefined;
+    }
 
     auto fp = SPTAG::f_createIO();
     if (fp == nullptr || !fp->Initialize(p_file.c_str(), std::ios::binary | std::ios::out))
@@ -1249,7 +1347,11 @@ ErrorCode VectorIndex::SaveIndexToFile(const std::string &p_file, IAbortOperatio
             ret = m_pQuantizer->SaveQuantizer(fp);
         }
     }
-    fp->ShutDown();
+    const bool outputClosed =
+        fp->ShutDownAndCheck();
+    if (ret == ErrorCode::Success &&
+        !outputClosed)
+        ret = ErrorCode::DiskIOFail;
 
     if (ret != ErrorCode::Success)
         std::remove(p_file.c_str());

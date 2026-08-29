@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <fstream>
 #include <limits>
+#include <new>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -243,22 +245,586 @@ public:
         {
             return false;
         }
+        for (size_t index = 0;
+             index < p_tags.size(); ++index)
+        {
+            if (p_tags[index] == EmptyTag)
+            {
+                return false;
+            }
+            for (size_t prior = 0;
+                 prior < index; ++prior)
+            {
+                if (p_tags[prior] ==
+                    p_tags[index])
+                {
+                    return false;
+                }
+            }
+        }
         const size_t offset =
             static_cast<size_t>(p_head) *
             m_header.m_slotsPerHead;
         std::fill_n(
             m_tags.begin() + offset,
             m_header.m_slotsPerHead, EmptyTag);
-        std::unordered_set<std::uint32_t> unique;
         for (size_t slot = 0; slot < p_tags.size(); ++slot)
         {
-            if (p_tags[slot] == EmptyTag ||
-                !unique.insert(p_tags[slot]).second)
+            m_tags[offset + slot] = p_tags[slot];
+        }
+        return true;
+    }
+
+    bool AppendHead(
+        const std::vector<std::uint32_t>& p_tags,
+        const std::uint32_t* p_attributes,
+        int p_attributeCount)
+    {
+        if (p_tags.empty() ||
+            p_tags.size() > m_header.m_slotsPerHead ||
+            p_attributes == nullptr ||
+            p_attributeCount !=
+                static_cast<int>(
+                    m_header.m_attributeCount) ||
+            p_tags.front() !=
+                p_attributes[m_header.m_keyColumn] ||
+            m_header.m_headCount ==
+                (std::numeric_limits<std::uint32_t>::max)())
+        {
+            return false;
+        }
+        std::unordered_set<std::uint32_t> unique;
+        for (std::uint32_t tag : p_tags)
+        {
+            if (tag == EmptyTag ||
+                !unique.insert(tag).second)
             {
                 return false;
             }
-            m_tags[offset + slot] = p_tags[slot];
         }
+        if (m_tags.size() >
+                (std::numeric_limits<size_t>::max)() -
+                    m_header.m_slotsPerHead ||
+            m_headAttributes.size() >
+                (std::numeric_limits<size_t>::max)() -
+                    m_header.m_attributeCount)
+        {
+            return false;
+        }
+
+        m_tags.insert(
+            m_tags.end(), m_header.m_slotsPerHead,
+            EmptyTag);
+        std::copy(
+            p_tags.begin(), p_tags.end(),
+            m_tags.end() - m_header.m_slotsPerHead);
+        m_headAttributes.insert(
+            m_headAttributes.end(), p_attributes,
+            p_attributes + p_attributeCount);
+        ++m_header.m_headCount;
+        return true;
+    }
+
+    bool AppendTombstoneHead()
+    {
+        if (m_header.m_headCount ==
+                (std::numeric_limits<std::uint32_t>::max)() ||
+            m_tags.size() >
+                (std::numeric_limits<size_t>::max)() -
+                    m_header.m_slotsPerHead ||
+            m_headAttributes.size() >
+                (std::numeric_limits<size_t>::max)() -
+                    m_header.m_attributeCount)
+        {
+            return false;
+        }
+        m_tags.insert(
+            m_tags.end(), m_header.m_slotsPerHead,
+            EmptyTag);
+        m_headAttributes.insert(
+            m_headAttributes.end(),
+            m_header.m_attributeCount, 0);
+        ++m_header.m_headCount;
+        return true;
+    }
+
+    bool TombstoneHead(SizeType p_head)
+    {
+        if (p_head < 0 ||
+            static_cast<std::uint32_t>(p_head) >=
+                m_header.m_headCount)
+        {
+            return false;
+        }
+        std::fill_n(
+            m_tags.begin() +
+                static_cast<size_t>(p_head) *
+                    m_header.m_slotsPerHead,
+            m_header.m_slotsPerHead, EmptyTag);
+        std::fill_n(
+            m_headAttributes.begin() +
+                static_cast<size_t>(p_head) *
+                    m_header.m_attributeCount,
+            m_header.m_attributeCount, 0);
+        return true;
+    }
+
+    bool ReplaceHead(
+        SizeType p_head,
+        const std::vector<std::uint32_t>& p_tags,
+        const std::uint32_t* p_attributes,
+        int p_attributeCount)
+    {
+        if (p_tags.empty() || p_attributes == nullptr ||
+            p_attributeCount !=
+                static_cast<int>(
+                    m_header.m_attributeCount) ||
+            p_tags.front() !=
+                p_attributes[m_header.m_keyColumn])
+        {
+            return false;
+        }
+        return SetHeadAttributes(
+                   p_head, p_attributes,
+                   p_attributeCount) &&
+            SetHeadTags(p_head, p_tags);
+    }
+
+    bool PrepareRuntimeAppendHead(
+        const std::vector<std::uint32_t>& p_tags,
+        const std::uint32_t* p_attributes,
+        int p_attributeCount)
+    {
+        if (!ValidActiveRow(
+                p_tags, p_attributes,
+                p_attributeCount) ||
+            m_header.m_headCount ==
+                (std::numeric_limits<std::uint32_t>::max)())
+        {
+            return false;
+        }
+        try
+        {
+            m_tags.reserve(
+                m_tags.size() +
+                m_header.m_slotsPerHead);
+            m_headAttributes.reserve(
+                m_headAttributes.size() +
+                m_header.m_attributeCount);
+            for (std::uint32_t tag : p_tags)
+            {
+                auto found = m_headsByTag.find(tag);
+                if (found == m_headsByTag.end())
+                    return false;
+                found->second.reserve(
+                    found->second.size() + 1);
+            }
+        }
+        catch (const std::bad_alloc&)
+        {
+            return false;
+        }
+        catch (const std::length_error&)
+        {
+            return false;
+        }
+        return true;
+    }
+
+    bool AppendRuntimeHead(
+        const std::vector<std::uint32_t>& p_tags,
+        const std::uint32_t* p_attributes,
+        int p_attributeCount)
+    {
+        if (!PrepareRuntimeAppendHead(
+                p_tags, p_attributes,
+                p_attributeCount))
+        {
+            return false;
+        }
+        return AppendPreparedRuntimeHead(
+            p_tags, p_attributes,
+            p_attributeCount);
+    }
+
+    bool AppendPreparedRuntimeHead(
+        const std::vector<std::uint32_t>& p_tags,
+        const std::uint32_t* p_attributes,
+        int p_attributeCount)
+    {
+        if (!ValidActiveRow(
+                p_tags, p_attributes,
+                p_attributeCount) ||
+            m_header.m_headCount ==
+                (std::numeric_limits<std::uint32_t>::max)() ||
+            m_tags.capacity() <
+                m_tags.size() +
+                    m_header.m_slotsPerHead ||
+            m_headAttributes.capacity() <
+                m_headAttributes.size() +
+                    m_header.m_attributeCount)
+        {
+            return false;
+        }
+        for (std::uint32_t tag : p_tags)
+        {
+            const auto found =
+                m_headsByTag.find(tag);
+            if (found == m_headsByTag.end() ||
+                found->second.capacity() <
+                    found->second.size() + 1)
+            {
+                return false;
+            }
+        }
+        const SizeType head =
+            static_cast<SizeType>(
+                m_header.m_headCount);
+        m_tags.insert(
+            m_tags.end(),
+            m_header.m_slotsPerHead,
+            EmptyTag);
+        std::copy(
+            p_tags.begin(), p_tags.end(),
+            m_tags.end() -
+                m_header.m_slotsPerHead);
+        m_headAttributes.insert(
+            m_headAttributes.end(),
+            p_attributes,
+            p_attributes + p_attributeCount);
+        for (std::uint32_t tag : p_tags)
+        {
+            m_headsByTag.find(tag)
+                ->second.push_back(head);
+        }
+        ++m_header.m_headCount;
+        m_header.m_bodyFingerprint = 0;
+        return true;
+    }
+
+    bool PrepareRuntimeTombstoneHead()
+    {
+        if (m_header.m_headCount ==
+            (std::numeric_limits<std::uint32_t>::max)())
+        {
+            return false;
+        }
+        try
+        {
+            m_tags.reserve(
+                m_tags.size() +
+                m_header.m_slotsPerHead);
+            m_headAttributes.reserve(
+                m_headAttributes.size() +
+                m_header.m_attributeCount);
+        }
+        catch (const std::bad_alloc&)
+        {
+            return false;
+        }
+        catch (const std::length_error&)
+        {
+            return false;
+        }
+        return true;
+    }
+
+    bool AppendRuntimeTombstoneHead()
+    {
+        if (!PrepareRuntimeTombstoneHead())
+            return false;
+        return AppendPreparedRuntimeTombstoneHead();
+    }
+
+    bool AppendPreparedRuntimeTombstoneHead()
+    {
+        if (m_header.m_headCount ==
+                (std::numeric_limits<std::uint32_t>::max)() ||
+            m_tags.capacity() <
+                m_tags.size() +
+                    m_header.m_slotsPerHead ||
+            m_headAttributes.capacity() <
+                m_headAttributes.size() +
+                    m_header.m_attributeCount)
+        {
+            return false;
+        }
+        m_tags.insert(
+            m_tags.end(),
+            m_header.m_slotsPerHead,
+            EmptyTag);
+        m_headAttributes.insert(
+            m_headAttributes.end(),
+            m_header.m_attributeCount, 0);
+        ++m_header.m_headCount;
+        m_header.m_bodyFingerprint = 0;
+        return true;
+    }
+
+    bool TombstoneRuntimeHead(SizeType p_head)
+    {
+        if (!IsActiveHead(p_head))
+            return false;
+        const size_t offset =
+            static_cast<size_t>(p_head) *
+            m_header.m_slotsPerHead;
+        for (std::uint32_t slot = 0;
+             slot < m_header.m_slotsPerHead;
+             ++slot)
+        {
+            const std::uint32_t tag =
+                m_tags[offset + slot];
+            if (tag == EmptyTag) continue;
+            auto found = m_headsByTag.find(tag);
+            if (found == m_headsByTag.end())
+                return false;
+        }
+        for (std::uint32_t slot = 0;
+             slot < m_header.m_slotsPerHead;
+             ++slot)
+        {
+            const std::uint32_t tag =
+                m_tags[offset + slot];
+            if (tag == EmptyTag) continue;
+            auto& heads =
+                m_headsByTag.find(tag)->second;
+            heads.erase(
+                std::remove(
+                    heads.begin(), heads.end(),
+                    p_head),
+                heads.end());
+        }
+        if (!TombstoneHead(p_head))
+            return false;
+        m_header.m_bodyFingerprint = 0;
+        return true;
+    }
+
+    bool PrepareRuntimeReplaceAndTombstone(
+        SizeType p_survivor,
+        const std::vector<std::uint32_t>& p_tags,
+        const std::uint32_t* p_attributes,
+        int p_attributeCount,
+        SizeType p_loser)
+    {
+        if (p_survivor == p_loser ||
+            !IsActiveHead(p_survivor) ||
+            !IsActiveHead(p_loser) ||
+            !ValidActiveRow(
+                p_tags, p_attributes,
+                p_attributeCount))
+        {
+            return false;
+        }
+        std::unordered_set<std::uint32_t> affected;
+        try
+        {
+            const auto survivorTags =
+                HeadTags(p_survivor);
+            const auto loserTags =
+                HeadTags(p_loser);
+            affected.reserve(
+                survivorTags.size() +
+                loserTags.size() +
+                p_tags.size());
+            affected.insert(
+                survivorTags.begin(),
+                survivorTags.end());
+            affected.insert(
+                loserTags.begin(),
+                loserTags.end());
+            affected.insert(
+                p_tags.begin(), p_tags.end());
+            for (std::uint32_t tag : affected)
+            {
+                auto found = m_headsByTag.find(tag);
+                if (found == m_headsByTag.end())
+                    return false;
+                int coverage =
+                    static_cast<int>(
+                        found->second.size());
+                coverage -=
+                    std::find(
+                        found->second.begin(),
+                        found->second.end(),
+                        p_survivor) !=
+                    found->second.end()
+                        ? 1
+                        : 0;
+                coverage -=
+                    std::find(
+                        found->second.begin(),
+                        found->second.end(),
+                        p_loser) !=
+                    found->second.end()
+                        ? 1
+                        : 0;
+                if (std::find(
+                        p_tags.begin(), p_tags.end(),
+                        tag) != p_tags.end())
+                {
+                    ++coverage;
+                }
+                if (coverage <
+                    static_cast<int>(
+                        m_header.m_minHeadCount))
+                {
+                    return false;
+                }
+            }
+            for (std::uint32_t tag : p_tags)
+            {
+                auto& heads =
+                    m_headsByTag.find(tag)->second;
+                if (std::find(
+                        heads.begin(), heads.end(),
+                        p_survivor) ==
+                    heads.end())
+                {
+                    heads.reserve(heads.size() + 1);
+                }
+            }
+        }
+        catch (const std::bad_alloc&)
+        {
+            return false;
+        }
+        catch (const std::length_error&)
+        {
+            return false;
+        }
+        return true;
+    }
+
+    bool ReplaceAndTombstoneRuntime(
+        SizeType p_survivor,
+        const std::vector<std::uint32_t>& p_tags,
+        const std::uint32_t* p_attributes,
+        int p_attributeCount,
+        SizeType p_loser)
+    {
+        if (!PrepareRuntimeReplaceAndTombstone(
+                p_survivor, p_tags,
+                p_attributes, p_attributeCount,
+                p_loser))
+        {
+            return false;
+        }
+        return ApplyPreparedRuntimeReplaceAndTombstone(
+            p_survivor, p_tags,
+            p_attributes, p_attributeCount,
+            p_loser);
+    }
+
+    bool ApplyPreparedRuntimeReplaceAndTombstone(
+        SizeType p_survivor,
+        const std::vector<std::uint32_t>& p_tags,
+        const std::uint32_t* p_attributes,
+        int p_attributeCount,
+        SizeType p_loser)
+    {
+        if (p_survivor == p_loser ||
+            !IsActiveHead(p_survivor) ||
+            !IsActiveHead(p_loser) ||
+            !ValidActiveRow(
+                p_tags, p_attributes,
+                p_attributeCount))
+        {
+            return false;
+        }
+        for (std::uint32_t tag : p_tags)
+        {
+            const auto found =
+                m_headsByTag.find(tag);
+            if (found == m_headsByTag.end())
+                return false;
+            const bool alreadyPresent =
+                std::find(
+                    found->second.begin(),
+                    found->second.end(),
+                    p_survivor) !=
+                found->second.end();
+            if (!alreadyPresent &&
+                found->second.capacity() <
+                    found->second.size() + 1)
+            {
+                return false;
+            }
+        }
+        const size_t survivorOffset =
+            static_cast<size_t>(p_survivor) *
+            m_header.m_slotsPerHead;
+        const size_t loserOffset =
+            static_cast<size_t>(p_loser) *
+            m_header.m_slotsPerHead;
+        for (std::uint32_t slot = 0;
+             slot < m_header.m_slotsPerHead;
+             ++slot)
+        {
+            const std::uint32_t tag =
+                m_tags[survivorOffset + slot];
+            if (tag == EmptyTag) continue;
+            const auto found =
+                m_headsByTag.find(tag);
+            if (found == m_headsByTag.end())
+                return false;
+        }
+        for (std::uint32_t slot = 0;
+             slot < m_header.m_slotsPerHead;
+             ++slot)
+        {
+            const std::uint32_t tag =
+                m_tags[loserOffset + slot];
+            if (tag == EmptyTag) continue;
+            const auto found =
+                m_headsByTag.find(tag);
+            if (found == m_headsByTag.end())
+                return false;
+        }
+        for (std::uint32_t slot = 0;
+             slot < m_header.m_slotsPerHead;
+             ++slot)
+        {
+            const std::uint32_t tag =
+                m_tags[survivorOffset + slot];
+            if (tag == EmptyTag) continue;
+            auto& heads =
+                m_headsByTag.find(tag)->second;
+            heads.erase(
+                std::remove(
+                    heads.begin(), heads.end(),
+                    p_survivor),
+                heads.end());
+        }
+        for (std::uint32_t slot = 0;
+             slot < m_header.m_slotsPerHead;
+             ++slot)
+        {
+            const std::uint32_t tag =
+                m_tags[loserOffset + slot];
+            if (tag == EmptyTag) continue;
+            auto& heads =
+                m_headsByTag.find(tag)->second;
+            heads.erase(
+                std::remove(
+                    heads.begin(), heads.end(),
+                    p_loser),
+                heads.end());
+        }
+        if (!ReplaceHead(
+                p_survivor, p_tags,
+                p_attributes,
+                p_attributeCount) ||
+            !TombstoneHead(p_loser))
+        {
+            return false;
+        }
+        for (std::uint32_t tag : p_tags)
+        {
+            m_headsByTag.find(tag)
+                ->second.push_back(p_survivor);
+        }
+        m_header.m_bodyFingerprint = 0;
         return true;
     }
 
@@ -414,6 +980,7 @@ public:
              head < m_header.m_headCount; ++head)
         {
             std::unordered_set<std::uint32_t> unique;
+            bool active = false;
             const size_t offset =
                 static_cast<size_t>(head) *
                 m_header.m_slotsPerHead;
@@ -422,6 +989,7 @@ public:
             {
                 const std::uint32_t tag = m_tags[offset + slot];
                 if (tag == EmptyTag) continue;
+                active = true;
                 if (!unique.insert(tag).second)
                 {
                     return fail(
@@ -434,6 +1002,10 @@ public:
             const std::uint32_t* attributes =
                 HeadAttributes(
                     static_cast<SizeType>(head));
+            if (!active)
+            {
+                continue;
+            }
             if (ownTag == EmptyTag ||
                 attributes == nullptr ||
                 attributes[m_header.m_keyColumn] !=
@@ -810,6 +1382,12 @@ public:
         return static_cast<int>(m_header.m_slotsPerHead);
     }
 
+    int MinHeadCount() const
+    {
+        return static_cast<int>(
+            m_header.m_minHeadCount);
+    }
+
     int KeyColumn() const
     {
         return static_cast<int>(m_header.m_keyColumn);
@@ -862,6 +1440,19 @@ public:
                 : 0;
     }
 
+    int CoverageCount(std::uint32_t p_tag) const
+    {
+        const auto found = m_headsByTag.find(p_tag);
+        return found == m_headsByTag.end()
+            ? 0
+            : static_cast<int>(found->second.size());
+    }
+
+    bool IsActiveHead(SizeType p_head) const
+    {
+        return OwnTag(p_head) != EmptyTag;
+    }
+
     bool TagSelectivityInRange(
         std::uint32_t p_tag,
         double p_minExclusive,
@@ -888,6 +1479,46 @@ public:
     }
 
 private:
+    bool ValidActiveRow(
+        const std::vector<std::uint32_t>& p_tags,
+        const std::uint32_t* p_attributes,
+        int p_attributeCount) const
+    {
+        if (p_tags.empty() ||
+            p_tags.size() >
+                m_header.m_slotsPerHead ||
+            p_attributes == nullptr ||
+            p_attributeCount !=
+                static_cast<int>(
+                    m_header.m_attributeCount) ||
+            p_tags.front() !=
+                p_attributes[
+                    m_header.m_keyColumn])
+        {
+            return false;
+        }
+        for (size_t index = 0;
+             index < p_tags.size(); ++index)
+        {
+            const std::uint32_t tag =
+                p_tags[index];
+            if (tag == EmptyTag ||
+                TagVectorCount(tag) == 0)
+            {
+                return false;
+            }
+            for (size_t prior = 0;
+                 prior < index; ++prior)
+            {
+                if (p_tags[prior] == tag)
+                {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     void RebuildHeadIndex()
     {
         m_headsByTag.clear();

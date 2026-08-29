@@ -5066,6 +5066,51 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
          tag < distinctTags; ++tag) {
         BOOST_CHECK_GE(coverage[tag], 8);
     }
+    const auto searchPostingCount =
+        [&](float secondLevelThreshold) {
+            BOOST_REQUIRE(
+                index->SetParameter(
+                    "SecondLevelRouteSelectivityThreshold",
+                    std::to_string(
+                        secondLevelThreshold),
+                    "SearchSSDIndex") ==
+                ErrorCode::Success);
+            const std::uint32_t tag = tags.front();
+            VectorIndex::ThreadLocalSearchContext
+                context;
+            context.m_active = true;
+            context.m_queryTags = {tag};
+            context.m_filterSelectivity =
+                1.0f / distinctTags;
+            context.m_routeSelectivity =
+                context.m_filterSelectivity;
+            context.m_limitedTagRouteEligible =
+                true;
+            context.m_limitedTagQueryValues = {
+                tag};
+            VectorIndex::ThreadLocalSearchContextGuard
+                guard(std::move(context));
+            COMMON::QueryResultSet<float> result(
+                data, 4);
+            BOOST_REQUIRE(
+                index->SearchIndex(result) ==
+                ErrorCode::Success);
+            return VectorIndex::
+                GetThreadLocalPostingScanStats()
+                    .m_readPostings;
+        };
+    const auto h1PostingCount =
+        searchPostingCount(0.0f);
+    const auto h2PostingCount =
+        searchPostingCount(1.0f);
+    BOOST_CHECK_EQUAL(h1PostingCount, 8);
+    BOOST_CHECK_EQUAL(
+        h1PostingCount, h2PostingCount);
+    BOOST_REQUIRE(
+        index->SetParameter(
+            "SecondLevelRouteSelectivityThreshold",
+            "0.02", "SearchSSDIndex") ==
+        ErrorCode::Success);
     BOOST_CHECK(
         !std::filesystem::exists(
             indexDirectory +
@@ -5911,15 +5956,31 @@ BOOST_AUTO_TEST_CASE(StaticHybridWorkspaceResetAndOptionDefaults)
     SPANN::ExtraWorkSpace workspace;
     workspace.m_useHybridPure = true;
     workspace.m_scanFullPostingForFilter = true;
+    workspace.m_limitedTagRegionsReadySnapshotValid = true;
+    workspace.m_limitedTagRegionsReadySnapshot = true;
     workspace.Initialize(8, 4, 2, PageSize, false, false);
     BOOST_CHECK(!workspace.m_useHybridPure);
     BOOST_CHECK(!workspace.m_scanFullPostingForFilter);
+    BOOST_CHECK(
+        !workspace
+             .m_limitedTagRegionsReadySnapshotValid);
+    BOOST_CHECK(
+        !workspace
+             .m_limitedTagRegionsReadySnapshot);
 
     workspace.m_useHybridPure = true;
     workspace.m_scanFullPostingForFilter = true;
+    workspace.m_limitedTagRegionsReadySnapshotValid = true;
+    workspace.m_limitedTagRegionsReadySnapshot = true;
     workspace.Clear(2, PageSize, false, false);
     BOOST_CHECK(!workspace.m_useHybridPure);
     BOOST_CHECK(!workspace.m_scanFullPostingForFilter);
+    BOOST_CHECK(
+        !workspace
+             .m_limitedTagRegionsReadySnapshotValid);
+    BOOST_CHECK(
+        !workspace
+             .m_limitedTagRegionsReadySnapshot);
 
     workspace.SetAsyncContextID(17);
     workspace.Clear(4, PageSize * 2, false, false);
@@ -6346,7 +6407,8 @@ BOOST_AUTO_TEST_CASE(TaggedPureTailUpdate)
     auto inspectCopies = [&](const std::shared_ptr<VectorIndex>& inspected,
                              SizeType vid, SizeType& pureCopies, SizeType& tailCopies,
                              SizeType& firstTailPosting,
-                             std::array<std::uint8_t, pqChunks>* firstPureCode) {
+                             std::array<std::uint8_t, pqChunks>* firstPureCode,
+                             SizeType* firstPurePosting) {
         auto* disk = dynamic_cast<SPANN::ExtraDynamicSearcher<float>*>(
             dynamic_cast<SPANN::ISPANNIndex*>(inspected.get())->GetDiskIndex().get());
         BOOST_REQUIRE(disk != nullptr);
@@ -6355,6 +6417,7 @@ BOOST_AUTO_TEST_CASE(TaggedPureTailUpdate)
         pureCopies = 0;
         tailCopies = 0;
         firstTailPosting = -1;
+        if (firstPurePosting != nullptr) *firstPurePosting = -1;
         const SizeType postingCount = disk->GetTaggedPostingCount();
         BOOST_REQUIRE_GT(postingCount, 0);
         const size_t metadataSize = sizeof(SizeType) + sizeof(std::uint8_t) +
@@ -6374,6 +6437,10 @@ BOOST_AUTO_TEST_CASE(TaggedPureTailUpdate)
                 if (recordVID != vid) continue;
                 if (static_cast<int>(record) < pureCount) {
                     ++pureCopies;
+                    if (firstPurePosting != nullptr &&
+                        *firstPurePosting < 0) {
+                        *firstPurePosting = posting;
+                    }
                     if (firstPureCode != nullptr) {
                         memcpy(firstPureCode->data(), bytes.data() + offset + metadataSize,
                                firstPureCode->size());
@@ -6388,11 +6455,14 @@ BOOST_AUTO_TEST_CASE(TaggedPureTailUpdate)
 
     SizeType pureCopies = 0;
     SizeType tailCopies = 0;
+    SizeType purePosting = -1;
     SizeType tailPosting = -1;
     std::array<std::uint8_t, pqChunks> pureCode {};
-    inspectCopies(index, updateVID, pureCopies, tailCopies, tailPosting, &pureCode);
+    inspectCopies(index, updateVID, pureCopies, tailCopies, tailPosting, &pureCode,
+                  &purePosting);
     BOOST_REQUIRE(pureCopies > 0);
     BOOST_REQUIRE(tailCopies > 0);
+    BOOST_REQUIRE(purePosting >= 0);
     BOOST_REQUIRE(tailPosting >= 0);
     BOOST_CHECK_EQUAL(pureCode[0], 250);
     BOOST_CHECK_EQUAL(pureCode[1], 250);
@@ -6404,10 +6474,13 @@ BOOST_AUTO_TEST_CASE(TaggedPureTailUpdate)
     BOOST_REQUIRE(VectorIndex::LoadIndex(indexDirectory, reloaded) == ErrorCode::Success);
     SizeType reloadedPureCopies = 0;
     SizeType reloadedTailCopies = 0;
+    SizeType reloadedPurePosting = -1;
     SizeType reloadedTailPosting = -1;
-    inspectCopies(reloaded, updateVID, reloadedPureCopies, reloadedTailCopies, reloadedTailPosting, nullptr);
+    inspectCopies(reloaded, updateVID, reloadedPureCopies, reloadedTailCopies,
+                  reloadedTailPosting, nullptr, &reloadedPurePosting);
     BOOST_CHECK_EQUAL(reloadedPureCopies, pureCopies);
     BOOST_CHECK_EQUAL(reloadedTailCopies, tailCopies);
+    BOOST_REQUIRE(reloadedPurePosting >= 0);
 
     const auto containsVID = [&](const std::vector<SizeType>& postings,
                                  const std::vector<std::uint32_t>& queryTags) {
@@ -6415,6 +6488,10 @@ BOOST_AUTO_TEST_CASE(TaggedPureTailUpdate)
         context.m_active = true;
         context.m_directPostingIDs = postings;
         context.m_queryTags = queryTags;
+        context.m_limitedTagRouteEligible =
+            !queryTags.empty();
+        context.m_limitedTagQueryValues =
+            queryTags;
         VectorIndex::ThreadLocalSearchContextGuard guard(std::move(context));
         COMMON::QueryResultSet<float> result(updateVector.data(), 10);
         BOOST_REQUIRE(reloaded->SearchIndex(result) == ErrorCode::Success);
@@ -6426,16 +6503,24 @@ BOOST_AUTO_TEST_CASE(TaggedPureTailUpdate)
 
     BOOST_CHECK(containsVID({tailPosting}, {}));
     BOOST_CHECK(!containsVID({tailPosting}, {updateTags[0]}));
-    std::vector<SizeType> allPostings;
+    auto* reloadedSpann = dynamic_cast<SPANN::Index<float>*>(reloaded.get());
+    BOOST_REQUIRE(reloadedSpann != nullptr);
     auto* reloadedDisk = dynamic_cast<SPANN::ExtraDynamicSearcher<float>*>(
         dynamic_cast<SPANN::ISPANNIndex*>(reloaded.get())->GetDiskIndex().get());
     BOOST_REQUIRE(reloadedDisk != nullptr);
+    reloadedSpann->GetOptions()->m_enableLimitedTagPosting = true;
+    reloadedDisk->SetLimitedTagReadRangesReady(true);
+    BOOST_CHECK(containsVID({reloadedPurePosting}, {updateTags[0]}));
+    BOOST_CHECK(!containsVID({reloadedPurePosting}, {}));
+    BOOST_CHECK(!containsVID({reloadedTailPosting}, {updateTags[0]}));
+    BOOST_CHECK(containsVID({reloadedTailPosting}, {}));
+    reloadedDisk->SetLimitedTagReadRangesReady(false);
+    reloadedSpann->GetOptions()->m_enableLimitedTagPosting = false;
+    std::vector<SizeType> allPostings;
     const SizeType postingCount = reloadedDisk->GetTaggedPostingCount();
     for (SizeType posting = 0; posting < postingCount; ++posting) allPostings.push_back(posting);
     BOOST_CHECK(containsVID(allPostings, {updateTags[0]}));
 
-    auto* reloadedSpann = dynamic_cast<SPANN::Index<float>*>(reloaded.get());
-    BOOST_REQUIRE(reloadedSpann != nullptr);
     BOOST_REQUIRE(reloadedSpann->DeleteIndex(updateVID) == ErrorCode::Success);
     BOOST_CHECK(!containsVID(allPostings, {updateTags[0]}));
     BOOST_REQUIRE(reloaded->SaveIndex(indexDirectory) == ErrorCode::Success);
@@ -6498,7 +6583,7 @@ BOOST_AUTO_TEST_CASE(TaggedPureTailUpdate)
     SizeType overflowTailCopies = 0;
     SizeType overflowTailPosting = -1;
     inspectCopies(reloaded, overflowVID, overflowPureCopies, overflowTailCopies,
-                  overflowTailPosting, nullptr);
+                  overflowTailPosting, nullptr, nullptr);
     BOOST_CHECK_GT(overflowPureCopies, 0);
 
     // Search-triggered merge maintenance must retain the original lifecycle:
@@ -6563,7 +6648,7 @@ BOOST_AUTO_TEST_CASE(TaggedPureTailUpdate)
     overflowTailCopies = 0;
     overflowTailPosting = -1;
     inspectCopies(reloaded, overflowVID, overflowPureCopies, overflowTailCopies,
-                  overflowTailPosting, nullptr);
+                  overflowTailPosting, nullptr, nullptr);
     BOOST_CHECK_GT(overflowPureCopies, 0);
     auto* checkpointSpann = dynamic_cast<SPANN::Index<float>*>(reloaded.get());
     BOOST_REQUIRE(checkpointSpann != nullptr);
@@ -6649,11 +6734,1966 @@ BOOST_AUTO_TEST_CASE(TaggedPureTailUpdate)
     SizeType recoveredTailCopies = 0;
     SizeType recoveredTailPosting = -1;
     inspectCopies(recovered, recoveredUpdateVID, recoveredPureCopies, recoveredTailCopies,
-                  recoveredTailPosting, nullptr);
+                  recoveredTailPosting, nullptr, nullptr);
     BOOST_CHECK_GT(recoveredPureCopies, 0);
     recovered.reset();
     std::filesystem::remove_all(indexDirectory);
     std::filesystem::remove_all(checkpointDirectory);
+}
+
+BOOST_AUTO_TEST_CASE(LimitedTagDualRegionInsert)
+{
+    constexpr SizeType baseCount = 128;
+    constexpr DimensionType dimension = 8;
+    constexpr std::uint32_t keyTag = 7;
+    constexpr std::uint32_t alternateTag = 8;
+    constexpr std::uint64_t generation = 0x12345678ULL;
+    const std::string indexDirectory =
+        "limited_tag_dual_insert_index";
+    const std::string checkpointDirectory =
+        indexDirectory + "_checkpoint";
+    const std::string supportFile =
+        "limited_tag_support.bin";
+    std::filesystem::remove_all(indexDirectory);
+    std::filesystem::remove_all(checkpointDirectory);
+    std::filesystem::create_directories(indexDirectory);
+    std::filesystem::create_directories(
+        checkpointDirectory);
+
+    ByteArray baseBytes = ByteArray::Alloc(
+        sizeof(float) *
+        static_cast<size_t>(baseCount) *
+        dimension);
+    auto* base =
+        reinterpret_cast<float*>(baseBytes.Data());
+    for (SizeType row = 0; row < baseCount; ++row) {
+        for (DimensionType dim = 0;
+             dim < dimension; ++dim) {
+            base[static_cast<size_t>(row) *
+                     dimension +
+                 dim] =
+                static_cast<float>(
+                    row * 17 + dim * 3);
+        }
+    }
+    auto vectors = std::make_shared<BasicVectorSet>(
+        baseBytes, VectorValueType::Float,
+        dimension, baseCount);
+    std::vector<std::uint32_t> baseTags(
+        static_cast<size_t>(baseCount), alternateTag);
+    baseTags.front() = keyTag;
+
+    auto index = VectorIndex::CreateInstance(
+        IndexAlgoType::SPANN,
+        VectorValueType::Float);
+    BOOST_REQUIRE(index != nullptr);
+    const auto set =
+        [&](const char* section, const char* key,
+            const std::string& value) {
+            BOOST_REQUIRE(
+                index->SetParameter(
+                    key, value.c_str(), section) ==
+                ErrorCode::Success);
+        };
+    set("Base", "DistCalcMethod", "L2");
+    set("Base", "IndexAlgoType", "BKT");
+    set("Base", "ValueType", "Float");
+    set("Base", "Dim", std::to_string(dimension));
+    set("Base", "IndexDirectory", indexDirectory);
+    set("SelectHead", "isExecute", "true");
+    set("SelectHead", "NumberOfThreads", "2");
+    set("SelectHead", "SelectHeadType", "BKT");
+    set("SelectHead", "SelectThreshold", "0");
+    set("SelectHead", "SplitFactor", "0");
+    set("SelectHead", "SplitThreshold", "0");
+    set("SelectHead", "Ratio", "0.25");
+    set("BuildHead", "isExecute", "true");
+    set("BuildHead", "NumberOfThreads", "2");
+    set("BuildSSDIndex", "isExecute", "true");
+    set("BuildSSDIndex", "BuildSsdIndex", "true");
+    set("BuildSSDIndex", "InternalResultNum", "16");
+    set("BuildSSDIndex", "SearchInternalResultNum", "16");
+    set("BuildSSDIndex", "NumberOfThreads", "2");
+    set("BuildSSDIndex", "PostingPageLimit", "4");
+    set("BuildSSDIndex", "SearchPostingPageLimit", "1");
+    set("BuildSSDIndex", "Storage", "FILEIO");
+    set("BuildSSDIndex", "SpdkBatchSize", "16");
+    set("BuildSSDIndex", "CacheSizeGB", "1");
+    set("BuildSSDIndex", "PersistentBufferPath",
+        checkpointDirectory);
+    set("BuildSSDIndex", "ExcludeHead", "true");
+    set("BuildSSDIndex", "ResultNum", "10");
+    set("BuildSSDIndex", "SearchThreadNum", "2");
+    set("BuildSSDIndex", "Update", "false");
+    set("BuildSSDIndex", "BufferLength", "1");
+    set("BuildSSDIndex", "StartFileSizeGB", "1");
+    set("BuildSSDIndex", "ConsistencyCheck", "true");
+    set("BuildSSDIndex", "ChecksumCheck", "true");
+    set("BuildSSDIndex", "ChecksumInRead", "true");
+    set("BuildSSDIndex", "AsyncAppendQueueSize", "0");
+    set("BuildSSDIndex", "ReplicaCount", "1");
+    set("BuildSSDIndex", "TailReplicaCount", "0");
+    set("BuildSSDIndex", "UnfilterTailBufferLength", "0");
+    set("BuildSSDIndex", "NumTagsPerVec", "1");
+
+    auto* spannInterface =
+        dynamic_cast<SPANN::ISPANNIndex*>(
+            index.get());
+    BOOST_REQUIRE(spannInterface != nullptr);
+    spannInterface->SetVectorTags(
+        baseTags.data(), baseCount, 1);
+    BOOST_REQUIRE(
+        index->BuildIndex(
+            vectors, nullptr, true, false, false) ==
+        ErrorCode::Success);
+
+    auto* disk =
+        dynamic_cast<SPANN::ExtraDynamicSearcher<float>*>(
+            spannInterface->GetDiskIndex().get());
+    BOOST_REQUIRE(disk != nullptr);
+    const SizeType headCount =
+        disk->GetTaggedPostingCount();
+    BOOST_REQUIRE_GT(headCount, 1);
+    disk->InitializePureCountsFromTotals(headCount);
+    const SizeType hTargetPosting = 0;
+    const SizeType oTargetPosting = headCount - 1;
+    auto* builtSpann =
+        dynamic_cast<SPANN::Index<float>*>(
+            index.get());
+    BOOST_REQUIRE(builtSpann != nullptr);
+    const auto headIndex =
+        builtSpann->GetMemoryIndex();
+    BOOST_REQUIRE(headIndex != nullptr);
+    const auto* oHeadVector =
+        reinterpret_cast<const float*>(
+            headIndex->GetSample(oTargetPosting));
+    BOOST_REQUIRE(oHeadVector != nullptr);
+    std::array<float, dimension> updateVector;
+    std::copy_n(
+        oHeadVector, dimension,
+        updateVector.begin());
+    const std::array<std::uint32_t, 1>
+        updateTags = {keyTag};
+
+    SPANN::LimitedTagSupport support;
+    BOOST_REQUIRE(
+        support.Initialize(
+            headCount, 1, 1, 1, 0, 1,
+            generation));
+    for (SizeType head = 0;
+         head < headCount; ++head) {
+        const std::uint32_t headTag =
+            head == hTargetPosting
+                ? keyTag
+                : alternateTag;
+        const std::uint32_t attributes[] = {
+            headTag};
+        BOOST_REQUIRE(
+            support.SetHeadTags(
+                head, {headTag}));
+        BOOST_REQUIRE(
+            support.SetHeadAttributes(
+                head, attributes, 1));
+    }
+    BOOST_REQUIRE(
+        support.SetTagVectorCounts(
+            baseCount,
+            {{keyTag, 1},
+             {alternateTag, baseCount - 1}}));
+    std::string supportError;
+    BOOST_REQUIRE_MESSAGE(
+        support.Save(
+            indexDirectory + "/" + supportFile,
+            &supportError),
+        supportError);
+
+    set("BuildSSDIndex",
+        "EnableLimitedTagPosting", "true");
+    set("BuildSSDIndex",
+        "LimitedTagGenerationFingerprint",
+        std::to_string(generation));
+    set("BuildSSDIndex",
+        "LimitedTagSupportFile", supportFile);
+    set("BuildSSDIndex",
+        "LimitedTagColumn", "0");
+    set("BuildSSDIndex",
+        "LimitedTagSlotsPerHead", "1");
+    set("BuildSSDIndex",
+        "LimitedTagVoteHeadCount", "1");
+    set("BuildSSDIndex",
+        "LimitedTagMinHeadCount", "1");
+    {
+        SPANN::ExtraWorkSpace workspace;
+        disk->InitWorkSpace(&workspace, false);
+        const int stride =
+            disk->GetTaggedRecordSize();
+        BOOST_REQUIRE_GT(stride, 0);
+        std::vector<SPANN::TaggedPostingSnapshot>
+            rewrites;
+        rewrites.reserve(
+            static_cast<size_t>(headCount));
+        for (SizeType head = 0;
+             head < headCount; ++head) {
+            SPANN::TaggedPostingSnapshot original;
+            BOOST_REQUIRE(
+                disk->GetTaggedPostingSnapshot(
+                    &workspace, head, original) ==
+                ErrorCode::Success);
+            BOOST_REQUIRE_EQUAL(
+                original.m_records.size() %
+                    static_cast<size_t>(stride),
+                0U);
+            SPANN::TaggedPostingSnapshot migrated;
+            migrated.m_headID = head;
+            const int recordCount =
+                static_cast<int>(
+                    original.m_records.size() /
+                    static_cast<size_t>(stride));
+            for (int record = 0;
+                 record < recordCount; ++record) {
+                const char* bytes =
+                    original.m_records.data() +
+                    static_cast<size_t>(record) *
+                        static_cast<size_t>(stride);
+                std::uint32_t recordTag = 0;
+                std::memcpy(
+                    &recordTag,
+                    bytes + sizeof(SizeType) +
+                        sizeof(std::uint8_t),
+                    sizeof(recordTag));
+                if (support.Supports(head, recordTag)) {
+                    migrated.m_records.append(
+                        bytes,
+                        static_cast<size_t>(stride));
+                    ++migrated.m_pureCount;
+                }
+            }
+            migrated.m_records.append(
+                original.m_records);
+            rewrites.emplace_back(
+                std::move(migrated));
+        }
+        BOOST_REQUIRE(
+            disk->RewriteTaggedPostings(
+                &workspace, rewrites) ==
+            ErrorCode::Success);
+    }
+    disk->SetLimitedTagReadRangesReady(true);
+    BOOST_REQUIRE(
+        index->SaveIndex(indexDirectory) ==
+        ErrorCode::Success);
+    BOOST_CHECK(
+        std::filesystem::exists(
+            indexDirectory +
+            "/limited_tag_ho_ready.bin"));
+    index.reset();
+
+    const std::string readyMarkerPath =
+        indexDirectory +
+        "/limited_tag_ho_ready.bin";
+    std::ifstream readyMarkerInput(
+        readyMarkerPath, std::ios::binary);
+    BOOST_REQUIRE(readyMarkerInput.good());
+    const std::string readyMarkerBytes(
+        (std::istreambuf_iterator<char>(
+            readyMarkerInput)),
+        std::istreambuf_iterator<char>());
+    BOOST_REQUIRE(!readyMarkerBytes.empty());
+    const auto writeReadyMarker =
+        [&](const std::string& bytes) {
+            std::ofstream output(
+                readyMarkerPath,
+                std::ios::binary |
+                    std::ios::trunc);
+            BOOST_REQUIRE(output.good());
+            output.write(
+                bytes.data(),
+                static_cast<std::streamsize>(
+                    bytes.size()));
+            BOOST_REQUIRE(output.good());
+        };
+    {
+        BOOST_REQUIRE(
+            std::filesystem::remove(
+                readyMarkerPath));
+        std::shared_ptr<VectorIndex> unready;
+        BOOST_REQUIRE(
+            VectorIndex::LoadIndex(
+                indexDirectory, unready) ==
+            ErrorCode::Success);
+        auto* unreadySpann =
+            dynamic_cast<SPANN::Index<float>*>(
+                unready.get());
+        auto* unreadyDisk =
+            dynamic_cast<
+                SPANN::ExtraDynamicSearcher<float>*>(
+                dynamic_cast<SPANN::ISPANNIndex*>(
+                    unready.get())
+                    ->GetDiskIndex()
+                    .get());
+        BOOST_REQUIRE(unreadySpann != nullptr);
+        BOOST_REQUIRE(unreadyDisk != nullptr);
+        BOOST_CHECK(
+            !unreadyDisk
+                 ->LimitedTagPostingRegionsReady());
+        const SizeType before =
+            unreadySpann->GetNumSamples();
+        BOOST_CHECK(
+            unreadySpann->AddIndexWithTags(
+                updateVector.data(), 1, dimension,
+                updateTags.data(), 1, true) ==
+            ErrorCode::Fail);
+        BOOST_CHECK_EQUAL(
+            unreadySpann->GetNumSamples(), before);
+        unready.reset();
+        writeReadyMarker(readyMarkerBytes);
+    }
+    {
+        std::string staleMarker =
+            readyMarkerBytes;
+        staleMarker.back() =
+            static_cast<char>(
+                staleMarker.back() ^ 0x1);
+        writeReadyMarker(staleMarker);
+        std::shared_ptr<VectorIndex> stale;
+        BOOST_REQUIRE(
+            VectorIndex::LoadIndex(
+                indexDirectory, stale) ==
+            ErrorCode::Success);
+        auto* staleDisk =
+            dynamic_cast<
+                SPANN::ExtraDynamicSearcher<float>*>(
+                dynamic_cast<SPANN::ISPANNIndex*>(
+                    stale.get())
+                    ->GetDiskIndex()
+                    .get());
+        BOOST_REQUIRE(staleDisk != nullptr);
+        BOOST_CHECK(
+            !staleDisk
+                 ->LimitedTagPostingRegionsReady());
+        stale.reset();
+        writeReadyMarker(readyMarkerBytes);
+    }
+    {
+        const std::string incompletePath =
+            indexDirectory +
+            "/limited_tag_ho_checkpoint.incomplete";
+        std::ofstream incomplete(
+            incompletePath,
+            std::ios::binary |
+                std::ios::trunc);
+        BOOST_REQUIRE(incomplete.good());
+        incomplete.put('\0');
+        incomplete.close();
+        BOOST_REQUIRE(incomplete.good());
+        std::shared_ptr<VectorIndex> rejected;
+        BOOST_CHECK(
+            VectorIndex::LoadIndex(
+                indexDirectory, rejected) !=
+            ErrorCode::Success);
+        rejected.reset();
+        BOOST_REQUIRE(
+            std::filesystem::remove(
+                incompletePath));
+    }
+
+    BOOST_REQUIRE(
+        VectorIndex::LoadIndex(
+            indexDirectory, index) ==
+        ErrorCode::Success);
+    auto* spann =
+        dynamic_cast<SPANN::Index<float>*>(
+            index.get());
+    BOOST_REQUIRE(spann != nullptr);
+    spannInterface =
+        dynamic_cast<SPANN::ISPANNIndex*>(
+            index.get());
+    BOOST_REQUIRE(spannInterface != nullptr);
+    disk =
+        dynamic_cast<SPANN::ExtraDynamicSearcher<float>*>(
+            spannInterface->GetDiskIndex().get());
+    BOOST_REQUIRE(disk != nullptr);
+    BOOST_CHECK(
+        disk->LimitedTagPostingRegionsReady());
+    auto* mutableOptions = spann->GetOptions();
+    BOOST_REQUIRE(mutableOptions != nullptr);
+    mutableOptions->m_enableLimitedTagPosting =
+        false;
+    BOOST_CHECK(
+        spannInterface->HasLimitedTagLayout());
+    const std::string tamperedSingleFile =
+        indexDirectory + "/tampered_unsupported.bin";
+    BOOST_CHECK(
+        index->SaveIndexToFile(
+            tamperedSingleFile) ==
+        ErrorCode::Undefined);
+    BOOST_CHECK(
+        !std::filesystem::exists(
+            tamperedSingleFile));
+    std::string tamperedConfig;
+    const std::vector<ByteArray> tamperedBlobs;
+    BOOST_CHECK(
+        index->SaveIndex(
+            tamperedConfig, tamperedBlobs) ==
+        ErrorCode::Undefined);
+    BOOST_CHECK(
+        index->SaveIndex(indexDirectory) ==
+        ErrorCode::Undefined);
+    BOOST_CHECK(
+        std::filesystem::exists(
+            readyMarkerPath));
+    BOOST_CHECK(
+        !std::filesystem::exists(
+            indexDirectory +
+            "/limited_tag_ho_checkpoint.incomplete"));
+    BOOST_REQUIRE(
+        disk->BeginLimitedTagCheckpoint(
+            indexDirectory) ==
+        ErrorCode::Success);
+    BOOST_CHECK(
+        !std::filesystem::exists(
+            readyMarkerPath));
+    BOOST_CHECK(
+        std::filesystem::exists(
+            indexDirectory +
+            "/limited_tag_ho_checkpoint.incomplete"));
+    mutableOptions->m_enableLimitedTagPosting =
+        true;
+    BOOST_REQUIRE(
+        index->SaveIndex(indexDirectory) ==
+        ErrorCode::Success);
+    {
+        SPANN::ExtraWorkSpace invalidRewriteWorkspace;
+        disk->InitWorkSpace(
+            &invalidRewriteWorkspace, false);
+        SPANN::TaggedPostingSnapshot invalidRewrite;
+        invalidRewrite.m_headID =
+            disk->GetTaggedPostingCount();
+        BOOST_CHECK(
+            disk->RewriteTaggedPostings(
+                &invalidRewriteWorkspace,
+                {invalidRewrite}) ==
+            ErrorCode::Posting_SizeError);
+        BOOST_CHECK(
+            std::filesystem::exists(
+                readyMarkerPath));
+        BOOST_CHECK(
+            !std::filesystem::exists(
+                indexDirectory +
+                "/limited_tag_ho_checkpoint.incomplete"));
+    }
+    const std::string unsupportedSingleFile =
+        indexDirectory + "/unsupported.bin";
+    BOOST_CHECK(
+        index->SaveIndexToFile(
+            unsupportedSingleFile) ==
+        ErrorCode::Undefined);
+    BOOST_CHECK(
+        !std::filesystem::exists(
+            unsupportedSingleFile));
+    std::string unsupportedConfig;
+    const std::vector<ByteArray>
+        unsupportedBlobs;
+    BOOST_CHECK(
+        index->SaveIndex(
+            unsupportedConfig,
+            unsupportedBlobs) ==
+        ErrorCode::Undefined);
+    BOOST_CHECK(
+        disk->LimitedTagPostingRegionsReady());
+    BOOST_CHECK(
+        !std::filesystem::exists(
+            indexDirectory +
+            "/limited_tag_ho_checkpoint.incomplete"));
+
+    const size_t regionCapacity =
+        static_cast<size_t>(
+            disk->GetTaggedPureCapacity());
+    const SizeType samplesBeforeHOverflow =
+        spann->GetNumSamples();
+    const SizeType headsBeforeHOverflow =
+        disk->GetTaggedPostingCount();
+    const SizeType hOverflowCount =
+        static_cast<SizeType>(
+            regionCapacity + 1);
+    std::vector<float> hOverflowVectors(
+        static_cast<size_t>(hOverflowCount) *
+        dimension);
+    std::vector<std::uint32_t> hOverflowTags(
+        static_cast<size_t>(hOverflowCount),
+        keyTag);
+    for (SizeType row = 0;
+         row < hOverflowCount; ++row) {
+        const SizeType target =
+            1 +
+            row %
+                (headsBeforeHOverflow - 1);
+        const auto* center =
+            reinterpret_cast<const float*>(
+                spann->GetMemoryIndex()
+                    ->GetSample(target));
+        BOOST_REQUIRE(center != nullptr);
+        for (DimensionType dim = 0;
+             dim < dimension; ++dim) {
+            hOverflowVectors[
+                static_cast<size_t>(row) *
+                    dimension +
+                dim] =
+                center[dim] +
+                static_cast<float>(row + 1) *
+                    1.0e-7f;
+        }
+    }
+    BOOST_CHECK(
+        spann->AddIndexWithTags(
+            hOverflowVectors.data(),
+            hOverflowCount, dimension,
+            hOverflowTags.data(), 1, true) ==
+        ErrorCode::Posting_OverFlow);
+    BOOST_CHECK_EQUAL(
+        spann->GetNumSamples(),
+        samplesBeforeHOverflow);
+    BOOST_CHECK_EQUAL(
+        disk->GetTaggedPostingCount(),
+        headsBeforeHOverflow);
+    BOOST_CHECK(
+        std::filesystem::exists(
+            readyMarkerPath));
+    BOOST_CHECK(
+        !std::filesystem::exists(
+            indexDirectory +
+            "/limited_tag_ho_checkpoint.incomplete"));
+
+    const SizeType vectorCountBeforeLegacyInsert =
+        spann->GetNumSamples();
+    SizeType legacyVID = -1;
+    BOOST_CHECK(
+        spann->AddIndexSPFresh(
+            updateVector.data(), 1, dimension,
+            &legacyVID) ==
+        ErrorCode::Fail);
+    BOOST_CHECK_EQUAL(
+        spann->GetNumSamples(),
+        vectorCountBeforeLegacyInsert);
+    BOOST_REQUIRE(
+        spann->AddIndexWithTags(
+            updateVector.data(), 1, dimension,
+            updateTags.data(), 1, true) ==
+        ErrorCode::Success);
+    const SizeType updateVID = baseCount;
+    const std::string incompleteMarkerPath =
+        indexDirectory +
+        "/limited_tag_ho_checkpoint.incomplete";
+    BOOST_CHECK(
+        std::filesystem::exists(
+            incompleteMarkerPath));
+    BOOST_CHECK(
+        !std::filesystem::exists(
+            readyMarkerPath));
+
+    const SizeType fillerCount =
+        static_cast<SizeType>(
+            PageSize /
+                disk->GetTaggedRecordSize()) +
+        16;
+    std::vector<float> fillerVectors(
+        static_cast<size_t>(fillerCount) *
+        dimension);
+    std::vector<std::uint32_t> fillerTags(
+        static_cast<size_t>(fillerCount),
+        alternateTag);
+    for (SizeType row = 0;
+         row < fillerCount; ++row) {
+        for (DimensionType dim = 0;
+             dim < dimension; ++dim) {
+            fillerVectors[
+                static_cast<size_t>(row) *
+                    dimension +
+                dim] =
+                updateVector[
+                    static_cast<size_t>(dim)] +
+                static_cast<float>(row + 1) *
+                    0.001f;
+        }
+    }
+    BOOST_REQUIRE(
+        spann->AddIndexWithTags(
+            fillerVectors.data(), fillerCount,
+            dimension, fillerTags.data(), 1,
+            true) ==
+        ErrorCode::Success);
+
+    auto countRegions =
+        [&](const std::shared_ptr<VectorIndex>& inspected,
+            SizeType vid, SizeType& hPosting,
+            SizeType& oPosting) {
+            auto* inspectedDisk =
+                dynamic_cast<
+                    SPANN::ExtraDynamicSearcher<float>*>(
+                    dynamic_cast<SPANN::ISPANNIndex*>(
+                        inspected.get())
+                        ->GetDiskIndex()
+                        .get());
+            BOOST_REQUIRE(inspectedDisk != nullptr);
+            SPANN::ExtraWorkSpace workspace;
+            inspectedDisk->InitWorkSpace(
+                &workspace, false);
+            const int stride =
+                inspectedDisk->GetTaggedRecordSize();
+            BOOST_REQUIRE_GT(stride, 0);
+            int hCopies = 0;
+            int oCopies = 0;
+            hPosting = -1;
+            oPosting = -1;
+            for (SizeType head = 0;
+                 head <
+                     inspectedDisk
+                         ->GetTaggedPostingCount();
+                 ++head) {
+                SPANN::TaggedPostingSnapshot snapshot;
+                BOOST_REQUIRE(
+                    inspectedDisk
+                        ->GetTaggedPostingSnapshot(
+                            &workspace, head,
+                            snapshot) ==
+                    ErrorCode::Success);
+                BOOST_REQUIRE_EQUAL(
+                    snapshot.m_records.size() %
+                        static_cast<size_t>(stride),
+                    0U);
+                const int count = static_cast<int>(
+                    snapshot.m_records.size() /
+                    static_cast<size_t>(stride));
+                for (int record = 0;
+                     record < count; ++record) {
+                    SizeType recordVID = -1;
+                    std::memcpy(
+                        &recordVID,
+                        snapshot.m_records.data() +
+                            static_cast<size_t>(
+                                record) *
+                                static_cast<size_t>(
+                                    stride),
+                        sizeof(recordVID));
+                    if (recordVID != vid) continue;
+                    if (record <
+                        snapshot.m_pureCount) {
+                        ++hCopies;
+                        hPosting = head;
+                    } else {
+                        ++oCopies;
+                        oPosting = head;
+                    }
+                }
+            }
+            return std::make_pair(
+                hCopies, oCopies);
+        };
+
+    SizeType hPosting = -1;
+    SizeType oPosting = -1;
+    auto copies = countRegions(
+        index, updateVID, hPosting, oPosting);
+    BOOST_CHECK_EQUAL(copies.first, 1);
+    BOOST_CHECK_EQUAL(copies.second, 1);
+    BOOST_REQUIRE_EQUAL(
+        hPosting, hTargetPosting);
+    BOOST_REQUIRE_EQUAL(
+        oPosting, oTargetPosting);
+    BOOST_REQUIRE_NE(hPosting, oPosting);
+    const std::string saveAsDirectory =
+        indexDirectory + "_save_as";
+    std::filesystem::remove_all(saveAsDirectory);
+    BOOST_CHECK(
+        index->SaveIndex(saveAsDirectory) ==
+        ErrorCode::Undefined);
+    BOOST_CHECK(
+        !std::filesystem::exists(
+            saveAsDirectory));
+
+    const std::string blockedSyncDirectory =
+        indexDirectory + "/blocked_sync";
+    std::filesystem::create_directory(
+        blockedSyncDirectory);
+    std::filesystem::permissions(
+        blockedSyncDirectory,
+        std::filesystem::perms::none);
+    const ErrorCode failedSave =
+        index->SaveIndex(indexDirectory);
+    std::filesystem::permissions(
+        blockedSyncDirectory,
+        std::filesystem::perms::owner_all);
+    std::filesystem::remove(
+        blockedSyncDirectory);
+    BOOST_CHECK(
+        failedSave == ErrorCode::DiskIOFail);
+    BOOST_CHECK(
+        std::filesystem::exists(
+            incompleteMarkerPath));
+    BOOST_CHECK(
+        !std::filesystem::exists(
+            readyMarkerPath));
+
+    BOOST_REQUIRE(
+        index->SaveIndex(indexDirectory) ==
+        ErrorCode::Success);
+    BOOST_CHECK(
+        !std::filesystem::exists(
+            incompleteMarkerPath));
+    BOOST_CHECK(
+        std::filesystem::exists(
+            readyMarkerPath));
+    index.reset();
+
+    BOOST_REQUIRE(
+        VectorIndex::LoadIndex(
+            indexDirectory, index) ==
+        ErrorCode::Success);
+    spann =
+        dynamic_cast<SPANN::Index<float>*>(
+            index.get());
+    BOOST_REQUIRE(spann != nullptr);
+    disk =
+        dynamic_cast<SPANN::ExtraDynamicSearcher<float>*>(
+            dynamic_cast<SPANN::ISPANNIndex*>(
+                index.get())
+                ->GetDiskIndex()
+                .get());
+    BOOST_REQUIRE(disk != nullptr);
+    BOOST_CHECK(
+        disk->LimitedTagPostingRegionsReady());
+    SizeType reloadedHPosting = -1;
+    SizeType reloadedOPosting = -1;
+    copies = countRegions(
+        index, updateVID, reloadedHPosting,
+        reloadedOPosting);
+    BOOST_CHECK_EQUAL(copies.first, 1);
+    BOOST_CHECK_EQUAL(copies.second, 1);
+    BOOST_CHECK_EQUAL(
+        reloadedHPosting, hPosting);
+    BOOST_CHECK_EQUAL(
+        reloadedOPosting, oPosting);
+
+    {
+        SPANN::ExtraWorkSpace workspace;
+        disk->InitWorkSpace(
+            &workspace, false);
+        SPANN::TaggedPostingSnapshot snapshot;
+        BOOST_REQUIRE(
+            disk->GetTaggedPostingSnapshot(
+                &workspace, reloadedOPosting,
+                snapshot) ==
+            ErrorCode::Success);
+        const int stride =
+            disk->GetTaggedRecordSize();
+        BOOST_REQUIRE_GE(
+            static_cast<size_t>(
+                snapshot.m_pureCount) *
+                static_cast<size_t>(stride),
+            static_cast<size_t>(PageSize));
+        int updateRecord = -1;
+        const int recordCount =
+            static_cast<int>(
+                    snapshot.m_records.size() /
+                    static_cast<size_t>(stride));
+        for (int record =
+                     snapshot.m_pureCount;
+             record < recordCount; ++record) {
+            SizeType vid = -1;
+            std::memcpy(
+                    &vid,
+                    snapshot.m_records.data() +
+                        static_cast<size_t>(record) *
+                            static_cast<size_t>(stride),
+                    sizeof(vid));
+            if (vid == updateVID) {
+                    updateRecord = record;
+                    break;
+            }
+        }
+        BOOST_REQUIRE_GE(updateRecord, 0);
+        BOOST_CHECK_GE(
+            static_cast<size_t>(updateRecord) *
+                    static_cast<size_t>(stride),
+            static_cast<size_t>(PageSize));
+    }
+
+    const auto containsVID =
+        [&](const std::vector<SizeType>& postings,
+            const std::vector<std::uint32_t>& queryTags,
+            bool limitedRouteEligible = true) {
+            VectorIndex::ThreadLocalSearchContext context;
+            context.m_active = true;
+            context.m_directPostingIDs = postings;
+            context.m_queryTags = queryTags;
+            context.m_limitedTagRouteEligible =
+                limitedRouteEligible &&
+                !queryTags.empty();
+            if (context
+                    .m_limitedTagRouteEligible) {
+                context
+                    .m_limitedTagQueryValues =
+                    queryTags;
+            }
+            VectorIndex::ThreadLocalSearchContextGuard guard(
+                std::move(context));
+            COMMON::QueryResultSet<float> result(
+                updateVector.data(), 10);
+            BOOST_REQUIRE(
+                index->SearchIndex(result) ==
+                ErrorCode::Success);
+            for (int i = 0;
+                 i < result.GetResultNum(); ++i) {
+                if (result.GetResult(i)->VID ==
+                    updateVID) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+    disk->SetLimitedTagReadRangesReady(false);
+    BOOST_CHECK(
+        containsVID(
+            {reloadedOPosting}, {}));
+    disk->SetLimitedTagReadRangesReady(true);
+    BOOST_CHECK(
+        containsVID(
+            {reloadedHPosting}, {keyTag}));
+    BOOST_CHECK(
+        containsVID(
+            {reloadedOPosting}, {}));
+    BOOST_CHECK(
+        !containsVID(
+            {reloadedOPosting}, {keyTag}));
+    BOOST_CHECK(
+        !containsVID(
+            {reloadedHPosting}, {}));
+    BOOST_CHECK(
+        containsVID(
+            {reloadedOPosting}, {keyTag},
+            false));
+    auto* options = spann->GetOptions();
+    BOOST_REQUIRE(options != nullptr);
+    options->m_enableUnfilterTail = false;
+    BOOST_CHECK(
+        containsVID(
+            {reloadedOPosting}, {}));
+    options->m_enableUnfilterTail = true;
+    options->m_ablateTail = true;
+    BOOST_CHECK(
+        containsVID(
+            {reloadedOPosting}, {}));
+    options->m_ablateTail = false;
+
+    {
+        SPANN::ExtraWorkSpace workspace;
+        disk->InitWorkSpace(
+            &workspace, false);
+        workspace
+            .m_limitedTagRegionsReadySnapshotValid =
+            true;
+        workspace
+            .m_limitedTagRegionsReadySnapshot =
+            false;
+        workspace.m_queryTags =
+            updateTags.data();
+        workspace.m_numQueryTags = 1;
+        workspace.m_postingIDs = {
+            static_cast<int>(
+                reloadedOPosting)};
+        COMMON::QueryResultSet<float> result(
+            updateVector.data(), 10);
+        BOOST_REQUIRE(
+            disk->SearchIndex(
+                &workspace, result,
+                spann->GetMemoryIndex(),
+                nullptr, nullptr, nullptr) ==
+            ErrorCode::Success);
+        bool found = false;
+        for (int i = 0;
+             i < result.GetResultNum(); ++i) {
+            found =
+                found ||
+                result.GetResult(i)->VID ==
+                    updateVID;
+        }
+        BOOST_CHECK(found);
+    }
+
+    std::vector<std::shared_ptr<
+        Helper::DiskIO>> refineStreams;
+    std::vector<SizeType> refineMapping;
+    BOOST_CHECK(
+        spann->RefineIndex(
+            refineStreams, nullptr,
+            &refineMapping) ==
+        ErrorCode::Undefined);
+    BOOST_REQUIRE(
+        spann->DeleteIndex(updateVID) ==
+        ErrorCode::Success);
+    BOOST_CHECK(
+        !containsVID(
+            {reloadedHPosting}, {keyTag}));
+    BOOST_CHECK(
+        !containsVID(
+            {reloadedOPosting}, {}));
+
+    SPANN::ExtraWorkSpace gcWorkspace;
+    disk->InitWorkSpace(
+        &gcWorkspace, false);
+    SPANN::TaggedPostingSnapshot hBeforeGC;
+    SPANN::TaggedPostingSnapshot oBeforeGC;
+    BOOST_REQUIRE(
+        disk->GetTaggedPostingSnapshot(
+            &gcWorkspace, reloadedHPosting,
+            hBeforeGC) ==
+        ErrorCode::Success);
+    BOOST_REQUIRE(
+        disk->GetTaggedPostingSnapshot(
+            &gcWorkspace, reloadedOPosting,
+            oBeforeGC) ==
+        ErrorCode::Success);
+    spann->ForceGC();
+    SPANN::TaggedPostingSnapshot hAfterGC;
+    SPANN::TaggedPostingSnapshot oAfterGC;
+    BOOST_REQUIRE(
+        disk->GetTaggedPostingSnapshot(
+            &gcWorkspace, reloadedHPosting,
+            hAfterGC) ==
+        ErrorCode::Success);
+    BOOST_REQUIRE(
+        disk->GetTaggedPostingSnapshot(
+            &gcWorkspace, reloadedOPosting,
+            oAfterGC) ==
+        ErrorCode::Success);
+    BOOST_CHECK_EQUAL(
+        hAfterGC.m_pureCount,
+        hBeforeGC.m_pureCount);
+    BOOST_CHECK_EQUAL(
+        oAfterGC.m_pureCount,
+        oBeforeGC.m_pureCount);
+    BOOST_CHECK(
+        hAfterGC.m_records ==
+        hBeforeGC.m_records);
+    BOOST_CHECK(
+        oAfterGC.m_records ==
+        oBeforeGC.m_records);
+
+    SPANN::TaggedPostingSnapshot
+        dualRegionBefore;
+    BOOST_REQUIRE(
+        disk->GetTaggedPostingSnapshot(
+            &gcWorkspace, hTargetPosting,
+            dualRegionBefore) ==
+        ErrorCode::Success);
+    const size_t dualRegionTotalBefore =
+        dualRegionBefore.m_records.size() /
+        static_cast<size_t>(
+            disk->GetTaggedRecordSize());
+    BOOST_REQUIRE_LE(
+        static_cast<size_t>(
+            dualRegionBefore.m_pureCount),
+        dualRegionTotalBefore);
+    const size_t dualRegionHBefore =
+        static_cast<size_t>(
+            dualRegionBefore.m_pureCount);
+    const size_t dualRegionOBefore =
+        dualRegionTotalBefore -
+        dualRegionHBefore;
+    BOOST_REQUIRE_LT(
+        dualRegionHBefore, regionCapacity);
+    BOOST_REQUIRE_LT(
+        dualRegionOBefore, regionCapacity);
+    const size_t dualRegionNeeded =
+        dualRegionHBefore +
+                    dualRegionOBefore <
+                regionCapacity
+            ? (regionCapacity -
+                   dualRegionHBefore -
+                   dualRegionOBefore) /
+                      2 +
+                  1
+            : 1;
+    const size_t dualRegionAvailable =
+        (std::min)(
+            regionCapacity -
+                dualRegionHBefore,
+            regionCapacity -
+                dualRegionOBefore);
+    BOOST_REQUIRE_LE(
+        dualRegionNeeded,
+        dualRegionAvailable);
+    const SizeType dualRegionInsertCount =
+        static_cast<SizeType>(
+            dualRegionNeeded);
+    const SizeType dualRegionFirstVID =
+        spann->GetNumSamples();
+    const SizeType headsBeforeDualRegionInsert =
+        disk->GetTaggedPostingCount();
+    const auto* dualRegionCenter =
+        reinterpret_cast<const float*>(
+            spann->GetMemoryIndex()->GetSample(
+                hTargetPosting));
+    BOOST_REQUIRE(dualRegionCenter != nullptr);
+    std::vector<float> dualRegionVectors(
+        static_cast<size_t>(
+            dualRegionInsertCount) *
+        dimension);
+    std::vector<std::uint32_t>
+        dualRegionTags(
+            static_cast<size_t>(
+                dualRegionInsertCount),
+            keyTag);
+    for (SizeType row = 0;
+         row < dualRegionInsertCount; ++row) {
+        for (DimensionType dim = 0;
+             dim < dimension; ++dim) {
+            dualRegionVectors[
+                static_cast<size_t>(row) *
+                    dimension +
+                dim] =
+                dualRegionCenter[dim] +
+                static_cast<float>(row + 1) *
+                    1.0e-6f;
+        }
+    }
+    BOOST_REQUIRE(
+        spann->AddIndexWithTags(
+            dualRegionVectors.data(),
+            dualRegionInsertCount, dimension,
+            dualRegionTags.data(), 1, true) ==
+        ErrorCode::Success);
+    BOOST_CHECK_EQUAL(
+        disk->GetTaggedPostingCount(),
+        headsBeforeDualRegionInsert);
+    SizeType dualRegionH = -1;
+    SizeType dualRegionO = -1;
+    const auto dualRegionCopies =
+        countRegions(
+            index, dualRegionFirstVID,
+            dualRegionH, dualRegionO);
+    BOOST_CHECK_EQUAL(
+        dualRegionCopies.first, 1);
+    BOOST_CHECK_EQUAL(
+        dualRegionCopies.second, 1);
+    BOOST_CHECK_EQUAL(
+        dualRegionH, hTargetPosting);
+    BOOST_CHECK_EQUAL(
+        dualRegionO, hTargetPosting);
+
+    const SizeType headsBeforeLimitedSplit =
+        disk->GetTaggedPostingCount();
+    const SizeType splitProbeVID =
+        spann->GetNumSamples();
+    const SizeType splitInsertCount =
+        static_cast<SizeType>(
+            regionCapacity + 32);
+    std::vector<float> splitVectors(
+        static_cast<size_t>(splitInsertCount) *
+        dimension);
+    std::vector<std::uint32_t> splitTags(
+        static_cast<size_t>(splitInsertCount),
+        alternateTag);
+    const auto* splitCenter =
+        reinterpret_cast<const float*>(
+            spann->GetMemoryIndex()->GetSample(
+                oTargetPosting));
+    BOOST_REQUIRE(splitCenter != nullptr);
+    for (SizeType row = 0;
+         row < splitInsertCount; ++row) {
+        const float clusterOffset =
+            row % 2 == 0 ? -0.25f : 0.25f;
+        for (DimensionType dim = 0;
+             dim < dimension; ++dim) {
+            splitVectors[
+                static_cast<size_t>(row) *
+                    dimension +
+                dim] =
+                splitCenter[dim] +
+                clusterOffset +
+                static_cast<float>(row) *
+                    1.0e-5f;
+        }
+    }
+    constexpr SizeType splitBatchSize = 24;
+    for (SizeType begin = 0;
+         begin < splitInsertCount;
+         begin += splitBatchSize) {
+        const SizeType count =
+            (std::min)(
+                splitBatchSize,
+                splitInsertCount - begin);
+        BOOST_REQUIRE(
+            spann->AddIndexWithTags(
+                splitVectors.data() +
+                    static_cast<size_t>(begin) *
+                        dimension,
+                count, dimension,
+                splitTags.data() + begin, 1,
+                true) ==
+            ErrorCode::Success);
+    }
+    const SizeType headsAfterLimitedSplit =
+        disk->GetTaggedPostingCount();
+    BOOST_REQUIRE_GT(
+        headsAfterLimitedSplit,
+        headsBeforeLimitedSplit);
+    for (SizeType head = 0;
+         head < headsAfterLimitedSplit; ++head) {
+        SPANN::TaggedPostingSnapshot snapshot;
+        BOOST_REQUIRE(
+            disk->GetTaggedPostingSnapshot(
+                &gcWorkspace, head, snapshot) ==
+            ErrorCode::Success);
+        BOOST_CHECK_LE(
+            snapshot.m_pureCount,
+            static_cast<size_t>(
+                disk->GetTaggedPureCapacity()));
+        const size_t recordCount =
+            snapshot.m_records.size() /
+            static_cast<size_t>(
+                disk->GetTaggedRecordSize());
+        BOOST_REQUIRE_LE(
+            static_cast<size_t>(
+                snapshot.m_pureCount),
+            recordCount);
+        BOOST_CHECK_LE(
+            recordCount -
+                static_cast<size_t>(
+                    snapshot.m_pureCount),
+            static_cast<size_t>(
+                disk->GetTaggedPureCapacity()));
+    }
+    SizeType splitProbeH = -1;
+    SizeType splitProbeO = -1;
+    copies = countRegions(
+        index,
+        splitProbeVID +
+            splitInsertCount - 1,
+        splitProbeH, splitProbeO);
+    BOOST_CHECK_EQUAL(copies.first, 1);
+    BOOST_CHECK_EQUAL(copies.second, 1);
+
+    BOOST_REQUIRE(
+        index->SaveIndex(indexDirectory) ==
+        ErrorCode::Success);
+    SPANN::LimitedTagSupport splitSupport;
+    supportError.clear();
+    BOOST_REQUIRE_MESSAGE(
+        splitSupport.Load(
+            indexDirectory + "/" + supportFile,
+            headsAfterLimitedSplit, 1, 1, 1,
+            0, 1, generation, &supportError),
+        supportError);
+    BOOST_CHECK_EQUAL(
+        splitSupport.HeadCount(),
+        headsAfterLimitedSplit);
+
+    SizeType mergeCandidate = -1;
+    std::vector<SizeType> mergeCandidateO;
+    for (SizeType head =
+             headsBeforeLimitedSplit;
+         head < headsAfterLimitedSplit;
+         ++head) {
+        if (!spann->GetMemoryIndex()
+                 ->ContainSample(head)) {
+            continue;
+        }
+        SPANN::TaggedPostingSnapshot snapshot;
+        BOOST_REQUIRE(
+            disk->GetTaggedPostingSnapshot(
+                &gcWorkspace, head, snapshot) ==
+            ErrorCode::Success);
+        const int stride =
+            disk->GetTaggedRecordSize();
+        const int count = static_cast<int>(
+            snapshot.m_records.size() /
+            static_cast<size_t>(stride));
+        std::vector<SizeType> oVIDs;
+        for (int record =
+                 snapshot.m_pureCount;
+             record < count; ++record) {
+            SizeType vid = -1;
+            std::memcpy(
+                &vid,
+                snapshot.m_records.data() +
+                    static_cast<size_t>(record) *
+                        static_cast<size_t>(
+                            stride),
+                sizeof(vid));
+            if (vid >= 0)
+                oVIDs.push_back(vid);
+        }
+        if (oVIDs.size() >
+            static_cast<size_t>(
+                disk->GetTaggedMergeThreshold() +
+                2)) {
+            mergeCandidate = head;
+            mergeCandidateO =
+                std::move(oVIDs);
+            break;
+        }
+    }
+    BOOST_REQUIRE(mergeCandidate >= 0);
+    const auto readOVIDs =
+        [&](SizeType head) {
+            SPANN::TaggedPostingSnapshot snapshot;
+            BOOST_REQUIRE(
+                disk->GetTaggedPostingSnapshot(
+                    &gcWorkspace, head, snapshot) ==
+                ErrorCode::Success);
+            const int stride =
+                disk->GetTaggedRecordSize();
+            const int count = static_cast<int>(
+                snapshot.m_records.size() /
+                static_cast<size_t>(stride));
+            std::vector<SizeType> vids;
+            for (int record =
+                     snapshot.m_pureCount;
+                 record < count; ++record) {
+                SizeType vid = -1;
+                std::memcpy(
+                    &vid,
+                    snapshot.m_records.data() +
+                        static_cast<size_t>(record) *
+                            static_cast<size_t>(
+                                stride),
+                    sizeof(vid));
+                if (vid >= 0)
+                    vids.push_back(vid);
+            }
+            return vids;
+        };
+    const auto memoryIndex =
+        spann->GetMemoryIndex();
+    BOOST_REQUIRE(memoryIndex != nullptr);
+    COMMON::QueryResultSet<float> nearby(
+        const_cast<float*>(
+            reinterpret_cast<const float*>(
+                memoryIndex->GetSample(
+                    mergeCandidate))),
+        (std::max)(
+            2,
+            spann->GetOptions()
+                ->m_internalResultNum));
+    BOOST_REQUIRE(
+        memoryIndex->SearchIndex(nearby) ==
+        ErrorCode::Success);
+    SizeType mergeNeighbor = -1;
+    std::vector<SizeType> mergeNeighborO;
+    for (int result = 0;
+         result < nearby.GetResultNum(); ++result) {
+        const BasicResult* candidate =
+            nearby.GetResult(result);
+        if (candidate == nullptr ||
+            candidate->VID < 0 ||
+            candidate->VID == mergeCandidate ||
+            !splitSupport.IsActiveHead(
+                candidate->VID)) {
+            continue;
+        }
+        auto candidateO =
+            readOVIDs(candidate->VID);
+        if (candidateO.size() < 2)
+            continue;
+        std::unordered_set<SizeType> combined(
+            mergeCandidateO.begin(),
+            mergeCandidateO.end());
+        combined.insert(
+            candidateO.begin(), candidateO.end());
+        if (combined.size() >
+            static_cast<size_t>(
+                disk->GetTaggedPureCapacity())) {
+            continue;
+        }
+        mergeNeighbor = candidate->VID;
+        mergeNeighborO =
+            std::move(candidateO);
+        break;
+    }
+    BOOST_REQUIRE(mergeNeighbor >= 0);
+    const auto retainLastTwo =
+        [&](std::vector<SizeType>& vids) {
+            BOOST_REQUIRE_GE(vids.size(), 2U);
+            const size_t retainedBegin =
+                vids.size() - 2;
+            for (size_t i = 0;
+                 i < retainedBegin; ++i) {
+                const ErrorCode deleteRet =
+                    spann->DeleteIndex(vids[i]);
+                BOOST_REQUIRE(
+                    deleteRet ==
+                        ErrorCode::Success ||
+                    deleteRet ==
+                        ErrorCode::VectorNotFound);
+            }
+            vids.erase(
+                vids.begin(),
+                vids.begin() +
+                    static_cast<std::ptrdiff_t>(
+                        retainedBegin));
+        };
+    retainLastTwo(mergeCandidateO);
+    retainLastTwo(mergeNeighborO);
+    const auto countActiveHeads =
+        [&]() {
+            SizeType active = 0;
+            const auto headIndex =
+                spann->GetMemoryIndex();
+            for (SizeType head = 0;
+                 head <
+                     headIndex->GetNumSamples();
+                 ++head) {
+                if (headIndex->ContainSample(head))
+                    ++active;
+            }
+            return active;
+        };
+    const SizeType activeBeforeMerge =
+        countActiveHeads();
+    spann->GetOptions()
+        ->m_searchPostingPageLimit = 16;
+    spann->GetOptions()->m_replicaCount = 2;
+    spann->GetOptions()->m_rngFactor = 100.0f;
+    const auto queueMergeCandidate =
+        [&](SizeType head) {
+        VectorIndex::ThreadLocalSearchContext
+            context;
+        context.m_active = true;
+        context.m_directPostingIDs = {
+            head};
+        VectorIndex::ThreadLocalSearchContextGuard
+            guard(std::move(context));
+        COMMON::QueryResultSet<float> result(
+            splitVectors.data(), 10);
+        BOOST_REQUIRE(
+            index->SearchIndex(result) ==
+            ErrorCode::Success);
+        };
+    BOOST_CHECK(
+        disk->LimitedTagPostingRegionsReady());
+    BOOST_REQUIRE(
+        std::filesystem::exists(
+            incompleteMarkerPath));
+    BOOST_REQUIRE(
+        !std::filesystem::exists(
+            readyMarkerPath));
+    queueMergeCandidate(mergeCandidate);
+    BOOST_REQUIRE(
+        index->SaveIndex(indexDirectory) ==
+        ErrorCode::Success);
+    const SizeType activeAfterMerge =
+        countActiveHeads();
+    BOOST_CHECK_EQUAL(
+        activeAfterMerge + 1,
+        activeBeforeMerge);
+
+    SPANN::LimitedTagSupport mergedSupport;
+    supportError.clear();
+    BOOST_REQUIRE_MESSAGE(
+        mergedSupport.Load(
+            indexDirectory + "/" + supportFile,
+            headsAfterLimitedSplit, 1, 1, 1,
+            0, 1, generation, &supportError),
+        supportError);
+    SizeType activeSupportHeads = 0;
+    for (SizeType head = 0;
+         head < mergedSupport.HeadCount();
+         ++head) {
+        if (mergedSupport.IsActiveHead(head))
+            ++activeSupportHeads;
+    }
+    BOOST_CHECK_EQUAL(
+        activeSupportHeads,
+        activeAfterMerge);
+    const bool candidateActive =
+        mergedSupport.IsActiveHead(
+            mergeCandidate);
+    const bool neighborActive =
+        mergedSupport.IsActiveHead(
+            mergeNeighbor);
+    BOOST_REQUIRE_NE(
+        candidateActive, neighborActive);
+    const SizeType loserHead =
+        candidateActive
+            ? mergeNeighbor
+            : mergeCandidate;
+    const SizeType survivorHead =
+        candidateActive
+            ? mergeCandidate
+            : mergeNeighbor;
+    const auto survivorTagsBefore =
+        splitSupport.HeadTags(survivorHead);
+    const auto survivorTagsAfter =
+        mergedSupport.HeadTags(survivorHead);
+    BOOST_CHECK_EQUAL_COLLECTIONS(
+        survivorTagsBefore.begin(),
+        survivorTagsBefore.end(),
+        survivorTagsAfter.begin(),
+        survivorTagsAfter.end());
+    const SizeType loserAnchor =
+        spann->GetGlobalVID(loserHead);
+    BOOST_REQUIRE_GE(loserAnchor, 0);
+    std::vector<SizeType> reassignedOVIDs =
+        loserHead == mergeCandidate
+            ? std::vector<SizeType>{
+                  mergeCandidateO[0],
+                  mergeCandidateO[1],
+                  loserAnchor}
+            : std::vector<SizeType>{
+                  mergeNeighborO[0],
+                  mergeNeighborO[1],
+                  loserAnchor};
+    std::sort(
+        reassignedOVIDs.begin(),
+        reassignedOVIDs.end());
+    reassignedOVIDs.erase(
+        std::unique(
+            reassignedOVIDs.begin(),
+            reassignedOVIDs.end()),
+        reassignedOVIDs.end());
+    for (SizeType vid : reassignedOVIDs) {
+        SizeType replannedH = -1;
+        SizeType replannedO = -1;
+        const auto replannedCopies =
+            countRegions(
+                index, vid,
+                replannedH, replannedO);
+        BOOST_CHECK_GE(
+            replannedCopies.first, 1);
+        BOOST_CHECK_GE(
+            replannedCopies.second, 1);
+        BOOST_CHECK_LE(
+            replannedCopies.second, 2);
+    }
+    const auto& survivorOVIDs =
+        survivorHead == mergeCandidate
+            ? mergeCandidateO
+            : mergeNeighborO;
+    for (size_t i = 0; i < 2; ++i) {
+        SizeType retainedH = -1;
+        SizeType retainedO = -1;
+        const auto retainedCopies =
+            countRegions(
+                index, survivorOVIDs[i],
+                retainedH, retainedO);
+        BOOST_CHECK_GE(
+            retainedCopies.first, 1);
+        BOOST_CHECK_EQUAL(
+            retainedCopies.second, 1);
+    }
+
+    SPANN::TaggedPostingSnapshot zeroOSnapshot;
+    BOOST_REQUIRE(
+        disk->GetTaggedPostingSnapshot(
+            &gcWorkspace, survivorHead,
+            zeroOSnapshot) ==
+        ErrorCode::Success);
+    const int zeroOStride =
+        disk->GetTaggedRecordSize();
+    BOOST_REQUIRE_GT(zeroOStride, 0);
+    BOOST_REQUIRE_EQUAL(
+        zeroOSnapshot.m_records.size() %
+            static_cast<size_t>(zeroOStride),
+        0U);
+    BOOST_REQUIRE_GT(
+        zeroOSnapshot.m_records.size() /
+                static_cast<size_t>(zeroOStride),
+        static_cast<size_t>(
+            zeroOSnapshot.m_pureCount));
+    std::vector<SizeType> zeroORecordVIDs;
+    for (size_t offset = 0;
+         offset < zeroOSnapshot.m_records.size();
+         offset +=
+             static_cast<size_t>(zeroOStride)) {
+        SizeType vid = -1;
+        std::memcpy(
+            &vid,
+            zeroOSnapshot.m_records.data() +
+                offset,
+            sizeof(vid));
+        if (vid >= 0)
+            zeroORecordVIDs.push_back(vid);
+    }
+    std::sort(
+        zeroORecordVIDs.begin(),
+        zeroORecordVIDs.end());
+    zeroORecordVIDs.erase(
+        std::unique(
+            zeroORecordVIDs.begin(),
+            zeroORecordVIDs.end()),
+        zeroORecordVIDs.end());
+    BOOST_REQUIRE(
+        !zeroORecordVIDs.empty());
+    for (SizeType vid : zeroORecordVIDs) {
+        if (!index->ContainSample(vid))
+            continue;
+        BOOST_REQUIRE(
+            spann->DeleteIndex(vid) ==
+            ErrorCode::Success);
+    }
+    const SizeType activeBeforeZeroOMerge =
+        countActiveHeads();
+    queueMergeCandidate(survivorHead);
+    std::vector<SizeType> queuedZeroOHeads;
+    disk->DrainTaggedMergeCandidates(
+        queuedZeroOHeads);
+    BOOST_REQUIRE(
+        std::find(
+            queuedZeroOHeads.begin(),
+            queuedZeroOHeads.end(),
+            survivorHead) !=
+        queuedZeroOHeads.end());
+    queueMergeCandidate(survivorHead);
+    BOOST_REQUIRE(
+        index->SaveIndex(indexDirectory) ==
+        ErrorCode::Success);
+    BOOST_CHECK_EQUAL(
+        countActiveHeads() + 1,
+        activeBeforeZeroOMerge);
+
+    const SizeType checkpointVectorCount =
+        spann->GetNumSamples();
+    SPANN::ExtraWorkSpace
+        checkpointWorkspace;
+    disk->InitWorkSpace(
+        &checkpointWorkspace, false);
+    const SizeType checkpointPostingCount =
+        disk->GetTaggedPostingCount();
+    std::vector<SPANN::TaggedPostingSnapshot>
+        checkpointPostings(
+            static_cast<size_t>(
+                checkpointPostingCount));
+    for (SizeType head = 0;
+         head < checkpointPostingCount;
+         ++head) {
+        BOOST_REQUIRE(
+            disk->GetTaggedPostingSnapshot(
+                &checkpointWorkspace, head,
+                checkpointPostings[
+                    static_cast<size_t>(
+                        head)]) ==
+            ErrorCode::Success);
+    }
+    BOOST_REQUIRE(
+        spann->Checkpoint() ==
+        ErrorCode::Success);
+    BOOST_CHECK(
+        std::filesystem::exists(
+            checkpointDirectory + "/" +
+            supportFile));
+    std::array<float, dimension>
+        postCheckpointVector = updateVector;
+    postCheckpointVector[0] += 0.25f;
+    BOOST_REQUIRE(
+        spann->AddIndexWithTags(
+            postCheckpointVector.data(), 1,
+            dimension, updateTags.data(), 1,
+            true) == ErrorCode::Success);
+    BOOST_REQUIRE(
+        index->SaveIndex(indexDirectory) ==
+        ErrorCode::Success);
+    BOOST_CHECK(
+        std::filesystem::exists(
+            checkpointDirectory +
+            "/limited_tag_ho_ready.bin"));
+    const std::string liveMappingPath =
+        indexDirectory + "/ssdmapping";
+    const std::string livePostingPath =
+        indexDirectory + "/ssdmapping_postings";
+    const std::string liveBlockPoolPath =
+        indexDirectory +
+        "/ssdmapping_postings_blockpool";
+    BOOST_REQUIRE(
+        std::filesystem::exists(liveMappingPath));
+    BOOST_REQUIRE(
+        std::filesystem::exists(livePostingPath));
+    BOOST_REQUIRE(
+        std::filesystem::exists(
+            liveBlockPoolPath));
+    const auto cleanMappingWriteTime =
+        std::filesystem::last_write_time(
+            liveMappingPath);
+    const auto cleanPostingWriteTime =
+        std::filesystem::last_write_time(
+            livePostingPath);
+    const auto cleanBlockPoolWriteTime =
+        std::filesystem::last_write_time(
+            liveBlockPoolPath);
+    index.reset();
+    BOOST_CHECK(
+        std::filesystem::last_write_time(
+            liveMappingPath) ==
+        cleanMappingWriteTime);
+    BOOST_CHECK(
+        std::filesystem::last_write_time(
+            livePostingPath) ==
+        cleanPostingWriteTime);
+    BOOST_CHECK(
+        std::filesystem::last_write_time(
+            liveBlockPoolPath) ==
+        cleanBlockPoolWriteTime);
+    BOOST_REQUIRE(
+        VectorIndex::LoadIndex(
+            indexDirectory, index) ==
+        ErrorCode::Success);
+    auto* liveReloadedSpann =
+        dynamic_cast<SPANN::Index<float>*>(
+            index.get());
+    BOOST_REQUIRE(liveReloadedSpann != nullptr);
+    postCheckpointVector[0] += 0.25f;
+    BOOST_REQUIRE(
+        liveReloadedSpann->AddIndexWithTags(
+            postCheckpointVector.data(), 1,
+            dimension, updateTags.data(), 1,
+            true) == ErrorCode::Success);
+
+    index.reset();
+    {
+        const std::string loaderPath =
+            indexDirectory +
+            "/indexloader.ini";
+        std::ifstream input(loaderPath);
+        BOOST_REQUIRE(input.good());
+        const std::string config(
+            (std::istreambuf_iterator<char>(
+                input)),
+            std::istreambuf_iterator<char>());
+        const std::string disabled =
+            "Recovery=false";
+        const size_t recoveryOffset =
+            config.find(disabled);
+        BOOST_REQUIRE(
+            recoveryOffset !=
+            std::string::npos);
+        std::string recoveryConfig = config;
+        recoveryConfig.replace(
+            recoveryOffset, disabled.size(),
+            "Recovery=true");
+        std::ofstream output(
+            loaderPath, std::ios::trunc);
+        BOOST_REQUIRE(output.good());
+        output << recoveryConfig;
+        BOOST_REQUIRE(output.good());
+    }
+    BOOST_REQUIRE(
+        VectorIndex::LoadIndex(
+            indexDirectory, index) ==
+        ErrorCode::Success);
+    auto* recoveredSpann =
+        dynamic_cast<SPANN::Index<float>*>(
+            index.get());
+    BOOST_REQUIRE(recoveredSpann != nullptr);
+    auto* recoveredDisk =
+        dynamic_cast<
+            SPANN::ExtraDynamicSearcher<float>*>(
+            dynamic_cast<SPANN::ISPANNIndex*>(
+                index.get())
+                ->GetDiskIndex()
+                .get());
+    BOOST_REQUIRE(recoveredDisk != nullptr);
+    BOOST_CHECK(
+        recoveredDisk
+            ->LimitedTagPostingRegionsReady());
+    BOOST_CHECK_EQUAL(
+        index->GetNumSamples(),
+        checkpointVectorCount);
+    BOOST_REQUIRE_EQUAL(
+        recoveredDisk
+            ->GetTaggedPostingCount(),
+        checkpointPostingCount);
+    SPANN::ExtraWorkSpace
+        recoveredCheckpointWorkspace;
+    recoveredDisk->InitWorkSpace(
+        &recoveredCheckpointWorkspace,
+        false);
+    for (SizeType head = 0;
+         head < checkpointPostingCount;
+         ++head) {
+        SPANN::TaggedPostingSnapshot
+            recoveredPosting;
+        BOOST_REQUIRE(
+            recoveredDisk
+                ->GetTaggedPostingSnapshot(
+                    &recoveredCheckpointWorkspace,
+                    head, recoveredPosting) ==
+            ErrorCode::Success);
+        const auto& expected =
+            checkpointPostings[
+                static_cast<size_t>(head)];
+        BOOST_CHECK_EQUAL(
+            recoveredPosting.m_pureCount,
+            expected.m_pureCount);
+        BOOST_CHECK_EQUAL(
+            recoveredPosting.m_records,
+            expected.m_records);
+    }
+    const std::string checkpointMappingPath =
+        checkpointDirectory + "/ssdmapping";
+    const std::string checkpointBlockPoolPath =
+        checkpointDirectory +
+        "/ssdmapping_postings_blockpool";
+    const std::string checkpointReadyPath =
+        checkpointDirectory +
+        "/limited_tag_ho_ready.bin";
+    const std::string liveIncompletePath =
+        indexDirectory +
+        "/limited_tag_ho_checkpoint.incomplete";
+    const std::string liveReadyPath =
+        indexDirectory +
+        "/limited_tag_ho_ready.bin";
+    BOOST_REQUIRE(
+        std::filesystem::exists(
+            checkpointMappingPath));
+    BOOST_REQUIRE(
+        std::filesystem::exists(
+            checkpointBlockPoolPath));
+    BOOST_REQUIRE(
+        std::filesystem::exists(
+            checkpointReadyPath));
+    BOOST_REQUIRE(
+        std::filesystem::exists(
+            liveIncompletePath));
+    BOOST_CHECK(
+        !std::filesystem::exists(
+            liveReadyPath));
+    const auto recoveryLiveMappingWriteTime =
+        std::filesystem::last_write_time(
+            liveMappingPath);
+    const auto recoveryLivePostingWriteTime =
+        std::filesystem::last_write_time(
+            livePostingPath);
+    const auto recoveryLiveBlockPoolWriteTime =
+        std::filesystem::last_write_time(
+            liveBlockPoolPath);
+    const auto recoveryCheckpointMappingWriteTime =
+        std::filesystem::last_write_time(
+            checkpointMappingPath);
+    const auto recoveryCheckpointBlockPoolWriteTime =
+        std::filesystem::last_write_time(
+            checkpointBlockPoolPath);
+    const auto recoveryReadyWriteTime =
+        std::filesystem::last_write_time(
+            checkpointReadyPath);
+    const auto recoveryIncompleteWriteTime =
+        std::filesystem::last_write_time(
+            liveIncompletePath);
+    const SizeType recoveredVectorCount =
+        index->GetNumSamples();
+    BOOST_CHECK(
+        recoveredDisk
+            ->SupportsLimitedTagUpdates());
+    recoveredSpann->GetOptions()->m_recovery =
+        false;
+    recoveredSpann->GetOptions()
+        ->m_enableLimitedTagPosting = false;
+    const std::string blockedRecoveryFile =
+        indexDirectory +
+        "/recovery_unsupported.bin";
+    BOOST_CHECK(
+        index->SaveIndexToFile(
+            blockedRecoveryFile) ==
+        ErrorCode::Undefined);
+    BOOST_CHECK(
+        !std::filesystem::exists(
+            blockedRecoveryFile));
+    std::string blockedRecoveryConfig;
+    const std::vector<ByteArray>
+        blockedRecoveryBlobs;
+    BOOST_CHECK(
+        index->SaveIndex(
+            blockedRecoveryConfig,
+            blockedRecoveryBlobs) ==
+        ErrorCode::Undefined);
+    SizeType blockedLegacyVID = -1;
+    BOOST_CHECK(
+        recoveredSpann->AddIndexSPFresh(
+            postCheckpointVector.data(), 1,
+            dimension, &blockedLegacyVID) ==
+        ErrorCode::Undefined);
+    const std::vector<
+        std::shared_ptr<Helper::DiskIO>>
+        noRefineStreams;
+    BOOST_CHECK(
+        recoveredSpann->RefineIndex(
+            noRefineStreams, nullptr, nullptr) ==
+        ErrorCode::Undefined);
+    BOOST_CHECK(
+        recoveredDisk
+            ->BeginLimitedTagCheckpoint(
+                checkpointDirectory) ==
+        ErrorCode::Undefined);
+    BOOST_CHECK(
+        recoveredDisk
+            ->InvalidateLimitedTagReadiness(
+                checkpointDirectory) ==
+        ErrorCode::Undefined);
+    BOOST_CHECK(
+        recoveredDisk
+            ->CommitLimitedTagReadiness(
+                checkpointDirectory) ==
+        ErrorCode::Undefined);
+    BOOST_CHECK(
+        recoveredDisk->Checkpoint(
+            checkpointDirectory) ==
+        ErrorCode::Undefined);
+    BOOST_CHECK(
+        recoveredDisk->DeleteIndex(0) ==
+        ErrorCode::Undefined);
+    BOOST_CHECK(
+        recoveredDisk->ReserveTaggedPosting(
+            checkpointPostingCount) ==
+        ErrorCode::Undefined);
+    BOOST_CHECK(
+        recoveredDisk
+            ->RollbackReservedTaggedPosting(
+                checkpointPostingCount) ==
+        ErrorCode::Undefined);
+    std::vector<SPANN::TaggedPostingSnapshot>
+        blockedRewrite = {
+            checkpointPostings.front()};
+    BOOST_CHECK(
+        recoveredDisk->RewriteTaggedPostings(
+            &recoveredCheckpointWorkspace,
+            blockedRewrite) ==
+        ErrorCode::Undefined);
+    std::string blockedPosting =
+        checkpointPostings.front().m_records;
+    BOOST_CHECK(
+        recoveredDisk->GetWritePosting(
+            &recoveredCheckpointWorkspace, 0,
+            blockedPosting, true) ==
+        ErrorCode::Undefined);
+    recoveredDisk->ForceCompaction();
+    const auto recoveredStore =
+        recoveredDisk->GetKVStore();
+    BOOST_REQUIRE(recoveredStore != nullptr);
+    const std::chrono::microseconds
+        blockedTimeout(1000000);
+    BOOST_CHECK(
+        recoveredStore->Put(
+            0, blockedPosting, blockedTimeout,
+            &recoveredCheckpointWorkspace
+                 .m_diskRequests) ==
+        ErrorCode::Undefined);
+    BOOST_CHECK(
+        recoveredStore->Merge(
+            0, blockedPosting, blockedTimeout,
+            &recoveredCheckpointWorkspace
+                 .m_diskRequests,
+            [](const void*, int) {
+                return true;
+            }) ==
+        ErrorCode::Undefined);
+    BOOST_CHECK(
+        recoveredStore->Delete(0) ==
+        ErrorCode::Undefined);
+    BOOST_CHECK(
+        recoveredStore->Checkpoint(
+            checkpointDirectory) ==
+        ErrorCode::Undefined);
+    recoveredStore->ForceCompaction();
+    BOOST_CHECK(
+        recoveredSpann->AddIndexWithTags(
+            postCheckpointVector.data(), 1,
+            dimension, updateTags.data(), 1,
+            true) == ErrorCode::Undefined);
+    BOOST_CHECK(
+        recoveredSpann->DeleteIndex(0) ==
+        ErrorCode::Undefined);
+    recoveredSpann->ForceGC();
+    BOOST_CHECK(
+        recoveredSpann->Checkpoint() ==
+        ErrorCode::Undefined);
+    BOOST_CHECK(
+        index->SaveIndex(indexDirectory) ==
+        ErrorCode::Undefined);
+    BOOST_CHECK_EQUAL(
+        index->GetNumSamples(),
+        recoveredVectorCount);
+    for (SizeType head = 0;
+         head < checkpointPostingCount;
+         ++head) {
+        SPANN::TaggedPostingSnapshot
+            recoveredPosting;
+        BOOST_REQUIRE(
+            recoveredDisk
+                ->GetTaggedPostingSnapshot(
+                    &recoveredCheckpointWorkspace,
+                    head, recoveredPosting) ==
+            ErrorCode::Success);
+        const auto& expected =
+            checkpointPostings[
+                static_cast<size_t>(head)];
+        BOOST_CHECK_EQUAL(
+            recoveredPosting.m_pureCount,
+            expected.m_pureCount);
+        BOOST_CHECK_EQUAL(
+            recoveredPosting.m_records,
+            expected.m_records);
+    }
+    index.reset();
+    BOOST_CHECK(
+        std::filesystem::last_write_time(
+            liveMappingPath) ==
+        recoveryLiveMappingWriteTime);
+    BOOST_CHECK(
+        std::filesystem::last_write_time(
+            livePostingPath) ==
+        recoveryLivePostingWriteTime);
+    BOOST_CHECK(
+        std::filesystem::last_write_time(
+            liveBlockPoolPath) ==
+        recoveryLiveBlockPoolWriteTime);
+    BOOST_CHECK(
+        std::filesystem::last_write_time(
+            checkpointMappingPath) ==
+        recoveryCheckpointMappingWriteTime);
+    BOOST_CHECK(
+        std::filesystem::last_write_time(
+            checkpointBlockPoolPath) ==
+        recoveryCheckpointBlockPoolWriteTime);
+    BOOST_CHECK(
+        std::filesystem::last_write_time(
+            checkpointReadyPath) ==
+        recoveryReadyWriteTime);
+    BOOST_CHECK(
+        std::filesystem::last_write_time(
+            liveIncompletePath) ==
+        recoveryIncompleteWriteTime);
+    BOOST_CHECK(
+        !std::filesystem::exists(
+            liveReadyPath));
+    std::filesystem::remove_all(indexDirectory);
+    std::filesystem::remove_all(checkpointDirectory);
+}
+
+BOOST_AUTO_TEST_CASE(LimitedTagDynamicLoadRejectsWAL)
+{
+    const auto rejects =
+        [](SPANN::Options& options) {
+            COMMON::VersionLabel versionMap;
+            COMMON::Dataset<std::uint64_t>
+                vectorTranslateMap;
+            SPANN::ExtraDynamicSearcher<float>
+                searcher(options);
+            return !searcher.LoadIndex(
+                options, versionMap,
+                vectorTranslateMap, nullptr);
+        };
+
+    SPANN::Options walOptions;
+    walOptions.m_enableLimitedTagPosting = true;
+    walOptions.m_enableWAL = true;
+    BOOST_CHECK(rejects(walOptions));
+
+    SPANN::Options quantizedOptions;
+    quantizedOptions.m_enableLimitedTagPosting =
+        true;
+    quantizedOptions.m_postingQuantizer = "OPQ";
+    quantizedOptions.m_postingQuantM = 4;
+    BOOST_CHECK(rejects(quantizedOptions));
 }
 
 BOOST_AUTO_TEST_CASE(TestClone)

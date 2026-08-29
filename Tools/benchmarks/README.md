@@ -143,10 +143,14 @@ metadata fail open rather than rejecting a potentially matching posting. The PBS
 generation and body fingerprint, rejects legacy tail-bearing PBS2 files, and
 is published atomically.
 At load, the validated support sidecar builds only a compact tag-to-head lookup.
-H1 search always performs distance-only graph navigation for exactly the
-configured `InternalResultNum` heads, then applies the support predicate to
-those posting IDs before I/O. Tag support never participates in the H1 graph
-inner loop.
+H1 graph traversal remains distance-only, but support-aware result admission
+continues collecting eligible heads until `InternalResultNum` postings are
+filled before I/O. The filtered search budget scales from support coverage,
+retries up to a bounded `MaxCheck`, and uses a guarded exact-support completion
+when the graph still underfills; empty physical postings do not count. Fewer
+postings are returned only when fewer compatible postings exist globally. This
+gives H1 and H2 the same nprobe and posting-I/O semantics without pruning graph
+expansion by tag.
 
 EST4 classifies a tag by absolute expected head coverage, not selectivity. A
 tag uses the exact contiguous `[VID | all attributes | vector]` route when

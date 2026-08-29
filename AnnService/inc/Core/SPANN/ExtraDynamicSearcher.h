@@ -11,6 +11,7 @@
 #include "inc/Core/Common/TruthSet.h"
 #include "inc/Helper/KeyValueIO.h"
 #include "inc/Helper/ConcurrentSet.h"
+#include "inc/Helper/AtomicFile.h"
 #include "inc/Core/Common/FineGrainedLock.h"
 #include "inc/Core/Common/Checksum.h"
 #include "PersistentBuffer.h"
@@ -213,6 +214,61 @@ namespace SPTAG::SPANN {
 
         COMMON::VersionLabel* m_versionMap;
         Options* m_opt;
+        bool m_recoveredLimitedTagReadOnly = false;
+        bool m_limitedTagLayoutLatched = false;
+        std::string m_limitedTagArtifactRoot;
+
+        void LatchLimitedTagLayout(
+            const Options& p_opt)
+        {
+            if (!p_opt.m_enableLimitedTagPosting)
+                return;
+            m_limitedTagLayoutLatched = true;
+            if (m_limitedTagArtifactRoot.empty()) {
+                m_limitedTagArtifactRoot =
+                    p_opt.m_recovery
+                        ? p_opt.m_persistentBufferPath
+                        : p_opt.m_indexDirectory;
+            }
+        }
+
+        const std::string& LimitedTagArtifactRoot()
+            const
+        {
+            if (!m_limitedTagArtifactRoot.empty())
+                return m_limitedTagArtifactRoot;
+            static const std::string empty;
+            if (m_opt == nullptr) return empty;
+            return m_opt->m_recovery
+                ? m_opt->m_persistentBufferPath
+                : m_opt->m_indexDirectory;
+        }
+
+        bool HasLimitedTagLayout() const
+        {
+            return m_limitedTagLayoutLatched ||
+                (m_opt != nullptr &&
+                 m_opt->m_enableLimitedTagPosting);
+        }
+
+        bool IsRecoveredLimitedTagReadOnly()
+            const
+        {
+            return m_recoveredLimitedTagReadOnly;
+        }
+
+        bool RejectRecoveredLimitedTagWrite(
+            const char* p_operation) const
+        {
+            if (!IsRecoveredLimitedTagReadOnly()) {
+                return false;
+            }
+            SPTAGLIB_LOG(
+                Helper::LogLevel::LL_Error,
+                "Recovered limited-tag H/O generation is read-only; rejecting %s.\n",
+                p_operation);
+            return true;
+        }
 
         std::mutex m_dataAddLock;
 
@@ -302,6 +358,27 @@ namespace SPTAG::SPANN {
         bool m_dynamicVectorWritable = false;
         mutable std::shared_mutex m_dynamicVectorLock;
 
+#pragma pack(push, 1)
+        struct LimitedTagReadyHeader
+        {
+            std::uint32_t magic = 0x4F48544CU; // LTHO
+            std::uint32_t version = 1;
+            std::uint32_t headerBytes = 32;
+            std::uint32_t headCount = 0;
+            std::uint64_t generationFingerprint = 0;
+            std::uint64_t layoutFingerprint = 0;
+        };
+#pragma pack(pop)
+        static_assert(
+            sizeof(LimitedTagReadyHeader) == 32,
+            "Limited-tag H/O readiness header layout changed");
+        static constexpr const char*
+            kLimitedTagReadyFile =
+                "limited_tag_ho_ready.bin";
+        static constexpr const char*
+            kLimitedTagCheckpointFile =
+                "limited_tag_ho_checkpoint.incomplete";
+
         // Build-time slim (native): write [meta | RaBitQ-code] postings DIRECTLY during
         // the fresh build, never materializing the full-vector posting store. This is the
         // billion-scale path: the full ~1TB intermediate (replicas x full-vector records)
@@ -388,6 +465,20 @@ namespace SPTAG::SPANN {
         }
 
         bool HasPrimaryHeadCSR() const override { return m_primaryHeadCSR.Loaded(); }
+        bool CanSearchPrimaryHeadCandidates(
+            const std::uint32_t* p_queryTags,
+            int p_numQueryTags,
+            const SPTAG::Cache::DNFPredicate*
+                p_queryDNF) const override
+        {
+            if (!m_primaryHeadCSR.Loaded()) {
+                return false;
+            }
+            std::uint32_t projectTag = 0;
+            return ResolvePrimaryHeadProjectTag(
+                p_queryTags, p_numQueryTags,
+                p_queryDNF, projectTag);
+        }
 
         // Dual-pool v3: head role sidecar management
         void SetHeadRoles(const std::vector<uint8_t>& roles) {
@@ -607,22 +698,204 @@ namespace SPTAG::SPANN {
             int total = m_postingSizes.GetSize(headID);
             if (unfiltered || !m_hasPostingPureCounts) return total;
             int pure = m_postingPureCounts.GetSize(headID);
-            return (pure <= 0 || pure > total) ? total : pure;
+            return (pure < 0 || pure > total) ? total : pure;
         }
         inline int GetPureCount(const SizeType& headID) {
             int total = m_postingSizes.GetSize(headID);
             if (!m_hasPostingPureCounts) return total;
             int pure = m_postingPureCounts.GetSize(headID);
-            return (pure <= 0 || pure > total) ? total : pure;
+            return (pure < 0 || pure > total) ? total : pure;
         }
         inline bool HasPostingPureCounts() const { return m_hasPostingPureCounts; }
+        bool PrepareLimitedTagPostingReadRanges(
+            ExtraWorkSpace* p_exWorkSpace,
+            bool p_hasExactFilter,
+            int p_recordBytes,
+            std::vector<std::vector<std::uint8_t>>& p_pageSelectors)
+        {
+            p_exWorkSpace->m_postingReadRanges.clear();
+            p_pageSelectors.clear();
+            const bool limitedTagRegionsReady =
+                LimitedTagPostingRegionsReadyForQuery(
+                    p_exWorkSpace);
+            if (m_opt == nullptr ||
+                !HasLimitedTagLayout() ||
+                !m_hasPostingPureCounts ||
+                !limitedTagRegionsReady ||
+                p_recordBytes <= 0) {
+                return false;
+            }
+
+            const auto& postingIDs = p_exWorkSpace->m_postingIDs;
+            p_exWorkSpace->m_postingReadRanges.resize(postingIDs.size());
+            p_pageSelectors.resize(postingIDs.size());
+            const int pageLimit = (std::max)(0, m_opt->m_searchPostingPageLimit);
+            const bool readOriginalRegion =
+                !p_hasExactFilter ||
+                p_exWorkSpace->m_scanFullPostingForFilter;
+
+            for (size_t i = 0; i < postingIDs.size(); ++i) {
+                const SizeType headID = postingIDs[i];
+                if (headID < 0 ||
+                    headID >=
+                        m_postingSizes.GetPostingNum()) {
+                    continue;
+                }
+                const int total = (std::max)(0, m_postingSizes.GetSize(headID));
+                int pure = 0;
+                const bool hasBoundary =
+                    headID <
+                    m_postingPureCounts.GetPostingNum();
+                if (hasBoundary) {
+                    pure =
+                        m_postingPureCounts.GetSize(
+                            headID);
+                }
+                const bool validBoundary =
+                    hasBoundary &&
+                    pure >= 0 &&
+                    pure <= total;
+
+                const int scanBegin =
+                    validBoundary && readOriginalRegion
+                        ? pure
+                        : 0;
+                const int scanEnd =
+                    !validBoundary
+                        ? total
+                        : (readOriginalRegion
+                               ? total
+                               : pure);
+                auto& range = p_exWorkSpace->m_postingReadRanges[i];
+                range.SetContiguousRecordRange(
+                    0, scanBegin, scanEnd, p_recordBytes);
+
+                if (pageLimit > 0 && range.m_readPageCount > pageLimit) {
+                    range.m_readPageCount = pageLimit;
+                    const std::int64_t readableBytes =
+                        static_cast<std::int64_t>(
+                            range.m_readStartPage +
+                            range.m_readPageCount) *
+                        PageSize;
+                    const int readableRecords = readableBytes <= 0
+                        ? 0
+                        : static_cast<int>(
+                              readableBytes /
+                              p_recordBytes);
+                    range.m_scanEnd =
+                        (std::min)(range.m_scanEnd,
+                                   readableRecords);
+                    if (range.m_scanEnd <= range.m_scanBegin) {
+                        range.m_scanEnd = range.m_scanBegin;
+                        range.m_readPageCount = 0;
+                    }
+                }
+
+                const size_t postingBytes =
+                    static_cast<size_t>(total) *
+                    static_cast<size_t>(p_recordBytes);
+                const int pageCount = static_cast<int>(
+                    (postingBytes + PageSize - 1) >>
+                    PageSizeEx);
+                auto& selector = p_pageSelectors[i];
+                selector.assign(
+                    static_cast<size_t>((std::max)(0, pageCount)),
+                    0);
+                const int firstPage =
+                    (std::max)(
+                        0,
+                        (std::min)(
+                            range.m_readStartPage,
+                            pageCount));
+                const int endPage =
+                    (std::max)(
+                        firstPage,
+                        (std::min)(
+                            range.m_readStartPage +
+                                range.m_readPageCount,
+                            pageCount));
+                for (int page = firstPage;
+                     page < endPage;
+                     ++page) {
+                    selector[static_cast<size_t>(page)] = 1;
+                }
+            }
+            return true;
+        }
+        // Enable only after the dynamic generation has a complete self-contained O suffix.
+        void SetLimitedTagReadRangesReady(bool p_ready)
+        {
+            m_limitedTagReadRangesReady.store(
+                p_ready,
+                std::memory_order_release);
+            if (m_opt != nullptr &&
+                HasLimitedTagLayout()) {
+                m_taggedMaintenance.store(
+                    p_ready,
+                    std::memory_order_release);
+            }
+        }
+        bool HasHybridPurePostings() const override
+        {
+            return m_hasPostingPureCounts;
+        }
+        bool LimitedTagPostingRegionsReady() const override
+        {
+            return
+                m_hasPostingPureCounts &&
+                m_limitedTagReadRangesReady.load(
+                    std::memory_order_acquire);
+        }
+        bool LimitedTagPostingRegionsReadyForQuery(
+            const ExtraWorkSpace* p_exWorkSpace) const
+        {
+            if (p_exWorkSpace != nullptr &&
+                p_exWorkSpace
+                    ->m_limitedTagRegionsReadySnapshotValid) {
+                return
+                    p_exWorkSpace
+                        ->m_limitedTagRegionsReadySnapshot;
+            }
+            return LimitedTagPostingRegionsReady();
+        }
+        bool SupportsLimitedTagUpdates() const override
+        {
+            return
+                m_opt != nullptr &&
+                m_opt->m_storage ==
+                    Storage::FILEIO &&
+                Helper::StrUtils::StrEqualIgnoreCase(
+                    m_opt->m_postingQuantizer.c_str(),
+                    "None") &&
+                m_vectorInfoSize ==
+                    m_metaDataSize +
+                        static_cast<int>(
+                            sizeof(ValueType)) *
+                            m_opt->m_dim &&
+                !m_opqPF &&
+                !m_slimPostings &&
+                !m_opqInpostDb &&
+                !m_pipePQ &&
+                !m_rbq &&
+                !m_rbq2on &&
+                !m_inpostRbq &&
+                m_inpostQuantBits == 0;
+        }
         // Used by the build path (PerTagBKT head selection) to write the sidecar.
         inline void SetPureCount(const SizeType& headID, int pure_count) {
+            if (RejectRecoveredLimitedTagWrite(
+                    "SetPureCount")) {
+                return;
+            }
             m_postingPureCounts.UpdateSize(headID, pure_count);
         }
         // Initialize pure_count = total_size for every head (no-tail fallback).
         // Safe to call repeatedly.
         void InitializePureCountsFromTotals(SizeType numHeads) {
+            if (RejectRecoveredLimitedTagWrite(
+                    "InitializePureCountsFromTotals")) {
+                return;
+            }
             m_postingPureCounts.Initialize(numHeads, m_opt->m_datasetRowsInBlock, m_opt->m_datasetCapacity);
             for (SizeType h = 0; h < numHeads; ++h) {
                 m_postingPureCounts.UpdateSize(h, m_postingSizes.GetSize(h));
@@ -637,27 +910,324 @@ namespace SPTAG::SPANN {
             std::string path = baseDir + FolderSep + m_opt->m_postingPureCountsFile;
             if (fileexists(path.c_str())) {
                 if (m_postingPureCounts.Load(path, m_opt->m_datasetRowsInBlock, m_opt->m_datasetCapacity) == ErrorCode::Success) {
-                    m_hasPostingPureCounts = true;
-                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Loaded posting_pure_counts sidecar from %s (numHeads=%d).\n",
-                                 path.c_str(), m_postingPureCounts.GetPostingNum());
-                    return;
+                    if (m_postingPureCounts.GetPostingNum() ==
+                        m_postingSizes.GetPostingNum()) {
+                        m_hasPostingPureCounts = true;
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Loaded posting_pure_counts sidecar from %s (numHeads=%d).\n",
+                                     path.c_str(), m_postingPureCounts.GetPostingNum());
+                        return;
+                    }
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Warning,
+                        "Ignoring %s: pure-count heads=%d posting heads=%d.\n",
+                        path.c_str(),
+                        m_postingPureCounts.GetPostingNum(),
+                        m_postingSizes.GetPostingNum());
+                } else {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Warning, "Failed to load %s; falling back to pure=total.\n", path.c_str());
                 }
-                SPTAGLIB_LOG(Helper::LogLevel::LL_Warning, "Failed to load %s; falling back to pure=total.\n", path.c_str());
             }
             InitializePureCountsFromTotals(m_postingSizes.GetPostingNum());
             m_hasPostingPureCounts = false;  // not loaded => legacy mode; tail effectively absent
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "posting_pure_counts sidecar not present; using pure=total fallback.\n");
         }
         void SavePostingPureCounts() {
+            if (RejectRecoveredLimitedTagWrite(
+                    "SavePostingPureCounts")) {
+                return;
+            }
             if (!m_hasPostingPureCounts) return;
             std::string path = m_opt->m_indexDirectory + FolderSep + m_opt->m_postingPureCountsFile;
             m_postingPureCounts.Save(path);
+        }
+        std::uint64_t LimitedTagLayoutFingerprint()
+        {
+            std::uint64_t hash =
+                1469598103934665603ULL;
+            const auto append =
+                [&hash](const void* p_data,
+                        size_t p_bytes) {
+                const auto* bytes =
+                    reinterpret_cast<
+                        const std::uint8_t*>(
+                        p_data);
+                for (size_t i = 0;
+                     i < p_bytes; ++i) {
+                    hash ^= bytes[i];
+                    hash *= 1099511628211ULL;
+                }
+            };
+            const SizeType headCount =
+                m_postingSizes.GetPostingNum();
+            append(&headCount, sizeof(headCount));
+            for (SizeType head = 0;
+                 head < headCount; ++head) {
+                const int total =
+                    m_postingSizes.GetSize(head);
+                const int pure =
+                    m_postingPureCounts.GetSize(
+                        head);
+                append(&total, sizeof(total));
+                append(&pure, sizeof(pure));
+            }
+            return hash;
+        }
+        bool ParseLimitedTagGeneration(
+            std::uint64_t& p_generation) const
+        {
+            p_generation = 0;
+            return m_opt != nullptr &&
+                Helper::Convert::ConvertStringTo<
+                    std::uint64_t>(
+                    m_opt
+                        ->m_limitedTagGenerationFingerprint
+                        .c_str(),
+                    p_generation) &&
+                p_generation != 0;
+        }
+        void LoadLimitedTagReadyMarker()
+        {
+            SetLimitedTagReadRangesReady(false);
+            if (m_opt == nullptr ||
+                !HasLimitedTagLayout() ||
+                !m_hasPostingPureCounts) {
+                return;
+            }
+            const std::string& baseDir =
+                LimitedTagArtifactRoot();
+            const std::string path =
+                baseDir + FolderSep +
+                kLimitedTagReadyFile;
+            std::ifstream input(
+                path,
+                std::ios::binary |
+                    std::ios::ate);
+            if (!input ||
+                input.tellg() !=
+                    static_cast<std::streamoff>(
+                        sizeof(
+                            LimitedTagReadyHeader))) {
+                return;
+            }
+            input.seekg(0, std::ios::beg);
+            LimitedTagReadyHeader header;
+            input.read(
+                reinterpret_cast<char*>(&header),
+                sizeof(header));
+            std::uint64_t generation = 0;
+            const SizeType headCount =
+                m_postingSizes.GetPostingNum();
+            if (!input ||
+                !ParseLimitedTagGeneration(
+                    generation) ||
+                header.magic != 0x4F48544CU ||
+                header.version != 1 ||
+                header.headerBytes !=
+                    sizeof(header) ||
+                header.generationFingerprint !=
+                    generation ||
+                header.headCount !=
+                    static_cast<std::uint32_t>(
+                        headCount) ||
+                headCount < 0 ||
+                static_cast<std::uint64_t>(
+                    headCount) >
+                    (std::numeric_limits<
+                        std::uint32_t>::max)() ||
+                m_postingPureCounts
+                        .GetPostingNum() !=
+                    headCount ||
+                header.layoutFingerprint !=
+                    LimitedTagLayoutFingerprint()) {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Warning,
+                    "Ignoring stale limited-tag H/O readiness marker %s.\n",
+                    path.c_str());
+                return;
+            }
+            SetLimitedTagReadRangesReady(true);
+            SPTAGLIB_LOG(
+                Helper::LogLevel::LL_Info,
+                "Loaded generation-bound limited-tag H/O readiness marker from %s.\n",
+                path.c_str());
+        }
+        ErrorCode RemoveLimitedTagCheckpointMarker(
+            const std::string& p_prefix)
+        {
+            if (RejectRecoveredLimitedTagWrite(
+                    "RemoveLimitedTagCheckpointMarker")) {
+                return ErrorCode::Undefined;
+            }
+            const std::string path =
+                p_prefix + FolderSep +
+                kLimitedTagCheckpointFile;
+            if (fileexists(path.c_str())) {
+                if (std::remove(path.c_str()) != 0 ||
+                    !Helper::SyncParentDirectory(
+                        path)) {
+                    return ErrorCode::DiskIOFail;
+                }
+            }
+            return ErrorCode::Success;
+        }
+        ErrorCode BeginLimitedTagCheckpoint(
+            const std::string& p_prefix) override
+        {
+            if (RejectRecoveredLimitedTagWrite(
+                    "BeginLimitedTagCheckpoint")) {
+                return ErrorCode::Undefined;
+            }
+            if (m_opt == nullptr ||
+                !HasLimitedTagLayout()) {
+                return ErrorCode::Success;
+            }
+            std::uint64_t generation = 0;
+            const SizeType headCount =
+                m_postingSizes.GetPostingNum();
+            if (!ParseLimitedTagGeneration(
+                    generation) ||
+                headCount < 0 ||
+                static_cast<std::uint64_t>(
+                    headCount) >
+                    (std::numeric_limits<
+                        std::uint32_t>::max)()) {
+                return ErrorCode::Fail;
+            }
+            const std::string path =
+                p_prefix + FolderSep +
+                kLimitedTagCheckpointFile;
+            if (fileexists(path.c_str())) {
+                return InvalidateLimitedTagReadiness(
+                    p_prefix);
+            }
+            const std::string temporary =
+                path + ".tmp";
+            LimitedTagReadyHeader header;
+            header.headCount =
+                static_cast<std::uint32_t>(
+                    headCount);
+            header.generationFingerprint =
+                generation;
+            header.layoutFingerprint =
+                LimitedTagLayoutFingerprint();
+            std::ofstream output(
+                temporary,
+                std::ios::binary |
+                    std::ios::trunc);
+            if (!output) {
+                return ErrorCode::FailedCreateFile;
+            }
+            output.write(
+                reinterpret_cast<const char*>(
+                    &header),
+                sizeof(header));
+            output.close();
+            if (!output ||
+                !Helper::AtomicReplaceFile(
+                    temporary, path)) {
+                std::remove(temporary.c_str());
+                return ErrorCode::DiskIOFail;
+            }
+            return InvalidateLimitedTagReadiness(
+                p_prefix);
+        }
+        ErrorCode InvalidateLimitedTagReadiness(
+            const std::string& p_prefix) override
+        {
+            if (RejectRecoveredLimitedTagWrite(
+                    "InvalidateLimitedTagReadiness")) {
+                return ErrorCode::Undefined;
+            }
+            if (m_opt == nullptr ||
+                !HasLimitedTagLayout())
+                return ErrorCode::Success;
+            const std::string path =
+                p_prefix + FolderSep +
+                kLimitedTagReadyFile;
+            if (fileexists(path.c_str()) &&
+                std::remove(path.c_str()) != 0) {
+                return ErrorCode::DiskIOFail;
+            }
+            return ErrorCode::Success;
+        }
+        ErrorCode CommitLimitedTagReadiness(
+            const std::string& p_prefix)
+            override
+        {
+            if (RejectRecoveredLimitedTagWrite(
+                    "CommitLimitedTagReadiness")) {
+                return ErrorCode::Undefined;
+            }
+            if (m_opt == nullptr ||
+                !HasLimitedTagLayout())
+                return ErrorCode::Success;
+            if (!LimitedTagPostingRegionsReady()) {
+                const ErrorCode ret =
+                    InvalidateLimitedTagReadiness(
+                        p_prefix);
+                return ret == ErrorCode::Success
+                    ? RemoveLimitedTagCheckpointMarker(
+                          p_prefix)
+                    : ret;
+            }
+            const std::string path =
+                p_prefix + FolderSep +
+                kLimitedTagReadyFile;
+            std::uint64_t generation = 0;
+            const SizeType headCount =
+                m_postingSizes.GetPostingNum();
+            if (!ParseLimitedTagGeneration(
+                    generation) ||
+                headCount < 0 ||
+                static_cast<std::uint64_t>(
+                    headCount) >
+                    (std::numeric_limits<
+                        std::uint32_t>::max)() ||
+                m_postingPureCounts
+                        .GetPostingNum() !=
+                    headCount) {
+                return ErrorCode::Fail;
+            }
+            LimitedTagReadyHeader header;
+            header.headCount =
+                static_cast<std::uint32_t>(
+                    headCount);
+            header.generationFingerprint =
+                generation;
+            header.layoutFingerprint =
+                LimitedTagLayoutFingerprint();
+            const std::string temporary =
+                path + ".tmp";
+            std::ofstream output(
+                temporary,
+                std::ios::binary |
+                    std::ios::trunc);
+            if (!output) {
+                return ErrorCode::FailedCreateFile;
+            }
+            output.write(
+                reinterpret_cast<
+                    const char*>(&header),
+                sizeof(header));
+            output.close();
+            if (!output ||
+                !Helper::AtomicReplaceFile(
+                    temporary, path)) {
+                std::remove(temporary.c_str());
+                return ErrorCode::DiskIOFail;
+            }
+            return RemoveLimitedTagCheckpointMarker(
+                p_prefix);
         }
         // -----------------------------------------------------------------------
 
 
         ExtraDynamicSearcher(SPANN::Options& p_opt) {
             m_opt = &p_opt;
+            LatchLimitedTagLayout(p_opt);
+            m_recoveredLimitedTagReadOnly =
+                p_opt.m_enableLimitedTagPosting &&
+                p_opt.m_recovery;
             m_numTagsPerVec = p_opt.m_numTagsPerVec;
             m_tagBytesPerVec = m_numTagsPerVec * sizeof(uint32_t);
             m_metaDataSize = sizeof(int) + sizeof(uint8_t) + m_tagBytesPerVec;
@@ -1442,6 +2012,13 @@ namespace SPTAG::SPANN {
         ErrorCode RefineIndex(std::shared_ptr<VectorIndex>& p_index,
                               bool p_prereassign, std::vector<SizeType> *p_headmapping, std::vector<SizeType> *p_mapping) override
         {
+            if (m_opt != nullptr &&
+                HasLimitedTagLayout()) {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Error,
+                    "Dynamic limited-tag H/O postings do not support legacy RefineIndex.\n");
+                return ErrorCode::Undefined;
+            }
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Begin RefineIndex\n");
 
             COMMON::PostingSizeRecord new_postingSizes;
@@ -1623,6 +2200,10 @@ namespace SPTAG::SPANN {
         
         ErrorCode Split(ExtraWorkSpace* p_exWorkSpace, VectorIndex* p_index, const SizeType headID, bool reassign = false, bool preReassign = false, bool requirelock = true)
         {
+            if (RejectRecoveredLimitedTagWrite(
+                    "Split")) {
+                return ErrorCode::Undefined;
+            }
             auto splitBegin = std::chrono::high_resolution_clock::now();
             std::vector<SizeType> newHeadsID;
             std::vector<std::string> newPostingLists;
@@ -1900,6 +2481,10 @@ namespace SPTAG::SPANN {
 
         ErrorCode MergePostings(ExtraWorkSpace *p_exWorkSpace, VectorIndex* p_index, SizeType headID, bool reassign = false)
         {
+            if (RejectRecoveredLimitedTagWrite(
+                    "MergePostings")) {
+                return ErrorCode::Undefined;
+            }
             {
                 if (!m_mergeLock.try_lock()) {
                     auto* curJob = new MergeAsyncJob(p_index, this, headID, reassign, nullptr);
@@ -2167,6 +2752,13 @@ namespace SPTAG::SPANN {
 
         inline void SplitAsync(VectorIndex* p_index, SizeType headID, std::function<void()> p_callback = nullptr)
         {
+            if (RejectRecoveredLimitedTagWrite(
+                    "SplitAsync")) {
+                if (p_callback != nullptr) {
+                    p_callback();
+                }
+                return;
+            }
             // SPTAGLIB_LOG(Helper::LogLevel::LL_Info,"Into SplitAsync, current headID: %d, size: %d\n", headID, m_postingSizes.GetSize(headID));
             // tbb::concurrent_hash_map<SizeType, SizeType>::const_accessor headIDAccessor;
             // if (m_splitList.find(headIDAccessor, headID)) {
@@ -2191,6 +2783,13 @@ namespace SPTAG::SPANN {
 
         inline void MergeAsync(VectorIndex* p_index, SizeType headID, std::function<void()> p_callback = nullptr)
         {
+            if (RejectRecoveredLimitedTagWrite(
+                    "MergeAsync")) {
+                if (p_callback != nullptr) {
+                    p_callback();
+                }
+                return;
+            }
             Helper::Concurrent::ConcurrentMap<SizeType, SizeType>::value_type workPair(headID, headID);
             {
                 std::shared_lock<std::shared_timed_mutex> lock(m_mergeListLock);
@@ -2208,6 +2807,13 @@ namespace SPTAG::SPANN {
 
         inline void ReassignAsync(VectorIndex* p_index, std::shared_ptr<std::string> vectorInfo, SizeType HeadPrev, std::function<void()> p_callback = nullptr)
         {
+            if (RejectRecoveredLimitedTagWrite(
+                    "ReassignAsync")) {
+                if (p_callback != nullptr) {
+                    p_callback();
+                }
+                return;
+            }
             auto* curJob = new ReassignAsyncJob(p_index, this, std::move(vectorInfo), HeadPrev, p_callback);
             m_splitThreadPool->add(curJob);
         }
@@ -2494,11 +3100,31 @@ namespace SPTAG::SPANN {
 
         void InitWorkSpace(ExtraWorkSpace* p_exWorkSpace, bool clear = false) override
         {
+            const int regionPages =
+                max(m_opt->m_postingPageLimit,
+                    m_opt->m_searchPostingPageLimit) +
+                m_opt->m_bufferLength +
+                m_opt->m_unfilterTailBufferLength;
+            const int postingBufferBytes =
+                (regionPages *
+                 (HasLimitedTagLayout()
+                      ? 2
+                      : 1))
+                << PageSizeEx;
             if (clear) {
-                p_exWorkSpace->Clear(m_opt->m_searchInternalResultNum, (max(m_opt->m_postingPageLimit, m_opt->m_searchPostingPageLimit) + m_opt->m_bufferLength + m_opt->m_unfilterTailBufferLength) << PageSizeEx, true, m_opt->m_enableDataCompression);
+                p_exWorkSpace->Clear(
+                    m_opt->m_searchInternalResultNum,
+                    postingBufferBytes, true,
+                    m_opt->m_enableDataCompression);
             }
             else {
-                p_exWorkSpace->Initialize(m_opt->m_maxCheck, m_opt->m_hashExp, max(m_opt->m_searchInternalResultNum, m_opt->m_reassignK), (max(m_opt->m_postingPageLimit, m_opt->m_searchPostingPageLimit) + m_opt->m_bufferLength + m_opt->m_unfilterTailBufferLength) << PageSizeEx, true, m_opt->m_enableDataCompression);
+                p_exWorkSpace->Initialize(
+                    m_opt->m_maxCheck,
+                    m_opt->m_hashExp,
+                    max(m_opt->m_searchInternalResultNum,
+                        m_opt->m_reassignK),
+                    postingBufferBytes, true,
+                    m_opt->m_enableDataCompression);
                 int wid = 0;
                 if (m_freeWorkSpaceIds == nullptr)
                 {
@@ -2521,6 +3147,10 @@ namespace SPTAG::SPANN {
 
         ErrorCode AsyncAppend(ExtraWorkSpace* p_exWorkSpace, VectorIndex* p_index, SizeType headID, int appendNum, std::string& appendPosting, int reassignThreshold = 0)
         {
+            if (RejectRecoveredLimitedTagWrite(
+                    "AsyncAppend")) {
+                return ErrorCode::Undefined;
+            }
             if (m_asyncAppendQueue.size() >= m_opt->m_asyncAppendQueueSize) {
                 std::lock_guard<std::mutex> lock(m_asyncAppendLock);
                 if (m_asyncAppendQueue.size() < m_opt->m_asyncAppendQueueSize) {
@@ -2544,6 +3174,10 @@ namespace SPTAG::SPANN {
 
         ErrorCode Append(ExtraWorkSpace* p_exWorkSpace, VectorIndex* p_index, SizeType headID, int appendNum, std::string& appendPosting, int reassignThreshold = 0)
         {
+            if (RejectRecoveredLimitedTagWrite(
+                    "Append")) {
+                return ErrorCode::Undefined;
+            }
             auto appendBegin = std::chrono::high_resolution_clock::now();
             if (appendPosting.empty()) {
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Error! empty append posting!\n");
@@ -2636,6 +3270,10 @@ namespace SPTAG::SPANN {
         
         ErrorCode Reassign(ExtraWorkSpace* p_exWorkSpace, VectorIndex* p_index, std::shared_ptr<std::string> vectorInfo, SizeType HeadPrev)
         {
+            if (RejectRecoveredLimitedTagWrite(
+                    "Reassign")) {
+                return ErrorCode::Undefined;
+            }
             SizeType VID = *((SizeType*)vectorInfo->c_str());
             uint8_t version = *((uint8_t*)(vectorInfo->c_str() + sizeof(VID)));
             // return;
@@ -2685,6 +3323,52 @@ namespace SPTAG::SPANN {
         bool LoadIndex(Options& p_opt, COMMON::VersionLabel& p_versionMap, COMMON::Dataset<std::uint64_t>& p_vectorTranslateMap,  std::shared_ptr<VectorIndex> m_index) override {
             m_versionMap = &p_versionMap;
             m_opt = &p_opt;
+            LatchLimitedTagLayout(p_opt);
+            m_recoveredLimitedTagReadOnly =
+                m_recoveredLimitedTagReadOnly ||
+                (p_opt.m_enableLimitedTagPosting &&
+                 p_opt.m_recovery);
+            const auto envEnabled =
+                [](const char* p_name) {
+                    const char* value =
+                        std::getenv(p_name);
+                    return value != nullptr &&
+                           value[0] == '1';
+                };
+            const bool unsafeLimitedMigration =
+                envEnabled("SPTAG_OPQ_EXPORT") ||
+                envEnabled("SPTAG_OPQ_PREFILTER") ||
+                envEnabled("SPTAG_INPOST_QUANT_BUILD") ||
+                envEnabled("SPTAG_INPOST_RBQ_BUILD") ||
+                envEnabled("SPTAG_PIPEPQ_INPOST_DB_BUILD") ||
+                envEnabled("SPTAG_OPQ_INPOST_DB_BUILD") ||
+                envEnabled("SPTAG_TAIL_REWRITE_ONLY") ||
+                envEnabled("SPTAG_SLIM_POSTINGS") ||
+                m_opt->m_requantizeFromPipePQ;
+            if (HasLimitedTagLayout() &&
+                (m_opt->m_enableWAL ||
+                 !SupportsLimitedTagUpdates() ||
+                 unsafeLimitedMigration)) {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Error,
+                    "Dynamic limited-tag H/O postings require FILEIO raw records, EnableWAL=false, and no legacy posting migration.\n");
+                return false;
+            }
+            if (HasLimitedTagLayout()) {
+                const std::string& baseDir =
+                    LimitedTagArtifactRoot();
+                const std::string incompletePath =
+                    baseDir + FolderSep +
+                    kLimitedTagCheckpointFile;
+                if (fileexists(
+                        incompletePath.c_str())) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Refusing incomplete mutable limited-tag checkpoint %s.\n",
+                        incompletePath.c_str());
+                    return false;
+                }
+            }
 	        m_vectorTranslateMap = &p_vectorTranslateMap;
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "DataBlockSize: %d, Capacity: %d\n", m_opt->m_datasetRowsInBlock, m_opt->m_datasetCapacity);
             std::string versionmapPath = m_opt->m_indexDirectory + FolderSep + m_opt->m_deleteIDFile;
@@ -2712,6 +3396,13 @@ namespace SPTAG::SPANN {
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Current posting num: %d.\n", m_postingSizes.GetPostingNum());
             } else if (m_opt->m_storage == Storage::SPDKIO || m_opt->m_storage == Storage::FILEIO) {
 		        if (fileexists((m_opt->m_indexDirectory + FolderSep + m_opt->m_ssdIndex).c_str())) {
+                    if (HasLimitedTagLayout()) {
+                        SPTAGLIB_LOG(
+                            Helper::LogLevel::LL_Error,
+                            "Limited-tag STATIC-to-dynamic migration is unsupported because "
+                            "the legacy path cannot preserve the complete H/O layout.\n");
+                        return false;
+                    }
                 	m_versionMap->Initialize(m_opt->m_vectorSize, m_opt->m_datasetRowsInBlock, m_opt->m_datasetCapacity);
 			        SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Copying data from static to SPDK\n");
 			        std::shared_ptr<IExtraSearcher> storeExtraSearcher;
@@ -2794,6 +3485,7 @@ namespace SPTAG::SPANN {
 	    }
             // Unfilter-tail sidecar: load if present, fall back to pure=total.
             LoadOrInitPostingPureCounts();
+            LoadLimitedTagReadyMarker();
             // Dual-pool v3: head role sidecar (optional; absent = all heads are H1).
             LoadHeadRole();
             if (m_opt->m_enablePrimaryHeadBypass) {
@@ -3196,6 +3888,41 @@ namespace SPTAG::SPANN {
             return true;
         }
 
+        bool ResolvePrimaryHeadProjectTag(
+            const std::uint32_t* p_queryTags,
+            int p_numQueryTags,
+            const SPTAG::Cache::DNFPredicate* p_dnf,
+            std::uint32_t& p_projectTag) const
+        {
+            p_projectTag = 0;
+            if (p_dnf != nullptr && !p_dnf->Empty()) {
+                if (p_dnf->clauses.size() != 1) {
+                    return false;
+                }
+                for (const auto& literal :
+                     p_dnf->clauses.front().lits) {
+                    if (literal.kind == 0 &&
+                        literal.col == 3 &&
+                        literal.op ==
+                            SPTAG::Cache::DNF_EQ &&
+                        m_primaryHeadCSR.IsProjectTag(
+                            literal.val)) {
+                        p_projectTag = literal.val;
+                        return true;
+                    }
+                }
+                return false;
+            }
+            if (p_numQueryTags != 1 ||
+                p_queryTags == nullptr ||
+                !m_primaryHeadCSR.IsProjectTag(
+                    p_queryTags[0])) {
+                return false;
+            }
+            p_projectTag = p_queryTags[0];
+            return true;
+        }
+
         ErrorCode SearchPrimaryHeadCandidates(ExtraWorkSpace* p_exWorkSpace,
                                                QueryResult& p_queryResults,
                                                std::shared_ptr<VectorIndex> /*p_index*/) override
@@ -3206,30 +3933,10 @@ namespace SPTAG::SPANN {
 
             const SPTAG::Cache::DNFPredicate* dnf = p_exWorkSpace->m_dnf;
             std::uint32_t projectTag = 0;
-            if (dnf != nullptr && !dnf->Empty()) {
-                // A project equality literal is a safe sparse candidate generator
-                // only when it constrains the sole DNF clause. Remaining
-                // categorical/numeric literals are evaluated exactly below.
-                if (dnf->clauses.size() != 1) return ErrorCode::Fail;
-                bool foundProjectAnchor = false;
-                for (const auto& literal : dnf->clauses.front().lits) {
-                    if (literal.kind == 0 && literal.col == 3 &&
-                        literal.op == SPTAG::Cache::DNF_EQ &&
-                        m_primaryHeadCSR.IsProjectTag(literal.val)) {
-                        projectTag = literal.val;
-                        foundProjectAnchor = true;
-                        break;
-                    }
-                }
-                if (!foundProjectAnchor) return ErrorCode::Fail;
-            } else {
-                if (p_exWorkSpace->m_numQueryTags != 1 || p_exWorkSpace->m_queryTags == nullptr) {
-                    return ErrorCode::Fail;
-                }
-                projectTag = p_exWorkSpace->m_queryTags[0];
-            }
-
-            if (!m_primaryHeadCSR.IsProjectTag(projectTag)) {
+            if (!ResolvePrimaryHeadProjectTag(
+                    p_exWorkSpace->m_queryTags,
+                    p_exWorkSpace->m_numQueryTags,
+                    dnf, projectTag)) {
                 return ErrorCode::Fail;
             }
 
@@ -3279,6 +3986,12 @@ namespace SPTAG::SPANN {
             std::shared_ptr<VectorIndex> p_index,
             SearchStats* p_stats, std::set<int>* truth, std::map<int, std::set<int>>* found) override
         {
+            const ErrorCode asyncStatus =
+                m_asyncStatus.load(
+                    std::memory_order_acquire);
+            if (asyncStatus != ErrorCode::Success) {
+                return asyncStatus;
+            }
             if (m_opqPF) return SearchIndexOPQ(p_exWorkSpace, p_queryResults, p_index, p_stats, truth, found);
             if (p_stats) p_stats->m_exSetUpLatency = 0;
 
@@ -3368,8 +4081,23 @@ namespace SPTAG::SPANN {
             // Pure/tail split for filtered queries is ON by default whenever the
             // pure-count sidecar exists: filtered queries must never scan the
             // unfilter-only tail. EnableUnfilterTail=false force-disables it.
+            std::vector<std::vector<std::uint8_t>> pageSel;
+            const bool useLimitedTagReadRange =
+                PrepareLimitedTagPostingReadRanges(
+                    p_exWorkSpace,
+                    hasInlineTagFilter || hasDNF,
+                    m_vectorInfoSize,
+                    pageSel);
+            const bool limitedTagRegionsNotReady =
+                HasLimitedTagLayout() &&
+                !LimitedTagPostingRegionsReadyForQuery(
+                    p_exWorkSpace);
             const bool useUnfilterTail =
-                m_opt->m_enableUnfilterTail && m_hasPostingPureCounts && hasInlineTagFilter;
+                !useLimitedTagReadRange &&
+                !limitedTagRegionsNotReady &&
+                m_opt->m_enableUnfilterTail &&
+                m_hasPostingPureCounts &&
+                hasInlineTagFilter;
 
             // Page-selective IO (env SPTAG_PAGE_SELECT=1): for filtered queries,
             // read only the posting pages whose per-page signature may contain a
@@ -3380,10 +4108,22 @@ namespace SPTAG::SPANN {
                 const char* env = std::getenv("SPTAG_PAGE_SELECT");
                 return env && env[0] == '1';
             }();
-            bool usePageSelect = s_pageSelect && hasInlineTagFilter && m_numTagsPerVec > 0;
-            if (usePageSelect && !EnsurePagePS(p_exWorkSpace)) usePageSelect = false;
+            bool useTagPageSelect =
+                s_pageSelect &&
+                !HasLimitedTagLayout() &&
+                hasInlineTagFilter &&
+                m_numTagsPerVec > 0 &&
+                (!useLimitedTagReadRange ||
+                 !p_exWorkSpace->m_scanFullPostingForFilter);
+            if (useTagPageSelect && !EnsurePagePS(p_exWorkSpace)) {
+                useTagPageSelect = false;
+            }
+            const bool usePageSelect =
+                useLimitedTagReadRange ||
+                useTagPageSelect;
             const std::uint32_t searchPostingByteCap =
-                (m_opt->m_searchPostingPageLimit > 0)
+                (!limitedTagRegionsNotReady &&
+                 m_opt->m_searchPostingPageLimit > 0)
                     ? static_cast<std::uint32_t>(static_cast<std::uint64_t>(
                           m_opt->m_searchPostingPageLimit) * PageSize)
                     : 0;
@@ -3399,23 +4139,35 @@ namespace SPTAG::SPANN {
                 const char* env = std::getenv("SPTAG_PAGE_DIAG");
                 return env && env[0] == '1';
             }();
-            const bool runDiag = s_pageDiag && hasInlineTagFilter && m_numTagsPerVec > 0
-                                 && !usePageSelect && EnsurePagePS(p_exWorkSpace);
+            const bool runDiag =
+                s_pageDiag &&
+                hasInlineTagFilter &&
+                m_numTagsPerVec > 0 &&
+                !usePageSelect &&
+                EnsurePagePS(p_exWorkSpace);
 
             // Per-posting page selectors (only populated when usePageSelect).
-            std::vector<std::vector<std::uint8_t>> pageSel;
             SPTAG::Cache::PageBitmask qmask;
-            if (usePageSelect || runDiag) {
+            if (useTagPageSelect || runDiag) {
                 for (int qi = 0; qi < p_exWorkSpace->m_numQueryTags; qi++)
                     qmask.Insert(static_cast<uint32_t>(p_exWorkSpace->m_queryTags[qi]));
             }
-            if (usePageSelect) {
+            if (useTagPageSelect) {
                 const auto& ids = p_exWorkSpace->m_postingIDs;
-                pageSel.resize(ids.size());
+                if (!useLimitedTagReadRange) {
+                    pageSel.resize(ids.size());
+                }
                 for (size_t i = 0; i < ids.size(); ++i) {
                     SizeType hid = ids[i];
                     auto& sel = pageSel[i];
-                    if (hid < 0 || hid >= (SizeType)m_pagePS.size()) { sel.clear(); continue; }
+                    if (hid < 0 ||
+                        hid >=
+                            (SizeType)m_pagePS.size()) {
+                        if (!useLimitedTagReadRange) {
+                            sel.clear();
+                        }
+                        continue;
+                    }
                     const auto& pages = m_pagePS[hid];
                     int numPages = (int)pages.size();
                     int pStart = 0, pEnd = numPages;
@@ -3428,11 +4180,21 @@ namespace SPTAG::SPANN {
                     if (m_opt->m_searchPostingPageLimit > 0) {
                         pEnd = (std::min)(pEnd, m_opt->m_searchPostingPageLimit);
                     }
-                    sel.assign(numPages, 0);
+                    if (!useLimitedTagReadRange) {
+                        sel.assign(numPages, 0);
+                    }
                     for (int p = pStart; p < pEnd; ++p) {
+                        if (useLimitedTagReadRange &&
+                            (p >= (int)sel.size() ||
+                             sel[static_cast<size_t>(p)] == 0)) {
+                            continue;
+                        }
                         bool keep = hasDNF ? p_exWorkSpace->m_dnf->MayMatchPage(pages[p])
                                            : pages[p].MayIntersect(qmask);
-                        if (keep) sel[p] = 1;
+                        if (p < (int)sel.size()) {
+                            sel[static_cast<size_t>(p)] =
+                                keep ? 1 : 0;
+                        }
                     }
                 }
             }
@@ -3504,7 +4266,23 @@ namespace SPTAG::SPANN {
                 int vectorNum = (int)(buffer.GetAvailableSize() / m_vectorInfoSize);
                 int scanStart = 0;
                 int scanLimit = vectorNum;
-                if (useUnfilterTail) {
+                if (useLimitedTagReadRange) {
+                    const auto& range =
+                        p_exWorkSpace
+                            ->m_postingReadRanges[pi];
+                    scanStart =
+                        (std::max)(
+                            0,
+                            (std::min)(
+                                range.m_scanBegin,
+                                vectorNum));
+                    scanLimit =
+                        (std::max)(
+                            scanStart,
+                            (std::min)(
+                                range.m_scanEnd,
+                                vectorNum));
+                } else if (useUnfilterTail) {
                     if (IsUnfilterOnlyHead((int)curPostingID)) {
                         // Tail-only (U_extra) head: never scanned by filtered queries.
                         scanLimit = 0;
@@ -3593,6 +4371,7 @@ namespace SPTAG::SPANN {
                 
                 //SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "DEBUG: postingList %d size:%d m_vectorInfoSize:%d vectorNum:%d\n", pi, (int)(postingList.size()), m_vectorInfoSize, vectorNum);
                 int realNum = vectorNum;
+                int liveScanned = scanLimit - scanStart;
                 listElements += (scanLimit - scanStart);
                 auto compStart = std::chrono::high_resolution_clock::now();
                 for (int i = scanStart; i < scanLimit; i++) {
@@ -3608,13 +4387,25 @@ namespace SPTAG::SPANN {
                         for (int p = p0; p <= p1; ++p) {
                             if (p >= (int)sel.size() || sel[p] == 0) { pageOk = false; break; }
                         }
-                        if (!pageOk) { listElements--; continue; }
+                        if (!pageOk) {
+                            --liveScanned;
+                            listElements--;
+                            continue;
+                        }
                     }
                     int vectorID = *(reinterpret_cast<int*>(vectorInfo));
+                    const std::uint8_t version =
+                        *(reinterpret_cast<std::uint8_t*>(
+                            vectorInfo + sizeof(SizeType)));
 
 		            //SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "DEBUG: vectorID:%d\n", vectorID);
-                    if (m_versionMap->Deleted(vectorID)) {
+                    if (vectorID < 0 ||
+                        vectorID >= m_versionMap->Count() ||
+                        m_versionMap->Deleted(vectorID) ||
+                        m_versionMap->GetVersion(vectorID) !=
+                            version) {
                         realNum--;
+                        --liveScanned;
                         listElements--;
                         continue;
                     }
@@ -3670,12 +4461,25 @@ namespace SPTAG::SPANN {
                     ++p_exWorkSpace->m_postingProbeStats.m_matchedPostings;
                 }
                 auto compEnd = std::chrono::high_resolution_clock::now();
-                if (realNum <= m_mergeThreshold && m_taggedMaintenance.load(std::memory_order_acquire)) {
+                const bool limitedMergeCandidate =
+                    HasLimitedTagLayout() &&
+                    LimitedTagPostingRegionsReadyForQuery(
+                        p_exWorkSpace) &&
+                    scanStart == GetPureCount(
+                        curPostingID) &&
+                    scanLimit == vectorNum &&
+                    liveScanned <= m_mergeThreshold;
+                if ((limitedMergeCandidate ||
+                     (!HasLimitedTagLayout() &&
+                      realNum <= m_mergeThreshold)) &&
+                    m_taggedMaintenance.load(
+                        std::memory_order_acquire)) {
                     std::lock_guard<std::mutex> lock(m_taggedMergeCandidatesLock);
                     m_taggedMergeCandidates.insert(curPostingID);
                 }
                 // Async merge requires update-mode thread pools; in read-only serving they are not initialized.
-                else if (m_opt->m_update && m_opt->m_asyncMergeInSearch &&
+                else if (!HasLimitedTagLayout() &&
+                         m_opt->m_update && m_opt->m_asyncMergeInSearch &&
                          m_splitThreadPool != nullptr && realNum <= m_mergeThreshold) {
                     MergeAsync(p_index.get(), curPostingID);
                 }
@@ -3838,7 +4642,6 @@ namespace SPTAG::SPANN {
             }
             return ret;
         }
-
         virtual ErrorCode SearchNextInPosting(ExtraWorkSpace* p_exWorkSpace, QueryResult& p_headResults,
             QueryResult& p_queryResults,
             std::shared_ptr<VectorIndex>& p_index, const VectorIndex* p_spann)
@@ -5281,6 +6084,13 @@ namespace SPTAG::SPANN {
 
         ErrorCode AddIndex(ExtraWorkSpace* p_exWorkSpace, std::shared_ptr<VectorSet>& p_vectorSet,
             std::shared_ptr<VectorIndex> p_index, SizeType begin) override {
+            if (m_opt != nullptr &&
+                HasLimitedTagLayout()) {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Error,
+                    "Dynamic limited-tag H/O postings reject legacy AddIndex without explicit region targets.\n");
+                return ErrorCode::Fail;
+            }
 
             for (int v = 0; v < p_vectorSet->Count(); v++) {
                 SizeType VID = begin + v;
@@ -5334,20 +6144,71 @@ namespace SPTAG::SPANN {
                                       int p_numTagsPerVec,
                                       SizeType p_begin) override
         {
+            if (RejectRecoveredLimitedTagWrite(
+                    "AddIndexWithTargets")) {
+                return ErrorCode::Undefined;
+            }
             if (p_vectorSet == nullptr || p_tags == nullptr ||
                 p_targets.size() != static_cast<size_t>(p_vectorSet->Count()) ||
                 p_numTagsPerVec != m_numTagsPerVec) {
                 return ErrorCode::Fail;
             }
-            m_taggedMaintenance.store(true, std::memory_order_release);
+            bool hasLimitedTargets = false;
+            bool hasLegacyTargets = false;
+            for (const auto& vectorTargets : p_targets) {
+                for (const auto& target : vectorTargets) {
+                    if (target.m_kind ==
+                            PostingUpdateKind::LimitedH ||
+                        target.m_kind ==
+                            PostingUpdateKind::LimitedO) {
+                        hasLimitedTargets = true;
+                    } else {
+                        hasLegacyTargets = true;
+                    }
+                }
+            }
+            if (hasLimitedTargets == hasLegacyTargets) {
+                return ErrorCode::Fail;
+            }
+            if (hasLimitedTargets &&
+                !SupportsLimitedTagUpdates()) {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Error,
+                    "[LimitedTagUpdate] mutable H/O postings currently require raw vectors without OPQ, PipePQ, or RaBitQ sidecars.\n");
+                return ErrorCode::Undefined;
+            }
+            if (hasLimitedTargets &&
+                (m_opt == nullptr ||
+                 !HasLimitedTagLayout() ||
+                 !LimitedTagPostingRegionsReady())) {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Error,
+                    "[LimitedTagUpdate] mutable H/O insertion requires a validated generation-bound readiness marker.\n");
+                return ErrorCode::Fail;
+            }
+            if (hasLegacyTargets) {
+                m_taggedMaintenance.store(
+                    true, std::memory_order_release);
+            }
             if (m_opt->m_enableWAL) {
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                             "[TaggedUpdate] WAL cannot replay explicit pure/tail targets; disable EnableWAL "
+                             "[TaggedUpdate] WAL cannot replay explicit posting-region targets; disable EnableWAL "
                              "or use a target-aware WAL before inserting.\n");
                 return ErrorCode::Undefined;
             }
             if (!m_hasPostingPureCounts) {
                 InitializePureCountsFromTotals(m_postingSizes.GetPostingNum());
+            }
+            if (hasLimitedTargets) {
+                const std::string& mutableBaseDir =
+                    LimitedTagArtifactRoot();
+                const ErrorCode markerStatus =
+                    BeginLimitedTagCheckpoint(
+                        mutableBaseDir);
+                if (markerStatus !=
+                    ErrorCode::Success) {
+                    return markerStatus;
+                }
             }
             if (!AppendDynamicVectors(p_vectorSet, p_begin)) {
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
@@ -5363,26 +6224,51 @@ namespace SPTAG::SPANN {
 
                 std::unique_lock<std::shared_timed_mutex> lock(m_rwLocks[headID]);
                 std::string posting;
-                ErrorCode ret = db->Get(headID, &posting, MaxTimeout, &(p_exWorkSpace->m_diskRequests));
-                if (ret != ErrorCode::Success ||
-                    !m_checkSum.ValidateChecksum(posting.c_str(), static_cast<int>(posting.size()),
-                                                 *m_checkSums[headID])) {
-                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                                 "[TaggedUpdate] cannot read a valid posting %d.\n", headID);
-                    return ret == ErrorCode::Success ? ErrorCode::Fail : ret;
+                ErrorCode ret = ErrorCode::Success;
+                const int storedTotal =
+                    m_postingSizes.GetSize(headID);
+                if (storedTotal < 0) {
+                    return ErrorCode::Posting_SizeError;
+                }
+                if (storedTotal > 0) {
+                    ret = db->Get(headID, &posting, MaxTimeout,
+                                  &(p_exWorkSpace->m_diskRequests));
+                    if (ret != ErrorCode::Success ||
+                        !m_checkSum.ValidateChecksum(
+                            posting.c_str(),
+                            static_cast<int>(posting.size()),
+                            *m_checkSums[headID])) {
+                        SPTAGLIB_LOG(
+                            Helper::LogLevel::LL_Error,
+                            "[TaggedUpdate] cannot read a valid posting %d.\n",
+                            headID);
+                        return ret == ErrorCode::Success
+                            ? ErrorCode::Fail
+                            : ret;
+                    }
+                } else if (GetPureCount(headID) != 0 ||
+                           *m_checkSums[headID] != 0) {
+                    return ErrorCode::Posting_SizeError;
                 }
                 if (posting.size() % static_cast<size_t>(m_vectorInfoSize) != 0) {
                     return ErrorCode::Posting_SizeError;
                 }
 
                 const int total = static_cast<int>(posting.size() / static_cast<size_t>(m_vectorInfoSize));
+                if (total != storedTotal) {
+                    return ErrorCode::Posting_SizeError;
+                }
                 int pure = GetPureCount(headID);
                 if (pure < 0 || pure > total) return ErrorCode::Posting_SizeError;
 
                 SizeType newVID = -1;
                 memcpy(&newVID, record.data(), sizeof(newVID));
                 SizeType existingVID = -1;
-                for (int i = 0; i < total; ++i) {
+                const bool limitedH = kind == PostingUpdateKind::LimitedH;
+                const bool limitedO = kind == PostingUpdateKind::LimitedO;
+                const int duplicateBegin = limitedO ? pure : 0;
+                const int duplicateEnd = limitedH ? pure : total;
+                for (int i = duplicateBegin; i < duplicateEnd; ++i) {
                     memcpy(&existingVID, posting.data() + static_cast<size_t>(i) * m_vectorInfoSize,
                            sizeof(existingVID));
                     if (existingVID == newVID) {
@@ -5390,7 +6276,34 @@ namespace SPTAG::SPANN {
                     }
                 }
 
-                if (kind == PostingUpdateKind::Pure) {
+                if (limitedH || limitedO) {
+                    const long long regionLimit =
+                        static_cast<long long>(m_postingSizeLimit) +
+                        static_cast<long long>(m_bufferSizeLimit);
+                    const long long regionSize =
+                        limitedH
+                            ? pure
+                            : total - pure;
+                    if (regionLimit >= 0 &&
+                        regionSize >= regionLimit) {
+                        SPTAGLIB_LOG(
+                            Helper::LogLevel::LL_Error,
+                            "[LimitedTagUpdate] posting %d reached its %s-region capacity (%lld records).\n",
+                            headID,
+                            limitedH ? "H" : "O",
+                            regionLimit);
+                        return ErrorCode::Posting_OverFlow;
+                    }
+                    if (limitedH) {
+                        posting.insert(
+                            static_cast<size_t>(pure) *
+                                static_cast<size_t>(m_vectorInfoSize),
+                            record);
+                        ++pure;
+                    } else {
+                        posting.append(record);
+                    }
+                } else if (kind == PostingUpdateKind::Pure) {
                     const long long pureLimit = static_cast<long long>(m_postingSizeLimit) +
                                                 static_cast<long long>(m_bufferSizeLimit);
                     if (pureLimit >= 0 && pure >= pureLimit &&
@@ -5430,7 +6343,8 @@ namespace SPTAG::SPANN {
                 m_postingPureCounts.UpdateSize(headID, pure);
                 *m_checkSums[headID] =
                     m_checkSum.CalcChecksum(posting.c_str(), static_cast<int>(posting.size()));
-                if (m_opt->m_consistencyCheck && total > 0) {
+                if (m_opt->m_consistencyCheck &&
+                    !posting.empty()) {
                     ret = db->Check(headID, m_postingSizes.GetSize(headID) * m_vectorInfoSize, nullptr);
                 }
                 return ret;
@@ -5493,16 +6407,40 @@ namespace SPTAG::SPANN {
 
         ErrorCode ReserveTaggedPosting(SizeType p_expectedHeadID) override
         {
+            if (RejectRecoveredLimitedTagWrite(
+                    "ReserveTaggedPosting")) {
+                return ErrorCode::Undefined;
+            }
             std::lock_guard<std::mutex> lock(m_dataAddLock);
-            if (p_expectedHeadID != m_postingSizes.GetPostingNum()) {
+            if (!m_hasPostingPureCounts) {
+                InitializePureCountsFromTotals(
+                    m_postingSizes
+                        .GetPostingNum());
+            }
+            if (p_expectedHeadID !=
+                    m_postingSizes.GetPostingNum() ||
+                p_expectedHeadID !=
+                    m_checkSums.R() ||
+                p_expectedHeadID !=
+                    m_postingPureCounts
+                        .GetPostingNum()) {
                 return ErrorCode::Key_OverFlow;
             }
-            if (!m_hasPostingPureCounts) {
-                InitializePureCountsFromTotals(m_postingSizes.GetPostingNum());
-            }
-            if (m_postingSizes.AddBatch(1) != ErrorCode::Success ||
-                m_checkSums.AddBatch(1) != ErrorCode::Success ||
-                m_postingPureCounts.AddBatch(1) != ErrorCode::Success) {
+            const auto rollback = [&]() {
+                m_postingSizes.SetR(
+                    p_expectedHeadID);
+                m_checkSums.SetR(
+                    p_expectedHeadID);
+                m_postingPureCounts.SetR(
+                    p_expectedHeadID);
+            };
+            if (m_postingSizes.AddBatch(1) !=
+                    ErrorCode::Success ||
+                m_checkSums.AddBatch(1) !=
+                    ErrorCode::Success ||
+                m_postingPureCounts.AddBatch(1) !=
+                    ErrorCode::Success) {
+                rollback();
                 return ErrorCode::MemoryOverFlow;
             }
             m_postingSizes.UpdateSize(p_expectedHeadID, 0);
@@ -5511,13 +6449,42 @@ namespace SPTAG::SPANN {
             return ErrorCode::Success;
         }
 
+        ErrorCode RollbackReservedTaggedPosting(
+            SizeType p_expectedHeadID) override
+        {
+            if (RejectRecoveredLimitedTagWrite(
+                    "RollbackReservedTaggedPosting")) {
+                return ErrorCode::Undefined;
+            }
+            std::lock_guard<std::mutex> lock(
+                m_dataAddLock);
+            const SizeType expectedCount =
+                p_expectedHeadID + 1;
+            if (p_expectedHeadID < 0 ||
+                m_postingSizes.GetPostingNum() !=
+                    expectedCount ||
+                m_checkSums.R() != expectedCount ||
+                m_postingPureCounts.GetPostingNum() !=
+                    expectedCount) {
+                return ErrorCode::Fail;
+            }
+            m_postingSizes.SetR(p_expectedHeadID);
+            m_checkSums.SetR(p_expectedHeadID);
+            m_postingPureCounts.SetR(
+                p_expectedHeadID);
+            return ErrorCode::Success;
+        }
+
         ErrorCode RewriteTaggedPostings(ExtraWorkSpace* p_exWorkSpace,
                                         const std::vector<TaggedPostingSnapshot>& p_rewrites) override
         {
+            if (RejectRecoveredLimitedTagWrite(
+                    "RewriteTaggedPostings")) {
+                return ErrorCode::Undefined;
+            }
             if (p_exWorkSpace == nullptr || p_rewrites.empty()) {
                 return p_rewrites.empty() ? ErrorCode::Success : ErrorCode::Fail;
             }
-
             std::vector<SizeType> ids;
             ids.reserve(p_rewrites.size());
             for (const auto& rewrite : p_rewrites) {
@@ -5534,13 +6501,21 @@ namespace SPTAG::SPANN {
                 if (pureLimit >= 0 && rewrite.m_pureCount > pureLimit) {
                     return ErrorCode::Posting_OverFlow;
                 }
-                const size_t purePages =
-                    (static_cast<size_t>(rewrite.m_pureCount) * m_vectorInfoSize + PageSize - 1) / PageSize;
-                const size_t maxRecords =
-                    ((purePages + static_cast<size_t>(m_opt->m_unfilterTailBufferLength)) * PageSize) /
-                    static_cast<size_t>(m_vectorInfoSize);
-                if (static_cast<size_t>(total) > maxRecords) {
-                    return ErrorCode::Posting_OverFlow;
+                if (HasLimitedTagLayout()) {
+                    if (pureLimit >= 0 &&
+                        total - rewrite.m_pureCount >
+                            pureLimit) {
+                        return ErrorCode::Posting_OverFlow;
+                    }
+                } else {
+                    const size_t purePages =
+                        (static_cast<size_t>(rewrite.m_pureCount) * m_vectorInfoSize + PageSize - 1) / PageSize;
+                    const size_t maxRecords =
+                        ((purePages + static_cast<size_t>(m_opt->m_unfilterTailBufferLength)) * PageSize) /
+                        static_cast<size_t>(m_vectorInfoSize);
+                    if (static_cast<size_t>(total) > maxRecords) {
+                        return ErrorCode::Posting_OverFlow;
+                    }
                 }
                 ids.push_back(rewrite.m_headID);
             }
@@ -5591,16 +6566,70 @@ namespace SPTAG::SPANN {
                 }
                 previous.emplace_back(std::move(old));
             }
+            if (m_opt != nullptr &&
+                HasLimitedTagLayout()) {
+                const std::string& mutableBaseDir =
+                    LimitedTagArtifactRoot();
+                const ErrorCode markerStatus =
+                    BeginLimitedTagCheckpoint(
+                        mutableBaseDir);
+                if (markerStatus !=
+                    ErrorCode::Success) {
+                    return markerStatus;
+                }
+            }
 
-            auto restorePrevious = [&]() {
-                for (const auto& old : previous) {
+            auto restorePrevious =
+                [&](size_t p_count) {
+                ErrorCode restoreStatus =
+                    ErrorCode::Success;
+                while (p_count > 0) {
+                    const auto& old =
+                        previous[--p_count];
+                    ErrorCode restoreRet =
+                        ErrorCode::Success;
                     if (old.m_records.empty()) {
-                        db->Delete(old.m_headID);
+                        restoreRet =
+                            db->Delete(old.m_headID);
+                        if (restoreRet ==
+                                ErrorCode::Key_NotFound ||
+                            restoreRet ==
+                                ErrorCode::Key_OverFlow) {
+                            restoreRet =
+                                ErrorCode::Success;
+                        }
                     } else {
-                        db->Put(old.m_headID, old.m_records, MaxTimeout,
-                                &(p_exWorkSpace->m_diskRequests));
+                        restoreRet = db->Put(
+                            old.m_headID, old.m_records,
+                            MaxTimeout,
+                            &(p_exWorkSpace
+                                  ->m_diskRequests));
+                        if (restoreRet ==
+                                ErrorCode::Success &&
+                            m_opt->m_consistencyCheck) {
+                            restoreRet = db->Check(
+                                old.m_headID,
+                                static_cast<int>(
+                                    old.m_records.size()),
+                                nullptr);
+                        }
+                    }
+                    if (restoreRet !=
+                            ErrorCode::Success &&
+                        restoreStatus ==
+                            ErrorCode::Success) {
+                        restoreStatus = restoreRet;
                     }
                 }
+                if (restoreStatus !=
+                    ErrorCode::Success) {
+                    m_asyncStatus = restoreStatus;
+                    SetLimitedTagReadRangesReady(false);
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "[TaggedUpdate] posting rewrite rollback failed; disabling mutable limited-tag routing.\n");
+                }
+                return restoreStatus;
             };
 
             size_t applied = 0;
@@ -5609,6 +6638,12 @@ namespace SPTAG::SPANN {
                 const auto& rewrite = p_rewrites[applied];
                 if (rewrite.m_records.empty()) {
                     ret = db->Delete(rewrite.m_headID);
+                    if (ret ==
+                            ErrorCode::Key_NotFound ||
+                        ret ==
+                            ErrorCode::Key_OverFlow) {
+                        ret = ErrorCode::Success;
+                    }
                 } else {
                     ret = db->Put(rewrite.m_headID, rewrite.m_records, MaxTimeout,
                                   &(p_exWorkSpace->m_diskRequests));
@@ -5616,8 +6651,15 @@ namespace SPTAG::SPANN {
                 if (ret != ErrorCode::Success) break;
             }
             if (ret != ErrorCode::Success) {
-                restorePrevious();
-                return ret;
+                const ErrorCode restoreRet =
+                    restorePrevious(
+                        (std::min)(
+                            applied + 1,
+                            previous.size()));
+                return restoreRet ==
+                        ErrorCode::Success
+                    ? ret
+                    : restoreRet;
             }
 
             for (const auto& rewrite : p_rewrites) {
@@ -5627,8 +6669,13 @@ namespace SPTAG::SPANN {
                     ret = db->Check(rewrite.m_headID,
                                     total * m_vectorInfoSize, nullptr);
                     if (ret != ErrorCode::Success) {
-                        restorePrevious();
-                        return ret;
+                        const ErrorCode restoreRet =
+                            restorePrevious(
+                                p_rewrites.size());
+                        return restoreRet ==
+                                ErrorCode::Success
+                            ? ret
+                            : restoreRet;
                     }
                 }
             }
@@ -5667,6 +6714,38 @@ namespace SPTAG::SPANN {
             return ErrorCode::Success;
         }
 
+        ErrorCode SerializeTaggedRecord(
+            SizeType p_vid,
+            const void* p_vector,
+            const std::uint32_t* p_tags,
+            int p_numTagsPerVec,
+            std::string& p_record) override
+        {
+            if (!SupportsLimitedTagUpdates() ||
+                p_vid < 0 ||
+                p_vid >= m_versionMap->Count() ||
+                m_versionMap->Deleted(p_vid) ||
+                p_vector == nullptr ||
+                p_tags == nullptr ||
+                p_numTagsPerVec != m_numTagsPerVec) {
+                return ErrorCode::Fail;
+            }
+            p_record.assign(
+                static_cast<size_t>(
+                    m_vectorInfoSize),
+                '\0');
+            if (!SerializeDynamicPosting(
+                    p_record.data(), p_vid,
+                    m_versionMap->GetVersion(p_vid),
+                    reinterpret_cast<
+                        const ValueType*>(p_vector),
+                    p_tags, p_numTagsPerVec)) {
+                p_record.clear();
+                return ErrorCode::Fail;
+            }
+            return ErrorCode::Success;
+        }
+
         void DrainTaggedMergeCandidates(std::vector<SizeType>& p_candidates) override
         {
             std::lock_guard<std::mutex> lock(m_taggedMergeCandidatesLock);
@@ -5698,6 +6777,28 @@ namespace SPTAG::SPANN {
         }
 
         ErrorCode DeleteIndex(SizeType p_id) override {
+            if (RejectRecoveredLimitedTagWrite(
+                    "DeleteIndex")) {
+                return ErrorCode::Undefined;
+            }
+            if (m_opt != nullptr &&
+                HasLimitedTagLayout()) {
+                if (p_id < 0 ||
+                    static_cast<size_t>(p_id) >=
+                        m_versionMap->Count() ||
+                    m_versionMap->Deleted(p_id)) {
+                    return ErrorCode::VectorNotFound;
+                }
+                const std::string& mutableBaseDir =
+                    LimitedTagArtifactRoot();
+                const ErrorCode markerStatus =
+                    BeginLimitedTagCheckpoint(
+                        mutableBaseDir);
+                if (markerStatus !=
+                    ErrorCode::Success) {
+                    return markerStatus;
+                }
+            }
             if (m_opt->m_enableWAL && m_wal) {
                 std::string assignment(sizeof(SizeType), '\0');
                 memcpy((char*)assignment.c_str(), &p_id, sizeof(SizeType));
@@ -5741,6 +6842,13 @@ namespace SPTAG::SPANN {
         }
 
         void ForceGC(ExtraWorkSpace* p_exWorkSpace, VectorIndex* p_index) override {
+            if (m_opt != nullptr &&
+                HasLimitedTagLayout()) {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Error,
+                    "Dynamic limited-tag H/O postings do not support legacy ForceGC.\n");
+                return;
+            }
             for (int i = 0; i < p_index->GetNumSamples(); i++) {
                 if (!p_index->ContainSample(i)) continue;
                 Split(p_exWorkSpace, p_index, i, false);
@@ -5748,7 +6856,13 @@ namespace SPTAG::SPANN {
         }
 
         bool AllFinished() { return m_splitThreadPool ? m_splitThreadPool->allClear() : true; } // && m_reassignThreadPool->allClear(); }
-        void ForceCompaction() override { db->ForceCompaction(); }
+        void ForceCompaction() override {
+            if (RejectRecoveredLimitedTagWrite(
+                    "ForceCompaction")) {
+                return;
+            }
+            db->ForceCompaction();
+        }
         void GetDBStats() override { 
             db->GetStat();
             if (m_splitThreadPool)
@@ -5810,6 +6924,10 @@ namespace SPTAG::SPANN {
         ErrorCode GetWritePosting(ExtraWorkSpace* p_exWorkSpace, SizeType pid, std::string& posting, bool write = false) override {
             ErrorCode ret;
             if (write) {
+                if (RejectRecoveredLimitedTagWrite(
+                        "GetWritePosting")) {
+                    return ErrorCode::Undefined;
+                }
                 if ((ret = db->Put(pid, posting, MaxTimeout, &(p_exWorkSpace->m_diskRequests))) != ErrorCode::Success)
                 {
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "[GetWritePosting] Put fail!\n");
@@ -5836,6 +6954,10 @@ namespace SPTAG::SPANN {
         }
 
         ErrorCode Checkpoint(std::string prefix) override {
+            if (RejectRecoveredLimitedTagWrite(
+                    "Checkpoint")) {
+                return ErrorCode::Undefined;
+            }
             /**flush SPTAG, versionMap, block mapping, block pool**/
             /** Wait **/
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Waiting for index update complete\n");
@@ -5846,10 +6968,14 @@ namespace SPTAG::SPANN {
             if (m_asyncStatus != ErrorCode::Success)
                 return m_asyncStatus;
 
+            ErrorCode ret =
+                BeginLimitedTagCheckpoint(prefix);
+            if (ret != ErrorCode::Success)
+                return ret;
+
             std::string p_persistenMap = prefix + FolderSep + m_opt->m_deleteIDFile;
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Saving version map\n");
-            
-            ErrorCode ret;
+
             if ((ret = m_versionMap->Save(p_persistenMap)) != ErrorCode::Success)
                 return ret;
 
@@ -7667,24 +8793,58 @@ namespace SPTAG::SPANN {
                 ids.erase(std::remove_if(ids.begin(), ids.end(),
                     [&](int pid) { return IsUnfilterOnlyHead(pid); }), ids.end());
             }
+            static const bool s_asyncFull = []() {
+                const char* e =
+                    std::getenv("SPTAG_OPQ_ASYNC_FULL");
+                return e && e[0] == '1';
+            }();
+            const bool asyncScan =
+                !m_rbq &&
+                !m_rbq2on &&
+                ((s_asyncFull &&
+                  !m_opqInpostCode &&
+                  !m_opqCodes.empty()) ||
+                 m_opqInpostDb);
+            std::vector<std::vector<std::uint8_t>> limitedTagPageSel;
+            const bool useLimitedTagReadRange =
+                PrepareLimitedTagPostingReadRanges(
+                    p_exWorkSpace,
+                    hasInlineTagFilter,
+                    asyncScan
+                        ? m_vectorInfoSize
+                        : m_slimRec,
+                    limitedTagPageSel);
+            const bool limitedTagRegionsNotReady =
+                HasLimitedTagLayout() &&
+                !LimitedTagPostingRegionsReadyForQuery(
+                    p_exWorkSpace);
             // Filter: read+scan only the pure prefix (skip tail pages). Unfilter
             // reads the full posting unless the tail-ablation diagnostic is on.
             const bool useUnfilterTail =
-                m_opt->m_enableUnfilterTail && m_hasPostingPureCounts && hasInlineTagFilter;
+                !useLimitedTagReadRange &&
+                !limitedTagRegionsNotReady &&
+                m_opt->m_enableUnfilterTail &&
+                m_hasPostingPureCounts &&
+                hasInlineTagFilter;
             const bool capScanToPure =
-                useUnfilterTail ||
-                (m_opt->m_ablateTail && m_hasPostingPureCounts && !hasInlineTagFilter);
+                !limitedTagRegionsNotReady &&
+                (useUnfilterTail ||
+                 (m_opt->m_ablateTail &&
+                  m_hasPostingPureCounts &&
+                  !hasInlineTagFilter));
             // Experimental unfilter mode: read only the pages that cover the pure
             // prefix, but scan all records present in those pages. This keeps tail
             // records that fit in already-paid pure pages and avoids extra tail-page IO.
             const int unfilterExtraTailPages = std::max(0, m_opt->m_unfilterExtraTailPages);
             const bool capUnfilterToPurePages =
+                !limitedTagRegionsNotReady &&
                 (m_opt->m_unfilterPurePages || unfilterExtraTailPages > 0) &&
                 m_hasPostingPureCounts && !hasInlineTagFilter;
             static const bool s_trackAllStatsOPQ = (std::getenv("SPTAG_TRACK_ALL_STATS") != nullptr);
             const bool trackStatsOPQ = hasInlineTagFilter || s_trackAllStatsOPQ;
             const std::uint32_t searchPostingByteCap =
-                (m_opt->m_searchPostingPageLimit > 0)
+                (!limitedTagRegionsNotReady &&
+                 m_opt->m_searchPostingPageLimit > 0)
                     ? static_cast<std::uint32_t>(static_cast<std::uint64_t>(
                           m_opt->m_searchPostingPageLimit) * PageSize)
                     : 0;
@@ -7755,6 +8915,7 @@ namespace SPTAG::SPANN {
             const SizeType postingNum = m_postingSizes.GetPostingNum();
             auto queueTaggedMerge = [&](SizeType headID, int liveCount, bool scannedFullPosting) {
                 if (!scannedFullPosting || liveCount > m_mergeThreshold ||
+                    HasLimitedTagLayout() ||
                     !m_taggedMaintenance.load(std::memory_order_acquire)) {
                     return;
                 }
@@ -7772,15 +8933,20 @@ namespace SPTAG::SPANN {
             // In-posting-DB mode (m_opqInpostDb) ALWAYS takes this async path: the slim
             // [meta|code] records live in db (stride m_vectorInfoSize), read via the same
             // MultiGet, with the OPQ code taken inline from each record.
-            static const bool s_asyncFull = []() { const char* e = std::getenv("SPTAG_OPQ_ASYNC_FULL"); return e && e[0] == '1'; }();
-            const bool asyncScan = !m_rbq && !m_rbq2on &&
-                ((s_asyncFull && !m_opqInpostCode && !m_opqCodes.empty()) || m_opqInpostDb);
             const auto adcStart = logPhaseTime ? std::chrono::high_resolution_clock::now()
                                                : std::chrono::high_resolution_clock::time_point{};
             if (asyncScan) {
                 const auto postingIoStart = logPhaseTime ? std::chrono::high_resolution_clock::now()
                                                          : std::chrono::high_resolution_clock::time_point{};
-                if (((capScanToPure || capUnfilterToPurePages) && m_hasPostingPureCounts) ||
+                ErrorCode postingRead = ErrorCode::Undefined;
+                if (useLimitedTagReadRange) {
+                    postingRead = db->MultiGet(
+                        p_exWorkSpace->m_postingIDs,
+                        p_exWorkSpace->m_pageBuffers,
+                        limitedTagPageSel,
+                        HardLatencyLimit(),
+                        &(p_exWorkSpace->m_diskRequests));
+                } else if (((capScanToPure || capUnfilterToPurePages) && m_hasPostingPureCounts) ||
                     searchPostingByteCap > 0) {
                     // Cap each posting's READ to its pure prefix so tail-replica
                     // records are never fetched from SSD (saves IO, not just the
@@ -7812,22 +8978,49 @@ namespace SPTAG::SPANN {
                         }
                         maxBytes[i] = combineReadCap(maxBytes[i]);
                     }
-                    db->MultiGet(p_exWorkSpace->m_postingIDs, p_exWorkSpace->m_pageBuffers,
-                                 maxBytes, HardLatencyLimit(), &(p_exWorkSpace->m_diskRequests));
+                    postingRead = db->MultiGet(
+                        p_exWorkSpace->m_postingIDs,
+                        p_exWorkSpace->m_pageBuffers,
+                        maxBytes,
+                        HardLatencyLimit(),
+                        &(p_exWorkSpace->m_diskRequests));
                 } else {
-                    db->MultiGet(p_exWorkSpace->m_postingIDs, p_exWorkSpace->m_pageBuffers,
-                                 HardLatencyLimit(), &(p_exWorkSpace->m_diskRequests));
+                    postingRead = db->MultiGet(
+                        p_exWorkSpace->m_postingIDs,
+                        p_exWorkSpace->m_pageBuffers,
+                        HardLatencyLimit(),
+                        &(p_exWorkSpace->m_diskRequests));
+                }
+                if (postingRead != ErrorCode::Success) {
+                    return ErrorCode::DiskIOFail;
                 }
                 if (logPhaseTime) {
                     postingIoMs = std::chrono::duration<double, std::milli>(
                         std::chrono::high_resolution_clock::now() - postingIoStart).count();
                 }
                 for (uint32_t pi = 0; pi < postingListCount; ++pi) {
-                    const std::uint64_t logicalBytes =
-                        p_exWorkSpace->m_pageBuffers[pi].GetAvailableSize();
+                    std::uint64_t logicalBytes =
+                        p_exWorkSpace->m_pageBuffers[pi]
+                            .GetAvailableSize();
+                    std::uint64_t pageReads = 0;
+                    if (useLimitedTagReadRange) {
+                        logicalBytes =
+                            static_cast<std::uint64_t>(
+                                p_exWorkSpace
+                                    ->m_postingReadRanges[pi]
+                                    .ScanCount()) *
+                            static_cast<std::uint64_t>(
+                                m_vectorInfoSize);
+                        for (std::uint8_t selected :
+                             limitedTagPageSel[pi]) {
+                            pageReads += selected != 0;
+                        }
+                    } else {
+                        pageReads =
+                            (logicalBytes + PageSize - 1) /
+                            PageSize;
+                    }
                     if (logicalBytes == 0) continue;
-                    const std::uint64_t pageReads =
-                        (logicalBytes + PageSize - 1) / PageSize;
                     p_exWorkSpace->m_postingProbeStats.m_postingPageReads += pageReads;
                     p_exWorkSpace->m_postingProbeStats.m_postingLogicalBytes += logicalBytes;
                     // FileIO issues PageSize reads even for a posting's partial final page.
@@ -7840,15 +9033,33 @@ namespace SPTAG::SPANN {
                     auto& buffer = p_exWorkSpace->m_pageBuffers[pi];
                     const std::uint8_t* data = (const std::uint8_t*)buffer.GetBuffer();
                     int n = (int)(buffer.GetAvailableSize() / m_vectorInfoSize);
+                    int scanStart = 0;
                     int scanLimit = n;
-                    if (capScanToPure) {
+                    if (useLimitedTagReadRange) {
+                        const auto& range =
+                            p_exWorkSpace
+                                ->m_postingReadRanges[pi];
+                        scanStart =
+                            (std::max)(
+                                0,
+                                (std::min)(
+                                    range.m_scanBegin,
+                                    n));
+                        scanLimit =
+                            (std::max)(
+                                scanStart,
+                                (std::min)(
+                                    range.m_scanEnd,
+                                    n));
+                    } else if (capScanToPure) {
                         if (IsUnfilterOnlyHead((int)h)) scanLimit = 0;
                         else { int pure = m_postingPureCounts.GetSize(h); if (pure > 0 && pure < scanLimit) scanLimit = pure; }
                     }
                     p_exWorkSpace->m_postingProbeStats.m_adcScannedVectors +=
-                        static_cast<std::uint64_t>(scanLimit);
+                        static_cast<std::uint64_t>(
+                            scanLimit - scanStart);
                     int liveCount = n;
-                    for (int i = 0; i < scanLimit; i++) {
+                    for (int i = scanStart; i < scanLimit; i++) {
                         const std::uint8_t* e = data + (size_t)i * m_vectorInfoSize;
                         int vid = *(reinterpret_cast<const int*>(e));
                         // PipePQ records carry their ADC code inline. New tagged-update
@@ -7882,7 +9093,9 @@ namespace SPTAG::SPANN {
                         else if (adc < heap.top().first) { heap.pop(); heap.push({ adc, vid }); }
                     }
                     queueTaggedMerge(h, liveCount,
-                                     scanLimit == n && n == m_postingSizes.GetSize(h));
+                                     scanStart == 0 &&
+                                     scanLimit == n &&
+                                     n == m_postingSizes.GetSize(h));
                 }
             } else
             for (uint32_t pi = 0; pi < postingListCount; ++pi) {
@@ -7890,25 +9103,58 @@ namespace SPTAG::SPANN {
                 if (h < 0 || h >= postingNum) continue;
                 std::uint64_t o0 = m_slimOff[h], o1 = m_slimOff[h + 1];
                 int n = (int)((o1 - o0) / m_slimRec);
+                int scanStart = 0;
                 int scanLimit = n;
-                if (capScanToPure) {
+                if (useLimitedTagReadRange) {
+                    const auto& range =
+                        p_exWorkSpace
+                            ->m_postingReadRanges[pi];
+                    scanStart =
+                        (std::max)(
+                            0,
+                            (std::min)(
+                                range.m_scanBegin,
+                                n));
+                    scanLimit =
+                        (std::max)(
+                            scanStart,
+                            (std::min)(
+                                range.m_scanEnd,
+                                n));
+                } else if (capScanToPure) {
                     if (IsUnfilterOnlyHead((int)h)) scanLimit = 0;
                     else { int pure = m_postingPureCounts.GetSize(h); if (pure > 0 && pure < scanLimit) scanLimit = pure; }
                 }
-                if (searchPostingByteCap > 0) {
+                if (!useLimitedTagReadRange &&
+                    searchPostingByteCap > 0) {
                     scanLimit = (std::min)(
                         scanLimit,
                         static_cast<int>(searchPostingByteCap / m_slimRec));
                 }
-                slimBytesRead += (size_t)scanLimit * m_slimRec;
+                const int scanCount =
+                    scanLimit - scanStart;
+                slimBytesRead +=
+                    static_cast<size_t>(scanCount) *
+                    m_slimRec;
                 int liveCount = n;
                 const std::uint8_t* base;
-                if (m_slimDirectFd >= 0 && scanLimit > 0) {
-                    // O_DIRECT device-bound read of the scanned posting range [o0, o0+scanLimit*rec).
+                const std::uint64_t readStart =
+                    o0 +
+                    static_cast<std::uint64_t>(
+                        scanStart) *
+                        m_slimRec;
+                if (m_slimDirectFd >= 0 && scanCount > 0) {
+                    // O_DIRECT device-bound read of the selected posting range.
                     // Align the offset/length to the device block size into a per-thread bounce buffer.
                     const size_t ALIGN = 4096;
-                    std::uint64_t readEnd = o0 + (std::uint64_t)scanLimit * m_slimRec;
-                    std::uint64_t aStart = o0 & ~(std::uint64_t)(ALIGN - 1);
+                    std::uint64_t readEnd =
+                        readStart +
+                        static_cast<std::uint64_t>(
+                            scanCount) *
+                            m_slimRec;
+                    std::uint64_t aStart =
+                        readStart &
+                        ~(std::uint64_t)(ALIGN - 1);
                     std::uint64_t aEnd = (readEnd + ALIGN - 1) & ~(std::uint64_t)(ALIGN - 1);
                     size_t aLen = (size_t)(aEnd - aStart);
                     static thread_local std::uint8_t* t_buf = nullptr;
@@ -7919,14 +9165,16 @@ namespace SPTAG::SPANN {
                         else t_cap = aLen;
                     }
                     if (t_buf && pread(m_slimDirectFd, t_buf, aLen, (off_t)aStart) > 0) {
-                        base = t_buf + (o0 - aStart);
+                        base =
+                            t_buf +
+                            (readStart - aStart);
                     } else {
-                        base = m_slim + o0;
+                        base = m_slim + readStart;
                     }
                 } else {
-                    base = m_slim + o0;
+                    base = m_slim + readStart;
                 }
-                for (int i = 0; i < scanLimit; i++) {
+                for (int i = 0; i < scanCount; i++) {
                     const std::uint8_t* e = base + (size_t)i * m_slimRec;
                     int vid = *(reinterpret_cast<const int*>(e));
                     if (vid < 0 || vid >= m_opqN) {
@@ -7964,7 +9212,9 @@ namespace SPTAG::SPANN {
                     else if (adc < heap.top().first) { heap.pop(); heap.push({ adc, vid }); }
                 }
                 queueTaggedMerge(h, liveCount,
-                                 scanLimit == n && n == m_postingSizes.GetSize(h));
+                                 scanStart == 0 &&
+                                 scanLimit == n &&
+                                 n == m_postingSizes.GetSize(h));
             }
 
             if (logPhaseTime) {
@@ -8169,6 +9419,10 @@ namespace SPTAG::SPANN {
 
         bool CopyDynamicVectorStore(const std::string& p_checkpointDir)
         {
+            if (RejectRecoveredLimitedTagWrite(
+                    "CopyDynamicVectorStore")) {
+                return false;
+            }
             if (m_dynamicVectorFd < 0) return true;
             const std::string sourcePath = GetDynamicVectorPath();
             const std::string targetPath = GetDynamicVectorCheckpointPath(p_checkpointDir);
@@ -8202,6 +9456,10 @@ namespace SPTAG::SPANN {
 
         bool WriteDynamicVectorHeader()
         {
+            if (RejectRecoveredLimitedTagWrite(
+                    "WriteDynamicVectorHeader")) {
+                return false;
+            }
 #ifdef _MSC_VER
             return false;
 #else
@@ -8218,12 +9476,22 @@ namespace SPTAG::SPANN {
 
         bool OpenDynamicVectorStore(bool create)
         {
+            if (create &&
+                RejectRecoveredLimitedTagWrite(
+                    "OpenDynamicVectorStore")) {
+                return false;
+            }
             std::unique_lock<std::shared_mutex> lock(m_dynamicVectorLock);
             return OpenDynamicVectorStoreLocked(create);
         }
 
         bool OpenDynamicVectorStoreLocked(bool create)
         {
+            if (create &&
+                RejectRecoveredLimitedTagWrite(
+                    "OpenDynamicVectorStoreLocked")) {
+                return false;
+            }
 #ifdef _MSC_VER
             (void)create;
             return false;
@@ -8284,6 +9552,10 @@ namespace SPTAG::SPANN {
 
         bool AppendDynamicVectors(std::shared_ptr<VectorSet>& vectors, SizeType begin)
         {
+            if (RejectRecoveredLimitedTagWrite(
+                    "AppendDynamicVectors")) {
+                return false;
+            }
 #ifdef _MSC_VER
             (void)vectors;
             (void)begin;
@@ -8800,7 +10072,9 @@ namespace SPTAG::SPANN {
         }
 
         int m_mergeThreshold = 10;
-        ErrorCode m_asyncStatus = ErrorCode::Success;
+        std::atomic<ErrorCode> m_asyncStatus{
+            ErrorCode::Success};
+        std::atomic<bool> m_limitedTagReadRangesReady{false};
 
 	    COMMON::Dataset<std::uint64_t>* m_vectorTranslateMap;
 

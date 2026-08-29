@@ -220,6 +220,8 @@ namespace SPTAG {
                 m_relaxedMono = false;
                 m_useHybridPure = false;
                 m_scanFullPostingForFilter = false;
+                m_limitedTagRegionsReadySnapshotValid = false;
+                m_limitedTagRegionsReadySnapshot = false;
             }
 
             void Initialize(va_list& arg) {
@@ -288,6 +290,8 @@ namespace SPTAG {
                 }
                 m_useHybridPure = false;
                 m_scanFullPostingForFilter = false;
+                m_limitedTagRegionsReadySnapshotValid = false;
+                m_limitedTagRegionsReadySnapshot = false;
                 if (m_asyncContextID >= 0) {
                     for (auto& request : m_diskRequests) {
                         request.m_status = m_asyncContextID;
@@ -423,8 +427,8 @@ namespace SPTAG {
             };
 
             // Query-local source/destination range for a selected posting. Static
-            // ordered ACL page directories populate this before issuing I/O; dynamic
-            // stores leave it unused.
+            // ordered ACL pages and dynamic limited-tag H/O reads populate this before
+            // issuing I/O.
             std::vector<PostingReadRange> m_postingReadRanges;
 
             COMMON::OptHashPosVector m_deduper;
@@ -452,6 +456,10 @@ namespace SPTAG {
             bool m_useHybridPure = false;
 
             bool m_scanFullPostingForFilter = false;
+
+            bool m_limitedTagRegionsReadySnapshotValid = false;
+
+            bool m_limitedTagRegionsReadySnapshot = false;
 
             bool m_relaxedMono = false;
 
@@ -484,6 +492,8 @@ namespace SPTAG {
         {
             Pure,
             Tail,
+            LimitedH,
+            LimitedO,
         };
 
         struct PostingUpdateTarget
@@ -540,6 +550,14 @@ namespace SPTAG {
             virtual bool GetRaBitQEnabled() { return false; }
 
             virtual bool HasPrimaryHeadCSR() const { return false; }
+            virtual bool CanSearchPrimaryHeadCandidates(
+                const std::uint32_t* /*p_queryTags*/,
+                int /*p_numQueryTags*/,
+                const SPTAG::Cache::DNFPredicate*
+                    /*p_queryDNF*/) const
+            {
+                return false;
+            }
 
             // Expands in-memory primary owner lists for graph-selected heads and
             // exact-reranks matching sparse-filter candidates without posting IO.
@@ -626,6 +644,10 @@ namespace SPTAG {
             {
                 return ErrorCode::Undefined;
             }
+            virtual bool SupportsLimitedTagUpdates() const
+            {
+                return false;
+            }
 
             // Tagged maintenance keeps the physical [pure | tail] layout while the
             // owning SPANN index performs subset-local head-graph maintenance.
@@ -639,6 +661,11 @@ namespace SPTAG {
             {
                 return ErrorCode::Undefined;
             }
+            virtual ErrorCode RollbackReservedTaggedPosting(
+                SizeType /*p_expectedHeadID*/)
+            {
+                return ErrorCode::Undefined;
+            }
             virtual ErrorCode RewriteTaggedPostings(ExtraWorkSpace* /*p_exWorkSpace*/,
                                                      const std::vector<TaggedPostingSnapshot>& /*p_rewrites*/)
             {
@@ -646,6 +673,15 @@ namespace SPTAG {
             }
             virtual ErrorCode ReadTaggedFullVectors(const std::vector<SizeType>& /*p_vids*/,
                                                      ByteArray& /*p_vectors*/)
+            {
+                return ErrorCode::Undefined;
+            }
+            virtual ErrorCode SerializeTaggedRecord(
+                SizeType /*p_vid*/,
+                const void* /*p_vector*/,
+                const std::uint32_t* /*p_tags*/,
+                int /*p_numTagsPerVec*/,
+                std::string& /*p_record*/)
             {
                 return ErrorCode::Undefined;
             }
@@ -688,11 +724,18 @@ namespace SPTAG {
             }
 
             virtual ErrorCode Checkpoint(std::string prefix) { return ErrorCode::Success; }
+            virtual ErrorCode BeginLimitedTagCheckpoint(
+                const std::string&) { return ErrorCode::Success; }
+            virtual ErrorCode InvalidateLimitedTagReadiness(
+                const std::string&) { return ErrorCode::Success; }
+            virtual ErrorCode CommitLimitedTagReadiness(
+                const std::string&) { return ErrorCode::Success; }
 
             // Dual-pool: return true if the head at ordinal headOrd is unfilter-only (role==1).
             virtual bool IsUnfilterOnlyHead(int headOrd) const { return false; }
             virtual bool HasHeadRoles() const { return false; }
             virtual bool HasHybridPurePostings() const { return false; }
+            virtual bool LimitedTagPostingRegionsReady() const { return false; }
             virtual int GetPostingCount() const { return -1; }
             virtual double GetPostingAvgRecords(bool /*p_useHybrid*/ = false) const { return -1.0; }
             virtual double GetPostingAvgPages(bool /*p_useHybrid*/ = false) const { return -1.0; }

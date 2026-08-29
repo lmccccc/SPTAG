@@ -129,6 +129,25 @@ bool ValidSecondLevelRouteConfig(
         p_options.m_secondLevelMaxCheck > 0;
 }
 
+bool ValidDynamicLimitedTagRepresentation(
+    const Options& p_options,
+    bool p_hasQuantizer)
+{
+    if (!p_options.m_enableLimitedTagPosting ||
+        p_options.m_storage == Storage::STATIC ||
+        (!p_hasQuantizer &&
+         Helper::StrUtils::StrEqualIgnoreCase(
+             p_options.m_postingQuantizer.c_str(),
+             "None")))
+    {
+        return true;
+    }
+    SPTAGLIB_LOG(
+        Helper::LogLevel::LL_Error,
+        "Dynamic limited-tag H/O postings require one raw, unquantized BKT index.\n");
+    return false;
+}
+
 bool ParseHybridGeneration(
     const std::string& p_value,
     std::uint64_t& p_generation)
@@ -584,6 +603,8 @@ bool ValidLimitedTagArtifactLayout(
         "tagpure_meta.bin",
         "tag_routing_stats.bin",
         "head_select_state.bin",
+        "limited_tag_ho_ready.bin",
+        "limited_tag_ho_checkpoint.incomplete",
         "page_signatures.bin",
         "ordered_page_starts.bin",
         "pipepq_pivots.bin",
@@ -683,6 +704,8 @@ bool ValidSecondLevelArtifactLayout(
         "tagpure_meta.bin",
         "tag_routing_stats.bin",
         "head_select_state.bin",
+        "limited_tag_ho_ready.bin",
+        "limited_tag_ho_checkpoint.incomplete",
         "page_signatures.bin",
         "ordered_page_starts.bin",
         "pipepq_pivots.bin",
@@ -1012,8 +1035,10 @@ template <typename T> ErrorCode Index<T>::SaveHeadBundleManifest(const std::stri
         }
     }
 
-    success = success && fflush(manifestFile) == 0;
-    fclose(manifestFile);
+    success = success &&
+        fflush(manifestFile) == 0;
+    success = fclose(manifestFile) == 0 &&
+        success;
     if (!success) {
         remove(temporaryPath.c_str());
         return ErrorCode::Fail;
@@ -1039,6 +1064,56 @@ template <typename T> ErrorCode Index<T>::SaveLoadedHeadBundles(const std::strin
 
     const std::string sourceBaseDir =
         m_headBundleBaseDir.empty() ? m_options.m_indexDirectory : m_headBundleBaseDir;
+    if (m_options.m_enableLimitedTagPosting) {
+        const std::string sourceSupport =
+            JoinPath(
+                sourceBaseDir,
+                m_options.m_limitedTagSupportFile);
+        const std::string targetSupport =
+            JoinPath(
+                baseDir,
+                m_options.m_limitedTagSupportFile);
+        std::string supportError;
+        bool saved = false;
+        if (m_limitedTagSupport.HeadCount() == 0) {
+            saved = CopyFileAtomically(
+                sourceSupport,
+                targetSupport);
+        } else {
+            std::uint64_t expectedGeneration = 0;
+            if (m_limitedTagSupport.HeadCount() !=
+                    m_index->GetNumSamples()) {
+                supportError =
+                    "limited-tag support head count does not match the "
+                    "loaded head index";
+            } else if (
+                !Helper::Convert::ConvertStringTo<std::uint64_t>(
+                    m_options
+                        .m_limitedTagGenerationFingerprint
+                        .c_str(),
+                    expectedGeneration) ||
+                expectedGeneration == 0 ||
+                m_limitedTagSupport
+                        .GenerationFingerprint() !=
+                    expectedGeneration) {
+                supportError =
+                    "limited-tag support generation does not match the "
+                    "loaded index";
+            } else {
+                saved = m_limitedTagSupport.Save(
+                    targetSupport,
+                    &supportError);
+            }
+        }
+        if (!saved) {
+            SPTAGLIB_LOG(
+                Helper::LogLevel::LL_Error,
+                "Failed to checkpoint limited-tag support metadata %s: %s.\n",
+                targetSupport.c_str(),
+                supportError.c_str());
+            return ErrorCode::FailedCreateFile;
+        }
+    }
     const std::string sourceHeadDir = JoinPath(sourceBaseDir, m_options.m_headIndexFolder);
     const std::string targetHeadDir = JoinPath(baseDir, m_options.m_headIndexFolder);
     const bool sourceCrossEdgesDirty = fileexists(
@@ -2433,7 +2508,6 @@ ErrorCode Index<T>::LoadLimitedTagSupport(
         : m_options.m_numTagsPerVec;
     if (!ValidLimitedTagArtifactLayout(m_options) ||
         m_options.m_enableHybridDistance ||
-        m_options.m_storage != Storage::STATIC ||
         m_extraSearcher == nullptr ||
         !m_extraSearcher->HasHybridPurePostings() ||
         m_index == nullptr ||
@@ -2450,7 +2524,7 @@ ErrorCode Index<T>::LoadLimitedTagSupport(
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
             "Enabled limited-tag mode has no valid positive-slot constrained "
-            "static posting layout.\n");
+            "posting layout with a persisted H/O boundary.\n");
         return ErrorCode::Fail;
     }
 
@@ -2483,6 +2557,29 @@ ErrorCode Index<T>::LoadLimitedTagSupport(
             "Cannot load limited-tag support metadata %s: %s\n",
             path.c_str(), error.c_str());
         return ErrorCode::Fail;
+    }
+    {
+        std::lock_guard<std::mutex> lock(
+            m_globalHeadVIDToLocalHIDMutex);
+        m_globalHeadVIDToLocalHID.clear();
+        m_globalHeadVIDToLocalHID.reserve(
+            static_cast<size_t>(
+                m_vectorTranslateMap.R()) *
+                2 +
+            1);
+        for (SizeType head = 0;
+             head < m_vectorTranslateMap.R();
+             ++head) {
+            const SizeType vid =
+                static_cast<SizeType>(
+                    *(m_vectorTranslateMap[head]));
+            if (vid != MaxSize && vid >= 0 &&
+                m_limitedTagSupport.IsActiveHead(
+                    head)) {
+                m_globalHeadVIDToLocalHID[vid] =
+                    head;
+            }
+        }
     }
     SPTAGLIB_LOG(
         Helper::LogLevel::LL_Info,
@@ -4834,7 +4931,8 @@ ErrorCode Index<T>::SearchHeadBundlesNative(
     int p_graphResultNum,
     int& p_scannedOut,
     const std::function<bool(SizeType)>&
-        p_globalResultFilter) const
+        p_globalResultFilter,
+    int p_resultFilterMaxCheck) const
 {
     p_scannedOut = 0;
     if (p_queryResults == nullptr || p_graphResultNum <= 0 ||
@@ -4890,7 +4988,9 @@ ErrorCode Index<T>::SearchHeadBundlesNative(
                                 static_cast<size_t>(
                                     p_localID)]);
                 },
-                m_options.m_maxCheck,
+                p_resultFilterMaxCheck > 0
+                    ? p_resultFilterMaxCheck
+                    : m_options.m_maxCheck,
                 false);
         } else {
             status = nodeIndex->SearchIndex(
@@ -5067,6 +5167,12 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
 
 template <typename T> ErrorCode Index<T>::LoadIndexDataFromMemory(const std::vector<ByteArray> &p_indexBlobs)
 {
+    LatchMutableLimitedTagLayout();
+    m_recoveredLimitedTagReadOnly =
+        m_recoveredLimitedTagReadOnly ||
+        (m_options.m_enableLimitedTagPosting &&
+         m_options.m_storage == Storage::FILEIO &&
+         m_options.m_recovery);
     if (m_options.m_enableHybridDistance ||
         m_options.m_selectSecondLevel) {
         SPTAGLIB_LOG(
@@ -5074,6 +5180,10 @@ template <typename T> ErrorCode Index<T>::LoadIndexDataFromMemory(const std::vec
             "Hybrid and second-level routing do not support blob/memory "
             "index loading; load the persisted directory so graph and "
             "posting sidecars can be validated together.\n");
+        return ErrorCode::Fail;
+    }
+    if (!ValidDynamicLimitedTagRepresentation(
+            m_options, m_pQuantizer != nullptr)) {
         return ErrorCode::Fail;
     }
     /** Need to modify **/
@@ -5124,7 +5234,17 @@ template <typename T> ErrorCode Index<T>::LoadIndexDataFromMemory(const std::vec
 template <typename T>
 ErrorCode Index<T>::LoadIndexData(const std::vector<std::shared_ptr<Helper::DiskIO>> &p_indexStreams)
 {
+    LatchMutableLimitedTagLayout();
+    m_recoveredLimitedTagReadOnly =
+        m_recoveredLimitedTagReadOnly ||
+        (m_options.m_enableLimitedTagPosting &&
+         m_options.m_storage == Storage::FILEIO &&
+         m_options.m_recovery);
     m_index->SetQuantizer(m_pQuantizer);
+    if (!ValidDynamicLimitedTagRepresentation(
+            m_options, m_pQuantizer != nullptr)) {
+        return ErrorCode::Fail;
+    }
     if (!m_options.m_persistentBufferPath.empty() && !direxists(m_options.m_persistentBufferPath.c_str()))
         mkdir(m_options.m_persistentBufferPath.c_str());
 
@@ -5220,6 +5340,13 @@ ErrorCode Index<T>::LoadIndexData(const std::vector<std::shared_ptr<Helper::Disk
 
     if ((m_options.m_storage != Storage::STATIC) && m_options.m_preReassign)
     {
+        if (m_options.m_enableLimitedTagPosting)
+        {
+            SPTAGLIB_LOG(
+                Helper::LogLevel::LL_Error,
+                "PreReassign cannot mutate dynamic limited-tag H/O postings before region-aware split support exists.\n");
+            return ErrorCode::Fail;
+        }
         if (m_extraSearcher->RefineIndex(m_index) != ErrorCode::Success)
             return ErrorCode::Fail;
     }
@@ -5548,7 +5675,7 @@ ErrorCode Index<T>::SaveIndexData(const std::vector<std::shared_ptr<Helper::Disk
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
 
-    std::unique_lock<std::mutex> dataLock(m_dataAddLock);
+    std::unique_lock<std::recursive_mutex> dataLock(m_dataAddLock);
     ErrorCode ret;
     if ((ret = DrainTaggedMergeMaintenance()) != ErrorCode::Success)
         return ret;
@@ -5580,7 +5707,6 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     const auto* threadLocalSearchContext = SPTAG::VectorIndex::GetThreadLocalSearchContext();
     static const std::vector<SizeType> kEmptyDirectPostingIDs;
     static const std::function<bool(int)> kEmptyPostingFilter;
-    static const std::function<bool(SizeType)> kEmptyHeadFilter;
     const std::vector<SizeType>& directPostingIDs = threadLocalSearchContext != nullptr
         ? threadLocalSearchContext->m_directPostingIDs
         : kEmptyDirectPostingIDs;
@@ -5626,8 +5752,13 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     const bool hasExactFilter =
         (queryDNF != nullptr && !queryDNF->Empty()) ||
         (queryTags != nullptr && numQueryTags > 0);
+    const bool limitedTagRegionsReady =
+        HasLimitedTagLayout() &&
+        m_extraSearcher != nullptr &&
+        m_extraSearcher
+            ->LimitedTagPostingRegionsReady();
     const bool useLimitedTagPure =
-        m_options.m_enableLimitedTagPosting &&
+        limitedTagRegionsReady &&
         hasExactFilter && limitedTagRouteEligible;
     const auto limitedSupportMatchesPredicate =
         [this, &limitedTagQueryValues](
@@ -5697,9 +5828,22 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         };
     std::function<bool(SizeType)>
         limitedTagHeadAdmission;
+    const bool primaryHeadBypassRequested =
+        m_options.m_enablePrimaryHeadBypass &&
+        m_extraSearcher != nullptr &&
+        m_extraSearcher->CanSearchPrimaryHeadCandidates(
+            queryTags, numQueryTags, queryDNF);
     if (useLimitedTagPure) {
         limitedTagHeadAdmission =
-            limitedSupportMatchesPredicate;
+            [&](SizeType p_head) {
+                return limitedSupportMatchesPredicate(
+                           p_head) &&
+                    (primaryHeadBypassRequested ||
+                     (m_extraSearcher != nullptr &&
+                      m_extraSearcher
+                          ->CheckValidPosting(
+                              p_head, nullptr)));
+            };
     }
     static const std::vector<int> kEmptySearchHeadBundleNodes;
     const std::vector<int>& searchHeadBundleNodes = threadLocalSearchContext != nullptr
@@ -5744,6 +5888,18 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             // I/O context IDs before the scan.
             m_extraSearcher->InitWorkSpace(workSpace.get(), true);
         }
+        workSpace
+            ->m_limitedTagRegionsReadySnapshotValid =
+            true;
+        workSpace
+            ->m_limitedTagRegionsReadySnapshot =
+            limitedTagRegionsReady;
+        workSpace->m_useHybridPure =
+            useLimitedTagPure;
+        workSpace->m_scanFullPostingForFilter =
+            limitedTagRegionsReady &&
+            hasExactFilter &&
+            !useLimitedTagPure;
 
         const int directResultNum = (std::max)(
             m_options.m_searchInternalResultNum,
@@ -5790,8 +5946,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             }
 
             auto shouldKeepHeadResult = [&](SizeType localHid) -> bool {
-                if (m_options
-                        .m_enableLimitedTagPosting &&
+                if (limitedTagRegionsReady &&
                     hasExactFilter) {
                     return limitedHeadMatchesExactPredicate(
                         localHid);
@@ -5855,7 +6010,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         if (ret == ErrorCode::Success &&
             directHeadLocalIDs.empty() &&
             m_index != nullptr &&
-            ((m_options.m_enableLimitedTagPosting &&
+            ((limitedTagRegionsReady &&
               hasExactFilter) ||
              (queryTags != nullptr &&
               numQueryTags > 0)))
@@ -5872,7 +6027,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             }
 
             const bool useLimitedHeadSupport =
-                m_options.m_enableLimitedTagPosting &&
+                limitedTagRegionsReady &&
                 hasExactFilter;
             const SizeType sampleCount =
                 useLimitedHeadSupport
@@ -6150,16 +6305,21 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     // Route selection must happen before graph traversal and must not change
     // postingTarget. nprobe therefore selects only a point on the chosen route.
     const int graphResultNum = postingTarget;
+    std::unique_ptr<COMMON::QueryResultSet<T>>
+        temporaryQueryResults;
     COMMON::QueryResultSet<T>* p_queryResults;
     if (p_query.GetResultNum() >= graphResultNum) {
         p_queryResults =
             (COMMON::QueryResultSet<T>*)&p_query;
     }
     else {
-        p_queryResults =
-            new COMMON::QueryResultSet<T>(
+        temporaryQueryResults =
+            std::make_unique<
+                COMMON::QueryResultSet<T>>(
                 (const T*)p_query.GetTarget(),
                 graphResultNum);
+        p_queryResults =
+            temporaryQueryResults.get();
     }
 
     bool useHybridRoute = false;
@@ -6230,7 +6390,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                     ->GetQuantizer() != nullptr) {
             if (p_queryResults !=
                 (COMMON::QueryResultSet<T>*)&p_query) {
-                delete p_queryResults;
+                temporaryQueryResults.reset();
             }
             SPTAGLIB_LOG(
                 Helper::LogLevel::LL_Error,
@@ -6250,7 +6410,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             headIndex->GetNumSamples()) {
             if (p_queryResults !=
                 (COMMON::QueryResultSet<T>*)&p_query) {
-                delete p_queryResults;
+                temporaryQueryResults.reset();
             }
             SPTAGLIB_LOG(
                 Helper::LogLevel::LL_Error,
@@ -6315,7 +6475,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                     attributes == nullptr) {
                     if (p_queryResults !=
                         (COMMON::QueryResultSet<T>*)&p_query) {
-                        delete p_queryResults;
+                        temporaryQueryResults.reset();
                     }
                     SPTAGLIB_LOG(
                         Helper::LogLevel::LL_Error,
@@ -6395,9 +6555,6 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     // Its exact attributes are evaluated after graph navigation, so the old
     // physical-posting tag mask must not remove a primary owner before CSR
     // expansion.
-    const bool primaryHeadBypassRequested =
-        m_options.m_enablePrimaryHeadBypass && m_extraSearcher != nullptr &&
-        m_extraSearcher->HasPrimaryHeadCSR();
     const bool secondLevelSelectivityEligible =
         useLimitedTagPure &&
         m_options.m_selectSecondLevel &&
@@ -6470,13 +6627,33 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 limitedMatchingHeads.begin(),
                 limitedMatchingHeads.end()),
             limitedMatchingHeads.end());
+        limitedMatchingHeads.erase(
+            std::remove_if(
+                limitedMatchingHeads.begin(),
+                limitedMatchingHeads.end(),
+                [&](SizeType p_head) {
+                    return !limitedTagHeadAdmission(
+                        p_head);
+                }),
+            limitedMatchingHeads.end());
         limitedMatchingHeadsMaterialized = true;
         return limitedMatchingHeads;
     };
 
+    constexpr int kLimitedHeadSearchMaxCheckCap =
+        1 << 17;
+    constexpr std::uint64_t
+        kLimitedExactFallbackReferenceLimit =
+            1ULL << 20;
+    const int limitedConfiguredMaxCheck =
+        (std::max)(
+            1,
+            (std::min)(
+                m_options.m_maxCheck,
+                kLimitedHeadSearchMaxCheckCap));
     const size_t limitedExactHeadLimit =
-        static_cast<size_t>((std::max)(
-            1, m_options.m_maxCheck));
+        static_cast<size_t>(
+            limitedConfiguredMaxCheck);
     std::uint64_t limitedMatchingHeadReferences = 0;
     for (const auto* heads :
          limitedMatchingHeadLists)
@@ -6496,6 +6673,62 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         }
         limitedMatchingHeadReferences +=
             headCount;
+    }
+    const std::uint64_t limitedHeadCount =
+        static_cast<std::uint64_t>(
+            m_limitedTagSupport.HeadCount());
+    const std::uint64_t limitedHeadSearchLimit64 =
+        (std::min)(
+            limitedHeadCount >
+                    static_cast<std::uint64_t>(
+                        kLimitedHeadSearchMaxCheckCap) /
+                        4
+                ? static_cast<std::uint64_t>(
+                      kLimitedHeadSearchMaxCheckCap)
+                : limitedHeadCount * 4,
+            static_cast<std::uint64_t>(
+                kLimitedHeadSearchMaxCheckCap));
+    const int limitedHeadSearchMaxCheckLimit =
+        (std::max)(
+            limitedConfiguredMaxCheck,
+            static_cast<int>(
+                limitedHeadSearchLimit64));
+    int limitedHeadSearchMaxCheck =
+        limitedConfiguredMaxCheck;
+    if (useLimitedTagPure &&
+        !limitedMatchingHeadLists.empty() &&
+        m_limitedTagSupport.HeadCount() > 0)
+    {
+        std::uint64_t coverageLowerBound = 0;
+        for (const auto* heads :
+             limitedMatchingHeadLists)
+        {
+            coverageLowerBound = (std::max)(
+                coverageLowerBound,
+                static_cast<std::uint64_t>(
+                    heads->size()));
+        }
+        if (coverageLowerBound > 0)
+        {
+            const long double estimatedChecks =
+                std::ceil(
+                    2.0L *
+                    static_cast<long double>(
+                        graphResultNum) *
+                    static_cast<long double>(
+                        m_limitedTagSupport
+                            .HeadCount()) /
+                    static_cast<long double>(
+                        coverageLowerBound));
+            limitedHeadSearchMaxCheck =
+                (std::max)(
+                    limitedHeadSearchMaxCheck,
+                    static_cast<int>(
+                        (std::min)(
+                            estimatedChecks,
+                            static_cast<long double>(
+                                limitedHeadSearchMaxCheckLimit))));
+        }
     }
     const auto scanExactLimitedHeads =
         [&](int p_priorScanned) {
@@ -6533,6 +6766,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     g_secondLevelProfile =
         SecondLevelSearchProfile();
     bool usedSecondLevelSearch = false;
+    int h1FallbackPriorScanned = 0;
     double secondLevelRouteMs = 0.0;
     if (m_options.m_logAdaptiveNprobe &&
         useLimitedTagPure)
@@ -6551,6 +6785,26 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     auto _phT0 = s_phaseTime ? std::chrono::high_resolution_clock::now()
                              : std::chrono::high_resolution_clock::time_point{};
 
+    if (useLimitedTagPure &&
+        !useSecondLevelBySelectivity &&
+        limitedMatchingHeadReferences <
+            static_cast<std::uint64_t>(
+                graphResultNum) &&
+        limitedMatchingHeadReferences <=
+            limitedExactHeadLimit)
+    {
+        const int exactScanned =
+            scanExactLimitedHeads(0);
+        usedHeadBundleSearch = true;
+        if (m_options.m_logAdaptiveNprobe)
+        {
+            SPTAGLIB_LOG(
+                Helper::LogLevel::LL_Info,
+                "Using bounded exact H1 routing over %d compatible heads.\n",
+                exactScanned);
+        }
+    }
+
     if (useSecondLevelBySelectivity)
     {
         const auto secondLevelStart =
@@ -6567,6 +6821,8 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             scanned);
         if (ret == ErrorCode::MemoryOverFlow)
         {
+            h1FallbackPriorScanned =
+                scanned;
             p_queryResults->Reset();
             ret = ErrorCode::Success;
             if (m_options.m_logAdaptiveNprobe)
@@ -6598,9 +6854,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             }
             if (admitted < graphResultNum)
             {
-                const auto& exactMatchingHeads =
-                    materializeLimitedMatchingHeads();
-                if (exactMatchingHeads.size() <=
+                if (limitedMatchingHeadReferences <=
                     limitedExactHeadLimit)
                 {
                     const int secondLevelScanned =
@@ -6622,6 +6876,8 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 }
                 else
                 {
+                    h1FallbackPriorScanned =
+                        scanned;
                     p_queryResults->Reset();
                     scanned = 0;
                     if (m_options
@@ -6761,7 +7017,8 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                             candidateNodes,
                             graphResultNum,
                             scanned,
-                            kEmptyHeadFilter);
+                            limitedTagHeadAdmission,
+                            limitedHeadSearchMaxCheck);
                     }
                 }
                 else
@@ -6771,7 +7028,8 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                         candidateNodes,
                         graphResultNum,
                         scanned,
-                        kEmptyHeadFilter);
+                        limitedTagHeadAdmission,
+                        limitedHeadSearchMaxCheck);
                 }
                 if (ret != ErrorCode::Success) {
                     canUseHeadBundle = false;
@@ -6801,9 +7059,174 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         // In the dual-pool slim head store the root index physically holds only the
         // U_extra heads, so its tree cannot navigate H1; skip this dead fallback.
         if (!m_metadataOnlyHeadStore) {
-            ret = m_index->SearchIndex(
-                *p_queryResults);
+            ret = limitedTagHeadAdmission
+                ? m_index->SearchIndexWithResultFilter(
+                      *p_queryResults,
+                      limitedTagHeadAdmission,
+                      limitedHeadSearchMaxCheck)
+                : m_index->SearchIndex(
+                      *p_queryResults);
             if (ret != ErrorCode::Success) return ret;
+        }
+    }
+
+    if (useLimitedTagPure &&
+        !usedSecondLevelSearch)
+    {
+        if (h1FallbackPriorScanned > 0)
+        {
+            p_queryResults->SetScanned(
+                p_queryResults->GetScanned() +
+                h1FallbackPriorScanned);
+        }
+        const auto admittedHeadCount = [&]() {
+            int admitted = 0;
+            for (; admitted < graphResultNum;
+                 ++admitted)
+            {
+                const BasicResult* result =
+                    p_queryResults->GetResult(
+                        admitted);
+                if (result == nullptr ||
+                    result->VID < 0)
+                    break;
+            }
+            return admitted;
+        };
+        int admitted = admittedHeadCount();
+        int retryMaxCheck =
+            limitedHeadSearchMaxCheck;
+        int accumulatedScanned =
+            p_queryResults->GetScanned();
+        int requiredHeads = graphResultNum;
+        const std::vector<SizeType>*
+            exactMatchingHeads = nullptr;
+        if (admitted < graphResultNum &&
+            limitedMatchingHeadReferences <=
+                kLimitedExactFallbackReferenceLimit)
+        {
+            exactMatchingHeads =
+                &materializeLimitedMatchingHeads();
+            requiredHeads =
+                (std::min)(
+                    graphResultNum,
+                    static_cast<int>(
+                        (std::min)(
+                            exactMatchingHeads->size(),
+                            static_cast<size_t>(
+                                (std::numeric_limits<
+                                    int>::max)()))));
+        }
+        const auto completeWithExactHeads =
+            [&]() {
+                const int graphAdmitted = admitted;
+                const int exactScanned =
+                    scanExactLimitedHeads(
+                        accumulatedScanned);
+                admitted = admittedHeadCount();
+                if (m_options
+                        .m_logAdaptiveNprobe)
+                {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Info,
+                        "Limited-tag H1 used exact completion after graph admission returned %d/%d heads (%d exact heads).\n",
+                        graphAdmitted,
+                        requiredHeads,
+                        exactScanned);
+                }
+            };
+        if (admitted < requiredHeads &&
+            exactMatchingHeads != nullptr &&
+            exactMatchingHeads->size() <=
+                limitedExactHeadLimit)
+        {
+            completeWithExactHeads();
+        }
+        while (admitted < requiredHeads &&
+               retryMaxCheck <
+                   limitedHeadSearchMaxCheckLimit)
+        {
+            const std::int64_t doubledMaxCheck =
+                static_cast<std::int64_t>(
+                    retryMaxCheck) *
+                2;
+            retryMaxCheck = static_cast<int>(
+                (std::min)(
+                    static_cast<std::int64_t>(
+                        limitedHeadSearchMaxCheckLimit),
+                    (std::max)(
+                        doubledMaxCheck,
+                        static_cast<std::int64_t>(
+                            retryMaxCheck) +
+                            1)));
+            p_queryResults->Reset();
+            int retryScanned = 0;
+            if (usedHeadBundleSearch)
+            {
+                ret = SearchHeadBundlesNative(
+                    p_queryResults,
+                    candidateNodes,
+                    graphResultNum,
+                    retryScanned,
+                    limitedTagHeadAdmission,
+                    retryMaxCheck);
+                p_queryResults->SetScanned(
+                    accumulatedScanned +
+                    retryScanned);
+            }
+            else if (!m_metadataOnlyHeadStore)
+            {
+                ret =
+                    m_index
+                        ->SearchIndexWithResultFilter(
+                            *p_queryResults,
+                            limitedTagHeadAdmission,
+                            retryMaxCheck);
+                retryScanned =
+                    p_queryResults->GetScanned();
+                p_queryResults->SetScanned(
+                    accumulatedScanned +
+                    retryScanned);
+            }
+            else
+            {
+                ret = ErrorCode::Fail;
+            }
+            if (ret != ErrorCode::Success)
+            {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Error,
+                    "Limited-tag H1 retry failed at MaxCheck=%d.\n",
+                    retryMaxCheck);
+                return ret;
+            }
+            accumulatedScanned +=
+                retryScanned;
+            admitted = admittedHeadCount();
+        }
+
+        if (admitted < requiredHeads)
+        {
+            if (exactMatchingHeads == nullptr)
+            {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Error,
+                    "Limited-tag H1 exhausted MaxCheck=%d with %llu matching-head references; refusing an unbounded exact fallback.\n",
+                    retryMaxCheck,
+                    static_cast<unsigned long long>(
+                        limitedMatchingHeadReferences));
+                return ErrorCode::Fail;
+            }
+            completeWithExactHeads();
+            if (admitted < requiredHeads)
+            {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Error,
+                    "Limited-tag H1 could not fill the posting target (%d/%d heads).\n",
+                    admitted,
+                    requiredHeads);
+                return ErrorCode::Fail;
+            }
         }
     }
 
@@ -6913,16 +7336,22 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 !isStaticStorage,
                 m_options.m_enableDataCompression);
         }
+        workSpace
+            ->m_limitedTagRegionsReadySnapshotValid =
+            true;
+        workSpace
+            ->m_limitedTagRegionsReadySnapshot =
+            limitedTagRegionsReady;
 
-        // H1 navigation remains distance-only. Limited-tag eligibility, like
-        // posting signatures, is evaluated only after graph heads are selected.
+        // H1 traversal remains distance-only, while result admission collects
+        // supported heads until the posting target is filled before disk I/O.
         workSpace->m_useHybridPure =
             useHybridRoute ||
             useLimitedTagPure;
         const bool scanGlobalTailForFilter =
             (m_options.m_enableHybridDistance &&
              hasExactFilter && !useHybridRoute) ||
-            (m_options.m_enableLimitedTagPosting &&
+            (limitedTagRegionsReady &&
              hasExactFilter && !useLimitedTagPure);
         workSpace->m_scanFullPostingForFilter =
             scanGlobalTailForFilter;
@@ -6931,7 +7360,10 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         // tags are column-agnostic and cannot safely use a column-specific mask.
         workSpace->m_postingFilter =
             scanGlobalTailForFilter &&
-                    tailPostingFilter
+                    tailPostingFilter &&
+                    !(limitedTagRegionsReady &&
+                      m_options.m_storage !=
+                          Storage::STATIC)
                 ? tailPostingFilter
                 : (useLimitedTagPure
                        ? limitedTagHeadAdmission
@@ -7012,7 +7444,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                     nodeIndex->GetSample(local));
             };
         auto shouldKeepHeadResult = [&](SizeType localHid) -> bool {
-                if (m_options.m_enableLimitedTagPosting &&
+                if (limitedTagRegionsReady &&
                     hasExactFilter) {
                     return limitedHeadMatchesExactPredicate(
                         localHid);
@@ -7134,10 +7566,14 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         {
             if ((int)workSpace->m_postingIDs.size() >= postingTarget) break;
             auto res = p_queryResults->GetResult(i);
-            if (res->VID == -1 || (limitDist > 0.1 && res->Dist > limitDist))
+            if (res->VID == -1 ||
+                (!useLimitedTagPure &&
+                 limitDist > 0.1 &&
+                 res->Dist > limitDist))
                 break;
             SizeType localHid = res->VID;
-            if (m_extraSearcher->CheckValidPosting(
+            if (usePrimaryHeadBypass ||
+                m_extraSearcher->CheckValidPosting(
                     localHid, workSpace.get()))
             {
                 // The primary-owner sidecar is independent of the retained physical
@@ -7168,8 +7604,18 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         }
 
         if (usePrimaryHeadBypass) {
-        ret = m_extraSearcher->SearchPrimaryHeadCandidates(workSpace.get(), *p_queryResults, m_index);
-        if (ret == ErrorCode::Success) {
+            ret = m_extraSearcher->SearchPrimaryHeadCandidates(
+                workSpace.get(), *p_queryResults,
+                m_index);
+            if (ret != ErrorCode::Success) {
+                m_workSpaceFactory->ReturnWorkSpace(
+                    std::move(workSpace));
+                if (p_queryResults !=
+                    (COMMON::QueryResultSet<T>*)&p_query) {
+                    temporaryQueryResults.reset();
+                }
+                return ret;
+            }
             SPTAG::VectorIndex::SetThreadLocalPostingScanStats(
                 0, 0, 0, 0, 0, workSpace->m_postingProbeStats.m_primaryHeadCandidates);
             m_workSpaceFactory->ReturnWorkSpace(std::move(workSpace));
@@ -7179,10 +7625,9 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                           p_queryResults->GetResults() + p_query.GetResultNum(),
                           p_query.GetResults());
                 p_query.SetScanned(p_queryResults->GetScanned());
-                delete p_queryResults;
+                temporaryQueryResults.reset();
             }
             return ErrorCode::Success;
-        }
         }
 
         for (; i < p_queryResults->GetResultNum(); ++i)
@@ -7322,7 +7767,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         std::copy(p_queryResults->GetResults(), p_queryResults->GetResults() + p_query.GetResultNum(),
                   p_query.GetResults());
         p_query.SetScanned(p_queryResults->GetScanned());
-        delete p_queryResults;
+        temporaryQueryResults.reset();
     }
 
     if (p_query.WithMeta() && nullptr != m_pMetadata)
@@ -8615,6 +9060,7 @@ bool Index<T>::SelectHeadInternal(std::shared_ptr<Helper::VectorSetReader> &p_re
 
 template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Helper::VectorSetReader> &p_reader)
 {
+    LatchMutableLimitedTagLayout();
     if (!ValidSecondLevelRouteConfig(m_options))
     {
         SPTAGLIB_LOG(
@@ -9413,6 +9859,13 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
             }
             if ((m_options.m_storage != Storage::STATIC) && m_options.m_preReassign)
             {
+                if (m_options.m_enableLimitedTagPosting)
+                {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "PreReassign cannot mutate dynamic limited-tag H/O postings before region-aware split support exists.\n");
+                    return ErrorCode::Fail;
+                }
                 if (m_extraSearcher->RefineIndex(m_index) != ErrorCode::Success)
                     return ErrorCode::Fail;
             }
@@ -9621,13 +10074,20 @@ ErrorCode Index<T>::RefineIndex(const std::vector<std::shared_ptr<Helper::DiskIO
 {
     if (m_index == nullptr || m_versionMap.Count() == 0)
         return ErrorCode::EmptyIndex;
+    if (IsRecoveredLimitedTagReadOnly() ||
+        HasMutableLimitedTagLayout()) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "Dynamic limited-tag H/O postings do not support legacy RefineIndex.\n");
+        return ErrorCode::Undefined;
+    }
 
     while (!AllFinished())
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
 
-    std::lock_guard<std::mutex> lock(m_dataAddLock);
+    std::lock_guard<std::recursive_mutex> lock(m_dataAddLock);
     std::unique_lock<std::shared_timed_mutex> uniquelock(m_dataDeleteLock);
 
     std::vector<SizeType> headOldtoNew;
@@ -9876,6 +10336,12 @@ ErrorCode Index<T>::AddIndex(const void *p_data, SizeType p_vectorNum, Dimension
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Only Support KV Extra Update\n");
         return ErrorCode::Fail;
     }
+    if (IsRecoveredLimitedTagReadOnly()) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "Recovered limited-tag H/O generations are read-only.\n");
+        return ErrorCode::Undefined;
+    }
 
     if (p_data == nullptr || p_vectorNum == 0 || p_dimension == 0)
         return ErrorCode::EmptyData;
@@ -9890,7 +10356,7 @@ ErrorCode Index<T>::AddIndex(const void *p_data, SizeType p_vectorNum, Dimension
 
     SizeType begin, end;
     {
-        std::lock_guard<std::mutex> lock(m_dataAddLock);
+        std::lock_guard<std::recursive_mutex> lock(m_dataAddLock);
 
         begin = m_versionMap.GetVectorNum();
         end = begin + p_vectorNum;
@@ -10067,41 +10533,85 @@ ErrorCode Index<T>::AddTaggedHeadToBundle(int p_bundleSlot, const T* p_center,
     }
     if (graph == nullptr) return ErrorCode::Fail;
 
+    const SizeType newHeadID = m_vectorTranslateMap.R();
+    if (m_index->HasHeadNodeMeta()) {
+        const SizeType oldMetaCount =
+            m_index->GetHeadNodeMetaSampleCount();
+        const size_t stride =
+            m_index->GetHeadNodeMetaStride();
+        auto& blob =
+            m_index->GetHeadNodeMetaBlob();
+        if (oldMetaCount != newHeadID ||
+            stride == 0 ||
+            blob.size() >
+                (std::numeric_limits<size_t>::max)() -
+                    stride) {
+            return ErrorCode::Fail;
+        }
+        try {
+            blob.reserve(blob.size() + stride);
+        } catch (const std::bad_alloc&) {
+            return ErrorCode::MemoryOverFlow;
+        } catch (const std::length_error&) {
+            return ErrorCode::MemoryOverFlow;
+        }
+    }
+    if (m_vectorTranslateMap.AddBatch(1) !=
+        ErrorCode::Success) {
+        return ErrorCode::MemoryOverFlow;
+    }
+    ErrorCode ret =
+        m_extraSearcher->ReserveTaggedPosting(
+            newHeadID);
+    if (ret != ErrorCode::Success) {
+        m_vectorTranslateMap.SetR(newHeadID);
+        return ret;
+    }
+    const auto rollbackReservations =
+        [&]() -> ErrorCode {
+        const ErrorCode rollbackRet =
+            m_extraSearcher
+                ->RollbackReservedTaggedPosting(
+                    newHeadID);
+        m_vectorTranslateMap.SetR(newHeadID);
+        return rollbackRet;
+    };
+
     // Cross-edge snapshots cannot represent a newly appended local graph head.
     // Publish the dirty marker before any topology mutation becomes visible.
     const ErrorCode dirtyRet = MarkCrossEdgesDirty();
-    if (dirtyRet != ErrorCode::Success) return dirtyRet;
-    const SizeType newHeadID = m_vectorTranslateMap.R();
+    if (dirtyRet != ErrorCode::Success) {
+        const ErrorCode rollbackRet =
+            rollbackReservations();
+        return rollbackRet == ErrorCode::Success
+            ? dirtyRet
+            : rollbackRet;
+    }
     int begin = -1;
     int end = -1;
-    ErrorCode ret = graph->AddIndexId(p_center, 1, m_options.m_dim, begin, end);
+    ret = graph->AddIndexId(
+        p_center, 1, m_options.m_dim,
+        begin, end);
     if (ret != ErrorCode::Success || begin < 0 || end != begin + 1) {
-        return ret == ErrorCode::Success ? ErrorCode::Fail : ret;
+        const ErrorCode addRet =
+            ret == ErrorCode::Success
+                ? ErrorCode::Fail
+                : ret;
+        const ErrorCode rollbackRet =
+            rollbackReservations();
+        return rollbackRet == ErrorCode::Success
+            ? addRet
+            : rollbackRet;
     }
+    p_headID = newHeadID;
     ret = graph->AddIndexIdx(static_cast<SizeType>(begin), static_cast<SizeType>(end));
     if (ret != ErrorCode::Success) {
         graph->DeleteIndex(static_cast<SizeType>(begin));
         return ret;
     }
-
-    ret = m_extraSearcher->ReserveTaggedPosting(newHeadID);
-    if (ret != ErrorCode::Success) {
-        graph->DeleteIndex(static_cast<SizeType>(begin));
-        return ret;
-    }
-    if (m_vectorTranslateMap.AddBatch(1) != ErrorCode::Success) {
-        graph->DeleteIndex(static_cast<SizeType>(begin));
-        return ErrorCode::MemoryOverFlow;
-    }
-    *(m_vectorTranslateMap.At(newHeadID)) = static_cast<std::uint64_t>(p_anchorVID);
-
     if (m_index->HasHeadNodeMeta()) {
         const SizeType oldMetaCount = m_index->GetHeadNodeMetaSampleCount();
         const size_t stride = m_index->GetHeadNodeMetaStride();
-        if (oldMetaCount != newHeadID || stride == 0) {
-            graph->DeleteIndex(static_cast<SizeType>(begin));
-            return ErrorCode::Fail;
-        }
         auto& blob = m_index->GetHeadNodeMetaBlob();
         const size_t oldBytes = blob.size();
         blob.resize(oldBytes + stride, 0);
@@ -10122,10 +10632,6 @@ ErrorCode Index<T>::AddTaggedHeadToBundle(int p_bundleSlot, const T* p_center,
         ++node.headCount;
         ++node.postingCount;
         {
-            std::lock_guard<std::mutex> lock(m_globalHeadVIDToLocalHIDMutex);
-            m_globalHeadVIDToLocalHID[p_anchorVID] = newHeadID;
-        }
-        {
             std::lock_guard<std::mutex> lock(m_globalVIDToBundleLocMutex);
             m_globalVIDToBundleLoc[p_anchorVID] =
                 std::make_pair(p_bundleSlot, static_cast<SizeType>(begin));
@@ -10133,6 +10639,12 @@ ErrorCode Index<T>::AddTaggedHeadToBundle(int p_bundleSlot, const T* p_center,
     } else if (!m_headBundleNodes.empty()) {
         ++m_headBundleNodes.front().headCount;
         ++m_headBundleNodes.front().postingCount;
+    }
+    {
+        std::lock_guard<std::mutex> lock(
+            m_globalHeadVIDToLocalHIDMutex);
+        m_globalHeadVIDToLocalHID[p_anchorVID] =
+            newHeadID;
     }
 
     {
@@ -10153,7 +10665,9 @@ ErrorCode Index<T>::AddTaggedHeadToBundle(int p_bundleSlot, const T* p_center,
             graph->GetSample(static_cast<SizeType>(begin));
     }
 
-    p_headID = newHeadID;
+    *(m_vectorTranslateMap.At(newHeadID)) =
+        static_cast<std::uint64_t>(
+            p_anchorVID);
     return ErrorCode::Success;
 }
 
@@ -10198,6 +10712,783 @@ void Index<T>::TombstoneTaggedHeads(ExtraWorkSpace* p_workspace,
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
                      "[TaggedUpdate] failed to restore posting state while rolling back split heads.\n");
     }
+}
+
+template <typename T>
+ErrorCode Index<T>::DecodeLimitedPosting(
+    const TaggedPostingSnapshot& p_snapshot,
+    std::vector<LimitedPostingRecord>& p_hRecords,
+    std::vector<LimitedPostingRecord>& p_oRecords)
+{
+    p_hRecords.clear();
+    p_oRecords.clear();
+    if (m_extraSearcher == nullptr ||
+        m_options.m_numTagsPerVec <= 0 ||
+        m_options.m_limitedTagColumn < 0 ||
+        m_options.m_limitedTagColumn >=
+            m_options.m_numTagsPerVec) {
+        return ErrorCode::Fail;
+    }
+
+    const int stride =
+        m_extraSearcher->GetTaggedRecordSize();
+    const size_t metadataBytes =
+        sizeof(SizeType) + sizeof(std::uint8_t) +
+        static_cast<size_t>(
+            m_options.m_numTagsPerVec) *
+            sizeof(std::uint32_t);
+    const size_t expectedStride =
+        metadataBytes +
+        static_cast<size_t>(m_options.m_dim) *
+            sizeof(T);
+    if (stride <= 0 ||
+        static_cast<size_t>(stride) != expectedStride ||
+        p_snapshot.m_records.size() %
+                static_cast<size_t>(stride) !=
+            0) {
+        return ErrorCode::Posting_SizeError;
+    }
+    const int recordCount = static_cast<int>(
+        p_snapshot.m_records.size() /
+        static_cast<size_t>(stride));
+    if (p_snapshot.m_pureCount < 0 ||
+        p_snapshot.m_pureCount > recordCount) {
+        return ErrorCode::Posting_SizeError;
+    }
+
+    std::unordered_set<SizeType> seenH;
+    std::unordered_set<SizeType> seenO;
+    p_hRecords.reserve(
+        static_cast<size_t>(p_snapshot.m_pureCount));
+    p_oRecords.reserve(
+        static_cast<size_t>(
+            recordCount - p_snapshot.m_pureCount));
+    for (int record = 0; record < recordCount;
+         ++record) {
+        const char* bytes =
+            p_snapshot.m_records.data() +
+            static_cast<size_t>(record) *
+                static_cast<size_t>(stride);
+        SizeType vid = -1;
+        std::uint8_t version = 0;
+        std::memcpy(&vid, bytes, sizeof(vid));
+        std::memcpy(
+            &version, bytes + sizeof(vid),
+            sizeof(version));
+        if (vid < 0 || vid >= m_versionMap.Count()) {
+            return ErrorCode::Posting_SizeError;
+        }
+        if (m_versionMap.Deleted(vid) ||
+            m_versionMap.GetVersion(vid) != version) {
+            continue;
+        }
+
+        auto& seen =
+            record < p_snapshot.m_pureCount
+                ? seenH
+                : seenO;
+        if (!seen.insert(vid).second) continue;
+        const auto* attributes =
+            reinterpret_cast<const std::uint32_t*>(
+                bytes + sizeof(SizeType) +
+                sizeof(std::uint8_t));
+        const std::uint32_t keyTag =
+            attributes[m_options.m_limitedTagColumn];
+        if (keyTag == LimitedTagSupport::EmptyTag) {
+            return ErrorCode::Fail;
+        }
+
+        LimitedPostingRecord live;
+        live.m_vid = vid;
+        live.m_keyTag = keyTag;
+        live.m_attributes.assign(
+            attributes,
+            attributes + m_options.m_numTagsPerVec);
+        live.m_record.assign(
+            bytes, static_cast<size_t>(stride));
+        (record < p_snapshot.m_pureCount
+             ? p_hRecords
+             : p_oRecords)
+            .emplace_back(std::move(live));
+    }
+    return ErrorCode::Success;
+}
+
+template <typename T>
+ErrorCode Index<T>::SplitLimitedTagPosting(
+    ExtraWorkSpace* p_workspace,
+    SizeType p_headID,
+    int p_pendingCount,
+    bool& p_topologyChanged)
+{
+    p_topologyChanged = false;
+    if (p_workspace == nullptr ||
+        m_extraSearcher == nullptr ||
+        !HasMutableLimitedTagLayout() ||
+        p_pendingCount < 0 ||
+        !m_limitedTagSupport.IsActiveHead(p_headID)) {
+        return ErrorCode::Fail;
+    }
+
+    TaggedHeadLocation location;
+    ErrorCode ret =
+        GetTaggedHeadLocation(p_headID, location);
+    if (ret != ErrorCode::Success) return ret;
+    std::shared_ptr<VectorIndex> graph =
+        location.m_bundleSlot < 0
+            ? m_index
+            : m_loadedHeadBundleIndexes[
+                  static_cast<size_t>(
+                      location.m_bundleSlot)];
+    if (graph == nullptr ||
+        !graph->ContainSample(
+            location.m_localHeadID)) {
+        return ErrorCode::VectorNotFound;
+    }
+
+    TaggedPostingSnapshot source;
+    ret = m_extraSearcher->GetTaggedPostingSnapshot(
+        p_workspace, p_headID, source);
+    if (ret != ErrorCode::Success) return ret;
+    std::vector<LimitedPostingRecord> hRecords;
+    std::vector<LimitedPostingRecord> oRecords;
+    ret = DecodeLimitedPosting(
+        source, hRecords, oRecords);
+    if (ret != ErrorCode::Success) return ret;
+
+    const int capacity =
+        m_extraSearcher->GetTaggedPureCapacity();
+    if (capacity <= 0) {
+        return ErrorCode::Posting_OverFlow;
+    }
+    const size_t liveCount =
+        hRecords.size() + oRecords.size();
+    if (hRecords.size() >
+        static_cast<size_t>(capacity)) {
+        return ErrorCode::Posting_OverFlow;
+    }
+    if (oRecords.size() >
+            static_cast<size_t>(
+                (std::numeric_limits<int>::max)()) ||
+        static_cast<size_t>(p_pendingCount) >
+            (std::numeric_limits<size_t>::max)() -
+                oRecords.size()) {
+        return ErrorCode::MemoryOverFlow;
+    }
+
+    const int stride =
+        m_extraSearcher->GetTaggedRecordSize();
+    auto makeCompacted =
+        [&](SizeType p_target) {
+            TaggedPostingSnapshot compacted;
+            compacted.m_headID = p_target;
+            for (const auto& record : hRecords) {
+                compacted.m_records.append(
+                    record.m_record);
+                ++compacted.m_pureCount;
+            }
+            for (const auto& record : oRecords) {
+                compacted.m_records.append(
+                    record.m_record);
+            }
+            return compacted;
+        };
+    if (oRecords.size() +
+            static_cast<size_t>(p_pendingCount) <=
+        static_cast<size_t>(capacity)) {
+        const size_t physicalCount =
+            source.m_records.size() /
+            static_cast<size_t>(stride);
+        if (physicalCount != liveCount) {
+            return m_extraSearcher
+                ->RewriteTaggedPostings(
+                    p_workspace,
+                    {makeCompacted(p_headID)});
+        }
+        return ErrorCode::Success;
+    }
+    if (oRecords.size() < 2) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "[LimitedTagUpdate] posting %d cannot split from only %zu live O records.\n",
+            p_headID, oRecords.size());
+        return ErrorCode::Posting_OverFlow;
+    }
+    const auto& clusterRecords = oRecords;
+
+    const size_t vectorBytes =
+        static_cast<size_t>(m_options.m_dim) *
+        sizeof(T);
+    const size_t metadataBytes =
+        static_cast<size_t>(stride) - vectorBytes;
+    ByteArray clusterVectorBytes =
+        ByteArray::Alloc(
+            clusterRecords.size() *
+                vectorBytes);
+    if (clusterVectorBytes.Data() == nullptr) {
+        return ErrorCode::MemoryOverFlow;
+    }
+    for (size_t i = 0;
+         i < clusterRecords.size(); ++i) {
+        std::memcpy(
+            clusterVectorBytes.Data() +
+                i * vectorBytes,
+            clusterRecords[i].m_record.data() +
+                metadataBytes,
+            vectorBytes);
+    }
+    const SizeType clusterCount =
+        static_cast<SizeType>(
+            clusterRecords.size());
+    COMMON::Dataset<T> samples(
+        clusterCount, m_options.m_dim,
+        (std::max)(
+            static_cast<SizeType>(1),
+            graph->m_iDataBlockSize),
+        (std::max)(
+            clusterCount + 1,
+            graph->m_iDataCapacity),
+        reinterpret_cast<T*>(
+            clusterVectorBytes.Data()),
+        true);
+    std::vector<int> localIndices(
+        static_cast<size_t>(clusterCount));
+    std::iota(
+        localIndices.begin(),
+        localIndices.end(), 0);
+    SPTAG::COMMON::KmeansArgs<T> args(
+        2, samples.C(), clusterCount, 1,
+        graph->GetDistCalcMethod(),
+        graph->m_pQuantizer);
+    std::shuffle(
+        localIndices.begin(),
+        localIndices.end(),
+        std::mt19937(std::random_device()()));
+    const int clusters =
+        SPTAG::COMMON::KmeansClustering(
+            samples, localIndices, 0,
+            clusterCount,
+            args, 1000, 100.0F, false,
+            nullptr);
+    if (clusters != 2 || args.counts[0] == 0 ||
+        args.counts[1] == 0) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "[LimitedTagUpdate] O clustering could not split posting %d (%d, %d).\n",
+            p_headID, args.counts[0],
+            args.counts[1]);
+        return ErrorCode::Posting_OverFlow;
+    }
+
+    std::vector<int> sourceCluster(
+        clusterRecords.size(), -1);
+    int offset = 0;
+    for (int cluster = 0; cluster < 2;
+         ++cluster) {
+        for (int i = 0; i < args.counts[cluster];
+             ++i) {
+            const int index =
+                localIndices[
+                    static_cast<size_t>(
+                        offset + i)];
+            if (index < 0 ||
+                static_cast<size_t>(index) >=
+                    sourceCluster.size()) {
+                return ErrorCode::Fail;
+            }
+            sourceCluster[
+                static_cast<size_t>(index)] =
+                cluster;
+        }
+        offset += args.counts[cluster];
+    }
+
+    const T* oldCenter =
+        reinterpret_cast<const T*>(
+            graph->GetSample(
+                location.m_localHeadID));
+    if (oldCenter == nullptr) {
+        return ErrorCode::Fail;
+    }
+    const float center0Distance =
+        graph->ComputeDistance(
+            args.centers, oldCenter);
+    const float center1Distance =
+        graph->ComputeDistance(
+            args.centers + m_options.m_dim,
+            oldCenter);
+    const int newCluster =
+        center0Distance >= center1Distance ? 0 : 1;
+    const T* newCenter =
+        args.centers +
+        static_cast<size_t>(newCluster) *
+            m_options.m_dim;
+
+    const auto vectorOf =
+        [metadataBytes](
+            const LimitedPostingRecord& p_record) {
+            return reinterpret_cast<const T*>(
+                p_record.m_record.data() +
+                metadataBytes);
+        };
+    std::vector<int> hTarget(
+        hRecords.size(), 0);
+    std::vector<int> oTarget(
+        oRecords.size(), 0);
+    for (size_t i = 0; i < oRecords.size();
+         ++i) {
+        if (sourceCluster[i] < 0) {
+            return ErrorCode::Fail;
+        }
+        oTarget[i] =
+            sourceCluster[i] == newCluster
+                ? 1
+                : 0;
+    }
+    for (size_t i = 0; i < hRecords.size();
+         ++i) {
+        const T* vector =
+            vectorOf(hRecords[i]);
+        hTarget[i] =
+            graph->ComputeDistance(
+                vector, newCenter) <
+                    graph->ComputeDistance(
+                        vector, oldCenter)
+                ? 1
+                : 0;
+    }
+
+    const auto isKnownHeadVID =
+        [&](SizeType p_vid) {
+            if (p_vid == MaxSize || p_vid < 0)
+                return true;
+            std::lock_guard<std::mutex> lock(
+                m_globalHeadVIDToLocalHIDMutex);
+            const auto found =
+                m_globalHeadVIDToLocalHID.find(
+                    p_vid);
+            if (found ==
+                m_globalHeadVIDToLocalHID.end()) {
+                return false;
+            }
+            const SizeType headID = found->second;
+            return headID < 0 ||
+                headID >=
+                    m_limitedTagSupport.HeadCount() ||
+                m_limitedTagSupport.IsActiveHead(
+                    headID);
+        };
+    SizeType anchorVID = -1;
+    std::vector<std::uint32_t> anchorAttributes;
+    const T* anchorVector = nullptr;
+    float anchorDistance = MaxDist;
+    auto considerAnchor =
+        [&](const LimitedPostingRecord& p_record,
+            int p_target) {
+            if (p_target != 1 ||
+                isKnownHeadVID(p_record.m_vid) ||
+                !m_limitedTagSupport.Supports(
+                    p_headID, p_record.m_keyTag)) {
+                return;
+            }
+            const float distance =
+                graph->ComputeDistance(
+                    vectorOf(p_record),
+                    newCenter);
+            if (anchorVID < 0 ||
+                distance < anchorDistance ||
+                (distance == anchorDistance &&
+                 p_record.m_vid < anchorVID)) {
+                anchorVID = p_record.m_vid;
+                anchorAttributes =
+                    p_record.m_attributes;
+                anchorVector =
+                    vectorOf(p_record);
+                anchorDistance = distance;
+            }
+        };
+    for (size_t i = 0; i < oRecords.size();
+         ++i) {
+        considerAnchor(oRecords[i], oTarget[i]);
+    }
+    if (anchorVID < 0 ||
+        anchorVector == nullptr ||
+        anchorAttributes.size() !=
+            static_cast<size_t>(
+                m_options.m_numTagsPerVec)) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "[LimitedTagUpdate] posting %d has no O-region non-head anchor carrying an inherited support tag.\n",
+            p_headID);
+        return ErrorCode::Posting_OverFlow;
+    }
+
+    const auto rebalanceRegion =
+        [&](const std::vector<
+                LimitedPostingRecord>& p_records,
+            std::vector<int>& p_targets) {
+            std::array<int, 2> load = {0, 0};
+            for (size_t i = 0;
+                 i < p_records.size(); ++i) {
+                if (p_records[i].m_vid != anchorVID) {
+                    ++load[static_cast<size_t>(
+                        p_targets[i])];
+                }
+            }
+            if (load[0] + load[1] >
+                capacity * 2) {
+                return false;
+            }
+            for (int from = 0; from < 2; ++from) {
+                const int to = 1 - from;
+                std::vector<
+                    std::pair<float, size_t>>
+                    moves;
+                for (size_t i = 0;
+                     i < p_records.size(); ++i) {
+                    if (p_targets[i] != from ||
+                        p_records[i].m_vid ==
+                           anchorVID) {
+                        continue;
+                    }
+                    const T* vector =
+                        vectorOf(p_records[i]);
+                    const float oldDistance =
+                        graph->ComputeDistance(
+                           vector, oldCenter);
+                    const float newDistance =
+                        graph->ComputeDistance(
+                           vector, newCenter);
+                    moves.emplace_back(
+                        from == 0
+                           ? newDistance -
+                                 oldDistance
+                           : oldDistance -
+                                 newDistance,
+                        i);
+                }
+                std::sort(
+                    moves.begin(), moves.end(),
+                    [](const auto& p_left,
+                       const auto& p_right) {
+                        if (p_left.first !=
+                           p_right.first) {
+                           return p_left.first <
+                               p_right.first;
+                        }
+                        return p_left.second <
+                           p_right.second;
+                    });
+                for (const auto& move : moves) {
+                    if (load[from] <= capacity ||
+                        load[to] >= capacity) {
+                        break;
+                    }
+                    p_targets[move.second] = to;
+                    --load[from];
+                    ++load[to];
+                }
+            }
+            return load[0] <= capacity &&
+                load[1] <= capacity;
+        };
+    if (!rebalanceRegion(hRecords, hTarget) ||
+        !rebalanceRegion(oRecords, oTarget)) {
+        return ErrorCode::Posting_OverFlow;
+    }
+
+    std::array<TaggedPostingSnapshot, 2>
+        rewrites;
+    rewrites[0].m_headID = p_headID;
+    for (size_t i = 0; i < hRecords.size();
+         ++i) {
+        if (hRecords[i].m_vid == anchorVID)
+            continue;
+        auto& rewrite =
+            rewrites[static_cast<size_t>(
+                hTarget[i])];
+        rewrite.m_records.append(
+            hRecords[i].m_record);
+        ++rewrite.m_pureCount;
+    }
+    for (size_t i = 0; i < oRecords.size();
+         ++i) {
+        if (oRecords[i].m_vid == anchorVID)
+            continue;
+        rewrites[static_cast<size_t>(
+                     oTarget[i])]
+            .m_records.append(
+                oRecords[i].m_record);
+    }
+
+    std::vector<std::uint32_t> inheritedTags =
+        m_limitedTagSupport.HeadTags(p_headID);
+    const std::uint32_t anchorTag =
+        anchorAttributes[
+            static_cast<size_t>(
+                m_options.m_limitedTagColumn)];
+    const auto anchorTagIt = std::find(
+        inheritedTags.begin(),
+        inheritedTags.end(), anchorTag);
+    if (anchorTagIt == inheritedTags.end()) {
+        return ErrorCode::Fail;
+    }
+    std::rotate(
+        inheritedTags.begin(), anchorTagIt,
+        anchorTagIt + 1);
+
+    if (!m_limitedTagSupport
+             .PrepareRuntimeAppendHead(
+                 inheritedTags,
+                 anchorAttributes.data(),
+                 m_options.m_numTagsPerVec) ||
+        !m_limitedTagSupport
+             .PrepareRuntimeTombstoneHead()) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "[LimitedTagUpdate] cannot reserve one transactional support row for split.\n");
+        return ErrorCode::MemoryOverFlow;
+    }
+
+    const SizeType expectedHeadID =
+        m_limitedTagSupport.HeadCount();
+    SizeType newHeadID = -1;
+    ret = AddTaggedHeadToBundle(
+        location.m_bundleSlot, anchorVector,
+        anchorVID, p_headID, newHeadID);
+    if (ret != ErrorCode::Success) {
+        if (newHeadID == expectedHeadID) {
+            TombstoneTaggedHeads(
+                p_workspace, {newHeadID});
+            if (!m_limitedTagSupport
+                     .AppendPreparedRuntimeTombstoneHead()) {
+                return ErrorCode::Fail;
+            }
+        }
+        return ret;
+    }
+    if (newHeadID != expectedHeadID) {
+        TombstoneTaggedHeads(
+            p_workspace, {newHeadID},
+            &source);
+        m_limitedTagSupport
+            .AppendPreparedRuntimeTombstoneHead();
+        return ErrorCode::Fail;
+    }
+    if (!m_limitedTagSupport
+             .AppendPreparedRuntimeHead(
+                 inheritedTags,
+                 anchorAttributes.data(),
+                 m_options.m_numTagsPerVec)) {
+        TombstoneTaggedHeads(
+            p_workspace, {newHeadID},
+            &source);
+        m_limitedTagSupport
+            .AppendPreparedRuntimeTombstoneHead();
+        return ErrorCode::Fail;
+    }
+    rewrites[1].m_headID = newHeadID;
+    ret = m_extraSearcher
+        ->RewriteTaggedPostings(
+            p_workspace,
+            {rewrites[0], rewrites[1]});
+    if (ret != ErrorCode::Success) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "[LimitedTagUpdate] split rewrite for heads %d/%d failed with error %d (records %zu/%zu, pure %d/%d, capacity %d).\n",
+            p_headID, newHeadID,
+            static_cast<int>(ret),
+            rewrites[0].m_records.size() /
+                static_cast<size_t>(stride),
+            rewrites[1].m_records.size() /
+                static_cast<size_t>(stride),
+            rewrites[0].m_pureCount,
+            rewrites[1].m_pureCount,
+            capacity);
+        TombstoneTaggedHeads(
+            p_workspace, {newHeadID},
+            &source);
+        m_limitedTagSupport
+            .TombstoneRuntimeHead(newHeadID);
+        return ret;
+    }
+
+    std::uint8_t newVersion = 0;
+    if (!m_versionMap.IncVersion(
+            anchorVID, &newVersion)) {
+        TombstoneTaggedHeads(
+            p_workspace, {newHeadID},
+            &source);
+        m_limitedTagSupport
+            .TombstoneRuntimeHead(newHeadID);
+        return ErrorCode::Fail;
+    }
+    p_topologyChanged = true;
+    return ErrorCode::Success;
+}
+
+template <typename T>
+ErrorCode Index<T>::EnsureLimitedTagCapacity(
+    ExtraWorkSpace* p_workspace,
+    const PostingUpdateTargets& p_targets,
+    bool& p_topologyChanged,
+    bool& p_checkpointStarted,
+    const std::string& p_checkpointBaseDir)
+{
+    p_topologyChanged = false;
+    if (p_workspace == nullptr ||
+        m_extraSearcher == nullptr) {
+        return ErrorCode::Fail;
+    }
+    const int capacity =
+        m_extraSearcher->GetTaggedPureCapacity();
+    const int stride =
+        m_extraSearcher->GetTaggedRecordSize();
+    if (capacity <= 0 || stride <= 0) {
+        return ErrorCode::Posting_OverFlow;
+    }
+    const auto beginCheckpoint =
+        [&]() -> ErrorCode {
+            if (p_checkpointStarted) {
+                return ErrorCode::Success;
+            }
+            const ErrorCode markerStatus =
+                m_extraSearcher
+                    ->BeginLimitedTagCheckpoint(
+                        p_checkpointBaseDir);
+            if (markerStatus ==
+                ErrorCode::Success) {
+                p_checkpointStarted = true;
+            }
+            return markerStatus;
+        };
+
+    struct PendingRegions
+    {
+        int m_h = 0;
+        int m_o = 0;
+    };
+    std::map<SizeType, PendingRegions> pending;
+    for (const auto& vectorTargets : p_targets) {
+        for (const auto& target : vectorTargets) {
+            if (target.m_kind !=
+                    PostingUpdateKind::LimitedH &&
+                target.m_kind !=
+                    PostingUpdateKind::LimitedO) {
+                return ErrorCode::Fail;
+            }
+            if (target.m_headID < 0) {
+                return ErrorCode::MemoryOverFlow;
+            }
+            int& count =
+                target.m_kind ==
+                        PostingUpdateKind::LimitedH
+                    ? pending[target.m_headID].m_h
+                    : pending[target.m_headID].m_o;
+            if (count ==
+                (std::numeric_limits<int>::max)()) {
+                return ErrorCode::MemoryOverFlow;
+            }
+            ++count;
+        }
+    }
+
+    struct CapacityState
+    {
+        SizeType m_head = -1;
+        PendingRegions m_pending;
+        size_t m_physicalCount = 0;
+        std::vector<LimitedPostingRecord> m_h;
+        std::vector<LimitedPostingRecord> m_o;
+    };
+    std::vector<CapacityState> states;
+    states.reserve(pending.size());
+    for (const auto& entry : pending) {
+        TaggedPostingSnapshot snapshot;
+        ErrorCode ret =
+            m_extraSearcher
+                ->GetTaggedPostingSnapshot(
+                    p_workspace, entry.first,
+                    snapshot);
+        if (ret != ErrorCode::Success)
+            return ret;
+        if (snapshot.m_records.size() %
+                static_cast<size_t>(stride) !=
+            0) {
+            return ErrorCode::Posting_SizeError;
+        }
+        CapacityState state;
+        state.m_head = entry.first;
+        state.m_pending = entry.second;
+        state.m_physicalCount =
+            snapshot.m_records.size() /
+            static_cast<size_t>(stride);
+        ret = DecodeLimitedPosting(
+            snapshot, state.m_h, state.m_o);
+        if (ret != ErrorCode::Success)
+            return ret;
+        states.emplace_back(std::move(state));
+    }
+
+    const auto oFits =
+        [capacity](const CapacityState& p_state) {
+            return p_state.m_o.size() <=
+                    static_cast<size_t>(capacity) &&
+                static_cast<size_t>(
+                    p_state.m_pending.m_o) <=
+                    static_cast<size_t>(capacity) -
+                        p_state.m_o.size();
+        };
+    for (const auto& state : states) {
+        if (oFits(state)) continue;
+        ErrorCode ret = beginCheckpoint();
+        if (ret != ErrorCode::Success) {
+            return ret;
+        }
+        ret = SplitLimitedTagPosting(
+            p_workspace, state.m_head,
+            state.m_pending.m_o,
+            p_topologyChanged);
+        if (ret != ErrorCode::Success ||
+            p_topologyChanged) {
+            return ret;
+        }
+    }
+
+    for (const auto& state : states) {
+        if (state.m_h.size() >
+                static_cast<size_t>(capacity) ||
+            static_cast<size_t>(
+                state.m_pending.m_h) >
+                static_cast<size_t>(capacity) -
+                    state.m_h.size()) {
+            SPTAGLIB_LOG(
+                Helper::LogLevel::LL_Error,
+                "[LimitedTagUpdate] H region of posting %d exceeds its independent capacity; topology is unchanged.\n",
+                state.m_head);
+            return ErrorCode::Posting_OverFlow;
+        }
+    }
+
+    for (const auto& state : states) {
+        if (state.m_physicalCount ==
+            state.m_h.size() + state.m_o.size()) {
+            continue;
+        }
+        ErrorCode ret = beginCheckpoint();
+        if (ret != ErrorCode::Success) {
+            return ret;
+        }
+        ret = SplitLimitedTagPosting(
+            p_workspace, state.m_head,
+            state.m_pending.m_o,
+            p_topologyChanged);
+        if (ret != ErrorCode::Success ||
+            p_topologyChanged) {
+            return ret;
+        }
+    }
+    return ErrorCode::Success;
 }
 
 template <typename T>
@@ -10577,8 +11868,901 @@ ErrorCode Index<T>::EnsureTaggedPureCapacity(ExtraWorkSpace* p_workspace,
 }
 
 template <typename T>
+ErrorCode Index<T>::SelectLimitedMaintenanceHeads(
+    const T* p_vector,
+    std::uint32_t p_tag,
+    const LimitedTagSupport& p_support,
+    SizeType p_excludedHead,
+    SizeType p_replacementHead,
+    const std::vector<std::uint32_t>*
+        p_replacementTags,
+    std::vector<SizeType>& p_heads)
+{
+    p_heads.clear();
+    if (p_vector == nullptr ||
+        m_options.m_replicaCount <= 0) {
+        return ErrorCode::Fail;
+    }
+
+    struct Candidate
+    {
+        SizeType m_global = -1;
+        SizeType m_local = -1;
+        std::shared_ptr<VectorIndex> m_graph;
+        float m_distance = MaxDist;
+    };
+    std::vector<Candidate> candidates;
+    const auto addCandidate =
+        [&](SizeType head) {
+        if (head == p_excludedHead ||
+            !p_support.IsActiveHead(head)) {
+            return;
+        }
+        for (const auto& candidate : candidates) {
+            if (candidate.m_global == head)
+                return;
+        }
+        TaggedHeadLocation location;
+        if (GetTaggedHeadLocation(
+                head, location) !=
+            ErrorCode::Success) {
+            return;
+        }
+        std::shared_ptr<VectorIndex> graph =
+            location.m_bundleSlot < 0
+                ? m_index
+                : m_loadedHeadBundleIndexes[
+                      static_cast<size_t>(
+                          location.m_bundleSlot)];
+        if (graph == nullptr ||
+            !graph->ContainSample(
+                location.m_localHeadID)) {
+            return;
+        }
+        candidates.push_back(
+            {head, location.m_localHeadID, graph,
+             graph->ComputeDistance(
+                 p_vector,
+                 graph->GetSample(
+                     location.m_localHeadID))});
+    };
+
+    if (p_tag != LimitedTagSupport::EmptyTag) {
+        const auto supportsProspectiveTag =
+            [&](SizeType p_head) {
+            if (p_head == p_excludedHead)
+                return false;
+            if (p_head == p_replacementHead &&
+                p_replacementTags != nullptr) {
+                return std::find(
+                           p_replacementTags->begin(),
+                           p_replacementTags->end(),
+                           p_tag) !=
+                    p_replacementTags->end();
+            }
+            return p_support.Supports(
+                p_head, p_tag);
+        };
+        const auto found =
+            p_support.TagHeads().find(p_tag);
+        if (found != p_support.TagHeads().end()) {
+            candidates.reserve(
+                found->second.size() + 1);
+            for (SizeType head : found->second) {
+                if (supportsProspectiveTag(head))
+                    addCandidate(head);
+            }
+        }
+        if (p_replacementHead >= 0 &&
+            supportsProspectiveTag(
+                p_replacementHead)) {
+            addCandidate(p_replacementHead);
+        }
+    } else {
+        if (m_index == nullptr ||
+            m_index->GetNumSamples() <= 0) {
+            return ErrorCode::Fail;
+        }
+        const int requestCount =
+            (std::min)(
+                static_cast<int>(
+                    m_index->GetNumSamples()),
+                (std::max)(
+                    m_options.m_internalResultNum,
+                    (std::max)(
+                        8,
+                        m_options.m_replicaCount *
+                            4)));
+        COMMON::QueryResultSet<T> results(
+            const_cast<T*>(p_vector),
+            requestCount);
+        const ErrorCode searchRet =
+            m_index->SearchIndexWithResultFilter(
+                results,
+                [&](SizeType p_head) {
+                    return p_head >= 0 &&
+                        p_head != p_excludedHead &&
+                        p_support.IsActiveHead(
+                            p_head);
+                });
+        if (searchRet != ErrorCode::Success)
+            return searchRet;
+        candidates.reserve(
+            static_cast<size_t>(
+                results.GetResultNum()));
+        for (int result = 0;
+             result < results.GetResultNum();
+             ++result) {
+            const BasicResult* candidate =
+                results.GetResult(result);
+            if (candidate != nullptr &&
+                candidate->VID >= 0) {
+                addCandidate(candidate->VID);
+            }
+        }
+    }
+    if (candidates.empty()) {
+        return ErrorCode::Fail;
+    }
+    std::sort(
+        candidates.begin(), candidates.end(),
+        [](const Candidate& p_left,
+           const Candidate& p_right) {
+            if (p_left.m_distance !=
+                p_right.m_distance) {
+                return p_left.m_distance <
+                    p_right.m_distance;
+            }
+            return p_left.m_global <
+                p_right.m_global;
+        });
+
+    std::vector<const Candidate*> selected;
+    selected.reserve(
+        static_cast<size_t>(
+            m_options.m_replicaCount));
+    for (const auto& candidate : candidates) {
+        if (selected.size() >=
+            static_cast<size_t>(
+                m_options.m_replicaCount)) {
+            break;
+        }
+        bool rejected = false;
+        for (const Candidate* prior : selected) {
+            if (prior->m_graph.get() !=
+                candidate.m_graph.get()) {
+                continue;
+            }
+            const float headDistance =
+                candidate.m_graph->ComputeDistance(
+                    candidate.m_graph->GetSample(
+                        candidate.m_local),
+                    prior->m_graph->GetSample(
+                        prior->m_local));
+            if (m_options.m_rngFactor *
+                    headDistance <=
+                candidate.m_distance) {
+                rejected = true;
+                break;
+            }
+        }
+        if (!rejected) {
+            selected.push_back(&candidate);
+            p_heads.push_back(
+                candidate.m_global);
+        }
+    }
+    if (p_heads.empty() && !candidates.empty()) {
+        p_heads.push_back(
+            candidates.front().m_global);
+    }
+    return p_heads.empty()
+        ? ErrorCode::Fail
+        : ErrorCode::Success;
+}
+
+template <typename T>
+ErrorCode Index<T>::MergeLimitedTagPosting(
+    ExtraWorkSpace* p_workspace,
+    SizeType p_headID)
+{
+    if (p_workspace == nullptr ||
+        m_extraSearcher == nullptr ||
+        !HasMutableLimitedTagLayout()) {
+        return ErrorCode::Fail;
+    }
+    if (p_headID < 0 ||
+        p_headID >=
+            m_limitedTagSupport.HeadCount()) {
+        return ErrorCode::Key_OverFlow;
+    }
+    if (!m_limitedTagSupport.IsActiveHead(
+            p_headID)) {
+        return ErrorCode::Success;
+    }
+    const int stride =
+        m_extraSearcher->GetTaggedRecordSize();
+    const int capacity =
+        m_extraSearcher->GetTaggedPureCapacity();
+    if (stride <= 0 || capacity <= 0) {
+        return ErrorCode::Fail;
+    }
+
+    TaggedHeadLocation currentLocation;
+    ErrorCode ret =
+        GetTaggedHeadLocation(
+            p_headID, currentLocation);
+    if (ret != ErrorCode::Success) return ret;
+    std::shared_ptr<VectorIndex> graph =
+        currentLocation.m_bundleSlot < 0
+            ? m_index
+            : m_loadedHeadBundleIndexes[
+                  static_cast<size_t>(
+                      currentLocation.m_bundleSlot)];
+    if (graph == nullptr ||
+        !graph->ContainSample(
+            currentLocation.m_localHeadID)) {
+        return ErrorCode::VectorNotFound;
+    }
+
+    TaggedPostingSnapshot current;
+    ret = m_extraSearcher
+        ->GetTaggedPostingSnapshot(
+            p_workspace, p_headID, current);
+    if (ret != ErrorCode::Success) return ret;
+    std::vector<LimitedPostingRecord> currentH;
+    std::vector<LimitedPostingRecord> currentO;
+    ret = DecodeLimitedPosting(
+        current, currentH, currentO);
+    if (ret != ErrorCode::Success) return ret;
+
+    const auto compact =
+        [](SizeType p_head,
+           const std::vector<
+               LimitedPostingRecord>& p_h,
+           const std::vector<
+               LimitedPostingRecord>& p_o) {
+            TaggedPostingSnapshot snapshot;
+            snapshot.m_headID = p_head;
+            for (const auto& record : p_h) {
+                snapshot.m_records.append(
+                    record.m_record);
+                ++snapshot.m_pureCount;
+            }
+            for (const auto& record : p_o) {
+                snapshot.m_records.append(
+                    record.m_record);
+            }
+            return snapshot;
+        };
+    const size_t currentPhysical =
+        current.m_records.size() /
+        static_cast<size_t>(stride);
+    if (static_cast<int>(currentO.size()) >
+            m_extraSearcher
+                ->GetTaggedMergeThreshold()) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Info,
+            "[LimitedTagUpdate] merge candidate %d has %zu live O records (threshold %d); compacting without topology change.\n",
+            p_headID, currentO.size(),
+            m_extraSearcher
+                ->GetTaggedMergeThreshold());
+        if (currentPhysical !=
+            currentH.size() + currentO.size()) {
+            return m_extraSearcher
+                ->RewriteTaggedPostings(
+                    p_workspace,
+                    {compact(
+                        p_headID, currentH,
+                        currentO)});
+        }
+        return ErrorCode::Success;
+    }
+
+    COMMON::QueryResultSet<T> nearby(
+        const_cast<T*>(
+            reinterpret_cast<const T*>(
+                graph->GetSample(
+                    currentLocation
+                        .m_localHeadID))),
+        (std::max)(
+            2, m_options.m_internalResultNum));
+    ret = graph->SearchIndex(nearby);
+    if (ret != ErrorCode::Success) return ret;
+
+    SizeType neighborHeadID = -1;
+    SizeType neighborLocalID = -1;
+    TaggedPostingSnapshot neighbor;
+    std::vector<LimitedPostingRecord> neighborH;
+    std::vector<LimitedPostingRecord> neighborO;
+    for (int result = 0;
+         result < nearby.GetResultNum();
+         ++result) {
+        const BasicResult* candidate =
+            nearby.GetResult(result);
+        if (candidate == nullptr ||
+            candidate->VID < 0 ||
+            candidate->VID ==
+                currentLocation.m_localHeadID ||
+            !graph->ContainSample(
+                candidate->VID)) {
+            continue;
+        }
+        SizeType candidateGlobal =
+            candidate->VID;
+        if (currentLocation.m_bundleSlot >= 0) {
+            const auto& localToGlobal =
+                m_headBundleLocalToGlobalHIDs[
+                    static_cast<size_t>(
+                        currentLocation
+                            .m_bundleSlot)];
+            if (static_cast<size_t>(
+                    candidate->VID) >=
+                localToGlobal.size()) {
+                continue;
+            }
+            candidateGlobal =
+                localToGlobal[
+                    static_cast<size_t>(
+                        candidate->VID)];
+        }
+        if (candidateGlobal == p_headID ||
+            !m_limitedTagSupport.IsActiveHead(
+                candidateGlobal)) {
+            continue;
+        }
+
+        TaggedPostingSnapshot candidateSnapshot;
+        ret = m_extraSearcher
+            ->GetTaggedPostingSnapshot(
+                p_workspace, candidateGlobal,
+                candidateSnapshot);
+        if (ret != ErrorCode::Success)
+            return ret;
+        std::vector<LimitedPostingRecord>
+            candidateH;
+        std::vector<LimitedPostingRecord>
+            candidateO;
+        ret = DecodeLimitedPosting(
+            candidateSnapshot, candidateH,
+            candidateO);
+        if (ret != ErrorCode::Success)
+            return ret;
+        std::unordered_set<SizeType>
+            combinedO;
+        for (const auto& record : currentO)
+            combinedO.insert(record.m_vid);
+        for (const auto& record : candidateO)
+            combinedO.insert(record.m_vid);
+        if (combinedO.size() >
+            static_cast<size_t>(capacity)) {
+            continue;
+        }
+        neighborHeadID = candidateGlobal;
+        neighborLocalID = candidate->VID;
+        neighbor =
+            std::move(candidateSnapshot);
+        neighborH = std::move(candidateH);
+        neighborO = std::move(candidateO);
+        break;
+    }
+    if (neighborHeadID < 0) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Info,
+            "[LimitedTagUpdate] merge candidate %d has no O-capacity-compatible neighbor.\n",
+            p_headID);
+        return ErrorCode::Success;
+    }
+
+    const size_t vectorBytes =
+        static_cast<size_t>(m_options.m_dim) *
+        sizeof(T);
+    const size_t metadataBytes =
+        static_cast<size_t>(stride) -
+        vectorBytes;
+    const auto vectorOf =
+        [metadataBytes](
+            const LimitedPostingRecord& p_record) {
+            return reinterpret_cast<const T*>(
+                p_record.m_record.data() +
+                metadataBytes);
+        };
+    const bool currentSurvives =
+        currentO.size() > neighborO.size() ||
+        (currentO.size() == neighborO.size() &&
+         p_headID < neighborHeadID);
+    const SizeType survivorHeadID =
+        currentSurvives ? p_headID
+                        : neighborHeadID;
+    const SizeType loserHeadID =
+        currentSurvives ? neighborHeadID
+                        : p_headID;
+    const SizeType loserLocalID =
+        currentSurvives
+            ? neighborLocalID
+            : currentLocation.m_localHeadID;
+    const T* loserCenter =
+        reinterpret_cast<const T*>(
+            graph->GetSample(loserLocalID));
+    if (loserCenter == nullptr) {
+        return ErrorCode::Fail;
+    }
+    const std::vector<std::uint32_t>
+        selectedTags =
+            m_limitedTagSupport.HeadTags(
+                survivorHeadID);
+    const std::uint32_t* survivorAttributes =
+        m_limitedTagSupport.HeadAttributes(
+            survivorHeadID);
+    if (survivorAttributes == nullptr) {
+        return ErrorCode::Fail;
+    }
+    if (!m_limitedTagSupport
+             .PrepareRuntimeReplaceAndTombstone(
+                 survivorHeadID, selectedTags,
+                 survivorAttributes,
+                 m_options.m_numTagsPerVec,
+                 loserHeadID)) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Warning,
+            "[LimitedTagUpdate] merge %d/%d cannot reserve a valid support transaction.\n",
+            p_headID, neighborHeadID);
+        return ErrorCode::Success;
+    }
+
+    std::vector<LimitedPostingRecord>
+        affectedH;
+    std::unordered_set<SizeType> seenH;
+    const auto addAffectedH =
+        [&](const LimitedPostingRecord& p_record) {
+            if (seenH.insert(p_record.m_vid).second)
+                affectedH.push_back(p_record);
+        };
+    const auto& loserH =
+        currentSurvives ? neighborH : currentH;
+    const auto& survivorH =
+        currentSurvives ? currentH : neighborH;
+    for (const auto& record : loserH)
+        addAffectedH(record);
+
+    std::vector<LimitedPostingRecord> reassignedO;
+    std::unordered_set<SizeType> seenO;
+    const auto addReassignedO =
+        [&](const LimitedPostingRecord& p_record) {
+            if (seenO.insert(p_record.m_vid).second)
+                reassignedO.push_back(p_record);
+        };
+    const auto& loserO =
+        currentSurvives ? neighborO : currentO;
+    const auto& survivorO =
+        currentSurvives ? currentO : neighborO;
+    for (const auto& record : loserO)
+        addReassignedO(record);
+
+    const std::uint64_t loserAnchorRaw =
+        *(m_vectorTranslateMap[loserHeadID]);
+    const bool hasLoserAnchor =
+        loserAnchorRaw !=
+            static_cast<std::uint64_t>(
+                MaxSize) &&
+        loserAnchorRaw <=
+            static_cast<std::uint64_t>(
+                (std::numeric_limits<
+                    SizeType>::max)());
+    SizeType demotedAnchorVID = -1;
+    if (hasLoserAnchor) {
+        const SizeType loserAnchor =
+            static_cast<SizeType>(
+                loserAnchorRaw);
+        if (loserAnchor >= 0 &&
+            loserAnchor < m_versionMap.Count() &&
+            !m_versionMap.Deleted(
+                loserAnchor)) {
+            const void* loserAnchorVector =
+                graph->GetSample(loserLocalID);
+            if (loserAnchorVector == nullptr)
+                return ErrorCode::Fail;
+            const std::uint32_t* attributes =
+                m_limitedTagSupport
+                    .HeadAttributes(
+                        loserHeadID);
+            if (attributes == nullptr) {
+                return ErrorCode::Fail;
+            }
+            LimitedPostingRecord demoted;
+            demoted.m_vid = loserAnchor;
+            demoted.m_keyTag =
+                attributes[
+                    m_options
+                        .m_limitedTagColumn];
+            demoted.m_attributes.assign(
+                attributes,
+                attributes +
+                    m_options.m_numTagsPerVec);
+            ret = m_extraSearcher
+                ->SerializeTaggedRecord(
+                    loserAnchor,
+                    loserAnchorVector,
+                    attributes,
+                    m_options.m_numTagsPerVec,
+                    demoted.m_record);
+            if (ret != ErrorCode::Success)
+                return ret;
+            demotedAnchorVID = loserAnchor;
+            addAffectedH(demoted);
+            addReassignedO(demoted);
+        }
+    }
+    std::map<SizeType, TaggedPostingSnapshot>
+        originals;
+    std::map<SizeType, TaggedPostingSnapshot>
+        working;
+    std::unordered_map<
+        SizeType,
+        std::unordered_set<SizeType>>
+        hSeen;
+    std::unordered_map<
+        SizeType,
+        std::unordered_set<SizeType>>
+        oSeen;
+    originals.emplace(p_headID, current);
+    originals.emplace(neighborHeadID, neighbor);
+    TaggedPostingSnapshot survivorRewrite =
+        compact(
+            survivorHeadID, survivorH,
+            survivorO);
+    for (const auto& record : survivorH)
+        hSeen[survivorHeadID].insert(
+            record.m_vid);
+    for (const auto& record : survivorO)
+        oSeen[survivorHeadID].insert(
+            record.m_vid);
+    working.emplace(
+        survivorHeadID,
+        std::move(survivorRewrite));
+    TaggedPostingSnapshot loserRewrite;
+    loserRewrite.m_headID = loserHeadID;
+    working.emplace(
+        loserHeadID,
+        std::move(loserRewrite));
+
+    const auto ensureWorking =
+        [&](SizeType p_head) -> ErrorCode {
+            if (working.find(p_head) !=
+                working.end()) {
+                return ErrorCode::Success;
+            }
+            TaggedPostingSnapshot snapshot;
+            ErrorCode loadRet =
+                m_extraSearcher
+                    ->GetTaggedPostingSnapshot(
+                        p_workspace, p_head,
+                        snapshot);
+            if (loadRet != ErrorCode::Success)
+                return loadRet;
+            std::vector<LimitedPostingRecord> h;
+            std::vector<LimitedPostingRecord> o;
+            loadRet = DecodeLimitedPosting(
+                snapshot, h, o);
+            if (loadRet != ErrorCode::Success)
+                return loadRet;
+            originals.emplace(p_head, snapshot);
+            auto compacted =
+                compact(p_head, h, o);
+            auto& seen = hSeen[p_head];
+            for (const auto& record : h)
+                seen.insert(record.m_vid);
+            auto& seenO = oSeen[p_head];
+            for (const auto& record : o)
+                seenO.insert(record.m_vid);
+            working.emplace(
+                p_head, std::move(compacted));
+            return ErrorCode::Success;
+        };
+
+    std::unordered_map<std::uint32_t, SizeType>
+        directHHeads;
+    const auto findDirectHHead =
+        [&](std::uint32_t p_tag,
+            SizeType& p_head) -> ErrorCode {
+            const auto found =
+                directHHeads.find(p_tag);
+            if (found != directHHeads.end()) {
+                p_head = found->second;
+                return ErrorCode::Success;
+            }
+            std::vector<SizeType> heads;
+            ErrorCode selectRet =
+                SelectLimitedMaintenanceHeads(
+                    loserCenter, p_tag,
+                    m_limitedTagSupport,
+                    loserHeadID, -1, nullptr,
+                    heads);
+            if (selectRet != ErrorCode::Success ||
+                heads.empty()) {
+                return selectRet ==
+                        ErrorCode::Success
+                    ? ErrorCode::Fail
+                    : selectRet;
+            }
+            p_head = heads.front();
+            directHHeads.emplace(p_tag, p_head);
+            return ErrorCode::Success;
+        };
+    const auto distanceToHead =
+        [&](const T* p_vector,
+            SizeType p_head,
+            float& p_distance) -> ErrorCode {
+            TaggedHeadLocation location;
+            ErrorCode distanceRet =
+                GetTaggedHeadLocation(
+                    p_head, location);
+            if (distanceRet !=
+                ErrorCode::Success) {
+                return distanceRet;
+            }
+            std::shared_ptr<VectorIndex>
+                targetGraph =
+                    location.m_bundleSlot < 0
+                ? m_index
+                : m_loadedHeadBundleIndexes[
+                      static_cast<size_t>(
+                          location.m_bundleSlot)];
+            if (targetGraph == nullptr ||
+                !targetGraph->ContainSample(
+                    location.m_localHeadID)) {
+                return ErrorCode::VectorNotFound;
+            }
+            const void* target =
+                targetGraph->GetSample(
+                    location.m_localHeadID);
+            if (target == nullptr) {
+                return ErrorCode::VectorNotFound;
+            }
+            p_distance =
+                targetGraph->ComputeDistance(
+                    p_vector, target);
+            return ErrorCode::Success;
+        };
+    const auto selectMergeTargets =
+        [&](const LimitedPostingRecord& p_record,
+            std::uint32_t p_tag,
+            SizeType p_directHead,
+            bool p_forceReassign,
+            std::vector<SizeType>& p_heads)
+            -> ErrorCode {
+            p_heads.clear();
+            if (!p_forceReassign) {
+                float directDistance = MaxDist;
+                ErrorCode distanceRet =
+                    distanceToHead(
+                        vectorOf(p_record),
+                        p_directHead,
+                        directDistance);
+                if (distanceRet !=
+                    ErrorCode::Success) {
+                    return distanceRet;
+                }
+                const float oldDistance =
+                    graph->ComputeDistance(
+                        vectorOf(p_record),
+                        loserCenter);
+                if (directDistance <=
+                    oldDistance) {
+                    p_heads.push_back(
+                        p_directHead);
+                    return ErrorCode::Success;
+                }
+            }
+
+            std::vector<SizeType> reassigned;
+            ErrorCode selectRet =
+                SelectLimitedMaintenanceHeads(
+                    vectorOf(p_record), p_tag,
+                    m_limitedTagSupport,
+                    loserHeadID, -1, nullptr,
+                    reassigned);
+            if (selectRet != ErrorCode::Success ||
+                reassigned.empty()) {
+                return selectRet ==
+                        ErrorCode::Success
+                    ? ErrorCode::Fail
+                    : selectRet;
+            }
+            if (!p_forceReassign &&
+                std::find(
+                    reassigned.begin(),
+                    reassigned.end(),
+                    p_directHead) !=
+                    reassigned.end()) {
+                p_heads.push_back(p_directHead);
+            } else {
+                p_heads =
+                    std::move(reassigned);
+            }
+            return ErrorCode::Success;
+        };
+
+    for (const auto& record : affectedH) {
+        const bool forceReassign =
+            record.m_vid == demotedAnchorVID;
+        SizeType directHead = -1;
+        if (!forceReassign) {
+            ret = findDirectHHead(
+                record.m_keyTag,
+                directHead);
+            if (ret != ErrorCode::Success) {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Info,
+                    "[LimitedTagUpdate] merge %d/%d has no direct H destination for tag %u.\n",
+                    p_headID, neighborHeadID,
+                    record.m_keyTag);
+                return ErrorCode::Success;
+            }
+        }
+        std::vector<SizeType> targets;
+        ret = selectMergeTargets(
+            record,
+            record.m_keyTag,
+            directHead, forceReassign,
+            targets);
+        if (ret != ErrorCode::Success) {
+            SPTAGLIB_LOG(
+                Helper::LogLevel::LL_Info,
+                "[LimitedTagUpdate] merge %d/%d cannot reassign loser H record %d.\n",
+                p_headID, neighborHeadID,
+                record.m_vid);
+            return ErrorCode::Success;
+        }
+        for (SizeType target : targets) {
+            ret = ensureWorking(target);
+            if (ret != ErrorCode::Success)
+                return ret;
+            auto& seen = hSeen[target];
+            if (!seen.insert(
+                    record.m_vid).second) {
+                continue;
+            }
+            auto& rewrite = working[target];
+            rewrite.m_records.insert(
+                static_cast<size_t>(
+                    rewrite.m_pureCount) *
+                    static_cast<size_t>(stride),
+                record.m_record);
+            ++rewrite.m_pureCount;
+        }
+    }
+
+    for (const auto& record : reassignedO) {
+        const bool forceReassign =
+            record.m_vid == demotedAnchorVID;
+        std::vector<SizeType> targets;
+        ret = selectMergeTargets(
+            record,
+            LimitedTagSupport::EmptyTag,
+            survivorHeadID,
+            forceReassign,
+            targets);
+        if (ret != ErrorCode::Success) {
+            SPTAGLIB_LOG(
+                Helper::LogLevel::LL_Info,
+                "[LimitedTagUpdate] merge %d/%d cannot reassign loser O record %d.\n",
+                p_headID, neighborHeadID,
+                record.m_vid);
+            return ErrorCode::Success;
+        }
+        for (SizeType target : targets) {
+            ret = ensureWorking(target);
+            if (ret != ErrorCode::Success)
+                return ret;
+            auto& seen = oSeen[target];
+            if (!seen.insert(
+                    record.m_vid).second) {
+                continue;
+            }
+            working[target].m_records.append(
+                record.m_record);
+        }
+    }
+
+    std::vector<TaggedPostingSnapshot>
+        rewrites;
+    rewrites.reserve(working.size());
+    for (auto& entry : working) {
+        const size_t total =
+            entry.second.m_records.size() /
+            static_cast<size_t>(stride);
+        if (entry.second.m_records.size() %
+                    static_cast<size_t>(stride) !=
+                0 ||
+            entry.second.m_pureCount < 0 ||
+            static_cast<size_t>(
+                entry.second.m_pureCount) >
+                total ||
+            static_cast<size_t>(
+                entry.second.m_pureCount) >
+                static_cast<size_t>(capacity) ||
+            total -
+                    static_cast<size_t>(
+                        entry.second.m_pureCount) >
+                static_cast<size_t>(
+                    capacity)) {
+            SPTAGLIB_LOG(
+                Helper::LogLevel::LL_Info,
+                "[LimitedTagUpdate] merge %d/%d would overflow H or O region %d; keeping both heads.\n",
+                p_headID, neighborHeadID,
+                entry.first);
+            return ErrorCode::Success;
+        }
+        rewrites.push_back(
+            std::move(entry.second));
+    }
+
+    const std::string mutableBaseDir =
+        m_options.m_recovery
+            ? m_options.m_persistentBufferPath
+            : m_options.m_indexDirectory;
+    ret = m_extraSearcher
+              ->BeginLimitedTagCheckpoint(
+                  mutableBaseDir);
+    if (ret != ErrorCode::Success) return ret;
+    ret = MarkCrossEdgesDirty();
+    if (ret != ErrorCode::Success) return ret;
+    ret = m_extraSearcher
+        ->RewriteTaggedPostings(
+            p_workspace, rewrites);
+    if (ret != ErrorCode::Success) return ret;
+    ret = graph->DeleteIndex(loserLocalID);
+    if (ret != ErrorCode::Success) {
+        std::vector<TaggedPostingSnapshot>
+            rollback;
+        rollback.reserve(originals.size());
+        for (const auto& entry : originals)
+            rollback.push_back(entry.second);
+        const ErrorCode rollbackRet =
+            m_extraSearcher
+                ->RewriteTaggedPostings(
+                    p_workspace, rollback);
+        return rollbackRet == ErrorCode::Success
+            ? ret
+            : rollbackRet;
+    }
+    if (!m_limitedTagSupport
+             .ApplyPreparedRuntimeReplaceAndTombstone(
+                 survivorHeadID, selectedTags,
+                 survivorAttributes,
+                 m_options.m_numTagsPerVec,
+                 loserHeadID)) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "[LimitedTagUpdate] preflighted support transaction changed before commit.\n");
+        return ErrorCode::Fail;
+    }
+    if (hasLoserAnchor) {
+        const SizeType loserAnchor =
+            static_cast<SizeType>(
+                loserAnchorRaw);
+        std::lock_guard<std::mutex> lock(
+            m_globalHeadVIDToLocalHIDMutex);
+        const auto found =
+            m_globalHeadVIDToLocalHID.find(
+                loserAnchor);
+        if (found !=
+                m_globalHeadVIDToLocalHID.end() &&
+            found->second == loserHeadID) {
+            m_globalHeadVIDToLocalHID.erase(found);
+        }
+    }
+    return ErrorCode::Success;
+}
+
+template <typename T>
 ErrorCode Index<T>::MergeTaggedPosting(ExtraWorkSpace* p_workspace, SizeType p_headID)
 {
+    if (HasMutableLimitedTagLayout()) {
+        return MergeLimitedTagPosting(
+            p_workspace, p_headID);
+    }
     if (p_workspace == nullptr || m_extraSearcher == nullptr) return ErrorCode::Fail;
 
     TaggedHeadLocation currentLocation;
@@ -10839,12 +13023,24 @@ ErrorCode Index<T>::AddIndexWithTags(const void* p_data, SizeType p_vectorNum,
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "[TaggedUpdate] only FileIO/KV postings support updates.\n");
         return ErrorCode::Fail;
     }
+    if (IsRecoveredLimitedTagReadOnly()) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "[LimitedTagUpdate] recovered H/O generations are read-only.\n");
+        return ErrorCode::Undefined;
+    }
+    if (!MutableLimitedTagConfigurationIntact()) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "[LimitedTagUpdate] mutable H/O layout identity cannot be changed at runtime.\n");
+        return ErrorCode::Undefined;
+    }
     if (p_data == nullptr || p_tags == nullptr || p_vectorNum <= 0 ||
         p_dimension != GetFeatureDim() || p_numTagsPerVec != m_options.m_numTagsPerVec) {
         return p_dimension != GetFeatureDim() ? ErrorCode::DimensionSizeMismatch : ErrorCode::Fail;
     }
     std::shared_lock<std::shared_timed_mutex> checkpointLock(m_checkPointLock);
-    std::unique_lock<std::mutex> addLock(m_dataAddLock);
+    std::unique_lock<std::recursive_mutex> addLock(m_dataAddLock);
     std::unique_lock<std::shared_timed_mutex> topologyLock(m_headTopologyLock);
 
     std::shared_ptr<VectorSet> vectorSet;
@@ -10878,12 +13074,53 @@ ErrorCode Index<T>::AddIndexWithTags(const void* p_data, SizeType p_vectorNum,
     };
     const bool useBundleRuntime = !m_headBundleNodes.empty() &&
                                   (m_headBundleNodes.size() > 1 || m_metadataOnlyHeadStore);
+    const bool limitedTagInsert =
+        HasMutableLimitedTagLayout();
+    if (limitedTagInsert &&
+        (m_options.m_indexAlgoType != IndexAlgoType::BKT ||
+         m_options.m_tailReplicaCount != 0 ||
+         m_options.m_enableWAL ||
+         m_options.m_selectSecondLevel ||
+         m_options.m_enableExtremeSparseTag ||
+         m_options.m_enablePrimaryHeadBypass ||
+         !m_extraSearcher
+              ->SupportsLimitedTagUpdates() ||
+         !m_extraSearcher
+              ->LimitedTagPostingRegionsReady() ||
+         m_limitedTagSupport.HeadCount() <= 0 ||
+         m_limitedTagSupport.KeyColumn() !=
+             m_options.m_limitedTagColumn ||
+         m_limitedTagSupport.AttributeCount() !=
+             p_numTagsPerVec ||
+         m_options.m_limitedTagColumn < 0 ||
+         m_options.m_limitedTagColumn >=
+             p_numTagsPerVec ||
+         m_pQuantizer != nullptr ||
+         !Helper::StrUtils::StrEqualIgnoreCase(
+             m_options.m_postingQuantizer.c_str(),
+             "None") ||
+         (useBundleRuntime &&
+          m_headBundleNodes.size() != 1) ||
+         m_extraSearcher->GetTaggedPostingCount() !=
+             m_limitedTagSupport.HeadCount())) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "[LimitedTagUpdate] insert requires one raw BKT head graph, "
+            "a loaded support table matching every posting, "
+            "a validated H/O readiness generation, TailReplicaCount=0, "
+            "EnableWAL=false, H1-only routing, and a valid key-column tag.\n");
+        return ErrorCode::Fail;
+    }
 
     int routingPivotLevel = -1;
     std::unordered_map<std::uint32_t, std::vector<int>> tagToNodes;
-    const std::string routingBaseDir = m_options.m_recovery
-        ? m_options.m_persistentBufferPath
-        : m_options.m_indexDirectory;
+    const std::string routingBaseDir =
+        limitedTagInsert &&
+                !m_mutableLimitedTagIndexDirectory.empty()
+            ? m_mutableLimitedTagIndexDirectory
+            : (m_options.m_recovery
+                   ? m_options.m_persistentBufferPath
+                   : m_options.m_indexDirectory);
     if (useBundleRuntime && m_headBundleNodes.size() > 1 &&
         !LoadUpdateRoutingNodes(routingBaseDir, m_options.m_headIndexFolder,
                                 routingPivotLevel, tagToNodes)) {
@@ -10892,8 +13129,10 @@ ErrorCode Index<T>::AddIndexWithTags(const void* p_data, SizeType p_vectorNum,
         return ErrorCode::Fail;
     }
 
-    auto collectCandidates = [&](const T* vector, int bundleSlot, int requestCount,
-                                 std::vector<HeadCandidate>& output) -> ErrorCode {
+    auto collectCandidates =
+        [&](const T* vector, int bundleSlot, int requestCount,
+            std::vector<HeadCandidate>& output,
+            const std::function<bool(SizeType)>* filter) -> ErrorCode {
         std::shared_ptr<VectorIndex> headIndex;
         const std::vector<SizeType>* localToGlobal = nullptr;
         if (bundleSlot >= 0) {
@@ -10915,7 +13154,30 @@ ErrorCode Index<T>::AddIndexWithTags(const void* p_data, SizeType p_vectorNum,
                 reinterpret_cast<const std::uint8_t*>(results.GetTarget()), reconstructed.get());
             results.SetTarget(reinterpret_cast<T*>(reconstructed.get()), headIndex->m_pQuantizer);
         }
-        if (headIndex->SearchIndex(results) != ErrorCode::Success) return ErrorCode::Fail;
+        ErrorCode searchRet = ErrorCode::Success;
+        if (filter == nullptr) {
+            searchRet = headIndex->SearchIndex(results);
+        } else {
+            searchRet = headIndex->SearchIndexWithResultFilter(
+                results,
+                [&](SizeType localHead) {
+                    if (localHead < 0 ||
+                        (localToGlobal != nullptr &&
+                         static_cast<size_t>(localHead) >=
+                             localToGlobal->size())) {
+                        return false;
+                    }
+                    const SizeType globalHead =
+                        localToGlobal == nullptr
+                        ? localHead
+                        : (*localToGlobal)[
+                              static_cast<size_t>(
+                                  localHead)];
+                    return (*filter)(globalHead);
+                });
+        }
+        if (searchRet != ErrorCode::Success)
+            return searchRet;
         for (int i = 0; i < results.GetResultNum(); ++i) {
             const BasicResult* result = results.GetResult(i);
             if (result == nullptr || result->VID < 0) continue;
@@ -10930,15 +13192,229 @@ ErrorCode Index<T>::AddIndexWithTags(const void* p_data, SizeType p_vectorNum,
         return ErrorCode::Success;
     };
 
+    auto selectRNGHeads =
+        [&](const std::vector<HeadCandidate>& candidates,
+            int replicaCount, bool rejectEqual,
+            std::vector<HeadCandidate>& selected) -> ErrorCode {
+        selected.clear();
+        for (const HeadCandidate& candidate : candidates) {
+            if (static_cast<int>(selected.size()) >= replicaCount)
+                break;
+            bool duplicate = false;
+            for (const HeadCandidate& existing : selected) {
+                if (existing.global == candidate.global) {
+                    duplicate = true;
+                    break;
+                }
+                if (candidate.bundleSlot !=
+                    existing.bundleSlot) {
+                    continue;
+                }
+                const std::shared_ptr<VectorIndex>&
+                    headIndex =
+                        candidate.bundleSlot < 0
+                        ? m_index
+                        : m_loadedHeadBundleIndexes[
+                              static_cast<size_t>(
+                                  candidate.bundleSlot)];
+                if (headIndex == nullptr ||
+                    candidate.local < 0 ||
+                    existing.local < 0 ||
+                    !headIndex->ContainSample(
+                        candidate.local) ||
+                    !headIndex->ContainSample(
+                        existing.local)) {
+                    return ErrorCode::Fail;
+                }
+                const float headDistance =
+                    headIndex->ComputeDistance(
+                        headIndex->GetSample(
+                            candidate.local),
+                        headIndex->GetSample(
+                            existing.local));
+                const float threshold =
+                    m_options.m_rngFactor *
+                    headDistance;
+                if (rejectEqual
+                        ? threshold <= candidate.distance
+                        : threshold < candidate.distance) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) selected.push_back(candidate);
+        }
+        return ErrorCode::Success;
+    };
+
     const int pureRequestCount = std::max(m_options.m_internalResultNum,
                                           std::max(8, m_options.m_replicaCount * 4));
     const int tailRequestCount = std::max(m_options.m_internalResultNum,
                                           std::max(8, m_options.m_tailReplicaCount * 4));
+    const int limitedRequestCount =
+        (std::max)(1, m_options.m_internalResultNum);
     auto buildPlans = [&](PostingUpdateTargets& p_plans) -> ErrorCode {
         p_plans.assign(static_cast<size_t>(p_vectorNum), {});
         for (SizeType vectorOffset = 0; vectorOffset < p_vectorNum; ++vectorOffset) {
             const std::uint32_t* tags =
                 p_tags + static_cast<size_t>(vectorOffset) * static_cast<size_t>(p_numTagsPerVec);
+            const T* vector =
+                reinterpret_cast<const T*>(
+                    vectorSet->GetVector(vectorOffset));
+            if (limitedTagInsert) {
+                const int bundleSlot =
+                    useBundleRuntime ? 0 : -1;
+                const std::uint32_t keyTag =
+                    tags[m_options.m_limitedTagColumn];
+                if (keyTag ==
+                    LimitedTagSupport::EmptyTag) {
+                    return ErrorCode::Fail;
+                }
+
+                std::vector<HeadCandidate>
+                    originalCandidates;
+                ErrorCode ret = collectCandidates(
+                    vector, bundleSlot,
+                    limitedRequestCount,
+                    originalCandidates, nullptr);
+                if (ret != ErrorCode::Success)
+                    return ret;
+                std::sort(
+                    originalCandidates.begin(),
+                    originalCandidates.end(),
+                    [](const HeadCandidate& left,
+                       const HeadCandidate& right) {
+                        if (left.distance !=
+                            right.distance)
+                            return left.distance <
+                                right.distance;
+                        return left.global <
+                            right.global;
+                    });
+                std::vector<HeadCandidate>
+                    originalHeads;
+                ret = selectRNGHeads(
+                    originalCandidates,
+                    m_options.m_replicaCount,
+                    false, originalHeads);
+                if (ret != ErrorCode::Success ||
+                    originalHeads.empty()) {
+                    return ret == ErrorCode::Success
+                        ? ErrorCode::Fail
+                        : ret;
+                }
+
+                const std::function<bool(SizeType)>
+                    supportsTag =
+                        [&](SizeType head) {
+                            return m_limitedTagSupport
+                                .Supports(head, keyTag);
+                        };
+                std::vector<HeadCandidate>
+                    limitedCandidates;
+                ret = collectCandidates(
+                    vector, bundleSlot,
+                    limitedRequestCount,
+                    limitedCandidates,
+                    &supportsTag);
+                if (ret != ErrorCode::Success)
+                    return ret;
+                std::sort(
+                    limitedCandidates.begin(),
+                    limitedCandidates.end(),
+                    [](const HeadCandidate& left,
+                       const HeadCandidate& right) {
+                        if (left.distance !=
+                            right.distance)
+                            return left.distance <
+                                right.distance;
+                        return left.global <
+                            right.global;
+                    });
+                std::vector<HeadCandidate>
+                    limitedHeads;
+                ret = selectRNGHeads(
+                    limitedCandidates,
+                    m_options.m_replicaCount,
+                    true, limitedHeads);
+                if (ret != ErrorCode::Success)
+                    return ret;
+
+                if (limitedHeads.empty()) {
+                    const auto supported =
+                        m_limitedTagSupport
+                            .TagHeads()
+                            .find(keyTag);
+                    if (supported ==
+                        m_limitedTagSupport
+                            .TagHeads()
+                            .end()) {
+                        return ErrorCode::Fail;
+                    }
+                    HeadCandidate closest;
+                    for (SizeType head :
+                         supported->second) {
+                        TaggedHeadLocation location;
+                        ret = GetTaggedHeadLocation(
+                            head, location);
+                        if (ret !=
+                                ErrorCode::Success ||
+                            location.m_bundleSlot !=
+                                bundleSlot) {
+                            continue;
+                        }
+                        const std::shared_ptr<
+                            VectorIndex>& headIndex =
+                                bundleSlot < 0
+                                ? m_index
+                                : m_loadedHeadBundleIndexes[
+                                      static_cast<size_t>(
+                                          bundleSlot)];
+                        const float distance =
+                            headIndex->ComputeDistance(
+                                vector,
+                                headIndex->GetSample(
+                                    location.m_localHeadID));
+                        if (distance <
+                                closest.distance ||
+                            (distance ==
+                                 closest.distance &&
+                             head < closest.global)) {
+                            closest = {
+                                head,
+                                location.m_localHeadID,
+                                bundleSlot,
+                                distance};
+                        }
+                    }
+                    if (closest.global < 0)
+                        return ErrorCode::Fail;
+                    limitedHeads.push_back(
+                        closest);
+                }
+
+                auto& plan =
+                    p_plans[
+                        static_cast<size_t>(
+                            vectorOffset)];
+                plan.reserve(
+                    limitedHeads.size() +
+                    originalHeads.size());
+                for (const HeadCandidate& head :
+                     limitedHeads) {
+                    plan.push_back(
+                        {head.global,
+                         PostingUpdateKind::LimitedH});
+                }
+                for (const HeadCandidate& head :
+                     originalHeads) {
+                    plan.push_back(
+                        {head.global,
+                         PostingUpdateKind::LimitedO});
+                }
+                continue;
+            }
+
             int pureBundleSlot = -1;
             if (useBundleRuntime) {
                 if (m_headBundleNodes.size() == 1) {
@@ -10961,8 +13437,9 @@ ErrorCode Index<T>::AddIndexWithTags(const void* p_data, SizeType p_vectorNum,
 
             std::vector<HeadCandidate> pureCandidates;
             ErrorCode ret = collectCandidates(
-                reinterpret_cast<const T*>(vectorSet->GetVector(vectorOffset)), pureBundleSlot,
-                pureRequestCount, pureCandidates);
+                vector, pureBundleSlot,
+                pureRequestCount, pureCandidates,
+                nullptr);
             if (ret != ErrorCode::Success) return ret;
             std::sort(pureCandidates.begin(), pureCandidates.end(),
                       [](const HeadCandidate& left, const HeadCandidate& right) {
@@ -10970,28 +13447,12 @@ ErrorCode Index<T>::AddIndexWithTags(const void* p_data, SizeType p_vectorNum,
                       });
 
             std::vector<HeadCandidate> pureHeads;
-            for (const HeadCandidate& candidate : pureCandidates) {
-                if (static_cast<int>(pureHeads.size()) >= m_options.m_replicaCount) break;
-                bool duplicate = false;
-                for (const HeadCandidate& existing : pureHeads) {
-                    if (existing.global == candidate.global) {
-                        duplicate = true;
-                        break;
-                    }
-                    if (candidate.bundleSlot == existing.bundleSlot) {
-                        const std::shared_ptr<VectorIndex>& bundleIndex =
-                            candidate.bundleSlot < 0 ? m_index
-                                                    : m_loadedHeadBundleIndexes[static_cast<size_t>(candidate.bundleSlot)];
-                        const float headDistance = bundleIndex->ComputeDistance(
-                            bundleIndex->GetSample(candidate.local), bundleIndex->GetSample(existing.local));
-                        if (m_options.m_rngFactor * headDistance <= candidate.distance) {
-                            duplicate = true;
-                            break;
-                        }
-                    }
-                }
-                if (!duplicate) pureHeads.push_back(candidate);
-            }
+            ret = selectRNGHeads(
+                pureCandidates,
+                m_options.m_replicaCount,
+                true, pureHeads);
+            if (ret != ErrorCode::Success)
+                return ret;
             if (pureHeads.empty()) return ErrorCode::Fail;
             for (const HeadCandidate& head : pureHeads) {
                 p_plans[static_cast<size_t>(vectorOffset)].push_back(
@@ -11001,13 +13462,16 @@ ErrorCode Index<T>::AddIndexWithTags(const void* p_data, SizeType p_vectorNum,
             if (m_options.m_tailReplicaCount <= 0) continue;
             std::vector<HeadCandidate> tailCandidates;
             if (!useBundleRuntime) {
-                ret = collectCandidates(reinterpret_cast<const T*>(vectorSet->GetVector(vectorOffset)), -1,
-                                        tailRequestCount, tailCandidates);
+                ret = collectCandidates(
+                    vector, -1, tailRequestCount,
+                    tailCandidates, nullptr);
                 if (ret != ErrorCode::Success) return ret;
             } else {
                 for (size_t slot = 0; slot < m_headBundleNodes.size(); ++slot) {
-                    ret = collectCandidates(reinterpret_cast<const T*>(vectorSet->GetVector(vectorOffset)),
-                                           static_cast<int>(slot), tailRequestCount, tailCandidates);
+                    ret = collectCandidates(
+                        vector, static_cast<int>(slot),
+                        tailRequestCount, tailCandidates,
+                        nullptr);
                     if (ret != ErrorCode::Success) return ret;
                 }
             }
@@ -11046,14 +13510,6 @@ ErrorCode Index<T>::AddIndexWithTags(const void* p_data, SizeType p_vectorNum,
     ErrorCode planningRet = buildPlans(plans);
     if (planningRet != ErrorCode::Success) return planningRet;
 
-    const SizeType begin = m_versionMap.GetVectorNum();
-    if (begin == 0 || m_versionMap.AddBatch(p_vectorNum) != ErrorCode::Success) {
-        return begin == 0 ? ErrorCode::EmptyIndex : ErrorCode::MemoryOverFlow;
-    }
-    if (m_pMetadata != nullptr) {
-        for (SizeType i = 0; i < p_vectorNum; ++i) m_pMetadata->Add(ByteArray::c_empty);
-    }
-
     auto workSpace = m_workSpaceFactory->GetWorkSpace();
     if (!workSpace) {
         workSpace.reset(new ExtraWorkSpace());
@@ -11064,21 +13520,75 @@ ErrorCode Index<T>::AddIndexWithTags(const void* p_data, SizeType p_vectorNum,
     workSpace->m_deduper.clear();
     workSpace->m_postingIDs.clear();
 
+    if (limitedTagInsert) {
+        bool checkpointStarted = false;
+        for (;;) {
+            const SizeType headsBefore =
+                m_vectorTranslateMap.R();
+            bool topologyChanged = false;
+            const ErrorCode capacityRet =
+                EnsureLimitedTagCapacity(
+                        workSpace.get(), plans,
+                        topologyChanged,
+                        checkpointStarted,
+                        routingBaseDir);
+            if (capacityRet != ErrorCode::Success) {
+                return capacityRet;
+            }
+            if (!topologyChanged) {
+                break;
+            }
+            const SizeType headsAfter =
+                m_vectorTranslateMap.R();
+            if (headsAfter <= headsBefore) {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Error,
+                    "[LimitedTagUpdate] H/O capacity maintenance reported a topology change without appending a head.\n");
+                return ErrorCode::Fail;
+            }
+            const ErrorCode replanRet =
+                buildPlans(plans);
+            if (replanRet != ErrorCode::Success) {
+                return replanRet;
+            }
+        }
+        if (!checkpointStarted) {
+            const ErrorCode markerStatus =
+                m_extraSearcher
+                    ->BeginLimitedTagCheckpoint(
+                        routingBaseDir);
+            if (markerStatus !=
+                ErrorCode::Success) {
+                return markerStatus;
+            }
+        }
+    }
+
+    const SizeType begin = m_versionMap.GetVectorNum();
+    if (begin == 0 || m_versionMap.AddBatch(p_vectorNum) != ErrorCode::Success) {
+        return begin == 0 ? ErrorCode::EmptyIndex : ErrorCode::MemoryOverFlow;
+    }
+    if (m_pMetadata != nullptr) {
+        for (SizeType i = 0; i < p_vectorNum; ++i) m_pMetadata->Add(ByteArray::c_empty);
+    }
+
     // Preserve original SPANN ordering: append the selected records first,
     // then cluster the genuinely overfull posting, including this update.
     ErrorCode ret = m_extraSearcher->AddIndexWithTargets(
         workSpace.get(), vectorSet, plans, p_tags, p_numTagsPerVec, begin);
     if (ret == ErrorCode::Success) {
-        for (int splitRound = 0; splitRound < 64; ++splitRound) {
-            bool topologyChanged = false;
-            ret = EnsureTaggedPureCapacity(
-                workSpace.get(), vectorSet, begin, plans, topologyChanged);
-            if (ret != ErrorCode::Success || !topologyChanged) break;
-            if (splitRound == 63) {
-                SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                             "[TaggedUpdate] pure posting split did not converge after 64 rounds.\n");
-                ret = ErrorCode::Posting_OverFlow;
-                break;
+        if (!limitedTagInsert) {
+            for (int splitRound = 0; splitRound < 64; ++splitRound) {
+                bool topologyChanged = false;
+                ret = EnsureTaggedPureCapacity(
+                    workSpace.get(), vectorSet, begin, plans, topologyChanged);
+                if (ret != ErrorCode::Success || !topologyChanged) break;
+                if (splitRound == 63) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                                 "[TaggedUpdate] pure posting split did not converge after 64 rounds.\n");
+                    ret = ErrorCode::Posting_OverFlow;
+                    break;
+                }
             }
         }
         if (ret == ErrorCode::Success) {
@@ -11164,6 +13674,18 @@ ErrorCode Index<T>::Check()
 
 template <typename T> ErrorCode Index<T>::DeleteIndex(const SizeType &p_id)
 {
+    if (IsRecoveredLimitedTagReadOnly()) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "[LimitedTagUpdate] recovered H/O generations are read-only.\n");
+        return ErrorCode::Undefined;
+    }
+    if (!MutableLimitedTagConfigurationIntact()) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "[LimitedTagUpdate] mutable H/O layout identity cannot be changed at runtime.\n");
+        return ErrorCode::Undefined;
+    }
     std::shared_lock<std::shared_timed_mutex> sharedlock(m_dataDeleteLock);
     // if (m_versionMap.Delete(p_id)) return ErrorCode::Success;
     // return ErrorCode::VectorNotFound;

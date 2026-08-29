@@ -22,6 +22,7 @@
 #include "inc/Helper/StringConvert.h"
 #include "inc/Helper/ThreadPool.h"
 #include "inc/Helper/ConcurrentSet.h"
+#include "inc/Helper/AtomicFile.h"
 #include "inc/Helper/VectorSetReader.h"
 #include "inc/Core/Common/IQuantizer.h"
 
@@ -78,6 +79,7 @@ namespace SPTAG
             virtual std::shared_ptr<VectorIndex> GetMemoryIndex() = 0;
             virtual std::shared_ptr<IExtraSearcher> GetDiskIndex() = 0;
             virtual Options* GetOptions() = 0;
+            virtual bool HasLimitedTagLayout() const = 0;
             virtual SizeType GetGlobalVID(SizeType vid) = 0;
             virtual bool PopulateHeadNodeGlobalVIDsFromBundles() = 0;
             virtual void SetVectorTags(const uint32_t* tags, int numVecs, int numTagsPerVec) = 0;
@@ -161,11 +163,15 @@ namespace SPTAG
             std::unique_ptr<SPTAG::COMMON::IWorkSpaceFactory<ExtraWorkSpace>> m_workSpaceFactory;
 
             Options m_options;
+            bool m_recoveredLimitedTagReadOnly = false;
+            bool m_mutableLimitedTagLayout = false;
+            bool m_mutableLimitedTagRecovery = false;
+            std::string m_mutableLimitedTagIndexDirectory;
 
             std::function<float(const T*, const T*, DimensionType)> m_fComputeDistance;
             int m_iBaseSquare;
 
-            std::mutex m_dataAddLock;
+            std::recursive_mutex m_dataAddLock;
             std::shared_timed_mutex m_dataDeleteLock;
             std::shared_timed_mutex m_checkPointLock;
 
@@ -317,6 +323,83 @@ namespace SPTAG
             }
 
             ErrorCode SaveConfig(std::shared_ptr<Helper::DiskIO> p_configout);
+            ErrorCode PrepareIndexSave(
+                const std::string& p_folderPath) override
+            {
+                if (IsRecoveredLimitedTagReadOnly()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Recovered limited-tag H/O generations are read-only.\n");
+                    return ErrorCode::Undefined;
+                }
+                if (!MutableLimitedTagConfigurationIntact()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Mutable limited-tag H/O layout identity cannot be changed at runtime.\n");
+                    return ErrorCode::Undefined;
+                }
+                if (HasMutableLimitedTagLayout() &&
+                    !IsCurrentIndexDirectory(
+                        p_folderPath)) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Mutable limited-tag H/O indexes do not support cross-directory SaveIndex.\n");
+                    return ErrorCode::Undefined;
+                }
+                return m_extraSearcher == nullptr
+                    ? ErrorCode::Success
+                    : m_extraSearcher
+                          ->BeginLimitedTagCheckpoint(
+                              p_folderPath);
+            }
+
+            ErrorCode AcquireIndexSaveLock(
+                const std::string& p_folderPath) override
+            {
+                if (HasMutableLimitedTagLayout()) {
+                    if (!IsCurrentIndexDirectory(
+                            p_folderPath)) {
+                        return ErrorCode::Undefined;
+                    }
+                    m_checkPointLock.lock();
+                    m_dataAddLock.lock();
+                    m_dataDeleteLock.lock();
+                }
+                return ErrorCode::Success;
+            }
+
+            void ReleaseIndexSaveLock(
+                const std::string&) override
+            {
+                if (HasMutableLimitedTagLayout()) {
+                    m_dataDeleteLock.unlock();
+                    m_dataAddLock.unlock();
+                    m_checkPointLock.unlock();
+                }
+            }
+
+            bool SupportsNonDirectorySave()
+                const override
+            {
+                return
+                    !HasMutableLimitedTagLayout() &&
+                    !IsRecoveredLimitedTagReadOnly();
+            }
+
+            ErrorCode CompleteIndexSave(
+                const std::string& p_folderPath) override
+            {
+                if (HasMutableLimitedTagLayout() &&
+                    !Helper::SyncDirectoryTree(
+                        p_folderPath)) {
+                    return ErrorCode::DiskIOFail;
+                }
+                return m_extraSearcher == nullptr
+                    ? ErrorCode::Success
+                    : m_extraSearcher
+                          ->CommitLimitedTagReadiness(
+                              p_folderPath);
+            }
             ErrorCode SaveIndexData(const std::vector<std::shared_ptr<Helper::DiskIO>>& p_indexStreams);
 
             ErrorCode LoadConfig(Helper::IniReader& p_reader);
@@ -399,7 +482,8 @@ namespace SPTAG
                 int p_graphResultNum,
                 int& p_scannedOut,
                 const std::function<bool(SizeType)>&
-                    p_globalResultFilter = {}) const;
+                    p_globalResultFilter = {},
+                int p_resultFilterMaxCheck = 0) const;
 
             ErrorCode SetParameter(const char* p_param, const char* p_value, const char* p_section = nullptr);
             std::string GetParameter(const char* p_param, const char* p_section = nullptr) const;
@@ -408,6 +492,17 @@ namespace SPTAG
             inline SizeType GetNumDeleted() const { return m_versionMap.GetDeleteCount(); }
             inline bool NeedRefine() const
             {
+                // Limited H/O head and posting IDs are append-only; legacy
+                // compaction cannot preserve their support-row identity.
+                if (IsRecoveredLimitedTagReadOnly()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Recovered limited-tag H/O generations are read-only.\n");
+                    return false;
+                }
+                if (HasMutableLimitedTagLayout()) {
+                    return false;
+                }
                 return m_versionMap.GetDeleteCount() > (size_t)(GetNumSamples() * m_options.m_fDeletePercentageForRefine);
             }
             ErrorCode RefineSearchIndex(QueryResult &p_query, bool p_searchDeleted = false) const { return ErrorCode::Undefined; }
@@ -508,6 +603,95 @@ namespace SPTAG
                 int m_bundleSlot = -1;
                 SizeType m_localHeadID = -1;
             };
+            struct LimitedPostingRecord
+            {
+                SizeType m_vid = -1;
+                std::uint32_t m_keyTag =
+                    LimitedTagSupport::EmptyTag;
+                std::vector<std::uint32_t> m_attributes;
+                std::string m_record;
+            };
+
+            bool IsCurrentIndexDirectory(
+                const std::string& p_path) const
+            {
+                const std::string& currentDirectory =
+                    m_mutableLimitedTagLayout &&
+                            !m_mutableLimitedTagIndexDirectory
+                                 .empty()
+                        ? m_mutableLimitedTagIndexDirectory
+                        : m_options.m_indexDirectory;
+                std::error_code error;
+                if (std::filesystem::equivalent(
+                        p_path,
+                        currentDirectory,
+                        error)) {
+                    return true;
+                }
+                error.clear();
+                const auto target =
+                    std::filesystem::weakly_canonical(
+                        p_path, error);
+                if (error) return false;
+                const auto current =
+                    std::filesystem::weakly_canonical(
+                        currentDirectory,
+                        error);
+                return !error && target == current;
+            }
+
+            void LatchMutableLimitedTagLayout()
+            {
+                if (!m_options
+                         .m_enableLimitedTagPosting ||
+                    m_options.m_storage !=
+                        Storage::FILEIO) {
+                    return;
+                }
+                if (!m_mutableLimitedTagLayout) {
+                    m_mutableLimitedTagRecovery =
+                        m_options.m_recovery;
+                    m_mutableLimitedTagIndexDirectory =
+                        m_options.m_indexDirectory;
+                }
+                m_mutableLimitedTagLayout = true;
+            }
+
+            bool HasMutableLimitedTagLayout() const
+            {
+                return m_mutableLimitedTagLayout ||
+                    (m_options
+                         .m_enableLimitedTagPosting &&
+                     m_options.m_storage ==
+                         Storage::FILEIO);
+            }
+
+            bool HasLimitedTagLayout()
+                const override
+            {
+                return m_mutableLimitedTagLayout ||
+                    m_options
+                        .m_enableLimitedTagPosting;
+            }
+
+            bool MutableLimitedTagConfigurationIntact()
+                const
+            {
+                return !m_mutableLimitedTagLayout ||
+                    (m_options
+                         .m_enableLimitedTagPosting &&
+                     m_options.m_storage ==
+                         Storage::FILEIO &&
+                     m_options.m_recovery ==
+                         m_mutableLimitedTagRecovery &&
+                     IsCurrentIndexDirectory(
+                         m_options.m_indexDirectory));
+            }
+
+            bool IsRecoveredLimitedTagReadOnly() const
+            {
+                return m_recoveredLimitedTagReadOnly;
+            }
 
             bool CheckHeadIndexType();
             void SelectHeadAdjustOptions(Options& p_options, int p_vectorCount);
@@ -535,6 +719,33 @@ namespace SPTAG
             ErrorCode SplitTaggedPosting(ExtraWorkSpace* p_workspace, SizeType p_headID,
                                          const T* p_preferredCenter, SizeType p_preferredVID);
             ErrorCode MergeTaggedPosting(ExtraWorkSpace* p_workspace, SizeType p_headID);
+            ErrorCode DecodeLimitedPosting(
+                const TaggedPostingSnapshot& p_snapshot,
+                std::vector<LimitedPostingRecord>& p_hRecords,
+                std::vector<LimitedPostingRecord>& p_oRecords);
+            ErrorCode SplitLimitedTagPosting(
+                ExtraWorkSpace* p_workspace,
+                SizeType p_headID,
+                int p_pendingCount,
+                bool& p_topologyChanged);
+            ErrorCode SelectLimitedMaintenanceHeads(
+                const T* p_vector,
+                std::uint32_t p_tag,
+                const LimitedTagSupport& p_support,
+                SizeType p_excludedHead,
+                SizeType p_replacementHead,
+                const std::vector<std::uint32_t>*
+                    p_replacementTags,
+                std::vector<SizeType>& p_heads);
+            ErrorCode MergeLimitedTagPosting(
+                ExtraWorkSpace* p_workspace,
+                SizeType p_headID);
+            ErrorCode EnsureLimitedTagCapacity(
+                ExtraWorkSpace* p_workspace,
+                const PostingUpdateTargets& p_targets,
+                bool& p_topologyChanged,
+                bool& p_checkpointStarted,
+                const std::string& p_checkpointBaseDir);
             void TombstoneTaggedHeads(ExtraWorkSpace* p_workspace,
                                       const std::vector<SizeType>& p_headIDs,
                                       const TaggedPostingSnapshot* p_restorePosting = nullptr);
@@ -564,6 +775,18 @@ namespace SPTAG
             void OpenMerge() { m_options.m_inPlace = false; }
 
             void ForceGC() { 
+                if (IsRecoveredLimitedTagReadOnly()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Recovered limited-tag H/O generations are read-only.\n");
+                    return;
+                }
+                if (HasMutableLimitedTagLayout()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Dynamic limited-tag H/O postings do not support legacy ForceGC.\n");
+                    return;
+                }
                 auto workSpace = m_workSpaceFactory->GetWorkSpace();
                 if (!workSpace) {
                     workSpace.reset(new ExtraWorkSpace());
@@ -578,6 +801,18 @@ namespace SPTAG
             }
             
             ErrorCode Checkpoint() {
+                if (IsRecoveredLimitedTagReadOnly()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Recovered limited-tag H/O generations cannot be checkpointed in place.\n");
+                    return ErrorCode::Undefined;
+                }
+                if (!MutableLimitedTagConfigurationIntact()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Mutable limited-tag H/O layout identity cannot be changed at runtime.\n");
+                    return ErrorCode::Undefined;
+                }
                 /** Lock & wait until all jobs done **/
                 while (!AllFinished())
                 {
@@ -588,11 +823,18 @@ namespace SPTAG
                 if (m_options.m_persistentBufferPath == "") return ErrorCode::FailedCreateFile;
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Locking Index\n");
                 std::unique_lock<std::shared_timed_mutex> lock(m_checkPointLock);
-                std::unique_lock<std::mutex> dataLock(m_dataAddLock);
+                std::unique_lock<std::recursive_mutex> dataLock(m_dataAddLock);
+                std::unique_lock<std::shared_timed_mutex> deleteLock(m_dataDeleteLock);
 
                 // Flush block pool states & block mapping states
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Saving storage states\n");
                 ErrorCode ret;
+                if ((ret = m_extraSearcher
+                               ->BeginLimitedTagCheckpoint(
+                                   m_options
+                                       .m_persistentBufferPath)) !=
+                    ErrorCode::Success)
+                    return ret;
                 if ((ret = DrainTaggedMergeMaintenance()) != ErrorCode::Success)
                     return ret;
                 if ((ret = m_extraSearcher->Checkpoint(m_options.m_persistentBufferPath)) != ErrorCode::Success)
@@ -606,12 +848,28 @@ namespace SPTAG
                     return ret;
                 if ((ret = SaveLoadedHeadBundles(m_options.m_persistentBufferPath)) != ErrorCode::Success)
                     return ret;
+                if ((ret = CompleteIndexSave(
+                         m_options
+                             .m_persistentBufferPath)) != ErrorCode::Success)
+                    return ret;
                 return ErrorCode::Success;
             }
 
             ErrorCode AddIndexSPFresh(const void *p_data, SizeType p_vectorNum, DimensionType p_dimension, SizeType* VID) {
                 if (m_options.m_storage == Storage::STATIC || m_extraSearcher == nullptr) {
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Only Support KV Extra Update\n");
+                    return ErrorCode::Fail;
+                }
+                if (IsRecoveredLimitedTagReadOnly()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Recovered limited-tag H/O generations are read-only.\n");
+                    return ErrorCode::Undefined;
+                }
+                if (HasMutableLimitedTagLayout()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Dynamic limited-tag H/O postings require AddIndexWithTags; legacy AddIndexSPFresh is unsupported.\n");
                     return ErrorCode::Fail;
                 }
 
@@ -622,7 +880,7 @@ namespace SPTAG
 
                 SizeType begin;
                 {
-                    std::lock_guard<std::mutex> lock(m_dataAddLock);
+                    std::lock_guard<std::recursive_mutex> lock(m_dataAddLock);
 
                     begin = m_versionMap.GetVectorNum();
 

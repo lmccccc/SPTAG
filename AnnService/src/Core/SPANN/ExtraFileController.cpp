@@ -14,7 +14,12 @@ bool FileIO::BlockController::Initialize(SPANN::Options &p_opt)
     m_maxBlocks = ((std::uint64_t)p_opt.m_maxFileSize) << (30 - PageSizeEx);
     m_batchSize = p_opt.m_spdkBatchSize;
     strcpy(m_filePath, (p_opt.m_indexDirectory + FolderSep + p_opt.m_ssdMappingFile + "_postings").c_str());
-    m_disableCheckpoint = p_opt.m_disableCheckpoint;
+    m_readOnly =
+        p_opt.m_recovery &&
+        p_opt.m_enableLimitedTagPosting;
+    m_disableCheckpoint =
+        p_opt.m_disableCheckpoint ||
+        m_readOnly;
     m_startTime = std::chrono::high_resolution_clock::now();
 
     int numblocks = m_batchSize;
@@ -23,12 +28,17 @@ bool FileIO::BlockController::Initialize(SPANN::Options &p_opt)
         !m_fileHandle->Initialize(
             m_filePath,
 #ifndef _MSC_VER
-            O_RDWR | O_DIRECT, numblocks, 2, 2,
+            (m_readOnly ? O_RDONLY : O_RDWR) |
+                O_DIRECT,
+            numblocks, 2, 2,
             max(p_opt.m_ioThreads, (2 * max(p_opt.m_searchThreadNum, p_opt.m_iSSDNumberOfThreads) +
                                     p_opt.m_insertThreadNum + p_opt.m_reassignThreadNum + p_opt.m_appendThreadNum)),
             ((std::uint64_t)p_opt.m_startFileSize) << 30
 #else
-            GENERIC_READ | GENERIC_WRITE, numblocks, 2, 2,
+            m_readOnly
+                ? GENERIC_READ
+                : GENERIC_READ | GENERIC_WRITE,
+            numblocks, 2, 2,
             (std::uint16_t)(p_opt.m_ioThreads),
             ((std::uint64_t)p_opt.m_startFileSize) << 30
 #endif
@@ -109,6 +119,10 @@ bool FileIO::BlockController::ExpandFile(AddressType blocksToAdd)
 
 bool FileIO::BlockController::GetBlocks(AddressType *p_data, int p_size)
 {
+    if (m_readOnly)
+    {
+        return false;
+    }
     // Trigger expansion if we're below threshold
     if (NeedsExpansion(p_size))
     {
@@ -157,6 +171,10 @@ bool FileIO::BlockController::GetBlocks(AddressType *p_data, int p_size)
 
 bool FileIO::BlockController::ReleaseBlocks(AddressType *p_data, int p_size)
 {
+    if (m_readOnly)
+    {
+        return false;
+    }
     for (int i = 0; i < p_size; i++)
     {
         if (!m_available.Insert(p_data[i]))
@@ -642,6 +660,10 @@ bool FileIO::BlockController::WriteBlocks(AddressType *p_data, int p_size, const
                                           const std::chrono::microseconds &timeout,
                                           std::vector<Helper::AsyncReadRequest> *reqs)
 {
+    if (m_readOnly)
+    {
+        return false;
+    }
     // SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "WriteBlocks to string with blocknum=%d size=%u!\n", p_size,
     // p_value.size());
     AddressType currOffset = 0;
@@ -710,7 +732,7 @@ bool FileIO::BlockController::ShutDown()
     SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "FileIO:BlockController:ShutDown!\n");
     if (!m_disableCheckpoint)
     {
-        Checkpoint(m_filePath);
+        Checkpoint(m_filePath, false);
     }
     while (!m_blockAddresses.empty())
     {

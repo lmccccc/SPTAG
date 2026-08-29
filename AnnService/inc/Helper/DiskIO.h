@@ -159,6 +159,12 @@ namespace SPTAG
 
             virtual void ShutDown() = 0; 
 
+            virtual bool ShutDownAndCheck()
+            {
+                ShutDown();
+                return true;
+            }
+
             virtual bool Available() = 0;
         };
 
@@ -246,7 +252,19 @@ namespace SPTAG
 
             virtual void ShutDown()
             {
-                if (m_handle != nullptr) m_handle->close();
+                (void)ShutDownAndCheck();
+            }
+
+            bool ShutDownAndCheck() override
+            {
+                if (m_handle == nullptr) return true;
+                if (m_handle->is_open())
+                {
+                    m_handle->flush();
+                    m_handle->close();
+                }
+                return !m_handle->fail() &&
+                    !m_handle->bad();
             }
 
         private:

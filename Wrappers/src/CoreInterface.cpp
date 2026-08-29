@@ -6936,8 +6936,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                         options->m_storage ==
                             SPTAG::Storage::STATIC;
                     limitedTagEnabled =
-                        options != nullptr &&
-                        options->m_enableLimitedTagPosting;
+                        spann->HasLimitedTagLayout();
                     extremeSparseTagEnabled =
                         options != nullptr &&
                         options->m_enableExtremeSparseTag;
@@ -9230,6 +9229,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
     bool adaptiveFilteredNprobeEnabled = false;
     bool hybridDistanceEnabled = false;
     bool secondLevelRoutingEnabled = false;
+    bool limitedTagLayout = false;
     const SPTAG::SPANN::Options*
         spannSearchOptions = nullptr;
     int categoricalColumns = 0;
@@ -9252,6 +9252,9 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
         auto* spannIndex = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(internalIdx.get());
         const auto* searchOptions = spannIndex != nullptr ? spannIndex->GetOptions() : nullptr;
         spannSearchOptions = searchOptions;
+        limitedTagLayout =
+            spannIndex != nullptr &&
+            spannIndex->HasLimitedTagLayout();
         if (searchOptions != nullptr)
         {
             categoricalColumns =
@@ -9686,7 +9689,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
         limitedTagQueryValues;
     bool limitedTagRouteEligible = false;
     if (spannSearchOptions != nullptr &&
-        spannSearchOptions->m_enableLimitedTagPosting)
+        limitedTagLayout)
     {
         const int keyColumn =
             spannSearchOptions->m_limitedTagColumn;
@@ -10033,8 +10036,9 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
                 std::uint64_t expectedGeneration = 0;
                 if (searchOptions != nullptr) {
                     const std::string& generationText =
-                        searchOptions
-                                ->m_enableLimitedTagPosting
+                        spannInternalIdx != nullptr &&
+                                spannInternalIdx
+                                    ->HasLimitedTagLayout()
                             ? searchOptions
                                   ->m_limitedTagGenerationFingerprint
                             : searchOptions
@@ -10125,7 +10129,9 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
                         : categoricalColumns;
                 if (searchOptions != nullptr &&
                     searchOptions->m_enableHierPostingFilter &&
-                    !searchOptions->m_enableLimitedTagPosting) {
+                    (spannInternalIdx == nullptr ||
+                     !spannInternalIdx
+                          ->HasLimitedTagLayout())) {
                 searchContext.m_postingFilter =
                     [memIdx = memoryIndex.get(), queryHierMask, queryHierWidths,
                      dnf, dnfHasNum, quantCols, quantParams, qp,

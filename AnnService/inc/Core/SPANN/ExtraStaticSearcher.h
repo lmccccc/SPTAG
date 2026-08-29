@@ -242,6 +242,10 @@ namespace SPTAG
             {
                 return m_hasHybridPurePostings;
             }
+            bool LimitedTagPostingRegionsReady() const override
+            {
+                return m_hasHybridPurePostings;
+            }
 
             virtual int GetPostingCount() const override
             {

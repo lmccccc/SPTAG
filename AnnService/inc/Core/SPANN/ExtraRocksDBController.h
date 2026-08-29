@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <climits>
 #include <future>
+#include <memory>
 
 namespace SPTAG::SPANN
 {
@@ -408,10 +409,31 @@ namespace SPTAG::SPANN
 
         ErrorCode Checkpoint(std::string prefix) {
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "RocksDB: checkpoint\n");
-            rocksdb::Checkpoint* checkpoint_ptr;
-            rocksdb::Checkpoint::Create(db, &checkpoint_ptr);
+            rocksdb::Checkpoint* checkpoint_ptr = nullptr;
+            rocksdb::Status status =
+                rocksdb::Checkpoint::Create(
+                    db, &checkpoint_ptr);
+            if (!status.ok() ||
+                checkpoint_ptr == nullptr) {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Error,
+                    "RocksDB: cannot create checkpoint handle: %s\n",
+                    status.ToString().c_str());
+                return ErrorCode::Fail;
+            }
+            std::unique_ptr<rocksdb::Checkpoint>
+                checkpoint(checkpoint_ptr);
             std::string filename = prefix + FolderSep + dbPath.substr(dbPath.find_last_of(FolderSep) + 1);
-            checkpoint_ptr->CreateCheckpoint(filename);
+            status = checkpoint->CreateCheckpoint(
+                filename);
+            if (!status.ok()) {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Error,
+                    "RocksDB: cannot create checkpoint %s: %s\n",
+                    filename.c_str(),
+                    status.ToString().c_str());
+                return ErrorCode::Fail;
+            }
             return ErrorCode::Success;
         }
 

@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <filesystem>
 #include <string>
+#include <algorithm>
+#include <vector>
 
 #ifdef _WIN32
 #include <io.h>
@@ -22,6 +24,119 @@ namespace SPTAG
 {
 namespace Helper
 {
+
+inline bool SyncParentDirectory(
+    const std::string& p_path)
+{
+#ifdef _WIN32
+    (void)p_path;
+    return true;
+#else
+    std::filesystem::path parent =
+        std::filesystem::path(
+            p_path).parent_path();
+    if (parent.empty()) parent = ".";
+    int directoryFlags = O_RDONLY;
+#ifdef O_DIRECTORY
+    directoryFlags |= O_DIRECTORY;
+#endif
+    const int directory = open(
+        parent.c_str(), directoryFlags);
+    if (directory < 0) return false;
+    const bool synced = fsync(directory) == 0;
+    const bool closed = close(directory) == 0;
+    return synced && closed;
+#endif
+}
+
+inline bool SyncFile(
+    const std::filesystem::path& p_path)
+{
+#ifdef _WIN32
+    const HANDLE file = CreateFileA(
+        p_path.string().c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE |
+            FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    const bool synced =
+        FlushFileBuffers(file) != 0;
+    const bool closed =
+        CloseHandle(file) != 0;
+    return synced && closed;
+#else
+    const int file = open(
+        p_path.c_str(), O_RDONLY);
+    if (file < 0) return false;
+    const bool synced = fsync(file) == 0;
+    const bool closed = close(file) == 0;
+    return synced && closed;
+#endif
+}
+
+inline bool SyncDirectoryTree(
+    const std::string& p_root)
+{
+#ifdef _WIN32
+    (void)p_root;
+    return true;
+#else
+    const std::filesystem::path root(p_root);
+    std::error_code error;
+    if (!std::filesystem::is_directory(
+            root, error) ||
+        error) {
+        return false;
+    }
+    std::vector<std::filesystem::path>
+        directories = {root};
+    for (std::filesystem::recursive_directory_iterator
+             it(root, error),
+         end;
+         !error && it != end;
+         it.increment(error)) {
+        if (it->is_symlink(error)) {
+            continue;
+        } else if (it->is_directory(error)) {
+            directories.push_back(it->path());
+        } else if (!error &&
+                   it->is_regular_file(error) &&
+                   !SyncFile(it->path())) {
+            return false;
+        }
+        if (error) return false;
+    }
+    if (error) return false;
+    std::sort(
+        directories.begin(), directories.end(),
+        [](const std::filesystem::path& p_left,
+           const std::filesystem::path& p_right) {
+            return p_left.native().size() >
+                p_right.native().size();
+        });
+    for (const auto& directoryPath :
+         directories) {
+        int directoryFlags = O_RDONLY;
+#ifdef O_DIRECTORY
+        directoryFlags |= O_DIRECTORY;
+#endif
+        const int directory = open(
+            directoryPath.c_str(),
+            directoryFlags);
+        if (directory < 0) return false;
+        const bool synced =
+            fsync(directory) == 0;
+        const bool closed =
+            close(directory) == 0;
+        if (!synced || !closed) return false;
+    }
+    return SyncParentDirectory(root.string());
+#endif
+}
 
 inline bool GetOpenFileSize(
     FILE* p_file,
@@ -120,9 +235,12 @@ inline bool AtomicReplaceFile(
         close(directory);
         return false;
     }
-    fsync(directory);
-    close(directory);
-    return true;
+    const bool directorySynced =
+        fsync(directory) == 0;
+    const bool directoryClosed =
+        close(directory) == 0;
+    return directorySynced &&
+        directoryClosed;
 #endif
 }
 

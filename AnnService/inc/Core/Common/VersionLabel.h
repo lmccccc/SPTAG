@@ -111,7 +111,14 @@ namespace SPTAG
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Save %s To %s\n", m_data.Name().c_str(), filename.c_str());
                 auto ptr = f_createIO();
                 if (ptr == nullptr || !ptr->Initialize(filename.c_str(), std::ios::binary | std::ios::out)) return ErrorCode::FailedCreateFile;
-                return Save(ptr);
+                const ErrorCode ret = Save(ptr);
+                const bool closed =
+                    ptr->ShutDownAndCheck();
+                return ret != ErrorCode::Success
+                    ? ret
+                    : (closed
+                           ? ErrorCode::Success
+                           : ErrorCode::DiskIOFail);
             }
 
             inline ErrorCode Load(std::shared_ptr<Helper::DiskIO> input, SizeType blockSize, SizeType capacity)
