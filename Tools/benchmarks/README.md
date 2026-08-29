@@ -152,6 +152,17 @@ postings are returned only when fewer compatible postings exist globally. This
 gives H1 and H2 the same nprobe and posting-I/O semantics without pruning graph
 expansion by tag.
 
+H2 decouples its initial coarse-row count from the final posting nprobe.
+`[SearchSSDIndex] SecondLevelInitialProbeRatio` is the minimum ratio for
+unrestricted dense-yield routes. It defaults to `1` for existing-index
+compatibility; the canonical SIFT limited-tag INIs explicitly use `0.666666`.
+Filtered routes interpolate back toward the full probe according to their H1
+support coverage, and extremely sparse routes retain the full
+replica-multiplied probe. Any underfilled dense route retries first with the
+legacy full probe and then its existing bounded expansion. The setting changes
+only in-memory H2 row expansion; the final posting target and SSD I/O semantics
+remain `InternalResultNum`.
+
 EST4 classifies a tag by absolute expected head coverage, not selectivity. A
 tag uses the exact contiguous `[VID | all attributes | vector]` route when
 `tagCount < ExtremeSparseTagMinCount` or

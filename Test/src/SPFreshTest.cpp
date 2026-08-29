@@ -4337,6 +4337,10 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
             std::string::npos);
         BOOST_CHECK(
             defaultConfig.find(
+                "SecondLevelInitialProbeRatio=1.000000") !=
+            std::string::npos);
+        BOOST_CHECK(
+            defaultConfig.find(
                 "SecondLevelSignatureMinSelectivity=0") !=
             std::string::npos);
         BOOST_CHECK(
@@ -4369,6 +4373,11 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
             reloadedTyped->GetOptions()
                 ->m_secondLevelMaxCheck,
             112);
+        BOOST_CHECK_SMALL(
+            reloadedTyped->GetOptions()
+                    ->m_secondLevelInitialProbeRatio -
+                1.0,
+            1e-12);
         reloadedDefault.reset();
         std::filesystem::remove_all(
             indexDirectory);
@@ -4667,6 +4676,10 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
         "SecondLevelRouteSelectivityThreshold", "-0.01");
     rejectConfiguration(
         "SecondLevelRouteSelectivityThreshold", "1.01");
+    rejectConfiguration(
+        "SecondLevelInitialProbeRatio", "0");
+    rejectConfiguration(
+        "SecondLevelInitialProbeRatio", "1.01");
     rejectConfiguration(
         "SecondLevelSignatureMinSelectivity", "-0.01");
     rejectConfiguration(
@@ -5101,6 +5114,21 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
         };
     const auto h1PostingCount =
         searchPostingCount(0.0f);
+    BOOST_CHECK(
+        index->SetParameter(
+            "SecondLevelInitialProbeRatio", "0",
+            "SearchSSDIndex") ==
+        ErrorCode::FailedParseValue);
+    BOOST_CHECK_SMALL(
+        typed->GetOptions()
+                ->m_secondLevelInitialProbeRatio -
+            1.0,
+        1e-12);
+    BOOST_REQUIRE(
+        index->SetParameter(
+            "SecondLevelInitialProbeRatio", "0.125",
+            "SearchSSDIndex") ==
+        ErrorCode::Success);
     const auto h2PostingCount =
         searchPostingCount(1.0f);
     BOOST_CHECK_EQUAL(h1PostingCount, 8);
@@ -5110,6 +5138,11 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
         index->SetParameter(
             "SecondLevelRouteSelectivityThreshold",
             "0.02", "SearchSSDIndex") ==
+        ErrorCode::Success);
+    BOOST_REQUIRE(
+        index->SetParameter(
+            "SecondLevelInitialProbeRatio",
+            "1", "SearchSSDIndex") ==
         ErrorCode::Success);
     BOOST_CHECK(
         !std::filesystem::exists(
@@ -5394,6 +5427,47 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
                 static_cast<size_t>(rank)]);
     }
     reloaded.reset();
+
+    {
+        const std::string loaderPath =
+            indexDirectory + "/indexloader.ini";
+        std::ifstream loaderInput(loaderPath);
+        BOOST_REQUIRE(loaderInput.good());
+        const std::string loaderConfig(
+            (std::istreambuf_iterator<char>(loaderInput)),
+            std::istreambuf_iterator<char>());
+        loaderInput.close();
+        const std::string validProbeRatio =
+            "SecondLevelInitialProbeRatio=1.000000";
+        const size_t runtimeProbeRatio =
+            loaderConfig.rfind(validProbeRatio);
+        BOOST_REQUIRE_NE(
+            runtimeProbeRatio, std::string::npos);
+        std::string invalidLoaderConfig = loaderConfig;
+        invalidLoaderConfig.replace(
+            runtimeProbeRatio, validProbeRatio.size(),
+            "SecondLevelInitialProbeRatio=0");
+        {
+            std::ofstream loaderOutput(
+                loaderPath, std::ios::trunc);
+            BOOST_REQUIRE(loaderOutput.good());
+            loaderOutput << invalidLoaderConfig;
+            BOOST_REQUIRE(loaderOutput.good());
+        }
+        std::shared_ptr<VectorIndex> invalidRuntimeRatio;
+        BOOST_CHECK(
+            VectorIndex::LoadIndex(
+                indexDirectory, invalidRuntimeRatio) ==
+            ErrorCode::FailedParseValue);
+        invalidRuntimeRatio.reset();
+        {
+            std::ofstream loaderOutput(
+                loaderPath, std::ios::trunc);
+            BOOST_REQUIRE(loaderOutput.good());
+            loaderOutput << loaderConfig;
+            BOOST_REQUIRE(loaderOutput.good());
+        }
+    }
 
     {
         std::fstream posting(

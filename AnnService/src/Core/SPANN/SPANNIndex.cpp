@@ -112,6 +112,11 @@ bool ValidSecondLevelRouteConfig(
             1.0f &&
         std::isfinite(
             p_options
+                .m_secondLevelInitialProbeRatio) &&
+        p_options.m_secondLevelInitialProbeRatio > 0.0 &&
+        p_options.m_secondLevelInitialProbeRatio <= 1.0 &&
+        std::isfinite(
+            p_options
                 .m_secondLevelSignatureMinSelectivity) &&
         std::isfinite(
             p_options
@@ -3595,7 +3600,7 @@ ErrorCode Index<T>::SearchSecondLevelHeads(
             p_graphResultNum) *
         static_cast<long long>(
             initialMultiplier);
-    int upperProbe = (std::min)(
+    const int fullUpperProbe = (std::min)(
         secondCount,
         static_cast<int>((std::min)(
             static_cast<long long>(
@@ -3603,15 +3608,47 @@ ErrorCode Index<T>::SearchSecondLevelHeads(
             (std::max)(
                 1LL,
                 requestedUpperProbe))));
+    // Selective filters need nearly all coarse rows; unrestricted searches can
+    // use the configured floor without coupling H2 work to final nprobe.
+    long double effectiveInitialProbeRatio =
+        m_options.m_secondLevelInitialProbeRatio;
+    if (p_matchingHeadReferences > 0 &&
+        firstLevelHeadCount > 0)
+    {
+        const long double matchingHeadCoverage =
+            (std::min)(
+                1.0L,
+                static_cast<long double>(
+                    p_matchingHeadReferences) /
+                    static_cast<long double>(
+                        firstLevelHeadCount));
+        effectiveInitialProbeRatio =
+            1.0L -
+            (1.0L - effectiveInitialProbeRatio) *
+                matchingHeadCoverage;
+    }
+    int upperProbe = sparsePostingYield
+        ? fullUpperProbe
+        : (std::max)(
+              1,
+              (std::min)(
+                  fullUpperProbe,
+                  static_cast<int>(std::ceil(
+                      static_cast<long double>(
+                          fullUpperProbe) *
+                      effectiveInitialProbeRatio))));
+    const int doubledFullUpperProbe =
+        fullUpperProbe >
+                (std::numeric_limits<int>::max)() / 2
+            ? (std::numeric_limits<int>::max)()
+            : fullUpperProbe * 2;
     const int maxUpperProbe = (std::min)(
         secondCount,
         (std::max)(
-            upperProbe,
+            fullUpperProbe,
             sparsePostingYield
-                ? upperProbe
-                : (upperProbe > (std::numeric_limits<int>::max)() / 2
-                ? (std::numeric_limits<int>::max)()
-                : upperProbe * 2)));
+                ? fullUpperProbe
+                : doubledFullUpperProbe));
     const std::uint64_t expectedExpansion =
         averagePosting >
                 (std::numeric_limits<
@@ -3918,12 +3955,19 @@ ErrorCode Index<T>::SearchSecondLevelHeads(
                     p_graphResultNum) ||
             upperProbe >= maxUpperProbe)
             break;
-        upperProbe = static_cast<int>(
-            (std::min)(
-                static_cast<long long>(
-                    maxUpperProbe),
-                static_cast<long long>(
-                    upperProbe) * 2LL));
+        if (upperProbe < fullUpperProbe)
+        {
+            upperProbe = fullUpperProbe;
+        }
+        else
+        {
+            upperProbe = static_cast<int>(
+                (std::min)(
+                    static_cast<long long>(
+                        maxUpperProbe),
+                    static_cast<long long>(
+                        upperProbe) * 2LL));
+        }
     }
 
     const auto sortStart = profile
@@ -5086,7 +5130,10 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
     // settings. SetParameter maps its aliases to mutable SSD options.
     for (const auto& entry : p_reader.GetParameters("SearchSSDIndex"))
     {
-        SetParameter(entry.first.c_str(), entry.second.c_str(), "SearchSSDIndex");
+        const ErrorCode ret = SetParameter(
+            entry.first.c_str(), entry.second.c_str(),
+            "SearchSSDIndex");
+        if (ret != ErrorCode::Success) return ret;
     }
 
     if (m_options.m_enableHybridDistance &&
@@ -5111,6 +5158,7 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
             "SecondLevelRouteSelectivityThreshold must be in [0,1], "
+            "SecondLevelInitialProbeRatio must be in (0,1], "
             "SecondLevelSignature selectivity must satisfy 0<=min<max<=1, "
             "and SecondLevelMaxCheck must be positive.\n");
         return ErrorCode::FailedParseValue;
@@ -9066,6 +9114,7 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
             "SecondLevelRouteSelectivityThreshold must be in [0,1], "
+            "SecondLevelInitialProbeRatio must be in (0,1], "
             "SecondLevelSignature selectivity must satisfy 0<=min<max<=1, "
             "and SecondLevelMaxCheck must be positive.\n");
         return ErrorCode::FailedParseValue;
@@ -10191,6 +10240,21 @@ template <typename T> ErrorCode Index<T>::SetParameter(const char *p_param, cons
 
     if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_section, "SearchSSDIndex"))
     {
+        if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(
+                p_param, "SecondLevelInitialProbeRatio"))
+        {
+            double ratio = 0.0;
+            if (!SPTAG::Helper::Convert::ConvertStringTo<double>(
+                    p_value, ratio) ||
+                !std::isfinite(ratio) ||
+                ratio <= 0.0 || ratio > 1.0)
+            {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Error,
+                    "SecondLevelInitialProbeRatio must be in (0,1].\n");
+                return ErrorCode::FailedParseValue;
+            }
+        }
         storeParameter(m_searchSSDParameters, p_param, p_value);
 
         // These are SSDServing control flags, not mutable runtime options.

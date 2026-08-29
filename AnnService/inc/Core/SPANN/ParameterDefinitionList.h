@@ -105,6 +105,7 @@ DefineSSDParameter(m_extremeSparseTagMinCount, int, 10, "ExtremeSparseTagMinCoun
 DefineSSDParameter(m_extremeSparseTagFile, std::string, std::string("extreme_sparse_tags.bin"), "ExtremeSparseTagFile")
 DefineSSDParameter(m_logExtremeSparseTagRoute, bool, false, "LogExtremeSparseTagRoute")
 DefineSSDParameter(m_secondLevelRouteSelectivityThreshold, float, 0.02f, "SecondLevelRouteSelectivityThreshold") // Mutable
+DefineSSDParameter(m_secondLevelInitialProbeRatio, double, 1.0, "SecondLevelInitialProbeRatio") // Mutable
 DefineSSDParameter(m_secondLevelSignatureMinSelectivity, double, 0.0, "SecondLevelSignatureMinSelectivity")
 DefineSSDParameter(m_secondLevelSignatureMaxSelectivity, double, 1.0, "SecondLevelSignatureMaxSelectivity")
 DefineSSDParameter(m_secondLevelMaxCheck, int, 112, "SecondLevelMaxCheck") // Mutable

@@ -87,6 +87,7 @@ namespace SPTAG {
             std::string m_secondLevelPostingFile;
             std::string m_secondLevelGenerationFingerprint;
             float m_secondLevelRouteSelectivityThreshold;
+            double m_secondLevelInitialProbeRatio;
             double m_secondLevelSignatureMinSelectivity;
             double m_secondLevelSignatureMaxSelectivity;
             int m_secondLevelMaxCheck;
