@@ -811,6 +811,11 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
             for (DimensionType edge = p_begin;
                  edge < p_end; ++edge)
             {
+                if (p_space.m_iNumberOfCheckedLeaves >=
+                    p_space.m_iMaxCheck)
+                {
+                    break;
+                }
                 const bool isCross =
                     EnableCrossEdges && p_crossEncoded;
                 if constexpr (EnableCrossEdges)
@@ -1039,7 +1044,10 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                 p_space.m_SPTQueue.Top().distance)
         {
             m_pTrees.SearchTrees(m_pSamples, m_fComputeDistance, p_query, p_space,
-                                 m_iNumberOfOtherDynamicPivots + p_space.m_iNumberOfCheckedLeaves);
+                                 (std::min)(
+                                     p_space.m_iMaxCheck,
+                                     m_iNumberOfOtherDynamicPivots +
+                                         p_space.m_iNumberOfCheckedLeaves));
         }
     }
     finishSearch();
@@ -1341,10 +1349,22 @@ bool Index<T>::SearchIndexIterativeFromNeareast(QueryResult &p_query, COMMON::Wo
 
 template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool p_searchDeleted) const
 {
+    return SearchIndexWithMaxCheck(
+        p_query, m_iMaxCheck, p_searchDeleted);
+}
+
+template <typename T>
+ErrorCode Index<T>::SearchIndexWithMaxCheck(
+    QueryResult& p_query,
+    int p_maxCheck,
+    bool p_searchDeleted) const
+{
     if (!m_bReady)
         return ErrorCode::EmptyIndex;
 
-    auto workSpace = RentWorkSpace(p_query.GetResultNum(), nullptr, m_iMaxCheck);
+    auto workSpace = RentWorkSpace(
+        p_query.GetResultNum(), nullptr,
+        p_maxCheck > 0 ? p_maxCheck : m_iMaxCheck);
 
     SearchIndex(*((COMMON::QueryResultSet<T> *)&p_query), *workSpace, p_searchDeleted, true);
 

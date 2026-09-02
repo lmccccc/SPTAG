@@ -1039,11 +1039,15 @@ break;
                     NodeDistPair bcell = p_space.m_SPTQueue.pop();
                     const BKTNode& tnode = m_pTreeRoots[bcell.node];
                     if (tnode.childStart < 0) {
+                        if (p_space.m_iNumberOfCheckedLeaves >=
+                            p_limits)
+                        {
+                            break;
+                        }
                         if (!p_space.CheckAndSet(tnode.centerid)) {
                             p_space.m_iNumberOfCheckedLeaves++;
                             p_space.m_NGQueue.insert(NodeDistPair(tnode.centerid, bcell.distance));
                         }
-                        if (p_space.m_iNumberOfCheckedLeaves >= p_limits) break;
                     }
                     else {
                         for (SizeType begin = tnode.childStart; begin < tnode.childEnd; begin++) {

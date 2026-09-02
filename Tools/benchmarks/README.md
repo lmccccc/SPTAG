@@ -142,15 +142,14 @@ metadata fail open rather than rejecting a potentially matching posting. The PBS
 `signatures_bitmask.bin` sidecar likewise binds `H`/`O` masks to the posting
 generation and body fingerprint, rejects legacy tail-bearing PBS2 files, and
 is published atomically.
-At load, the validated support sidecar builds only a compact tag-to-head lookup.
-H1 graph traversal remains distance-only, but support-aware result admission
-continues collecting eligible heads until `InternalResultNum` postings are
-filled before I/O. The filtered search budget scales from support coverage,
-retries up to a bounded `MaxCheck`, and uses a guarded exact-support completion
-when the graph still underfills; empty physical postings do not count. Fewer
-postings are returned only when fewer compatible postings exist globally. This
-gives H1 and H2 the same nprobe and posting-I/O semantics without pruning graph
-expansion by tag.
+At load, the validated support sidecar builds the support metadata used for
+result admission and H2 posting signatures. H1 graph traversal remains
+distance-only, while support-aware result admission continues collecting
+eligible heads until `InternalResultNum` postings are filled before I/O. The
+filtered search budget scales from support coverage and retries up to a bounded
+`MaxCheck`; it does not directly enumerate a tag-to-H1 list. Empty physical
+postings do not count. This gives H1 and H2 the same nprobe and posting-I/O
+semantics without adding a predicate-specific H1 entry path.
 
 H2 decouples its initial coarse-row count from the final posting nprobe.
 `[SearchSSDIndex] SecondLevelInitialProbeRatio` is the minimum ratio for

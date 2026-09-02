@@ -100,7 +100,15 @@ bool ValidHybridRouteConfig(const Options& p_options)
 bool ValidSecondLevelRouteConfig(
     const Options& p_options)
 {
+    const bool validNavigationMode =
+        Helper::StrUtils::StrEqualIgnoreCase(
+            p_options.m_headNavigationMode.c_str(), "Auto") ||
+        Helper::StrUtils::StrEqualIgnoreCase(
+            p_options.m_headNavigationMode.c_str(), "H1Only") ||
+        Helper::StrUtils::StrEqualIgnoreCase(
+            p_options.m_headNavigationMode.c_str(), "H2Only");
     return
+        validNavigationMode &&
         std::isfinite(
             p_options
                 .m_secondLevelRouteSelectivityThreshold) &&
@@ -3547,7 +3555,6 @@ ErrorCode Index<T>::SearchSecondLevelHeads(
     g_secondLevelProfile = SecondLevelSearchProfile();
     if (p_queryResults == nullptr ||
         p_graphResultNum <= 0 ||
-        p_querySignature.Popcount() <= 0 ||
         !p_headAdmission ||
         m_index == nullptr ||
         m_secondLevelIndex == nullptr ||
@@ -3642,13 +3649,19 @@ ErrorCode Index<T>::SearchSecondLevelHeads(
                 (std::numeric_limits<int>::max)() / 2
             ? (std::numeric_limits<int>::max)()
             : fullUpperProbe * 2;
-    const int maxUpperProbe = (std::min)(
-        secondCount,
-        (std::max)(
-            fullUpperProbe,
-            sparsePostingYield
-                ? fullUpperProbe
-                : doubledFullUpperProbe));
+    // H2 signatures are candidate filters, never graph-edge filters. A sparse
+    // signature can require examining far more distance-nearest H2 rows before
+    // enough matching H1 heads are found, so permit the expansion to cover H2.
+    const int maxUpperProbe =
+        p_querySignature.Popcount() > 0
+            ? secondCount
+            : (std::min)(
+                  secondCount,
+                  (std::max)(
+                      fullUpperProbe,
+                      sparsePostingYield
+                          ? fullUpperProbe
+                          : doubledFullUpperProbe));
     const std::uint64_t expectedExpansion =
         averagePosting >
                 (std::numeric_limits<
@@ -3685,6 +3698,8 @@ ErrorCode Index<T>::SearchSecondLevelHeads(
     const auto postingMatches =
         [this, &p_querySignature](
             SizeType p_secondLevelHead) {
+            if (p_querySignature.Popcount() == 0)
+                return true;
             const auto* signature =
                 m_secondLevelPostings
                     .SignatureAt(
@@ -3699,30 +3714,45 @@ ErrorCode Index<T>::SearchSecondLevelHeads(
     const bool profile = m_options.m_logPhaseTime;
     while (true)
     {
+        if (upperScanned >= static_cast<std::uint64_t>(
+                                m_options.m_secondLevelMaxCheck))
+        {
+            break;
+        }
         ++g_secondLevelProfile.m_iterations;
         g_secondLevelProfile.m_upperProbe = upperProbe;
         COMMON::QueryResultSet<T> upperResults(
             p_queryResults->GetTarget(),
             upperProbe);
+        // The configured value is a hard cap, shared conceptually with H1's
+        // MaxCheck. Scale the working budget with the current H2 result target
+        // so early sparse-filter expansion does not pay the cap up front.
+        constexpr int kChecksPerH2Result = 16;
         const int proportionalMaxCheck =
             upperProbe >
                     (std::numeric_limits<int>::max)() /
-                        2
+                        kChecksPerH2Result
                 ? (std::numeric_limits<int>::max)()
-                : upperProbe * 2;
+                : upperProbe * kChecksPerH2Result;
         const int secondLevelMaxCheck =
-            (std::max)(
-                m_options.m_secondLevelMaxCheck,
-                proportionalMaxCheck);
+            (std::min)(
+                static_cast<int>(
+                    static_cast<std::uint64_t>(
+                        m_options.m_secondLevelMaxCheck) -
+                    upperScanned),
+                (std::max)(
+                    p_graphResultNum,
+                    proportionalMaxCheck));
         g_secondLevelProfile.m_maxCheck =
             secondLevelMaxCheck;
         const auto graphStart = profile
             ? std::chrono::high_resolution_clock::now()
             : std::chrono::high_resolution_clock::time_point{};
+        // Apply the H2 cap through the normal BKT path. Unlike a result
+        // filter, this preserves ordinary distance-result early termination.
         if (m_secondLevelIndex
-                ->SearchIndexWithResultFilter(
+                ->SearchIndexWithMaxCheck(
                     upperResults,
-                    postingMatches,
                     secondLevelMaxCheck) !=
             ErrorCode::Success)
             return ErrorCode::Fail;
@@ -3752,6 +3782,25 @@ ErrorCode Index<T>::SearchSecondLevelHeads(
         for (int result = 0;
              result < upperProbe; ++result)
         {
+            constexpr int kRowPrefetchAhead = 4;
+            const int futureResult =
+                result + kRowPrefetchAhead;
+            if (futureResult < upperProbe)
+            {
+                const BasicResult* future =
+                    upperResults.GetResult(futureResult);
+                if (future != nullptr &&
+                    future->VID >= 0 &&
+                    future->VID < secondCount)
+                {
+                    PrefetchL1(
+                        m_secondLevelPostings.SignatureAt(
+                            future->VID));
+                    PrefetchL1(
+                        m_secondLevelPostings.Begin(
+                            future->VID));
+                }
+            }
             const BasicResult* upper =
                 upperResults.GetResult(result);
             if (upper == nullptr ||
@@ -3759,7 +3808,7 @@ ErrorCode Index<T>::SearchSecondLevelHeads(
                 upper->VID >= secondCount)
                 continue;
             if (!postingMatches(upper->VID))
-                return ErrorCode::Fail;
+                continue;
             const auto* begin =
                 m_secondLevelPostings.Begin(
                     upper->VID);
@@ -3908,6 +3957,11 @@ ErrorCode Index<T>::SearchSecondLevelHeads(
                      mask) != 0)
                     continue;
                 seenFirstLevelHeads[word] |= mask;
+                // Start fetching H1 support metadata while this H2 member is
+                // being expanded; admission consumes it in the next batch.
+                PrefetchL1(
+                    m_limitedTagSupport.HeadTagData(
+                        candidate));
                 candidateBatch.push_back(
                     static_cast<SizeType>(
                         candidate));
@@ -3951,7 +4005,7 @@ ErrorCode Index<T>::SearchSecondLevelHeads(
                  vectorMsBefore);
         }
         if (matchingCount >=
-                static_cast<size_t>(
+                    static_cast<size_t>(
                     p_graphResultNum) ||
             upperProbe >= maxUpperProbe)
             break;
@@ -5160,7 +5214,8 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
             "SecondLevelRouteSelectivityThreshold must be in [0,1], "
             "SecondLevelInitialProbeRatio must be in (0,1], "
             "SecondLevelSignature selectivity must satisfy 0<=min<max<=1, "
-            "and SecondLevelMaxCheck must be positive.\n");
+            "SecondLevelMaxCheck must be positive, and HeadNavigationMode "
+            "must be Auto, H1Only, or H2Only.\n");
         return ErrorCode::FailedParseValue;
     }
     if (m_options.m_selectSecondLevel &&
@@ -5897,9 +5952,20 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     const std::vector<int>& searchHeadBundleNodes = threadLocalSearchContext != nullptr
         ? threadLocalSearchContext->m_searchHeadBundleNodes
         : kEmptySearchHeadBundleNodes;
+    const bool forceH1Navigation =
+        Helper::StrUtils::StrEqualIgnoreCase(
+            m_options.m_headNavigationMode.c_str(),
+            "H1Only");
+    const bool forceH2Navigation =
+        Helper::StrUtils::StrEqualIgnoreCase(
+            m_options.m_headNavigationMode.c_str(),
+            "H2Only");
 
     // ═══ Sparse tag fast path: skip graph search, read postings directly ═══
-    if (!directPostingIDs.empty() && m_extraSearcher != nullptr)
+    if (!forceH1Navigation &&
+        !forceH2Navigation &&
+        !directPostingIDs.empty() &&
+        m_extraSearcher != nullptr)
     {
         if (directPostingIDs.size() > static_cast<size_t>((std::numeric_limits<int>::max)()) ||
             directHeadLocalIDs.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) {
@@ -6614,14 +6680,12 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     Cache::PostingBitmask
         secondLevelQuerySignature;
     secondLevelQuerySignature.Clear();
-    std::vector<const std::vector<SizeType>*>
-        limitedMatchingHeadLists;
     bool allSecondLevelAnchorsRepresented =
+        !limitedTagQueryValues.empty();
+    bool allSecondLevelAnchorsDense =
         !limitedTagQueryValues.empty();
     if (useLimitedTagPure)
     {
-        const auto& tagHeads =
-            m_limitedTagSupport.TagHeads();
         for (std::uint32_t tag :
              limitedTagQueryValues)
         {
@@ -6636,177 +6700,45 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 allSecondLevelAnchorsRepresented =
                     false;
             }
-            secondLevelQuerySignature.Insert(tag);
-            const auto found = tagHeads.find(tag);
-            if (found != tagHeads.end() &&
-                std::find(
-                    limitedMatchingHeadLists.begin(),
-                    limitedMatchingHeadLists.end(),
-                    &found->second) ==
-                    limitedMatchingHeadLists.end())
+            if (!m_limitedTagSupport
+                     .TagSelectivityInRange(
+                         tag,
+                         m_secondLevelPostings
+                             .SignatureMaxSelectivity(),
+                         1.0))
             {
-                limitedMatchingHeadLists.push_back(
-                    &found->second);
+                allSecondLevelAnchorsDense = false;
             }
+            secondLevelQuerySignature.Insert(tag);
         }
     }
     const bool useSecondLevelBySelectivity =
-        secondLevelSelectivityEligible &&
-        allSecondLevelAnchorsRepresented;
-
-    std::vector<SizeType> limitedMatchingHeads;
-    bool limitedMatchingHeadsMaterialized = false;
-    const auto materializeLimitedMatchingHeads =
-        [&]() -> const std::vector<SizeType>& {
-        if (limitedMatchingHeadsMaterialized)
-            return limitedMatchingHeads;
-        for (const auto* heads :
-             limitedMatchingHeadLists)
-        {
-            limitedMatchingHeads.insert(
-                limitedMatchingHeads.end(),
-                heads->begin(), heads->end());
-        }
-        std::sort(
-            limitedMatchingHeads.begin(),
-            limitedMatchingHeads.end());
-        limitedMatchingHeads.erase(
-            std::unique(
-                limitedMatchingHeads.begin(),
-                limitedMatchingHeads.end()),
-            limitedMatchingHeads.end());
-        limitedMatchingHeads.erase(
-            std::remove_if(
-                limitedMatchingHeads.begin(),
-                limitedMatchingHeads.end(),
-                [&](SizeType p_head) {
-                    return !limitedTagHeadAdmission(
-                        p_head);
-                }),
-            limitedMatchingHeads.end());
-        limitedMatchingHeadsMaterialized = true;
-        return limitedMatchingHeads;
-    };
-
-    constexpr int kLimitedHeadSearchMaxCheckCap =
-        1 << 17;
-    constexpr std::uint64_t
-        kLimitedExactFallbackReferenceLimit =
-            1ULL << 20;
-    const int limitedConfiguredMaxCheck =
-        (std::max)(
-            1,
-            (std::min)(
-                m_options.m_maxCheck,
-                kLimitedHeadSearchMaxCheckCap));
-    const size_t limitedExactHeadLimit =
-        static_cast<size_t>(
-            limitedConfiguredMaxCheck);
-    std::uint64_t limitedMatchingHeadReferences = 0;
-    for (const auto* heads :
-         limitedMatchingHeadLists)
+        !forceH1Navigation &&
+        (forceH2Navigation ||
+         (secondLevelSelectivityEligible &&
+          allSecondLevelAnchorsRepresented) ||
+         (useLimitedTagPure &&
+          m_options.m_selectSecondLevel &&
+          allSecondLevelAnchorsDense));
+    // Dense tag signatures match nearly every H2 row. Search H2 by vector
+    // distance in that case, then apply the exact H1 support admission.
+    if (allSecondLevelAnchorsDense)
     {
-        const std::uint64_t headCount =
-            static_cast<std::uint64_t>(
-                heads->size());
-        if (headCount >
-            (std::numeric_limits<
-                std::uint64_t>::max)() -
-                limitedMatchingHeadReferences)
-        {
-            limitedMatchingHeadReferences =
-                (std::numeric_limits<
-                    std::uint64_t>::max)();
-            break;
-        }
-        limitedMatchingHeadReferences +=
-            headCount;
+        secondLevelQuerySignature.Clear();
     }
-    const std::uint64_t limitedHeadCount =
-        static_cast<std::uint64_t>(
-            m_limitedTagSupport.HeadCount());
-    const std::uint64_t limitedHeadSearchLimit64 =
-        (std::min)(
-            limitedHeadCount >
-                    static_cast<std::uint64_t>(
-                        kLimitedHeadSearchMaxCheckCap) /
-                        4
-                ? static_cast<std::uint64_t>(
-                      kLimitedHeadSearchMaxCheckCap)
-                : limitedHeadCount * 4,
-            static_cast<std::uint64_t>(
-                kLimitedHeadSearchMaxCheckCap));
-    const int limitedHeadSearchMaxCheckLimit =
-        (std::max)(
-            limitedConfiguredMaxCheck,
-            static_cast<int>(
-                limitedHeadSearchLimit64));
-    int limitedHeadSearchMaxCheck =
-        limitedConfiguredMaxCheck;
-    if (useLimitedTagPure &&
-        !limitedMatchingHeadLists.empty() &&
-        m_limitedTagSupport.HeadCount() > 0)
+    if (forceH2Navigation &&
+        (!useLimitedTagPure ||
+         !allSecondLevelAnchorsRepresented))
     {
-        std::uint64_t coverageLowerBound = 0;
-        for (const auto* heads :
-             limitedMatchingHeadLists)
-        {
-            coverageLowerBound = (std::max)(
-                coverageLowerBound,
-                static_cast<std::uint64_t>(
-                    heads->size()));
-        }
-        if (coverageLowerBound > 0)
-        {
-            const long double estimatedChecks =
-                std::ceil(
-                    2.0L *
-                    static_cast<long double>(
-                        graphResultNum) *
-                    static_cast<long double>(
-                        m_limitedTagSupport
-                            .HeadCount()) /
-                    static_cast<long double>(
-                        coverageLowerBound));
-            limitedHeadSearchMaxCheck =
-                (std::max)(
-                    limitedHeadSearchMaxCheck,
-                    static_cast<int>(
-                        (std::min)(
-                            estimatedChecks,
-                            static_cast<long double>(
-                                limitedHeadSearchMaxCheckLimit))));
-        }
+        secondLevelQuerySignature.Clear();
     }
-    const auto scanExactLimitedHeads =
-        [&](int p_priorScanned) {
-        const auto& exactMatchingHeads =
-            materializeLimitedMatchingHeads();
-        p_queryResults->Reset();
-        int exactScanned = 0;
-        for (SizeType head :
-             exactMatchingHeads)
-        {
-            if (head < 0 ||
-                head >=
-                    m_index->GetNumSamples())
-                continue;
-            const void* sample =
-                m_index->GetSample(head);
-            if (sample == nullptr) continue;
-            p_queryResults->AddPoint(
-                head,
-                m_index->ComputeDistance(
-                    p_queryResults
-                        ->GetQuantizedTarget(),
-                    sample));
-            ++exactScanned;
-        }
-        p_queryResults->SortResult();
-        p_queryResults->SetScanned(
-            p_priorScanned + exactScanned);
-        return exactScanned;
-    };
+    const std::function<bool(SizeType)>
+        secondLevelHeadAdmission =
+            limitedTagHeadAdmission
+                ? limitedTagHeadAdmission
+                : std::function<bool(SizeType)>(
+                      [](SizeType) { return true; });
+
     const bool s_phaseTime = m_options.m_logPhaseTime;
     int phaseHeadMaxCheck = 0;
     g_bktSeedMs = 0.0;
@@ -6814,7 +6746,6 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     g_secondLevelProfile =
         SecondLevelSearchProfile();
     bool usedSecondLevelSearch = false;
-    int h1FallbackPriorScanned = 0;
     double secondLevelRouteMs = 0.0;
     if (m_options.m_logAdaptiveNprobe &&
         useLimitedTagPure)
@@ -6833,26 +6764,6 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     auto _phT0 = s_phaseTime ? std::chrono::high_resolution_clock::now()
                              : std::chrono::high_resolution_clock::time_point{};
 
-    if (useLimitedTagPure &&
-        !useSecondLevelBySelectivity &&
-        limitedMatchingHeadReferences <
-            static_cast<std::uint64_t>(
-                graphResultNum) &&
-        limitedMatchingHeadReferences <=
-            limitedExactHeadLimit)
-    {
-        const int exactScanned =
-            scanExactLimitedHeads(0);
-        usedHeadBundleSearch = true;
-        if (m_options.m_logAdaptiveNprobe)
-        {
-            SPTAGLIB_LOG(
-                Helper::LogLevel::LL_Info,
-                "Using bounded exact H1 routing over %d compatible heads.\n",
-                exactScanned);
-        }
-    }
-
     if (useSecondLevelBySelectivity)
     {
         const auto secondLevelStart =
@@ -6864,13 +6775,18 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         ret = SearchSecondLevelHeads(
             p_queryResults, graphResultNum,
             secondLevelQuerySignature,
-            limitedTagHeadAdmission,
-            limitedMatchingHeadReferences,
+            secondLevelHeadAdmission,
+            0,
             scanned);
         if (ret == ErrorCode::MemoryOverFlow)
         {
-            h1FallbackPriorScanned =
-                scanned;
+            if (forceH2Navigation)
+            {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Error,
+                    "H2-only navigation exceeded its bounded expansion budget.\n");
+                return ret;
+            }
             p_queryResults->Reset();
             ret = ErrorCode::Success;
             if (m_options.m_logAdaptiveNprobe)
@@ -6902,30 +6818,20 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             }
             if (admitted < graphResultNum)
             {
-                if (limitedMatchingHeadReferences <=
-                    limitedExactHeadLimit)
+                if (forceH2Navigation)
                 {
-                    const int secondLevelScanned =
-                        scanned;
-                    const int exactScanned =
-                        scanExactLimitedHeads(
-                            secondLevelScanned);
-                    scanned =
-                        secondLevelScanned +
-                        exactScanned;
                     if (m_options
                             .m_logAdaptiveNprobe)
                     {
                         SPTAGLIB_LOG(
                             Helper::LogLevel::LL_Info,
-                            "Two-layer routing used bounded exact H1 completion (%d heads).\n",
-                            exactScanned);
+                            "H2-only navigation returned %d/%d H1 candidates without H1 completion.\n",
+                            admitted,
+                            graphResultNum);
                     }
                 }
                 else
                 {
-                    h1FallbackPriorScanned =
-                        scanned;
                     p_queryResults->Reset();
                     scanned = 0;
                     if (m_options
@@ -6961,6 +6867,13 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                         m_secondLevelPostings
                             .SecondLevelHeadCount()));
             }
+        }
+        else if (forceH2Navigation)
+        {
+            SPTAGLIB_LOG(
+                Helper::LogLevel::LL_Error,
+                "H2-only navigation returned no H1 candidates; H1 fallback is disabled.\n");
+            return ErrorCode::Fail;
         }
     }
 
@@ -7065,8 +6978,8 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                             candidateNodes,
                             graphResultNum,
                             scanned,
-                            limitedTagHeadAdmission,
-                            limitedHeadSearchMaxCheck);
+                            nullptr,
+                            0);
                     }
                 }
                 else
@@ -7076,8 +6989,8 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                         candidateNodes,
                         graphResultNum,
                         scanned,
-                        limitedTagHeadAdmission,
-                        limitedHeadSearchMaxCheck);
+                        nullptr,
+                        0);
                 }
                 if (ret != ErrorCode::Success) {
                     canUseHeadBundle = false;
@@ -7107,174 +7020,9 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         // In the dual-pool slim head store the root index physically holds only the
         // U_extra heads, so its tree cannot navigate H1; skip this dead fallback.
         if (!m_metadataOnlyHeadStore) {
-            ret = limitedTagHeadAdmission
-                ? m_index->SearchIndexWithResultFilter(
-                      *p_queryResults,
-                      limitedTagHeadAdmission,
-                      limitedHeadSearchMaxCheck)
-                : m_index->SearchIndex(
-                      *p_queryResults);
+            ret = m_index->SearchIndex(
+                *p_queryResults);
             if (ret != ErrorCode::Success) return ret;
-        }
-    }
-
-    if (useLimitedTagPure &&
-        !usedSecondLevelSearch)
-    {
-        if (h1FallbackPriorScanned > 0)
-        {
-            p_queryResults->SetScanned(
-                p_queryResults->GetScanned() +
-                h1FallbackPriorScanned);
-        }
-        const auto admittedHeadCount = [&]() {
-            int admitted = 0;
-            for (; admitted < graphResultNum;
-                 ++admitted)
-            {
-                const BasicResult* result =
-                    p_queryResults->GetResult(
-                        admitted);
-                if (result == nullptr ||
-                    result->VID < 0)
-                    break;
-            }
-            return admitted;
-        };
-        int admitted = admittedHeadCount();
-        int retryMaxCheck =
-            limitedHeadSearchMaxCheck;
-        int accumulatedScanned =
-            p_queryResults->GetScanned();
-        int requiredHeads = graphResultNum;
-        const std::vector<SizeType>*
-            exactMatchingHeads = nullptr;
-        if (admitted < graphResultNum &&
-            limitedMatchingHeadReferences <=
-                kLimitedExactFallbackReferenceLimit)
-        {
-            exactMatchingHeads =
-                &materializeLimitedMatchingHeads();
-            requiredHeads =
-                (std::min)(
-                    graphResultNum,
-                    static_cast<int>(
-                        (std::min)(
-                            exactMatchingHeads->size(),
-                            static_cast<size_t>(
-                                (std::numeric_limits<
-                                    int>::max)()))));
-        }
-        const auto completeWithExactHeads =
-            [&]() {
-                const int graphAdmitted = admitted;
-                const int exactScanned =
-                    scanExactLimitedHeads(
-                        accumulatedScanned);
-                admitted = admittedHeadCount();
-                if (m_options
-                        .m_logAdaptiveNprobe)
-                {
-                    SPTAGLIB_LOG(
-                        Helper::LogLevel::LL_Info,
-                        "Limited-tag H1 used exact completion after graph admission returned %d/%d heads (%d exact heads).\n",
-                        graphAdmitted,
-                        requiredHeads,
-                        exactScanned);
-                }
-            };
-        if (admitted < requiredHeads &&
-            exactMatchingHeads != nullptr &&
-            exactMatchingHeads->size() <=
-                limitedExactHeadLimit)
-        {
-            completeWithExactHeads();
-        }
-        while (admitted < requiredHeads &&
-               retryMaxCheck <
-                   limitedHeadSearchMaxCheckLimit)
-        {
-            const std::int64_t doubledMaxCheck =
-                static_cast<std::int64_t>(
-                    retryMaxCheck) *
-                2;
-            retryMaxCheck = static_cast<int>(
-                (std::min)(
-                    static_cast<std::int64_t>(
-                        limitedHeadSearchMaxCheckLimit),
-                    (std::max)(
-                        doubledMaxCheck,
-                        static_cast<std::int64_t>(
-                            retryMaxCheck) +
-                            1)));
-            p_queryResults->Reset();
-            int retryScanned = 0;
-            if (usedHeadBundleSearch)
-            {
-                ret = SearchHeadBundlesNative(
-                    p_queryResults,
-                    candidateNodes,
-                    graphResultNum,
-                    retryScanned,
-                    limitedTagHeadAdmission,
-                    retryMaxCheck);
-                p_queryResults->SetScanned(
-                    accumulatedScanned +
-                    retryScanned);
-            }
-            else if (!m_metadataOnlyHeadStore)
-            {
-                ret =
-                    m_index
-                        ->SearchIndexWithResultFilter(
-                            *p_queryResults,
-                            limitedTagHeadAdmission,
-                            retryMaxCheck);
-                retryScanned =
-                    p_queryResults->GetScanned();
-                p_queryResults->SetScanned(
-                    accumulatedScanned +
-                    retryScanned);
-            }
-            else
-            {
-                ret = ErrorCode::Fail;
-            }
-            if (ret != ErrorCode::Success)
-            {
-                SPTAGLIB_LOG(
-                    Helper::LogLevel::LL_Error,
-                    "Limited-tag H1 retry failed at MaxCheck=%d.\n",
-                    retryMaxCheck);
-                return ret;
-            }
-            accumulatedScanned +=
-                retryScanned;
-            admitted = admittedHeadCount();
-        }
-
-        if (admitted < requiredHeads)
-        {
-            if (exactMatchingHeads == nullptr)
-            {
-                SPTAGLIB_LOG(
-                    Helper::LogLevel::LL_Error,
-                    "Limited-tag H1 exhausted MaxCheck=%d with %llu matching-head references; refusing an unbounded exact fallback.\n",
-                    retryMaxCheck,
-                    static_cast<unsigned long long>(
-                        limitedMatchingHeadReferences));
-                return ErrorCode::Fail;
-            }
-            completeWithExactHeads();
-            if (admitted < requiredHeads)
-            {
-                SPTAGLIB_LOG(
-                    Helper::LogLevel::LL_Error,
-                    "Limited-tag H1 could not fill the posting target (%d/%d heads).\n",
-                    admitted,
-                    requiredHeads);
-                return ErrorCode::Fail;
-            }
         }
     }
 
@@ -8774,6 +8522,162 @@ bool Index<T>::SelectHeadInternal(std::shared_ptr<Helper::VectorSetReader> &p_re
             selected, "H1 SelectHead", false))
         return false;
 
+    if (m_options.m_minHeadsPerTag > 0)
+    {
+        const std::uint32_t* vectorTags =
+            m_pendingVectorTagsView != nullptr
+                ? m_pendingVectorTagsView
+                : (m_pendingVectorTags.empty()
+                       ? nullptr
+                       : m_pendingVectorTags.data());
+        const size_t vectorTagCount =
+            m_pendingVectorTagsView != nullptr
+                ? m_pendingVectorTagCount
+                : m_pendingVectorTags.size();
+        if (vectorTags == nullptr ||
+            m_pendingNumTagsPerVec <= 0 ||
+            m_options.m_limitedTagColumn < 0 ||
+            m_options.m_limitedTagColumn >=
+                m_pendingNumTagsPerVec ||
+            vectorTagCount !=
+                static_cast<size_t>(data.R()) *
+                    static_cast<size_t>(
+                        m_pendingNumTagsPerVec))
+        {
+            SPTAGLIB_LOG(
+                Helper::LogLevel::LL_Error,
+                "MinHeadsPerTag requires a complete in-memory tag matrix "
+                "and a valid LimitedTagColumn.\n");
+            return false;
+        }
+
+        const auto tagAt =
+            [&](SizeType p_vector) {
+            return vectorTags[
+                static_cast<size_t>(p_vector) *
+                    static_cast<size_t>(
+                        m_pendingNumTagsPerVec) +
+                static_cast<size_t>(
+                    m_options.m_limitedTagColumn)];
+        };
+        std::unordered_map<std::uint32_t, int>
+            allTagCounts;
+        std::unordered_map<std::uint32_t, int>
+            selectedTagCounts;
+        allTagCounts.reserve(
+            (std::min)(
+                static_cast<size_t>(data.R()),
+                static_cast<size_t>(4096)));
+        selectedTagCounts.reserve(selected.size());
+        for (SizeType vectorId = 0;
+             vectorId < data.R(); ++vectorId)
+        {
+            ++allTagCounts[tagAt(vectorId)];
+        }
+        for (SizeType head : selected)
+        {
+            if (head >= 0 && head < data.R())
+                ++selectedTagCounts[tagAt(head)];
+        }
+
+        std::unordered_map<
+            std::uint32_t, std::vector<SizeType>>
+            candidatesByDeficientTag;
+        for (const auto& tagCount : allTagCounts)
+        {
+            if (selectedTagCounts[tagCount.first] <
+                m_options.m_minHeadsPerTag)
+            {
+                candidatesByDeficientTag.emplace(
+                    tagCount.first,
+                    std::vector<SizeType>());
+            }
+        }
+        if (!candidatesByDeficientTag.empty())
+        {
+            std::unordered_set<SizeType> selectedSet(
+                selected.begin(), selected.end());
+            for (SizeType vectorId = 0;
+                 vectorId < data.R(); ++vectorId)
+            {
+                const auto found =
+                    candidatesByDeficientTag.find(
+                        tagAt(vectorId));
+                if (found !=
+                        candidatesByDeficientTag.end() &&
+                    selectedSet.count(vectorId) == 0)
+                {
+                    found->second.push_back(vectorId);
+                }
+            }
+
+            size_t promoted = 0;
+            for (auto& entry :
+                 candidatesByDeficientTag)
+            {
+                const std::uint32_t tag = entry.first;
+                auto& candidates = entry.second;
+                std::vector<SizeType> representatives;
+                representatives.reserve(
+                    static_cast<size_t>(
+                        m_options.m_minHeadsPerTag));
+                for (SizeType head : selected)
+                {
+                    if (tagAt(head) == tag)
+                        representatives.push_back(head);
+                }
+                while (
+                    static_cast<int>(
+                        representatives.size()) <
+                        m_options.m_minHeadsPerTag &&
+                    !candidates.empty())
+                {
+                    size_t best = 0;
+                    float bestMinDistance = -1.0f;
+                    for (size_t candidate = 0;
+                         candidate < candidates.size();
+                         ++candidate)
+                    {
+                        float minDistance = MaxDist;
+                        for (SizeType representative :
+                             representatives)
+                        {
+                            minDistance = (std::min)(
+                                minDistance,
+                                m_fComputeDistance(
+                                    data[candidates[candidate]],
+                                    data[representative],
+                                    m_options.m_dim));
+                        }
+                        if (representatives.empty() ||
+                            minDistance > bestMinDistance ||
+                            (minDistance == bestMinDistance &&
+                             candidates[candidate] <
+                                 candidates[best]))
+                        {
+                            best = candidate;
+                            bestMinDistance = minDistance;
+                        }
+                    }
+                    const SizeType promotedHead =
+                        candidates[best];
+                    representatives.push_back(promotedHead);
+                    selected.push_back(promotedHead);
+                    candidates[best] = candidates.back();
+                    candidates.pop_back();
+                    ++promoted;
+                }
+            }
+            std::sort(selected.begin(), selected.end());
+            SPTAGLIB_LOG(
+                Helper::LogLevel::LL_Info,
+                "MinHeadsPerTag=%d promoted %zu representative heads "
+                "for %zu under-covered tags.\n",
+                m_options.m_minHeadsPerTag,
+                promoted, candidatesByDeficientTag.size());
+        }
+    }
+
     SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Seleted Nodes: %u, about %.2lf%% of total.\n",
                  static_cast<unsigned int>(selected.size()), selected.size() * 100.0 / data.R());
 
@@ -9116,7 +9020,8 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
             "SecondLevelRouteSelectivityThreshold must be in [0,1], "
             "SecondLevelInitialProbeRatio must be in (0,1], "
             "SecondLevelSignature selectivity must satisfy 0<=min<max<=1, "
-            "and SecondLevelMaxCheck must be positive.\n");
+            "SecondLevelMaxCheck must be positive, and HeadNavigationMode "
+            "must be Auto, H1Only, or H2Only.\n");
         return ErrorCode::FailedParseValue;
     }
     if (!ValidSecondLevelArtifactLayout(
@@ -9265,6 +9170,21 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
             Helper::LogLevel::LL_Error,
             "Extreme-sparse tag routing requires limited-tag mode, a file name, "
             "and a positive ExtremeSparseTagMinCount.\n");
+        return ErrorCode::FailedParseValue;
+    }
+    if (m_options.m_minHeadsPerTag < 0) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "MinHeadsPerTag must be non-negative.\n");
+        return ErrorCode::FailedParseValue;
+    }
+    if (m_options.m_minHeadsPerTag > 0 &&
+        (!m_options.m_enableLimitedTagPosting ||
+         m_options.m_limitedTagColumn < 0)) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "MinHeadsPerTag requires limited-tag posting and a valid "
+            "LimitedTagColumn.\n");
         return ErrorCode::FailedParseValue;
     }
     if (m_options.m_enableHybridDistance &&

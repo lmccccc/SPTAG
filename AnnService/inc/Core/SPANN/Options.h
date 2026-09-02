@@ -74,6 +74,7 @@ namespace SPTAG {
             bool m_printSizeCount;
             std::string m_selectType;
             std::string m_perVectorTagsFile;
+            int m_minHeadsPerTag;
             bool m_dualPoolAugment;
             double m_dualPoolExtraRatio;
             std::string m_uExtraIDFile;
@@ -91,6 +92,7 @@ namespace SPTAG {
             double m_secondLevelSignatureMinSelectivity;
             double m_secondLevelSignatureMaxSelectivity;
             int m_secondLevelMaxCheck;
+            std::string m_headNavigationMode;
 
             // Section 3: for build head
             bool m_buildHead;

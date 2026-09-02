@@ -51,6 +51,17 @@ public:
     virtual ErrorCode DeleteIndex(const void* p_vectors, SizeType p_vectorNum) = 0;
 
     virtual ErrorCode SearchIndex(QueryResult& p_results, bool p_searchDeleted = false) const = 0;
+
+    // Applies a per-query graph-search cap without changing result admission.
+    // The default preserves compatibility for index implementations that do
+    // not expose a mutable search workspace budget.
+    virtual ErrorCode SearchIndexWithMaxCheck(
+        QueryResult& p_results,
+        int p_maxCheck,
+        bool p_searchDeleted = false) const
+    {
+        return SearchIndex(p_results, p_searchDeleted);
+    }
     
     virtual std::shared_ptr<ResultIterator> GetIterator(const void* p_target, bool p_searchDeleted = false, std::function<bool(const ByteArray&)> p_filterFunc = nullptr, int p_maxCheck = 0) const = 0;
 

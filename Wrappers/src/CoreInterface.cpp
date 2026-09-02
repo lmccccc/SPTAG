@@ -6855,6 +6855,10 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
     int p_tenantId, ByteArray p_tags, int p_numVectors,
     int p_numTagsPerVec, ByteArray p_vectors)
 {
+    // Extreme-sparse tags are represented by promoted regular heads. The
+    // historical EST sidecar remains readable only for index compatibility;
+    // it must never select a separate serving path.
+    constexpr bool kEnableExtremeSparseTagRoute = false;
     const uint32_t* p_tagsPtr = reinterpret_cast<const uint32_t*>(p_tags.Data());
     if (p_tagsPtr == nullptr || p_numVectors <= 0 ||
         p_numTagsPerVec <= 0 ||
@@ -6938,6 +6942,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                     limitedTagEnabled =
                         spann->HasLimitedTagLayout();
                     extremeSparseTagEnabled =
+                        kEnableExtremeSparseTagRoute &&
                         options != nullptr &&
                         options->m_enableExtremeSparseTag;
                     logExtremeSparseTagRoute =
@@ -9394,7 +9399,9 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
 
     std::shared_ptr<QueryResult>
         extremeSparseResult;
-    if (spannSearchOptions != nullptr &&
+    constexpr bool kEnableExtremeSparseTagRoute = false;
+    if (kEnableExtremeSparseTagRoute &&
+        spannSearchOptions != nullptr &&
         spannSearchOptions->m_enableExtremeSparseTag)
     {
         const auto storeEntry =
