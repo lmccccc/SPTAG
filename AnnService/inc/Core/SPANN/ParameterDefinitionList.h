@@ -76,6 +76,7 @@ DefineSelectHeadParameter(m_secondLevelReplicaCount, int, 4, "SecondLevelReplica
 DefineSelectHeadParameter(m_secondLevelHeadIndexFolder, std::string, std::string("SecondLevelHeadIndex"), "SecondLevelHeadIndexFolder")
 DefineSelectHeadParameter(m_secondLevelPostingFile, std::string, std::string("second_level_head_postings.bin"), "SecondLevelPostingFile")
 DefineSelectHeadParameter(m_secondLevelGenerationFingerprint, std::string, std::string(), "SecondLevelGenerationFingerprint")
+DefineSelectHeadParameter(m_buildH1Graph, bool, true, "BuildH1Graph")
 #endif
 
 #ifdef DefineBuildHeadParameter

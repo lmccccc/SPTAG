@@ -143,6 +143,15 @@ namespace SPTAG
             // only the U_extra head vectors; H1 head GetSample lookups are resolved into
             // the per-bundle subgraph stores. Detected at load via HeadIndex/head_metaonly.bin.
             mutable bool m_metadataOnlyHeadStore = false;
+            // Graphless H1 mode retains this catalog for H2 expansion/rerank.
+            // It is deliberately separate from the metadata-only root's one
+            // physical compatibility vector.
+            mutable std::shared_ptr<VectorSet> m_h1CatalogVectors;
+            // Build-time H2-to-H1 CSR used only while creating graphless-H1
+            // postings. The persisted, signature-bearing CSR is built after
+            // limited-tag support has been learned from those postings.
+            std::vector<std::uint64_t> m_graphlessH2Offsets;
+            std::vector<SecondLevelHeadPostings::Member> m_graphlessH2Members;
             // Precomputed H1 head-id -> resolved bundle sample pointer table. Built once at
             // load (SetupMetadataOnlyHeadStore) after every bundle is eager-loaded and
             // immutable, so the external sample resolver is a lock-free O(1) array lookup

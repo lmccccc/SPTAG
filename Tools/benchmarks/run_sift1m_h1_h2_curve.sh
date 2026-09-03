@@ -4,14 +4,14 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
 DATA=/mnt/nvme/baotonglu/mocheng/datasets/sift1m_zipf200_sparse193_numeric
-INDEX="$DATA/index_limited_tag_h2_15pct"
+INDEX="$DATA/index_limited_tag_h2_graphless"
 QUERY="$DATA/query"
-OUT="$DATA/h1_h2_curve_h2_15pct_r8"
+OUT="$DATA/h2_curve_h1_graphless"
 BENCH="$ROOT/Release/spannaclbench"
 NPROBES=(16 24 32 48 62 80 96 128 192 256 384)
 MODES=("$@")
 if [[ ${#MODES[@]} -eq 0 ]]; then
-    MODES=(H1Only H2Only)
+    MODES=(H2Only)
 fi
 
 [[ -x "$BENCH" ]] || { echo "Missing benchmark binary: $BENCH" >&2; exit 1; }
@@ -74,7 +74,7 @@ run_case() {
 }
 
 for mode in "${MODES[@]}"; do
-    [[ "$mode" == H1Only || "$mode" == H2Only ]] ||
+    [[ "$mode" == H2Only ]] ||
         { echo "Unsupported navigation mode: $mode" >&2; exit 2; }
     for nprobe in "${NPROBES[@]}"; do
         run_case "$mode" "$nprobe" unfilter \

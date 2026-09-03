@@ -96,6 +96,7 @@ namespace SPTAG {
 
             // Section 3: for build head
             bool m_buildHead;
+            bool m_buildH1Graph;
 
             // Section 4: for build ssd and search ssd
             bool m_enableSSD;

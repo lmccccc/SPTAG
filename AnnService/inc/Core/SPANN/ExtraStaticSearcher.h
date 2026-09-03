@@ -233,6 +233,18 @@ namespace SPTAG
                 CloseStaticPipePQCodes();
             }
 
+            using HeadPlacementSearch = std::function<ErrorCode(
+                const ValueType*,
+                int,
+                const std::function<bool(SizeType)>&,
+                COMMON::QueryResultSet<ValueType>&)>;
+
+            void SetHeadPlacementSearch(
+                HeadPlacementSearch p_search)
+            {
+                m_headPlacementSearch = std::move(p_search);
+            }
+
             virtual bool Available() override
             {
                 return m_available;
@@ -2375,17 +2387,23 @@ namespace SPTAG
                                     1,
                                     p_opt
                                         .m_internalResultNum));
+                            const auto filter =
+                                [&p_support, tag](SizeType p_head) {
+                                return p_support.Supports(
+                                    p_head, tag);
+                            };
                             const ErrorCode status =
-                                p_headIndex
+                                m_headPlacementSearch
+                                ? m_headPlacementSearch(
+                                    static_cast<const ValueType*>(
+                                        p_fullVectors->GetVector(vectorID)),
+                                    (std::max)(
+                                        1,
+                                        p_opt.m_internalResultNum),
+                                    filter, results)
+                                : p_headIndex
                                     ->SearchIndexWithResultFilter(
-                                        results,
-                                        [&p_support, tag](
-                                            SizeType p_head) {
-                                            return p_support
-                                                .Supports(
-                                                    p_head,
-                                                    tag);
-                                        });
+                                        results, filter);
                             if (status != ErrorCode::Success) {
                                 SizeType expected = MaxSize;
                                 if (failedVector.compare_exchange_strong(
@@ -8767,6 +8785,7 @@ namespace SPTAG
             std::unordered_map<SizeType, int> m_staticHeadVectorOwners;
             const std::unordered_map<SizeType, int>* m_staticHeadVectorOwnersView = nullptr;
             std::vector<std::shared_ptr<VectorIndex>> m_staticHeadBundleIndexes;
+            HeadPlacementSearch m_headPlacementSearch;
             const std::vector<std::vector<SizeType>>* m_staticHeadBundleLocalToGlobalHIDs = nullptr;
             const std::vector<std::vector<SizeType>>* m_staticHeadBundleNodeHeadVectorIDs = nullptr;
             StaticCrossGraphSearch m_staticCrossGraphSearch;

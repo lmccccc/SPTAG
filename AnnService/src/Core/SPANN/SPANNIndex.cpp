@@ -2018,6 +2018,10 @@ template <typename T> ErrorCode Index<T>::SetupMetadataOnlyHeadStore(const std::
 
     FILE* fp = std::fopen(sidecar.c_str(), "rb");
     if (fp == nullptr) return ErrorCode::Success; // not a slim index
+    SPTAGLIB_LOG(
+        Helper::LogLevel::LL_Info,
+        "Loading metadata-only H1 catalog descriptor: %s\n",
+        sidecar.c_str());
 
     // Sidecar layout is packed (no struct padding): u32 magic, i32 version,
     // i64 totalHeads, i64 h1Split, i32 dim  => 28 bytes. Read field-by-field so
@@ -2037,15 +2041,64 @@ template <typename T> ErrorCode Index<T>::SetupMetadataOnlyHeadStore(const std::
         return ErrorCode::Fail;
     }
 
+    SPTAGLIB_LOG(
+        Helper::LogLevel::LL_Info,
+        "Validating metadata-only H1 root type.\n");
     auto* kdt = dynamic_cast<KDT::Index<T>*>(m_index.get());
     if (kdt == nullptr) {
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Slim head store requires a KDT head index.\n");
         return ErrorCode::Fail;
     }
 
+    SPTAGLIB_LOG(
+        Helper::LogLevel::LL_Info,
+        "Metadata-only H1 descriptor validated: heads=%lld split=%lld.\n",
+        static_cast<long long>(totalHeads),
+        static_cast<long long>(h1Split));
     const SizeType total = static_cast<SizeType>(totalHeads);
     const SizeType h1Split_ = static_cast<SizeType>(h1Split);
     (void)dim;
+
+    if (!m_options.m_buildH1Graph) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Info,
+            "Loading graphless H1 catalog vectors.\n");
+        std::shared_ptr<Helper::ReaderOptions> catalogOptions(
+            new Helper::ReaderOptions(
+                m_options.m_valueType, m_options.m_dim,
+                VectorFileType::DEFAULT));
+        auto catalogReader =
+            Helper::VectorSetReader::CreateInstance(catalogOptions);
+        const std::string catalogPath =
+            (p_baseDir.empty() ? m_options.m_indexDirectory : p_baseDir) +
+            FolderSep + m_options.m_headVectorFile;
+        if (catalogReader == nullptr ||
+            catalogReader->LoadFile(catalogPath) != ErrorCode::Success ||
+            catalogReader->GetVectorSet() == nullptr ||
+            catalogReader->GetVectorSet()->Count() != h1Split_) {
+            SPTAGLIB_LOG(
+                Helper::LogLevel::LL_Error,
+                "Graphless H1 catalog is missing or inconsistent: %s\n",
+                catalogPath.c_str());
+            return ErrorCode::Fail;
+        }
+        m_h1CatalogVectors = catalogReader->GetVectorSet();
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Info,
+            "Binding %d graphless H1 catalog vectors.\n",
+            static_cast<int>(m_h1CatalogVectors->Count()));
+        kdt->SetMetadataOnly(total, h1Split_);
+        kdt->SetExternalSampleResolver(
+            [this](SizeType hid) -> const void* {
+                return m_h1CatalogVectors != nullptr &&
+                        hid >= 0 &&
+                        hid < m_h1CatalogVectors->Count()
+                    ? m_h1CatalogVectors->GetVector(hid)
+                    : nullptr;
+            });
+        m_metadataOnlyHeadStore = true;
+        return ErrorCode::Success;
+    }
 
     // Eager-load every bundle node so the globalVID -> (node, local) reverse map is
     // fully populated before any search-time H1 GetSample resolution.
@@ -2622,10 +2675,11 @@ ErrorCode Index<T>::BuildSecondLevelHeadPostings()
         m_secondLevelIndex == nullptr ||
         m_vectorTranslateMap.R() !=
             m_index->GetNumSamples() ||
-        m_limitedTagSupport.HeadCount() !=
-            m_index->GetNumSamples() ||
-        m_limitedTagSupport.ContentFingerprint() == 0 ||
-        !m_limitedTagSupport.HasTagVectorCounts() ||
+        (!m_metadataOnlyHeadStore &&
+         (m_limitedTagSupport.HeadCount() !=
+              m_index->GetNumSamples() ||
+          m_limitedTagSupport.ContentFingerprint() == 0 ||
+          !m_limitedTagSupport.HasTagVectorCounts())) ||
         m_index->GetNumSamples() <= 0 ||
         m_secondLevelIndex->GetNumSamples() <= 0)
     {
@@ -3110,6 +3164,13 @@ ErrorCode Index<T>::BuildSecondLevelHeadPostings()
     }
     for (Member& member : members)
         member &= ~kFinalMember;
+
+    if (m_metadataOnlyHeadStore &&
+        !m_limitedTagSupport.HasTagVectorCounts()) {
+        m_graphlessH2Offsets = offsets;
+        m_graphlessH2Members = std::move(members);
+        return ErrorCode::Success;
+    }
 
     using Signature =
         SecondLevelHeadPostings::Signature;
@@ -5457,17 +5518,26 @@ ErrorCode Index<T>::LoadIndexData(const std::vector<std::shared_ptr<Helper::Disk
     const std::string bundleBaseDir = m_options.m_recovery ? m_options.m_persistentBufferPath : m_options.m_indexDirectory;
     if (LoadHeadBundleManifest(bundleBaseDir) != ErrorCode::Success)
         return ErrorCode::Fail;
-    if (InitializeHeadBundleRuntime(bundleBaseDir) != ErrorCode::Success)
+    const std::string metadataRootSidecar =
+        bundleBaseDir + FolderSep + m_options.m_headIndexFolder +
+        FolderSep + "head_metaonly.bin";
+    if (fileexists(metadataRootSidecar.c_str())) {
+        if (SetupMetadataOnlyHeadStore(bundleBaseDir) != ErrorCode::Success)
+            return ErrorCode::Fail;
+    } else if (InitializeHeadBundleRuntime(bundleBaseDir) !=
+               ErrorCode::Success) {
         return ErrorCode::Fail;
-
-    if (SetupMetadataOnlyHeadStore(bundleBaseDir) != ErrorCode::Success)
-        return ErrorCode::Fail;
+    }
     if (LoadLimitedTagSupport(bundleBaseDir) !=
         ErrorCode::Success)
         return ErrorCode::Fail;
     if (LoadSecondLevelIndex(bundleBaseDir) !=
         ErrorCode::Success)
         return ErrorCode::Fail;
+    if (!m_options.m_buildH1Graph) {
+        // There is no H1 graph or bundle-local graph to augment in catalog mode.
+        return ErrorCode::Success;
+    }
 
     // Inline the unchanged cross-edge sidecar before the index is published to
     // query threads. This avoids reallocating graph rows during a concurrent
@@ -5952,14 +6022,26 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     const std::vector<int>& searchHeadBundleNodes = threadLocalSearchContext != nullptr
         ? threadLocalSearchContext->m_searchHeadBundleNodes
         : kEmptySearchHeadBundleNodes;
-    const bool forceH1Navigation =
+    const bool graphlessH1 =
+        m_metadataOnlyHeadStore &&
+        !m_options.m_buildH1Graph;
+    const bool requestedH1Navigation =
         Helper::StrUtils::StrEqualIgnoreCase(
             m_options.m_headNavigationMode.c_str(),
             "H1Only");
-    const bool forceH2Navigation =
+    const bool requestedH2Navigation =
         Helper::StrUtils::StrEqualIgnoreCase(
             m_options.m_headNavigationMode.c_str(),
             "H2Only");
+    if (graphlessH1 && requestedH1Navigation) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "HeadNavigationMode=H1Only is unavailable when BuildH1Graph=false.\n");
+        return ErrorCode::FailedParseValue;
+    }
+    const bool forceH1Navigation = requestedH1Navigation;
+    const bool forceH2Navigation =
+        requestedH2Navigation || graphlessH1;
 
     // ═══ Sparse tag fast path: skip graph search, read postings directly ═══
     if (!forceH1Navigation &&
@@ -9283,6 +9365,18 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
         m_pQuantizer == nullptr &&
         !m_options.m_enableDeltaEncoding &&
         !hasBundleUExtra;
+    const bool buildGraphlessH1Catalog = !m_options.m_buildH1Graph;
+    if (buildGraphlessH1Catalog &&
+        (m_options.m_storage != Storage::STATIC ||
+         !m_options.m_selectSecondLevel ||
+         m_pQuantizer != nullptr ||
+         hasBundleUExtra)) {
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Error,
+            "BuildH1Graph=false requires unquantized STATIC H1 catalog "
+            "build with SelectSecondLevel enabled and no U_extra heads.\n");
+        return ErrorCode::FailedParseValue;
+    }
     bool resumedCompletedBundleHeads = false;
     if (resumedSelectHead && m_options.m_buildHead && buildMetadataOnlyBundleRoot)
     {
@@ -9388,8 +9482,77 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
             return true;
         };
 
+        if (buildGraphlessH1Catalog) {
+            std::shared_ptr<Helper::ReaderOptions> catalogOptions(
+                new Helper::ReaderOptions(
+                    m_options.m_valueType, m_options.m_dim,
+                    VectorFileType::DEFAULT));
+            auto catalogReader =
+                Helper::VectorSetReader::CreateInstance(catalogOptions);
+            const std::string catalogPath =
+                m_options.m_indexDirectory + FolderSep +
+                m_options.m_headVectorFile;
+            if (catalogReader == nullptr ||
+                catalogReader->LoadFile(catalogPath) != ErrorCode::Success ||
+                catalogReader->GetVectorSet() == nullptr) {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Error,
+                    "Could not load graphless H1 catalog: %s\n",
+                    catalogPath.c_str());
+                return ErrorCode::Fail;
+            }
+            const SizeType totalHeads =
+                catalogReader->GetVectorSet()->Count();
+            if (totalHeads <= 0 ||
+                LoadTopLevelHeadIDMap(totalHeads) != ErrorCode::Success) {
+                return ErrorCode::Fail;
+            }
+            auto metadataRoot = SPTAG::VectorIndex::CreateInstance(
+                SPTAG::IndexAlgoType::KDT, m_options.m_valueType);
+            if (metadataRoot == nullptr) {
+                return ErrorCode::Fail;
+            }
+            metadataRoot->SetParameter(
+                "DistCalcMethod",
+                SPTAG::Helper::Convert::ConvertToString(
+                    m_options.m_distCalcMethod));
+            ByteArray rootBytes = ByteArray::Alloc(
+                static_cast<size_t>(m_options.m_dim) * sizeof(T));
+            std::memset(rootBytes.Data(), 0, rootBytes.Length());
+            auto rootVectors = std::make_shared<BasicVectorSet>(
+                rootBytes, m_options.m_valueType, m_options.m_dim, 1);
+            if (metadataRoot->BuildIndex(
+                    rootVectors, nullptr, false, true, true) !=
+                ErrorCode::Success) {
+                return ErrorCode::Fail;
+            }
+            m_index = std::move(metadataRoot);
+            const std::string headDir =
+                m_options.m_indexDirectory + FolderSep +
+                m_options.m_headIndexFolder;
+            if (!EnsureDirectory(headDir) ||
+                m_index->SaveIndex(headDir) != ErrorCode::Success ||
+                !WriteMetadataOnlyHeadStore(
+                    headDir + FolderSep + "head_metaonly.bin",
+                    totalHeads, m_options.m_dim) ||
+                SetupMetadataOnlyHeadStore(
+                    m_options.m_indexDirectory) != ErrorCode::Success) {
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Error,
+                    "Failed to create graphless H1 catalog root.\n");
+                return ErrorCode::Fail;
+            }
+            m_pendingNodeHeadSelections.clear();
+            SPTAGLIB_LOG(
+                Helper::LogLevel::LL_Info,
+                "BuildH1Graph=false: retained %d H1 catalog vectors without "
+                "an H1 BKT/RNG graph.\n",
+                static_cast<int>(totalHeads));
+        }
+
         if (!resumedCompletedBundleHeads &&
-            !buildMetadataOnlyBundleRoot) {
+            !buildMetadataOnlyBundleRoot &&
+            !buildGraphlessH1Catalog) {
         m_index = SPTAG::VectorIndex::CreateInstance(m_options.m_indexAlgoType, valueType);
         m_index->SetParameter("DistCalcMethod", SPTAG::Helper::Convert::ConvertToString(m_options.m_distCalcMethod));
         m_index->SetQuantizer(headQuant ? m_pQuantizer : nullptr);
@@ -9473,6 +9636,7 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
         }
 
         if (!resumedCompletedBundleHeads &&
+            !buildGraphlessH1Catalog &&
             !m_pendingNodeHeadSelections.empty())
         {
             m_headBundleNodes.clear();
@@ -9564,6 +9728,7 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
         }
 
         if (buildMetadataOnlyBundleRoot &&
+            !buildGraphlessH1Catalog &&
             !resumedCompletedBundleHeads)
         {
             if (ActivateMetadataOnlyBundleRoot() != ErrorCode::Success) {
@@ -9635,6 +9800,15 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
             m_secondLevelIndex->UpdateIndex();
         }
 
+        if (m_metadataOnlyHeadStore &&
+            m_options.m_selectSecondLevel &&
+            BuildSecondLevelHeadPostings() != ErrorCode::Success) {
+            SPTAGLIB_LOG(
+                Helper::LogLevel::LL_Error,
+                "Cannot build graphless H1 placement CSR.\n");
+            return ErrorCode::Fail;
+        }
+
         if (m_options.m_storage == Storage::STATIC)
         {
             if (m_pQuantizer)
@@ -9677,6 +9851,55 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
         }
         if (auto* staticSearcher =
                 dynamic_cast<ExtraStaticSearcher<T>*>(m_extraSearcher.get())) {
+            if (m_metadataOnlyHeadStore) {
+                staticSearcher->SetHeadPlacementSearch(
+                    [this](const T* target,
+                           int resultCount,
+                           const std::function<bool(SizeType)>& filter,
+                           COMMON::QueryResultSet<T>& results) {
+                        COMMON::QueryResultSet<T> h2Results(
+                            target,
+                            (std::max)(resultCount, 64));
+                        const ErrorCode status =
+                            m_secondLevelIndex->SearchIndex(h2Results);
+                        if (status != ErrorCode::Success) return status;
+                        std::unordered_set<SizeType> candidates;
+                        for (int rank = 0;
+                             rank < h2Results.GetResultNum();
+                             ++rank) {
+                            const BasicResult* h2 =
+                                h2Results.GetResult(rank);
+                            if (h2 == nullptr || h2->VID < 0) break;
+                            const SizeType second = h2->VID;
+                            if (second < 0 ||
+                                static_cast<size_t>(second + 1) >=
+                                    m_graphlessH2Offsets.size())
+                                continue;
+                            const std::uint64_t begin =
+                                m_graphlessH2Offsets[
+                                    static_cast<size_t>(second)];
+                            const std::uint64_t end =
+                                m_graphlessH2Offsets[
+                                    static_cast<size_t>(second + 1)];
+                            for (std::uint64_t i = begin; i < end; ++i)
+                                candidates.insert(
+                                    static_cast<SizeType>(
+                                        m_graphlessH2Members[
+                                            static_cast<size_t>(i)]));
+                        }
+                        for (SizeType head : candidates) {
+                            if (filter && !filter(head)) continue;
+                            results.AddPoint(
+                                head,
+                                m_index->ComputeDistance(
+                                    target, m_index->GetSample(head)));
+                        }
+                        results.SetScanned(
+                            h2Results.GetScanned() +
+                            static_cast<int>(candidates.size()));
+                        return ErrorCode::Success;
+                    });
+            }
             staticSearcher->SetHeadVectorOwnersView(&m_pendingHeadVectorOwners);
             if (m_metadataOnlyHeadStore) {
                 staticSearcher->SetHeadBundleBuildView(
@@ -9773,12 +9996,19 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "BuildSSDIndex Failed!\n");
                 return ErrorCode::Fail;
             }
+            SPTAGLIB_LOG(
+                Helper::LogLevel::LL_Info,
+                "Graphless H1: static postings written; finalizing catalog.\n");
             if (m_metadataOnlyHeadStore &&
+                m_h1CatalogVectors == nullptr &&
                 SetupMetadataOnlyHeadStore(m_options.m_indexDirectory) != ErrorCode::Success) {
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
                              "Failed to bind bundle samples to metadata-only head root.\n");
                 return ErrorCode::Fail;
             }
+            SPTAGLIB_LOG(
+                Helper::LogLevel::LL_Info,
+                "Graphless H1: catalog finalized; loading posting snapshot.\n");
 
             if (!m_options.m_excludehead)
             {
@@ -9803,6 +10033,9 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
                 m_extraSearcher.reset();
             }
         }
+        SPTAGLIB_LOG(
+            Helper::LogLevel::LL_Info,
+            "Graphless H1: posting snapshot loaded; building final H2 CSR.\n");
 
         if (m_extraSearcher != nullptr)
         {
@@ -9851,7 +10084,9 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
     // to HeadIndex/vectors.bin and at search-load is only a never-triggered fallback for
     // head count (SPTAGHeadVectorIDs.bin is always present). Dropping it removes one full
     // copy of the head vectors from disk.
-    if (m_options.m_deleteHeadVectors || !m_pendingNodeHeadSelections.empty())
+    if (m_options.m_deleteHeadVectors ||
+        (!m_pendingNodeHeadSelections.empty() &&
+         m_options.m_buildH1Graph))
     {
         if (fileexists((m_options.m_indexDirectory + FolderSep + m_options.m_headVectorFile).c_str()) &&
             remove((m_options.m_indexDirectory + FolderSep + m_options.m_headVectorFile).c_str()) != 0)
@@ -9957,7 +10192,7 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
                          "Failed to initialize metadata-only head root.\n");
             return ErrorCode::Fail;
         }
-    } else if (m_metaOnlyHeadVectorPtrs.empty() &&
+    } else if (m_h1CatalogVectors == nullptr &&
                SetupMetadataOnlyHeadStore(m_options.m_indexDirectory) != ErrorCode::Success) {
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
                      "Failed to initialize metadata-only head root.\n");
