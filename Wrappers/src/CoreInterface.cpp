@@ -5983,6 +5983,15 @@ void TenantIndexManager::LoadTenantSparseIndices()
 
 bool TenantIndexManager::LoadTenantExtremeSparseTagStores()
 {
+    // Extreme tags are served through the regular promoted-head H1/H2 path.
+    // Keep legacy sidecars optional while the separate direct-serving route is
+    // disabled, so the native EST build policy does not require its artifact.
+    constexpr bool kEnableExtremeSparseTagRoute = false;
+    if (!kEnableExtremeSparseTagRoute) {
+        m_tenantExtremeSparseTagStores.clear();
+        return true;
+    }
+
     for (const auto& entry : m_tenantSpannWorkDirs)
     {
         const int tenantId = entry.first;

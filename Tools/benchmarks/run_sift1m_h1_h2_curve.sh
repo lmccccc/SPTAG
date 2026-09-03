@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
-DATA=/mnt/nvme/baotonglu/mocheng/datasets/sift1m_zipf200_sparse_numeric
+DATA=/mnt/nvme/baotonglu/mocheng/datasets/sift1m_zipf200_sparse193_numeric
 INDEX="$DATA/index_limited_tag_h2_15pct"
 QUERY="$DATA/query"
 OUT="$DATA/h1_h2_curve_h2_15pct_r8"
@@ -88,9 +88,6 @@ for mode in "${MODES[@]}"; do
         run_case "$mode" "$nprobe" sparse_tag \
             "$QUERY/groundtruth_extreme_tag_local_ids.npy" \
             --query-tags "$QUERY/query_tags_extreme.npy" --tag-column 0
-        run_case "$mode" "$nprobe" numeric \
-            "$QUERY/groundtruth_numeric_local_ids.npy" \
-            --query-dnf "$QUERY/query_dnf_numeric.npy"
         run_case "$mode" "$nprobe" mixed_dnf \
             "$QUERY/groundtruth_mixed_dnf_local_ids.npy" \
             --query-dnf "$QUERY/query_dnf_mixed.npy"
