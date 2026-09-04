@@ -276,6 +276,19 @@ namespace SPTAG
                 return m_avgPagesPerList;
             }
 
+            int GetPostingPageCount(SizeType p_postingID) const override
+            {
+                if (p_postingID < 0 ||
+                    static_cast<size_t>(p_postingID) >=
+                        m_listInfos.size())
+                {
+                    return -1;
+                }
+                return m_listInfos[
+                    static_cast<size_t>(p_postingID)]
+                    .listPageCount;
+            }
+
             virtual double GetPostingAvgBytes(bool p_useHybrid = false) const override
             {
                 if (p_useHybrid) return m_hasHybridPurePostings ? m_hybridAvgBytesPerList : -1.0;

@@ -111,6 +111,8 @@ DefineSSDParameter(m_secondLevelInitialProbeRatio, double, 1.0, "SecondLevelInit
 DefineSSDParameter(m_secondLevelSignatureMinSelectivity, double, 0.0, "SecondLevelSignatureMinSelectivity")
 DefineSSDParameter(m_secondLevelSignatureMaxSelectivity, double, 1.0, "SecondLevelSignatureMaxSelectivity")
 DefineSSDParameter(m_secondLevelMaxCheck, int, 112, "SecondLevelMaxCheck") // Mutable
+DefineSSDParameter(m_sparseFallbackMaxHeads, int, 0, "SparseFallbackMaxHeads")
+DefineSSDParameter(m_sparseFallbackMaxPostingPages, int, 0, "SparseFallbackMaxPostingPages")
 DefineSSDParameter(m_headNavigationMode, std::string, std::string("Auto"), "HeadNavigationMode") // Mutable
 DefineSSDParameter(m_hybridVectorWeight, float, 1.0f, "HybridVectorWeight")
 DefineSSDParameter(m_hybridCategoricalCols, std::string, std::string(""), "HybridCategoricalCols")

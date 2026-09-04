@@ -739,6 +739,7 @@ namespace SPTAG {
             virtual int GetPostingCount() const { return -1; }
             virtual double GetPostingAvgRecords(bool /*p_useHybrid*/ = false) const { return -1.0; }
             virtual double GetPostingAvgPages(bool /*p_useHybrid*/ = false) const { return -1.0; }
+            virtual int GetPostingPageCount(SizeType /*p_postingID*/) const { return -1; }
             virtual double GetPostingAvgBytes(bool /*p_useHybrid*/ = false) const { return -1.0; }
             virtual int GetPostingBufferBytes(bool /*p_useHybrid*/ = false) const { return -1; }
         };

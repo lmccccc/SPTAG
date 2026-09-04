@@ -92,6 +92,8 @@ namespace SPTAG {
             double m_secondLevelSignatureMinSelectivity;
             double m_secondLevelSignatureMaxSelectivity;
             int m_secondLevelMaxCheck;
+            int m_sparseFallbackMaxHeads;
+            int m_sparseFallbackMaxPostingPages;
             std::string m_headNavigationMode;
 
             // Section 3: for build head

@@ -139,6 +139,8 @@ bool ValidSecondLevelRouteConfig(
                 .m_secondLevelSignatureMinSelectivity <
             p_options
                 .m_secondLevelSignatureMaxSelectivity &&
+        p_options.m_sparseFallbackMaxHeads >= 0 &&
+        p_options.m_sparseFallbackMaxPostingPages >= 0 &&
         p_options.m_secondLevelMaxCheck > 0;
 }
 
@@ -5275,6 +5277,7 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
             "SecondLevelRouteSelectivityThreshold must be in [0,1], "
             "SecondLevelInitialProbeRatio must be in (0,1], "
             "SecondLevelSignature selectivity must satisfy 0<=min<max<=1, "
+            "SparseFallback limits must be nonnegative, "
             "SecondLevelMaxCheck must be positive, and HeadNavigationMode "
             "must be Auto, H1Only, or H2Only.\n");
         return ErrorCode::FailedParseValue;
@@ -6885,7 +6888,11 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 "Second-level limited-tag head routing failed.\n");
             return ret;
         }
-        if (scanned > 0)
+        if (scanned > 0 ||
+            (useLimitedTagPure &&
+             limitedTagQueryValues.size() == 1 &&
+             m_options.m_sparseFallbackMaxHeads > 0 &&
+             m_options.m_sparseFallbackMaxPostingPages > 0))
         {
             int admitted = 0;
             for (; admitted < graphResultNum;
@@ -6898,6 +6905,94 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                     result->VID < 0)
                     break;
             }
+            bool usedSparseFallback = false;
+            if (admitted < graphResultNum &&
+                useLimitedTagPure &&
+                limitedTagQueryValues.size() == 1 &&
+                m_options.m_sparseFallbackMaxHeads > 0 &&
+                m_options.m_sparseFallbackMaxPostingPages > 0 &&
+                m_extraSearcher != nullptr)
+            {
+                const std::uint32_t tag =
+                    limitedTagQueryValues.front();
+                const auto tagHeads =
+                    m_limitedTagSupport.TagHeads().find(tag);
+                if (tagHeads !=
+                        m_limitedTagSupport.TagHeads().end() &&
+                    tagHeads->second.size() <=
+                        static_cast<size_t>(
+                            m_options.m_sparseFallbackMaxHeads) &&
+                    tagHeads->second.size() <=
+                        static_cast<size_t>(
+                            graphResultNum))
+                {
+                    std::uint64_t postingPages = 0;
+                    bool withinPageLimit = true;
+                    std::vector<SizeType> validHeads;
+                    validHeads.reserve(
+                        tagHeads->second.size());
+                    for (SizeType head : tagHeads->second)
+                    {
+                        if (!m_extraSearcher
+                                 ->CheckValidPosting(head))
+                            continue;
+                        const int pages =
+                            m_extraSearcher->GetPostingPageCount(head);
+                        if (pages < 0 ||
+                            pages >
+                                m_options
+                                    .m_sparseFallbackMaxPostingPages ||
+                            postingPages >
+                                static_cast<std::uint64_t>(
+                                    m_options
+                                        .m_sparseFallbackMaxPostingPages -
+                                    pages))
+                        {
+                            withinPageLimit = false;
+                            break;
+                        }
+                        postingPages +=
+                            static_cast<std::uint64_t>(pages);
+                        validHeads.push_back(head);
+                    }
+                    if (withinPageLimit &&
+                        !validHeads.empty())
+                    {
+                        p_queryResults->Reset();
+                        for (SizeType head : tagHeads->second)
+                        {
+                            const void* sample =
+                                m_index->GetSample(head);
+                            if (sample == nullptr)
+                                return ErrorCode::Fail;
+                            p_queryResults->AddPoint(
+                                head,
+                                m_index->ComputeDistance(
+                                    p_queryResults
+                                        ->GetQuantizedTarget(),
+                                    sample));
+                        }
+                        p_queryResults->SortResult();
+                        usedSparseFallback = true;
+                        admitted = static_cast<int>(
+                            tagHeads->second.size());
+                        scanned = (std::max)(
+                            scanned, admitted);
+                        if (m_options.m_logAdaptiveNprobe)
+                        {
+                            SPTAGLIB_LOG(
+                                Helper::LogLevel::LL_Info,
+                                "Sparse H1 fallback for tag %u added all %zu "
+                                "support heads and scans %zu valid postings "
+                                "(%llu pages).\n",
+                                tag, tagHeads->second.size(),
+                                validHeads.size(),
+                                static_cast<unsigned long long>(
+                                    postingPages));
+                        }
+                    }
+                }
+            }
             if (admitted < graphResultNum)
             {
                 if (forceH2Navigation)
@@ -6907,9 +7002,12 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                     {
                         SPTAGLIB_LOG(
                             Helper::LogLevel::LL_Info,
-                            "H2-only navigation returned %d/%d H1 candidates without H1 completion.\n",
+                            "H2-only navigation returned %d/%d H1 candidates%s.\n",
                             admitted,
-                            graphResultNum);
+                            graphResultNum,
+                            usedSparseFallback
+                                ? " after bounded sparse fallback"
+                                : " without H1 completion");
                     }
                 }
                 else
@@ -9102,6 +9200,7 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
             "SecondLevelRouteSelectivityThreshold must be in [0,1], "
             "SecondLevelInitialProbeRatio must be in (0,1], "
             "SecondLevelSignature selectivity must satisfy 0<=min<max<=1, "
+            "SparseFallback limits must be nonnegative, "
             "SecondLevelMaxCheck must be positive, and HeadNavigationMode "
             "must be Auto, H1Only, or H2Only.\n");
         return ErrorCode::FailedParseValue;
