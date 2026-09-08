@@ -305,7 +305,8 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                       std::function<bool(const ByteArray &)> filterFunc,
                       const CrossGraphSearchContext* p_crossContext,
                       CrossGraphSearchStats* p_crossStats,
-                      std::function<bool(SizeType)> p_resultFilter) const
+                      std::function<bool(SizeType)> p_resultFilter,
+                      const std::function<bool(SizeType)>& p_traversalFilter) const
 {
     std::shared_lock<std::shared_timed_mutex> treeLock;
     std::vector<std::shared_lock<std::shared_timed_mutex>> crossTreeLocks;
@@ -331,8 +332,9 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
     {
         treeStart = std::chrono::high_resolution_clock::now();
     }
-    m_pTrees.InitSearchTrees(m_pSamples, m_fComputeDistance, p_query, p_space);
-    m_pTrees.SearchTrees(m_pSamples, m_fComputeDistance, p_query, p_space, m_iNumberOfInitialDynamicPivots);
+    m_pTrees.InitSearchTrees(m_pSamples, m_fComputeDistance, p_query, p_space, p_traversalFilter);
+    m_pTrees.SearchTrees(m_pSamples, m_fComputeDistance, p_query, p_space,
+        m_iNumberOfInitialDynamicPivots, p_traversalFilter);
     std::chrono::high_resolution_clock::time_point graphStart;
 
     if constexpr (EnableCrossEdges)
@@ -626,7 +628,14 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                 }
 
                 bool admitted = false;
-                if (p_resultFilter)
+                bool traversalAllowed = true;
+                if constexpr (!EnableCrossEdges)
+                {
+                    if (p_traversalFilter && collapsedLocal != p_representative)
+                        traversalAllowed = !p_space.CheckResultAndSet(collapsedLocal) &&
+                            p_traversalFilter(collapsedLocal);
+                }
+                if (traversalAllowed && p_resultFilter)
                 {
                     SizeType collapsedKey =
                         collapsedLocal;
@@ -652,6 +661,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                     }
                 }
                 else if (
+                    traversalAllowed &&
                     collapsedResult >= 0 &&
                     notDeleted(
                         p_index->m_deletedID,
@@ -916,6 +926,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                 {
                     continue;
                 }
+                if (p_traversalFilter && !p_traversalFilter(targetLocal)) continue;
                 const float distance =
                     m_fComputeDistance(
                         p_query.GetQuantizedTarget(),
@@ -1047,7 +1058,8 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                                  (std::min)(
                                      p_space.m_iMaxCheck,
                                      m_iNumberOfOtherDynamicPivots +
-                                         p_space.m_iNumberOfCheckedLeaves));
+                                         p_space.m_iNumberOfCheckedLeaves),
+                                 p_traversalFilter);
         }
     }
     finishSearch();
@@ -1169,7 +1181,8 @@ bool CheckFilter(const std::shared_ptr<MetadataSet> &metadata, SizeType node,
 template <typename T>
 void Index<T>::SearchIndex(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_space, bool p_searchDeleted,
                            bool p_searchDuplicated, std::function<bool(const ByteArray &)> filterFunc,
-                           std::function<bool(SizeType)> p_resultFilter) const
+                           std::function<bool(SizeType)> p_resultFilter,
+                           const std::function<bool(SizeType)>& p_traversalFilter) const
 {
     if (m_pQuantizer && !p_query.HasQuantizedTarget())
     {
@@ -1186,35 +1199,35 @@ void Index<T>::SearchIndex(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace
     {
     case 0b000:
         Search<false, StaticDispatch::CheckIfNotDeleted, StaticDispatch::NeverDup, StaticDispatch::CheckFilter>(
-            p_query, p_space, filterFunc, nullptr, nullptr, p_resultFilter);
+            p_query, p_space, filterFunc, nullptr, nullptr, p_resultFilter, p_traversalFilter);
         break;
     case 0b001:
         Search<false, StaticDispatch::CheckIfNotDeleted, StaticDispatch::NeverDup, StaticDispatch::AlwaysTrue>(
-            p_query, p_space, filterFunc, nullptr, nullptr, p_resultFilter);
+            p_query, p_space, filterFunc, nullptr, nullptr, p_resultFilter, p_traversalFilter);
         break;
     case 0b010:
         Search<false, StaticDispatch::CheckIfNotDeleted, StaticDispatch::CheckDup, StaticDispatch::CheckFilter>(
-            p_query, p_space, filterFunc, nullptr, nullptr, p_resultFilter);
+            p_query, p_space, filterFunc, nullptr, nullptr, p_resultFilter, p_traversalFilter);
         break;
     case 0b011:
         Search<false, StaticDispatch::CheckIfNotDeleted, StaticDispatch::CheckDup, StaticDispatch::AlwaysTrue>(
-            p_query, p_space, filterFunc, nullptr, nullptr, p_resultFilter);
+            p_query, p_space, filterFunc, nullptr, nullptr, p_resultFilter, p_traversalFilter);
         break;
     case 0b100:
         Search<false, StaticDispatch::AlwaysTrue, StaticDispatch::NeverDup, StaticDispatch::CheckFilter>(
-            p_query, p_space, filterFunc, nullptr, nullptr, p_resultFilter);
+            p_query, p_space, filterFunc, nullptr, nullptr, p_resultFilter, p_traversalFilter);
         break;
     case 0b101:
         Search<false, StaticDispatch::AlwaysTrue, StaticDispatch::NeverDup, StaticDispatch::AlwaysTrue>(
-            p_query, p_space, filterFunc, nullptr, nullptr, p_resultFilter);
+            p_query, p_space, filterFunc, nullptr, nullptr, p_resultFilter, p_traversalFilter);
         break;
     case 0b110:
         Search<false, StaticDispatch::AlwaysTrue, StaticDispatch::CheckDup, StaticDispatch::CheckFilter>(
-            p_query, p_space, filterFunc, nullptr, nullptr, p_resultFilter);
+            p_query, p_space, filterFunc, nullptr, nullptr, p_resultFilter, p_traversalFilter);
         break;
     case 0b111:
         Search<false, StaticDispatch::AlwaysTrue, StaticDispatch::CheckDup, StaticDispatch::AlwaysTrue>(
-            p_query, p_space, filterFunc, nullptr, nullptr, p_resultFilter);
+            p_query, p_space, filterFunc, nullptr, nullptr, p_resultFilter, p_traversalFilter);
         break;
     default:
         std::ostringstream oss;
@@ -1435,6 +1448,34 @@ ErrorCode Index<T>::SearchIndexWithResultFilter(
                 i, (result < 0)
                        ? ByteArray::c_empty
                        : m_pMetadata->GetMetadataCopy(result));
+        }
+    }
+    return ErrorCode::Success;
+}
+
+template <typename T>
+ErrorCode Index<T>::SearchIndexWithTraversalFilter(
+    QueryResult& p_query,
+    const std::function<bool(SizeType)>& p_filter,
+    int p_maxCheck,
+    bool p_searchDeleted) const
+{
+    if (!m_bReady) return ErrorCode::EmptyIndex;
+    if (!p_filter) return SearchIndexWithMaxCheck(p_query, p_maxCheck, p_searchDeleted);
+    auto workSpace = RentWorkSpace(
+        p_query.GetResultNum(), nullptr, p_maxCheck > 0 ? p_maxCheck : m_iMaxCheck);
+    workSpace->PrepareResultCheckStatus();
+    SearchIndex(
+        *((COMMON::QueryResultSet<T>*)&p_query), *workSpace,
+        p_searchDeleted, true, nullptr, nullptr, p_filter);
+    m_workSpaceFactory->ReturnWorkSpace(std::move(workSpace));
+    if (p_query.WithMeta() && m_pMetadata != nullptr)
+    {
+        for (int rank = 0; rank < p_query.GetResultNum(); ++rank)
+        {
+            const SizeType result = p_query.GetResult(rank)->VID;
+            p_query.SetMetadata(rank, result < 0 ? ByteArray::c_empty
+                : m_pMetadata->GetMetadataCopy(result));
         }
     }
     return ErrorCode::Success;

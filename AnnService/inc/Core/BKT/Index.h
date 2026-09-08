@@ -234,6 +234,11 @@ namespace SPTAG
                 std::function<bool(SizeType)> p_resultFilter,
                 int p_maxCheck = 0,
                 bool p_searchDeleted = false) const override;
+            ErrorCode SearchIndexWithTraversalFilter(
+                QueryResult& p_query,
+                const std::function<bool(SizeType)>& p_filter,
+                int p_maxCheck,
+                bool p_searchDeleted = false) const override;
             ErrorCode RefineSearchIndex(QueryResult &p_query, bool p_searchDeleted = false) const;
             ErrorCode SearchTree(QueryResult &p_query) const;
             ErrorCode AddIndex(const void* p_data, SizeType p_vectorNum, DimensionType p_dimension, std::shared_ptr<MetadataSet> p_metadataSet, bool p_withMetaIndex = false, bool p_normalized = false);
@@ -274,7 +279,6 @@ namespace SPTAG
 
             virtual std::string GetPriorityID(int queryID) const override { return m_pTrees.GetPriorityID(m_pSamples, queryID, m_fComputeDistance); }
         private:
-
             int SearchIndexIterative(COMMON::QueryResultSet<T>& p_query, COMMON::WorkSpace& p_space, bool p_isFirst, int batch, bool p_searchDeleted, bool p_searchDuplicated) const;
 
             template <bool(*notDeleted)(const COMMON::LabelSet&, SizeType), bool(*isDup)(COMMON::QueryResultSet<T>&, SizeType, float), bool (*checkFilter)(const std::shared_ptr<MetadataSet> &, SizeType, std::function<bool(const ByteArray &)>)>
@@ -287,14 +291,16 @@ namespace SPTAG
                 bool p_searchDeleted,
                 bool p_searchDuplicated,
                 std::function<bool(const ByteArray&)> p_filterFunc = nullptr,
-                std::function<bool(SizeType)> p_resultFilter = nullptr) const;
+                std::function<bool(SizeType)> p_resultFilter = nullptr,
+                const std::function<bool(SizeType)>& p_traversalFilter = nullptr) const;
             template <bool EnableCrossEdges, bool(*notDeleted)(const COMMON::LabelSet&, SizeType), bool(*isDup)(COMMON::QueryResultSet<T>&, SizeType, float), bool(*checkFilter)(const std::shared_ptr<MetadataSet>&, SizeType, std::function<bool(const ByteArray&)>)>
             void Search(COMMON::QueryResultSet<T>& p_query,
                         COMMON::WorkSpace& p_space,
                         std::function<bool(const ByteArray&)> filterFunc,
                         const CrossGraphSearchContext* p_crossContext = nullptr,
                         CrossGraphSearchStats* p_crossStats = nullptr,
-                        std::function<bool(SizeType)> p_resultFilter = nullptr) const;
+                        std::function<bool(SizeType)> p_resultFilter = nullptr,
+                        const std::function<bool(SizeType)>& p_traversalFilter = nullptr) const;
         };
     } // namespace BKT
 } // namespace SPTAG

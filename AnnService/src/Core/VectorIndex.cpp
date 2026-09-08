@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "inc/Core/VectorIndex.h"
+#include "inc/Helper/AtomicFile.h"
 #include "inc/Helper/CommonHelper.h"
 #include "inc/Helper/ConcurrentSet.h"
 #include "inc/Helper/SimpleIniReader.h"
@@ -11,11 +12,14 @@
 #include "inc/Core/KDT/Index.h"
 #include "inc/Core/SPANN/Index.h"
 
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 
 typedef typename SPTAG::Helper::Concurrent::ConcurrentMap<std::string, SPTAG::SizeType> MetadataMap;
 
@@ -184,7 +188,8 @@ bool copyfile(const char *oldpath, const char *newpath)
     return true;
 }
 
-bool copydirectory(const fs::path &sourceDir, const fs::path &destinationDir)
+bool copydirectory(const fs::path &sourceDir, const fs::path &destinationDir,
+                   bool p_linkFiles)
 {
     try
     {
@@ -217,7 +222,8 @@ bool copydirectory(const fs::path &sourceDir, const fs::path &destinationDir)
                 // If it's a subdirectory, recursively copy its contents
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Copying directory: %s to %s\n", currentPath.string().c_str(),
                              destinationPath.string().c_str());
-                if (!copydirectory(currentPath, destinationPath))
+                if (entry.is_symlink() ||
+                    !copydirectory(currentPath, destinationPath, p_linkFiles))
                 {
                     return false; // Propagate error from recursive call
                 }
@@ -227,8 +233,11 @@ bool copydirectory(const fs::path &sourceDir, const fs::path &destinationDir)
                 // If it's a file, copy it directly
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Copying file: %s to %s\n", currentPath.string().c_str(),
                              destinationPath.string().c_str());
-                // Use copy_options::overwrite_existing to replace files if they exist in destination
-                fs::copy(currentPath, destinationPath, fs::copy_options::overwrite_existing);
+                if (!entry.is_regular_file()) return false;
+                if (p_linkFiles)
+                    fs::create_hard_link(fs::canonical(currentPath), destinationPath);
+                else
+                    fs::copy_file(currentPath, destinationPath, fs::copy_options::overwrite_existing);
             }
         }
     }
@@ -243,6 +252,11 @@ bool copydirectory(const fs::path &sourceDir, const fs::path &destinationDir)
         return false;
     }
     return true;
+}
+
+bool copydirectory(const fs::path &sourceDir, const fs::path &destinationDir)
+{
+    return copydirectory(sourceDir, destinationDir, false);
 }
 
 #ifndef _MSC_VER
@@ -484,8 +498,42 @@ void VectorIndex::InitializeHeadNodeMeta(
     const Cache::HierWidthTable& p_hierWidths,
     bool p_includeTailPS)
 {
+    if (!InitializeHeadNodeMetaLayout(
+            p_numSamples, p_numQuantCols, p_hierWidths, p_includeTailPS))
+        return;
+    m_headNodeMeta.assign(static_cast<size_t>(p_numSamples) * m_headNodeMetaStride, 0);
+    for (SizeType sampleId = 0; sampleId < p_numSamples; ++sampleId) {
+        SetHeadNodeGlobalVID(sampleId, MaxSize);
+        SetHeadNodeBundleNodeId(sampleId, -1);
+    }
+}
+
+bool VectorIndex::AdoptHeadNodeMeta(
+    SizeType p_numSamples, int p_numQuantCols,
+    const Cache::HierWidthTable& p_hierWidths,
+    bool p_includeTailPS, std::vector<std::uint8_t>&& p_blob)
+{
+    size_t stride = 0;
+    if (&p_blob == &m_headNodeMeta || p_numSamples <= 0 ||
+        !TryComputeHeadNodeMetaStride(
+            p_numQuantCols, p_hierWidths, p_includeTailPS, stride) ||
+        static_cast<size_t>(p_numSamples) > (std::numeric_limits<size_t>::max)() / stride ||
+        p_blob.size() != static_cast<size_t>(p_numSamples) * stride)
+        return false;
+    if (!InitializeHeadNodeMetaLayout(
+            p_numSamples, p_numQuantCols, p_hierWidths, p_includeTailPS))
+        return false;
+    m_headNodeMeta = std::move(p_blob);
+    return true;
+}
+
+bool VectorIndex::InitializeHeadNodeMetaLayout(
+    SizeType p_numSamples, int p_numQuantCols,
+    const Cache::HierWidthTable& p_hierWidths,
+    bool p_includeTailPS)
+{
     ClearHeadNodeMeta();
-    if (p_numSamples <= 0) return;
+    if (p_numSamples <= 0) return false;
     StoreHeadNodeHierWidths(
         this, p_hierWidths);
     const int quantCols =
@@ -498,7 +546,7 @@ void VectorIndex::InitializeHeadNodeMeta(
         static_cast<size_t>(p_numSamples) >
             (std::numeric_limits<size_t>::max)() /
                 computedStride) {
-        return;
+        return false;
     }
 
     // V3 layout per sample:
@@ -558,12 +606,7 @@ void VectorIndex::InitializeHeadNodeMeta(
         m_headNodeTailNumQuantOffset = 0;
     }
     m_headNodeMetaStride = computedStride;
-
-    m_headNodeMeta.assign(static_cast<size_t>(p_numSamples) * m_headNodeMetaStride, 0);
-    for (SizeType sampleId = 0; sampleId < p_numSamples; ++sampleId) {
-        SetHeadNodeGlobalVID(sampleId, MaxSize);
-        SetHeadNodeBundleNodeId(sampleId, -1);
-    }
+    return true;
 }
 
 std::uint64_t* VectorIndex::GetHeadNodeNumQuantMutable(SizeType p_sampleId)
@@ -886,13 +929,15 @@ void VectorIndex::SetThreadLocalPostingScanStats(uint64_t p_readPostings, uint64
                                                  uint64_t p_rerankReadRequests,
                                                  uint64_t p_rerankPhysicalBytes,
                                                  uint64_t p_uniqueMatchedPostings,
-                                                 uint64_t p_uniqueMatchedVectors)
+                                                 uint64_t p_uniqueMatchedVectors,
+                                                 uint64_t p_dedupSkippedVectors)
 {
     g_threadLocalPostingScanStats.m_readPostings = p_readPostings;
     g_threadLocalPostingScanStats.m_matchedPostings = p_matchedPostings;
     g_threadLocalPostingScanStats.m_prePSPostings = p_prePSPostings;
     g_threadLocalPostingScanStats.m_scannedVectors = p_scannedVectors;
     g_threadLocalPostingScanStats.m_matchedVectors = p_matchedVectors;
+    g_threadLocalPostingScanStats.m_dedupSkippedVectors = p_dedupSkippedVectors;
     g_threadLocalPostingScanStats.m_uniqueMatchedPostings = p_uniqueMatchedPostings;
     g_threadLocalPostingScanStats.m_uniqueMatchedVectors = p_uniqueMatchedVectors;
     g_threadLocalPostingScanStats.m_primaryHeadCandidates = p_primaryHeadCandidates;
@@ -1128,6 +1173,245 @@ ErrorCode VectorIndex::SaveIndex(const std::string &p_folderPath)
         fs::equivalent(
             configuredFolder, p_folderPath,
             pathError);
+    auto* spann = dynamic_cast<SPANN::ISPANNIndex*>(this);
+    if (spann != nullptr &&
+        spann->GetOptions()->m_storage == Storage::STATIC &&
+        spann->GetOptions()->m_selectSecondLevel &&
+        !spann->GetOptions()->m_buildH1Graph)
+    {
+        // A graphless root is a compatibility KDT, not a head bundle. Its
+        // catalog, upper graph and generation-bound CSR files are already
+        // persisted; serializing it as a bundle can damage that generation.
+        fs::path staging;
+        const auto cleanup = [&]()
+        {
+            SetParameter("IndexDirectory", configuredFolder, "Base");
+            if (!staging.empty())
+            {
+                std::error_code error;
+                fs::remove_all(staging, error);
+            }
+        };
+        try
+        {
+            if (configuredFolder.empty() || p_folderPath.empty())
+                return ErrorCode::FailedCreateFile;
+            const fs::path source = fs::canonical(configuredFolder);
+            const fs::path destination = fs::weakly_canonical(fs::absolute(p_folderPath));
+            const auto isWithin = [](const fs::path& child, const fs::path& parent)
+            {
+                auto childPart = child.begin();
+                for (auto parentPart = parent.begin(); parentPart != parent.end();
+                     ++parentPart, ++childPart)
+                {
+                    if (childPart == child.end() || *childPart != *parentPart)
+                        return false;
+                }
+                return true;
+            };
+            if (!sameFolder &&
+                (isWithin(destination, source) || isWithin(source, destination)))
+            {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                             "Index export source and destination must not overlap.\n");
+                return ErrorCode::FailedCreateFile;
+            }
+            if (fs::exists(destination) && !fs::is_directory(destination))
+                return ErrorCode::FailedCreateFile;
+            ErrorCode ret = PrepareIndexSave(p_folderPath);
+            if (ret != ErrorCode::Success) return ret;
+            fs::create_directories(destination.parent_path());
+            static std::atomic<std::uint64_t> saveSequence{0};
+            const auto createStage = [&]()
+            {
+                for (int attempt = 0; attempt < 32; ++attempt)
+                {
+                    fs::path candidate = destination;
+                    candidate += ".saving." +
+                        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+                        "." + std::to_string(saveSequence.fetch_add(1));
+                    if (fs::create_directory(candidate)) return candidate;
+                }
+                return fs::path();
+            };
+            staging = createStage();
+            if (staging.empty()) return ErrorCode::FailedCreateFile;
+            // In-place saves need only a read-only validation view, not a
+            // second copy of the SSD postings. Never open a linked file for
+            // writing: unlink the staged INI before generating its replacement.
+            if (!copydirectory(source, staging, sameFolder))
+            {
+                cleanup();
+                return ErrorCode::DiskIOFail;
+            }
+            ret = spann->PrepareHierarchyExport(staging.string());
+            if (ret != ErrorCode::Success)
+            {
+                cleanup();
+                return ret;
+            }
+            const fs::path stagedConfig = staging / "indexloader.ini";
+            fs::remove(stagedConfig);
+            SetParameter("IndexDirectory", destination.string(), "Base");
+            auto configFile = f_createIO();
+            if (configFile == nullptr ||
+                !configFile->Initialize(stagedConfig.string().c_str(), std::ios::out))
+            {
+                cleanup();
+                return ErrorCode::FailedCreateFile;
+            }
+            ret = SaveIndexConfig(configFile);
+            const bool configClosed = configFile->ShutDownAndCheck();
+            SetParameter("IndexDirectory", configuredFolder, "Base");
+            if (ret != ErrorCode::Success || !configClosed)
+            {
+                cleanup();
+                return ret != ErrorCode::Success ? ret : ErrorCode::DiskIOFail;
+            }
+
+            // Use the native loader's catalog/CSR/generation validation, rather
+            // than treating a successful directory copy as a complete index.
+            const auto requireFiles = [](const fs::path& directory,
+                                         const std::vector<std::string>& files)
+            {
+                for (const auto& name : files)
+                {
+                    const fs::path file = directory / name;
+                    if (name.empty() || !fs::is_regular_file(file) || fs::file_size(file) == 0)
+                    {
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                                     "Missing or empty index export artifact: %s\n",
+                                     file.string().c_str());
+                        return false;
+                    }
+                }
+                return true;
+            };
+            auto requiredFiles = GetIndexFiles();
+            requiredFiles->push_back(spann->GetOptions()->m_headIndexFolder +
+                                     FolderSep + "head_metaonly.bin");
+            requiredFiles->push_back(spann->GetOptions()->m_deleteIDFile);
+            requiredFiles->push_back(spann->GetOptions()->m_ssdIndex);
+            if (m_pMetadata != nullptr)
+            {
+                requiredFiles->push_back(m_sMetadataIndexFile);
+                if (!fs::is_regular_file(staging / m_sMetadataFile))
+                {
+                    cleanup();
+                    return ErrorCode::FailedOpenFile;
+                }
+            }
+            if (m_pQuantizer != nullptr) requiredFiles->push_back(m_sQuantizerFile);
+            if (!requireFiles(staging, *requiredFiles))
+            {
+                cleanup();
+                return ErrorCode::FailedOpenFile;
+            }
+            // BKT/KDT loaders allow absent deletion labels (and some legacy
+            // missing streams). Export must not silently synthesize those files.
+            const fs::path topDirectory = staging / spann->GetOptions()->m_secondLevelHeadIndexFolder;
+            Helper::IniReader topConfig;
+            ret = topConfig.LoadIniFile((topDirectory / "indexloader.ini").string());
+            auto topIndex = CreateInstance(
+                topConfig.GetParameter("Index", "IndexAlgoType", IndexAlgoType::Undefined),
+                topConfig.GetParameter("Index", "ValueType", VectorValueType::Undefined));
+            if (ret != ErrorCode::Success || topIndex == nullptr ||
+                topIndex->LoadIndexConfig(topConfig) != ErrorCode::Success ||
+                !requireFiles(topDirectory, *topIndex->GetIndexFiles()))
+            {
+                cleanup();
+                return ErrorCode::FailedOpenFile;
+            }
+            topIndex.reset();
+            std::shared_ptr<VectorIndex> verified;
+            ret = LoadIndex(staging.string(), verified);
+            if (ret == ErrorCode::Success &&
+                (verified->GetNumSamples() != GetNumSamples() ||
+                 verified->GetNumDeleted() != GetNumDeleted()))
+                ret = ErrorCode::Fail;
+            verified.reset();
+            if (ret != ErrorCode::Success ||
+                (ret = CompleteIndexSave(staging.string())) != ErrorCode::Success)
+            {
+                cleanup();
+                return ret;
+            }
+            if (sameFolder)
+            {
+                const bool published = Helper::AtomicReplaceFile(
+                    stagedConfig.string(), (destination / "indexloader.ini").string());
+                cleanup();
+                return published ? ErrorCode::Success : ErrorCode::DiskIOFail;
+            }
+            if (!Helper::SyncDirectoryTree(staging.string()))
+            {
+                cleanup();
+                return ErrorCode::DiskIOFail;
+            }
+            // Keep any previous export intact until its replacement has passed
+            // validation. A failed copy/load never exposes a partial native INI.
+            fs::path previous;
+            if (fs::exists(destination))
+            {
+                previous = createStage();
+                if (previous.empty())
+                {
+                    cleanup();
+                    return ErrorCode::FailedCreateFile;
+                }
+                fs::remove(previous);
+                std::error_code error;
+                fs::rename(destination, previous, error);
+                if (error)
+                {
+                    cleanup();
+                    return ErrorCode::DiskIOFail;
+                }
+            }
+            std::error_code publishError;
+            fs::rename(staging, destination, publishError);
+            if (publishError)
+            {
+                if (!previous.empty())
+                {
+                    std::error_code restoreError;
+                    fs::rename(previous, destination, restoreError);
+                    if (restoreError)
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                                     "Previous index export retained at %s: %s\n",
+                                     previous.string().c_str(), restoreError.message().c_str());
+                }
+                cleanup();
+                return ErrorCode::DiskIOFail;
+            }
+            staging.clear();
+            const bool synced = Helper::SyncParentDirectory(destination.string());
+            if (!previous.empty())
+            {
+                std::error_code error;
+                fs::remove_all(previous, error);
+                if (error)
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Warning,
+                                 "Previous index export retained at %s: %s\n",
+                                 previous.string().c_str(), error.message().c_str());
+            }
+            return synced ? ErrorCode::Success : ErrorCode::DiskIOFail;
+        }
+        catch (const fs::filesystem_error& error)
+        {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                         "Graphless index export failed: %s\n", error.what());
+            cleanup();
+            return ErrorCode::DiskIOFail;
+        }
+        catch (const std::bad_alloc&)
+        {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                         "Insufficient memory to validate graphless index export.\n");
+            cleanup();
+            return ErrorCode::MemoryOverFlow;
+        }
+    }
     if (GetIndexAlgoType() == IndexAlgoType::SPANN &&
         !sameFolder)
     {
@@ -1144,7 +1428,14 @@ ErrorCode VectorIndex::SaveIndex(const std::string &p_folderPath)
         }
         std::string oldFolder = configuredFolder;
         ret = SaveIndex(oldFolder);
-        if (ret != ErrorCode::Success || !copydirectory(oldFolder, p_folderPath))
+        if (ret != ErrorCode::Success)
+        {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                         "Failed to checkpoint source index directory %s before export!\n",
+                         oldFolder.c_str());
+            return ret;
+        }
+        if (!copydirectory(oldFolder, p_folderPath))
         {
             SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to copy index directory contents to %s!\n",
                          p_folderPath.c_str());
@@ -1635,6 +1926,11 @@ ErrorCode VectorIndex::LoadIndex(const std::string &p_loaderFilePath, std::share
     VectorValueType valueType = iniReader.GetParameter("Index", "ValueType", VectorValueType::Undefined);
     if ((p_vectorIndex = CreateInstance(algoType, valueType)) == nullptr)
         return ErrorCode::FailedParseValue;
+
+    // Physical root selection must inspect the directory being loaded, not a
+    // previous build/export path persisted in its configuration.
+    if (algoType == IndexAlgoType::SPANN)
+        iniReader.SetParameter("Base", "IndexDirectory", p_loaderFilePath);
 
     ErrorCode ret = ErrorCode::Success;
     if ((ret = p_vectorIndex->LoadIndexConfig(iniReader)) != ErrorCode::Success)

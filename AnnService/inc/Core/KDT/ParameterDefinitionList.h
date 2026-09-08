@@ -15,6 +15,7 @@ DefineKDTParameter(m_pTrees.m_iSamples, int, 100L, "Samples")
 DefineKDTParameter(m_pTrees.m_bOldVersion, bool, false, "IsOldVersion")
 
 DefineKDTParameter(m_pGraph.m_iTPTNumber, int, 32L, "TPTNumber")
+DefineKDTParameter(m_pGraph.m_iTPTSeed, int, -1, "TPTSeed")
 DefineKDTParameter(m_pGraph.m_iTPTLeafSize, int, 2000L, "TPTLeafSize")
 DefineKDTParameter(m_pGraph.m_numTopDimensionTPTSplit, int, 5L, "NumTopDimensionTPTSplit")
 

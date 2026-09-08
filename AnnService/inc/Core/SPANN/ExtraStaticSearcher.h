@@ -12,6 +12,7 @@
 #include "inc/Core/SPANN/HybridDistance.h"
 #include "inc/Core/SPANN/HybridRoutingStats.h"
 #include "inc/Core/SPANN/LimitedTagSupport.h"
+#include "inc/Core/SPANN/LimitedTagSupportExpansion.h"
 #include "Compressor.h"
 #include "PipePQ.h"
 
@@ -169,14 +170,17 @@ namespace SPTAG
             const char* record = p_postingListFullData + offsetVectorID;\
             int vectorID;\
             std::memcpy(&vectorID, record, sizeof(vectorID));\
+            if (p_exWorkSpace->m_deduper.CheckAndSet(vectorID)) { \
+                ++p_exWorkSpace->m_postingProbeStats.m_dedupSkippedVectors; \
+                listElements--; continue; \
+            } \
             if (!this->StaticRecordMatchesFilter(p_exWorkSpace, record)) { listElements--; continue; } \
             postingMatched = true; \
             ++p_exWorkSpace->m_postingProbeStats.m_matchedVectors; \
-            if (collectPostingContributionStats && uniqueMatchedVIDs.insert(vectorID).second) { \
+            if (collectPostingContributionStats) { \
                 postingContributedUnique = true; \
                 ++p_exWorkSpace->m_postingProbeStats.m_uniqueMatchedVectors; \
             } \
-            if (p_exWorkSpace->m_deduper.CheckAndSet(vectorID)) { listElements--; continue; } \
             (this->*m_parseEncoding)(p_index, listInfo, (ValueType*)(p_postingListFullData + offsetVector));\
             auto distance2leaf = p_index->ComputeDistance(queryResults.GetQuantizedTarget(), p_postingListFullData + offsetVector); \
             queryResults.AddPoint(vectorID, distance2leaf); \
@@ -195,8 +199,11 @@ namespace SPTAG
             const char* record = p_postingListFullData + offsetVectorID;\
             int vectorID;\
             std::memcpy(&vectorID, record, sizeof(vectorID));\
+            if (p_exWorkSpace->m_deduper.CheckAndSet(vectorID)) { \
+                ++p_exWorkSpace->m_postingProbeStats.m_dedupSkippedVectors; \
+                continue; \
+            } \
             if (!this->StaticRecordMatchesFilter(p_exWorkSpace, record)) continue; \
-            if (p_exWorkSpace->m_deduper.CheckAndSet(vectorID)) continue; \
             (this->*m_parseEncoding)(p_index, listInfo, (ValueType*)(p_postingListFullData + offsetVector));\
             auto distance2leaf = p_index->ComputeDistance(queryResults.GetQuantizedTarget(), p_postingListFullData + offsetVector); \
             queryResults.AddPoint(vectorID, distance2leaf); \
@@ -264,6 +271,16 @@ namespace SPTAG
                 return m_totalListCount;
             }
 
+            int GetPostingVectorCount(SizeType p_postingID, bool p_pureRegion) const override
+            {
+                if (p_postingID < 0 ||
+                    static_cast<size_t>(p_postingID) >= m_listInfos.size() ||
+                    (p_pureRegion && !m_hasHybridPurePostings))
+                    return -1;
+                const auto& list = m_listInfos[static_cast<size_t>(p_postingID)];
+                return p_pureRegion ? list.pureEleCount : list.listEleCount;
+            }
+
             virtual double GetPostingAvgRecords(bool p_useHybrid = false) const override
             {
                 if (p_useHybrid) return m_hasHybridPurePostings ? m_hybridAvgRecordsPerList : -1.0;
@@ -287,6 +304,40 @@ namespace SPTAG
                 return m_listInfos[
                     static_cast<size_t>(p_postingID)]
                     .listPageCount;
+            }
+
+            int GetPostingPageCount(
+                SizeType p_postingID,
+                bool p_pureRegion) const override
+            {
+                if (!p_pureRegion) {
+                    return GetPostingPageCount(p_postingID);
+                }
+                if (p_postingID < 0 ||
+                    static_cast<size_t>(p_postingID) >=
+                        m_listInfos.size() ||
+                    m_vectorInfoSize <= 0)
+                {
+                    return -1;
+                }
+                const ListInfo& listInfo =
+                    m_listInfos[static_cast<size_t>(
+                        p_postingID)];
+                const int pureCount = (std::max)(
+                    0,
+                    (std::min)(
+                        listInfo.pureEleCount,
+                        listInfo.listEleCount));
+                if (pureCount == 0) return 0;
+                const size_t bytes =
+                    static_cast<size_t>(
+                        listInfo.pageOffset) +
+                    static_cast<size_t>(pureCount) *
+                        static_cast<size_t>(
+                            m_vectorInfoSize);
+                return static_cast<int>(
+                    (bytes + PageSize - 1) >>
+                    PageSizeEx);
             }
 
             virtual double GetPostingAvgBytes(bool p_useHybrid = false) const override
@@ -1404,8 +1455,20 @@ namespace SPTAG
                                                 vectorID)),
                                     p_candidateCount);
                             const ErrorCode status =
-                                p_headIndex->SearchIndex(
-                                    results);
+                                m_headPlacementSearch
+                                    ? m_headPlacementSearch(
+                                          static_cast<
+                                              const ValueType*>(
+                                              p_fullVectors
+                                                  ->GetVector(
+                                                      vectorID)),
+                                          p_candidateCount,
+                                          std::function<
+                                              bool(SizeType)>(),
+                                          results)
+                                    : p_headIndex
+                                          ->SearchIndex(
+                                              results);
                             if (status !=
                                 ErrorCode::Success) {
                                 SizeType expected =
@@ -1584,6 +1647,8 @@ namespace SPTAG
                 Selection& p_selections,
                 std::vector<std::atomic_int>& p_postingListSize,
                 const std::unordered_map<SizeType, SizeType>& p_headVectorIDs,
+                const Selection& p_originalPosting,
+                const std::vector<int>& p_originalPostingSizes,
                 std::shared_ptr<VectorSet> p_fullVectors,
                 std::shared_ptr<VectorIndex> p_headIndex,
                 SizeType p_fullCount,
@@ -1709,7 +1774,8 @@ namespace SPTAG
                         "Limited-tag placement is missing the original O-search votes.\n");
                     return false;
                 }
-                if (headCount <
+                if (!p_opt.m_enableLimitedTagSupportExpansion &&
+                    headCount <
                     p_opt.m_limitedTagMinHeadCount) {
                     SPTAGLIB_LOG(
                         Helper::LogLevel::LL_Error,
@@ -1821,7 +1887,6 @@ namespace SPTAG
                     std::uint32_t,
                     std::uint64_t> tagVectorCounts;
                 {
-                    std::unordered_set<std::uint32_t> unique;
                     for (SizeType vectorID = 0;
                          vectorID < p_fullCount;
                          ++vectorID) {
@@ -1834,15 +1899,17 @@ namespace SPTAG
                                 "Limited-tag input contains the reserved empty tag.\n");
                             return false;
                         }
-                        ++tagVectorCounts[tag];
-                        if (unique.insert(tag).second)
+                        const auto count = tagVectorCounts.emplace(tag, 0);
+                        ++count.first->second;
+                        if (count.second)
                             observedTags.push_back(tag);
                     }
                 }
                 std::sort(
                     observedTags.begin(),
                     observedTags.end());
-                if (observedTags.size() < supportTarget) {
+                if (!p_opt.m_enableLimitedTagSupportExpansion &&
+                    observedTags.size() < supportTarget) {
                     SPTAGLIB_LOG(
                         Helper::LogLevel::LL_Error,
                         "Limited-tag placement needs at least %zu distinct tags "
@@ -1966,7 +2033,8 @@ namespace SPTAG
                 }
 
                 std::uint64_t centroidFallbackSupports = 0;
-                if (observedTags.size() > 1) {
+                if (!p_opt.m_enableLimitedTagSupportExpansion &&
+                    observedTags.size() > 1) {
                     const int fallbackResultCount =
                         (std::min)(
                             64,
@@ -2129,126 +2197,118 @@ namespace SPTAG
                         }
                     }
                 }
-                for (const LimitedTagVote& vote : p_votes) {
-                    if (coverage[vote.m_tag] <
-                        p_opt.m_limitedTagMinHeadCount) {
-                        tagCandidates[vote.m_tag]
-                            .emplace_back(
-                                vote.m_distance,
-                                vote.m_head);
-                    }
-                }
-                for (auto& entry : tagCandidates) {
-                    std::sort(
-                        entry.second.begin(),
-                        entry.second.end(),
-                        [](const std::pair<float, SizeType>& p_left,
-                           const std::pair<float, SizeType>& p_right) {
-                            if (p_left.first != p_right.first)
-                                return p_left.first <
-                                    p_right.first;
-                            return p_left.second <
-                                p_right.second;
-                        });
-                }
-
-                const auto supports =
-                    [&supportRow](
-                        SizeType p_head,
-                        std::uint32_t p_tag) {
-                        const auto choices =
-                            supportRow(p_head);
-                        return std::any_of(
-                            choices.begin(), choices.end(),
-                            [p_tag](
-                                const SupportChoice& p_choice) {
-                                return p_choice.m_tag ==
-                                    p_tag;
-                            });
-                    };
-                for (std::uint32_t tag : observedTags) {
-                    auto candidate =
-                        tagCandidates.find(tag);
-                    if (candidate == tagCandidates.end()) {
-                        if (coverage[tag] >=
+                if (!p_opt.m_enableLimitedTagSupportExpansion) {
+                    for (const LimitedTagVote& vote : p_votes) {
+                        if (coverage[vote.m_tag] <
                             p_opt.m_limitedTagMinHeadCount) {
-                            continue;
+                            tagCandidates[vote.m_tag]
+                                .emplace_back(
+                                    vote.m_distance,
+                                    vote.m_head);
                         }
-                        SPTAGLIB_LOG(
-                            Helper::LogLevel::LL_Error,
-                            "Tag %u has no non-head nearest-head votes.\n",
-                            tag);
-                        return false;
                     }
-                    for (const auto& headCandidate :
-                         candidate->second) {
-                        if (coverage[tag] >=
-                            p_opt.m_limitedTagMinHeadCount)
-                            break;
-                        const SizeType head =
-                            headCandidate.second;
-                        auto choices = supportRow(head);
-                        if (supports(head, tag)) continue;
-                        if (choices.size() <
-                            static_cast<size_t>(
-                                p_opt
-                                    .m_limitedTagSlotsPerHead)) {
-                            if (!choices.push_back({
-                                    tag, headCandidate.first,
-                                    false})) {
-                                return false;
-                            }
-                            ++coverage[tag];
-                            continue;
-                        }
+                    for (auto& entry : tagCandidates) {
+                        std::sort(
+                            entry.second.begin(),
+                            entry.second.end(),
+                            [](const std::pair<float, SizeType>& p_left,
+                               const std::pair<float, SizeType>& p_right) {
+                                if (p_left.first != p_right.first)
+                                    return p_left.first <
+                                        p_right.first;
+                                return p_left.second <
+                                    p_right.second;
+                            });
+                    }
 
-                        size_t replacement =
-                            choices.size();
-                        for (size_t slot = 0;
-                             slot < choices.size();
-                             ++slot) {
-                            if (choices[slot].m_isOwnTag)
+                    const auto supports =
+                        [&supportRow](
+                            SizeType p_head,
+                            std::uint32_t p_tag) {
+                            const auto choices =
+                                supportRow(p_head);
+                            return std::any_of(
+                                choices.begin(), choices.end(),
+                                [p_tag](
+                                    const SupportChoice& p_choice) {
+                                    return p_choice.m_tag ==
+                                        p_tag;
+                                });
+                        };
+                    for (std::uint32_t tag : observedTags) {
+                        auto candidate =
+                            tagCandidates.find(tag);
+                        if (candidate == tagCandidates.end()) {
+                            if (coverage[tag] >=
+                                p_opt.m_limitedTagMinHeadCount) {
                                 continue;
-                            if (coverage[
-                                    choices[slot].m_tag] <=
-                                p_opt
-                                    .m_limitedTagMinHeadCount)
-                                continue;
-                            if (replacement ==
-                                    choices.size() ||
-                                choices[slot].m_distance >
-                                    choices[replacement]
-                                        .m_distance ||
-                                (choices[slot].m_distance ==
-                                     choices[replacement]
-                                         .m_distance &&
-                                 choices[slot].m_tag >
-                                     choices[replacement]
-                                         .m_tag)) {
-                                replacement = slot;
                             }
+                            SPTAGLIB_LOG(
+                                Helper::LogLevel::LL_Error,
+                                "Tag %u has no non-head nearest-head votes.\n",
+                                tag);
+                            return false;
                         }
-                        if (replacement ==
-                            choices.size()) {
-                            continue;
+                        for (const auto& headCandidate :
+                             candidate->second) {
+                            if (coverage[tag] >=
+                                p_opt.m_limitedTagMinHeadCount)
+                                break;
+                            const SizeType head =
+                                headCandidate.second;
+                            auto choices = supportRow(head);
+                            if (supports(head, tag)) continue;
+                            if (choices.size() <
+                                static_cast<size_t>(
+                                    p_opt.m_limitedTagSlotsPerHead)) {
+                                if (!choices.push_back({
+                                        tag, headCandidate.first,
+                                        false})) {
+                                    return false;
+                                }
+                                ++coverage[tag];
+                                continue;
+                            }
+
+                            size_t replacement =
+                                choices.size();
+                            for (size_t slot = 0;
+                                 slot < choices.size();
+                                 ++slot) {
+                                if (choices[slot].m_isOwnTag)
+                                    continue;
+                                if (coverage[choices[slot].m_tag] <=
+                                    p_opt.m_limitedTagMinHeadCount)
+                                    continue;
+                                if (replacement == choices.size() ||
+                                    choices[slot].m_distance > choices[replacement].m_distance ||
+                                    (choices[slot].m_distance == choices[replacement].m_distance &&
+                                     choices[slot].m_tag > choices[replacement].m_tag)) {
+                                    replacement = slot;
+                                }
+                            }
+                            if (replacement ==
+                                choices.size()) {
+                                continue;
+                            }
+                            --coverage[
+                                choices[replacement].m_tag];
+                            choices[replacement] = {
+                                tag, headCandidate.first,
+                                false};
+                            ++coverage[tag];
                         }
-                        --coverage[
-                            choices[replacement].m_tag];
-                        choices[replacement] = {
-                            tag, headCandidate.first,
-                            false};
-                        ++coverage[tag];
-                    }
-                    if (coverage[tag] <
-                        p_opt.m_limitedTagMinHeadCount) {
-                        SPTAGLIB_LOG(
-                            Helper::LogLevel::LL_Error,
-                            "Cannot give tag %u the required %d supported heads "
-                            "(got %d).\n",
-                            tag,
-                            p_opt.m_limitedTagMinHeadCount,
-                            coverage[tag]);
-                        return false;
+                        if (coverage[tag] <
+                            p_opt.m_limitedTagMinHeadCount) {
+                            SPTAGLIB_LOG(
+                                Helper::LogLevel::LL_Error,
+                                "Cannot give tag %u the required %d supported heads "
+                                "(got %d).\n",
+                                tag,
+                                p_opt.m_limitedTagMinHeadCount,
+                                coverage[tag]);
+                            return false;
+                        }
                     }
                 }
 
@@ -2282,8 +2342,8 @@ namespace SPTAG
                             StaticBuildTagsData() +
                                 static_cast<size_t>(
                                     source) *
-                                    static_cast<size_t>(
-                                        m_staticNumTagsPerVec),
+                                static_cast<size_t>(
+                                    m_staticNumTagsPerVec),
                             m_staticNumTagsPerVec)) {
                         return false;
                     }
@@ -2298,6 +2358,36 @@ namespace SPTAG
                         "Limited-tag vector selectivity metadata is invalid.\n");
                     return false;
                 }
+                if (p_opt.m_enableLimitedTagSupportExpansion)
+                {
+                    LimitedTagSupportExpansion expansion;
+                    if (!expansion.Initialize(
+                            p_support, observedTags, p_opt.m_limitedTagMinHeadCount,
+                            p_opt.m_limitedTagMaxExtraSupports, &supportError))
+                    {
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                            "Cannot initialize O-based support expansion: %s\n", supportError.c_str());
+                        return false;
+                    }
+                    if (!expansion.ObserveRetainedOriginalPostings(
+                            p_originalPosting.m_selections, p_originalPostingSizes,
+                            p_fullCount, keyTagAt, &supportError) ||
+                        !expansion.Apply(p_support, &supportError))
+                    {
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                            "Cannot finalize O-based support expansion: %s\n", supportError.c_str());
+                        return false;
+                    }
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                        "O-based support expansion: floor=%d expandedTags=%llu extraSupports=%llu "
+                        "sourceCappedTags=%llu retainedOAssignments=%llu budget=%llu.\n",
+                        p_opt.m_limitedTagMinHeadCount,
+                        static_cast<unsigned long long>(expansion.ExpandedTags()),
+                        static_cast<unsigned long long>(expansion.AddedSupports()),
+                        static_cast<unsigned long long>(expansion.CappedTags()),
+                        static_cast<unsigned long long>(expansion.OriginalAssignments()),
+                        static_cast<unsigned long long>(p_opt.m_limitedTagMaxExtraSupports));
+                }
                 if (!p_support.Finalize(&supportError)) {
                     SPTAGLIB_LOG(
                         Helper::LogLevel::LL_Error,
@@ -2305,21 +2395,7 @@ namespace SPTAG
                         supportError.c_str());
                     return false;
                 }
-                auto supportHeadsByTag = [&]() {
-                    std::unordered_map<
-                        std::uint32_t,
-                        std::vector<SizeType>>
-                        headsByTag;
-                    for (SizeType head = 0;
-                         head < headCount; ++head) {
-                        for (const auto& choice :
-                             supportRow(head)) {
-                            headsByTag[choice.m_tag]
-                                .push_back(head);
-                        }
-                    }
-                    return headsByTag;
-                }();
+                const auto& supportHeadsByTag = p_support.TagHeads();
                 std::vector<LimitedTagVote>().swap(
                     p_votes);
                 tagCandidates.clear();
@@ -2336,6 +2412,8 @@ namespace SPTAG
                     headSourceVectorIDs);
                 coverage.clear();
                 coverage.rehash(0);
+                tagVectorCounts.clear();
+                tagVectorCounts.rehash(0);
 
                 std::vector<std::atomic_int> postingListSize(
                     static_cast<size_t>(headCount));
@@ -2436,126 +2514,76 @@ namespace SPTAG
                                         0, results.GetScanned())),
                                 std::memory_order_relaxed);
 
-                            selectedEdges.clear();
-                            int selected = 0;
-                            for (int rank = 0;
-                                 rank <
-                                     results.GetResultNum() &&
-                                 selected <
-                                     p_opt.m_replicaCount;
-                                 ++rank) {
-                                const BasicResult* result =
-                                    results.GetResult(rank);
-                                if (result == nullptr ||
-                                    result->VID < 0)
-                                    break;
-                                bool accepted = true;
-                                for (int prior = 0;
-                                     prior < selected;
-                                     ++prior) {
-                                    const SizeType priorHead =
-                                        selectedEdges[
-                                            static_cast<size_t>(
-                                                prior)]
-                                            .node;
-                                    const float headDistance =
-                                        p_headIndex
-                                            ->ComputeDistance(
-                                                p_headIndex
-                                                    ->GetSample(
-                                                        result
-                                                            ->VID),
-                                                p_headIndex
-                                                    ->GetSample(
-                                                        priorHead));
-                                    if (p_opt.m_rngFactor *
-                                            headDistance <=
-                                        result->Dist) {
-                                        accepted = false;
-                                        break;
-                                    }
-                                }
-                                if (!accepted) continue;
-                                Edge edge;
-                                edge.node = result->VID;
-                                edge.tonode = vectorID;
-                                edge.distance = result->Dist;
-                                ++postingListSize[
-                                    static_cast<size_t>(
-                                        edge.node)];
-                                selectedEdges.push_back(
-                                    edge);
-                                ++selected;
-                            }
-                            if (selected == 0) {
-                                const auto supported =
-                                    supportHeadsByTag.find(tag);
-                                SizeType bestHead = MaxSize;
-                                float bestDistance = MaxDist;
-                                if (supported !=
-                                    supportHeadsByTag.end()) {
-                                    for (SizeType head :
-                                         supported->second) {
-                                        const float distance =
-                                            p_headIndex
-                                                ->ComputeDistance(
-                                                    p_fullVectors
-                                                        ->GetVector(
-                                                            vectorID),
-                                                    p_headIndex
-                                                        ->GetSample(
-                                                            head));
-                                        if (distance <
-                                                bestDistance ||
-                                            (distance ==
-                                                 bestDistance &&
-                                             head < bestHead)) {
-                                            bestHead = head;
-                                            bestDistance =
-                                                distance;
+                            const auto selectRNG =
+                                [&](COMMON::QueryResultSet<ValueType>& candidates) {
+                                    selectedEdges.clear();
+                                    for (int rank = 0;
+                                         rank < candidates.GetResultNum() &&
+                                         selectedEdges.size() < static_cast<size_t>(p_opt.m_replicaCount);
+                                         ++rank) {
+                                        const BasicResult* result = candidates.GetResult(rank);
+                                        if (result == nullptr || result->VID < 0) break;
+                                        if (result->VID >= headCount ||
+                                            !p_support.Supports(result->VID, tag))
+                                            return false;
+                                        bool accepted = true;
+                                        for (const auto& prior : selectedEdges) {
+                                            const float headDistance = p_headIndex->ComputeDistance(
+                                                p_headIndex->GetSample(result->VID),
+                                                p_headIndex->GetSample(prior.node));
+                                            if (p_opt.m_rngFactor * headDistance <= result->Dist) {
+                                                accepted = false;
+                                                break;
+                                            }
                                         }
+                                        if (!accepted) continue;
+                                        Edge edge;
+                                        edge.node = result->VID;
+                                        edge.tonode = vectorID;
+                                        edge.distance = result->Dist;
+                                        selectedEdges.push_back(edge);
                                     }
-                                    exactFallbackDistanceChecks
-                                        .fetch_add(
-                                            supported->second
-                                                .size(),
-                                            std::memory_order_relaxed);
+                                    return true;
+                                };
+                            bool validCandidates = selectRNG(results);
+                            if (validCandidates && selectedEdges.empty()) {
+                                const auto supported = supportHeadsByTag.find(tag);
+                                COMMON::QueryResultSet<ValueType> fallback(
+                                    static_cast<const ValueType*>(p_fullVectors->GetVector(vectorID)),
+                                    p_opt.m_enableLimitedTagSupportExpansion
+                                        ? p_opt.m_internalResultNum : 1);
+                                if (supported != supportHeadsByTag.end()) {
+                                    for (SizeType head : supported->second) {
+                                        fallback.AddPoint(head, p_headIndex->ComputeDistance(
+                                            p_fullVectors->GetVector(vectorID),
+                                            p_headIndex->GetSample(head)));
+                                    }
+                                    exactFallbackDistanceChecks.fetch_add(
+                                        supported->second.size(), std::memory_order_relaxed);
                                 }
-                                if (bestHead != MaxSize) {
-                                    Edge edge;
-                                    edge.node = bestHead;
-                                    edge.tonode = vectorID;
-                                    edge.distance =
-                                        bestDistance;
-                                    ++postingListSize[
-                                        static_cast<size_t>(
-                                            bestHead)];
-                                    selectedEdges.push_back(
-                                        edge);
-                                    selected = 1;
+                                fallback.SortResult();
+                                validCandidates = selectRNG(fallback);
+                                if (validCandidates && !selectedEdges.empty())
                                     exactFallbacks.fetch_add(
-                                        1,
-                                        std::memory_order_relaxed);
-                                } else {
-                                    SizeType expected = MaxSize;
-                                    if (failedVector
-                                            .compare_exchange_strong(
-                                                expected,
-                                                vectorID)) {
-                                        failedTag.store(tag);
-                                        failedScanned.store(
-                                            results
-                                                .GetScanned());
-                                    }
-                                    failed.store(true);
-                                    return;
-                                }
+                                        1, std::memory_order_relaxed);
                             }
+                            if (!validCandidates || selectedEdges.empty()) {
+                                SizeType expected = MaxSize;
+                                if (failedVector.compare_exchange_strong(expected, vectorID)) {
+                                    failedTag.store(tag);
+                                    failedScanned.store(results.GetScanned());
+                                    failedStatus.store(static_cast<int>(ErrorCode::Fail));
+                                }
+                                failed.store(true);
+                                return;
+                            }
+                            for (const auto& edge : selectedEdges)
+                                ++postingListSize[static_cast<size_t>(edge.node)];
                             desiredReplicas[
                                 static_cast<size_t>(
                                     vectorID)] =
                                 static_cast<std::uint8_t>(
-                                    selected);
+                                    selectedEdges.size());
                             emitted.insert(
                                 emitted.end(),
                                 selectedEdges.begin(),
@@ -2590,8 +2618,6 @@ namespace SPTAG
                         failedStatus.load());
                     return false;
                 }
-                supportHeadsByTag.clear();
-                supportHeadsByTag.rehash(0);
 
                 size_t selectionCount = 0;
                 for (const auto& emitted :
@@ -2626,6 +2652,13 @@ namespace SPTAG
                     &limitedSelections.m_selections);
                 size_t read = 0;
                 std::uint64_t assignmentCount = 0;
+                struct RealizedCoverage
+                {
+                    std::uint32_t purePostings = 0;
+                    std::uint32_t effectiveHeads = 0;
+                };
+                std::unordered_map<std::uint32_t, RealizedCoverage> realizedCoverage;
+                std::uint64_t maxExpandedPurePages = 0;
                 for (SizeType head = 0;
                      head < headCount; ++head) {
                     const size_t begin = read;
@@ -2680,8 +2713,36 @@ namespace SPTAG
                     if (headTags.size() >
                         static_cast<size_t>(
                             p_opt
-                                .m_limitedTagSlotsPerHead)) {
+                                .m_limitedTagSlotsPerHead) +
+                            p_support.ExtraTagCount(head)) {
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                            "Limited-tag posting %d exceeds its complete support row.\n", head);
                         return false;
+                    }
+                    if (p_opt.m_enableLimitedTagSupportExpansion) {
+                        const auto ownTag = p_support.HeadAttributes(head)[p_opt.m_limitedTagColumn];
+                        ++realizedCoverage[ownTag].effectiveHeads;
+                        for (const auto tag : headTags) {
+                            auto& realized = realizedCoverage[tag];
+                            ++realized.purePostings;
+                            if (tag != ownTag) ++realized.effectiveHeads;
+                        }
+                        if (p_support.ExtraTagCount(head) != 0) {
+                            const std::uint64_t bytes =
+                                static_cast<std::uint64_t>(kept) *
+                                static_cast<std::uint64_t>(m_vectorInfoSize);
+                            const std::uint64_t pages = (bytes + PageSize - 1) / PageSize;
+                            maxExpandedPurePages = (std::max)(maxExpandedPurePages, pages);
+                            if (pages > static_cast<std::uint64_t>(
+                                    p_opt.m_limitedTagMaxExpandedPostingPages)) {
+                                SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                                    "Expanded posting %d needs %llu H-prefix payload pages; "
+                                    "LimitedTagMaxExpandedPostingPages=%d. No H replicas were trimmed.\n",
+                                    head, static_cast<unsigned long long>(pages),
+                                    p_opt.m_limitedTagMaxExpandedPostingPages);
+                                return false;
+                            }
+                        }
                     }
                 }
                 for (SizeType vectorID = 0;
@@ -2702,10 +2763,39 @@ namespace SPTAG
                     }
                 }
 
+                if (p_opt.m_enableLimitedTagSupportExpansion) {
+                    std::uint64_t noPurePosting = 0;
+                    std::uint64_t belowRequired = 0;
+                    std::uint64_t belowFloor = 0;
+                    std::uint32_t minEffective = (std::numeric_limits<std::uint32_t>::max)();
+                    for (const auto tag : observedTags) {
+                        const auto found = realizedCoverage.find(tag);
+                        const RealizedCoverage realized =
+                            found == realizedCoverage.end() ? RealizedCoverage{} : found->second;
+                        noPurePosting += realized.purePostings == 0;
+                        belowRequired += realized.effectiveHeads < p_support.RequiredHeadCount(tag);
+                        belowFloor += realized.effectiveHeads <
+                            static_cast<std::uint32_t>(p_opt.m_limitedTagMinHeadCount);
+                        minEffective = (std::min)(minEffective, realized.effectiveHeads);
+                        if (realized.effectiveHeads == 0) {
+                            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                                "Expanded tag %u has neither a real own head nor a nonempty H posting.\n", tag);
+                            return false;
+                        }
+                    }
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                        "O-based realized coverage: tags=%zu minEffectiveHeads=%u noPurePostingTags=%llu "
+                        "belowRequiredTags=%llu belowFloorTags=%llu maxExpandedPurePages=%llu.\n",
+                        observedTags.size(), minEffective,
+                        static_cast<unsigned long long>(noPurePosting),
+                        static_cast<unsigned long long>(belowRequired),
+                        static_cast<unsigned long long>(belowFloor),
+                        static_cast<unsigned long long>(maxExpandedPurePages));
+                }
                 SPTAGLIB_LOG(
                     Helper::LogLevel::LL_Info,
                     "Limited-tag support selected %zu tags over %d heads "
-                    "(self+top-%d external, slots=%d coverage>=%d); "
+                    "(self+up-to-%d external, baseSlots=%d supportFloor=%d expansion=%d); "
                     "retained all %llu RNG assignments "
                     "(voteChecks=%llu placementChecks=%llu "
                     "exactFallbacks=%llu/%llu "
@@ -2715,6 +2805,7 @@ namespace SPTAG
                     p_opt.m_limitedTagSlotsPerHead - 1,
                     p_opt.m_limitedTagSlotsPerHead,
                     p_opt.m_limitedTagMinHeadCount,
+                    static_cast<int>(p_opt.m_enableLimitedTagSupportExpansion),
                     static_cast<unsigned long long>(
                         assignmentCount),
                     static_cast<unsigned long long>(
@@ -3126,7 +3217,6 @@ namespace SPTAG
                 int scannedListElements = 0;
                 const bool collectPostingContributionStats =
                     m_opt != nullptr && m_opt->m_collectPostingContributionStats;
-                std::unordered_set<SizeType> uniqueMatchedVIDs;
                 const bool profilePhases =
                     p_stats != nullptr && m_opt != nullptr && m_opt->m_logPhaseTime;
                 std::atomic<std::int64_t> scanMicros{0};
@@ -3176,7 +3266,7 @@ namespace SPTAG
 
 #ifdef BATCH_READ // async batch read
                     request.m_callback = [&p_exWorkSpace, &queryResults, &p_index, &request, &listElements,
-                                          &collectPostingContributionStats, &uniqueMatchedVIDs, &scanMicros,
+                                          &collectPostingContributionStats, &scanMicros,
                                           profilePhases, this](bool success)
                     {
                         if (!success) return;
@@ -3246,10 +3336,6 @@ namespace SPTAG
                             std::memory_order_relaxed);
                     }
 #endif
-                }
-
-                if (collectPostingContributionStats) {
-                    uniqueMatchedVIDs.reserve(static_cast<size_t>((std::max)(scannedListElements, 0)));
                 }
 
 #ifdef ASYNC_READ
@@ -5528,6 +5614,8 @@ namespace SPTAG
                                 selections,
                                 postingListSize,
                                 headVectorIDS,
+                                originalPosting,
+                                originalPostingSizes,
                                 fullVectors,
                                 p_headIndex,
                                 fullCount,
@@ -7218,6 +7306,7 @@ namespace SPTAG
 
                 std::priority_queue<std::pair<float, int>> survivors;
                 int listElements = 0;
+                int scannedListElements = 0;
                 int diskPages = 0;
                 const uint32_t postingListCount = static_cast<uint32_t>(p_exWorkSpace->m_postingIDs.size());
                 auto scanPosting = [&](ListInfo* listInfo, char* buffer) {
@@ -7226,7 +7315,12 @@ namespace SPTAG
                         const std::uint8_t* record = records + static_cast<size_t>(i) * m_vectorInfoSize;
                         int vid = -1;
                         std::memcpy(&vid, record, sizeof(vid));
-                        if (vid < 0 || p_exWorkSpace->m_deduper.CheckAndSet(vid)) {
+                        if (vid < 0) {
+                            --listElements;
+                            continue;
+                        }
+                        if (p_exWorkSpace->m_deduper.CheckAndSet(vid)) {
+                            ++p_exWorkSpace->m_postingProbeStats.m_dedupSkippedVectors;
                             --listElements;
                             continue;
                         }
@@ -7252,6 +7346,7 @@ namespace SPTAG
                     const int fileid = GetPostingFileId(p_exWorkSpace, postingId);
                     diskPages += listInfo->listPageCount;
                     listElements += listInfo->listEleCount;
+                    scannedListElements += listInfo->listEleCount;
                     auto& request = p_exWorkSpace->m_diskRequests[pi];
                     request.m_offset = listInfo->listOffset;
                     request.m_readSize = static_cast<size_t>(listInfo->listPageCount) << PageSizeEx;
@@ -7283,7 +7378,7 @@ namespace SPTAG
 
                 p_exWorkSpace->m_postingProbeStats.m_readPostings += postingListCount;
                 p_exWorkSpace->m_postingProbeStats.m_scannedVectors +=
-                    static_cast<std::uint64_t>((std::max)(listElements, 0));
+                    static_cast<std::uint64_t>((std::max)(scannedListElements, 0));
                 p_exWorkSpace->m_postingProbeStats.m_adcScannedVectors +=
                     static_cast<std::uint64_t>((std::max)(listElements, 0));
                 p_exWorkSpace->m_postingProbeStats.m_adcSurvivors += rerankVIDs.size();
@@ -8573,7 +8668,7 @@ namespace SPTAG
                     return ErrorCode::DiskIOFail;
                 }
                 char* ptr = (char*)(posting.c_str());
-                memcpy(ptr, posting.c_str() + listInfo->pageOffset, realBytes);
+                memmove(ptr, posting.c_str() + listInfo->pageOffset, realBytes);
                 posting.resize(realBytes);
                 return ErrorCode::Success;
             }

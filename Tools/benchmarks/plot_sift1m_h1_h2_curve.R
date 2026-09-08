@@ -17,7 +17,44 @@ if (nrow(rows) == 0) {
   stop("benchmark result file is empty")
 }
 
-rows$mode <- factor(rows$mode, levels = c("H1Only", "H2Only"))
+has_fixed_hierarchy <- any(rows$mode == "H3HierarchyFixed")
+has_routing_only <- "hierarchy_design" %in% names(rows) &&
+  any(rows$hierarchy_design == "routing_only", na.rm = TRUE)
+has_corrected_placement <- "placement_policy" %in% names(rows) &&
+  any(rows$placement_policy == "merge_score_retain", na.rm = TRUE)
+if (has_fixed_hierarchy) {
+  rows <- rows[rows$mode != "H3Hierarchy", , drop = FALSE]
+  rows$mode[rows$mode == "H3HierarchyFixed"] <- "H3Hierarchy"
+}
+
+navigation_labels <- c(
+  H1Only = "H1-only (previous)",
+  H2Only = "H2-only (previous)",
+  H3Hierarchy = if (has_corrected_placement) {
+    "H3 hierarchy (rebuilt)"
+  } else if (has_routing_only) {
+    "H3 hierarchy (routing-only)"
+  } else if (has_fixed_hierarchy) {
+    "H3 hierarchy (fixed)"
+  } else {
+    "H3 hierarchy"
+  }
+)
+navigation_colors <- c(
+  H1Only = "#2166AC", H2Only = "#B2182B", H3Hierarchy = "#1B9E77"
+)
+navigation_shapes <- c(H1Only = 16, H2Only = 17, H3Hierarchy = 15)
+if (any(!rows$mode %in% names(navigation_labels))) {
+  stop("unknown navigation mode in benchmark results")
+}
+rows$mode <- factor(rows$mode, levels = names(navigation_labels))
+has_hierarchy <- any(rows$mode == "H3Hierarchy")
+active_modes <- names(navigation_labels)[names(navigation_labels) %in% rows$mode]
+probe_limits <- range(rows$nprobe)
+probe_breaks <- c(32, 128, 384, 1024)
+probe_breaks <- probe_breaks[
+  probe_breaks >= probe_limits[1] & probe_breaks <= probe_limits[2]
+]
 workload_labels <- c(
   unfilter = "unfilter (selectivity: 100%)",
   broad_tag = "broad tag (selectivity: 17.0092%)",
@@ -30,13 +67,14 @@ rows$workload <- factor(
   levels = names(workload_labels),
   labels = unname(workload_labels)
 )
+rows <- rows[order(rows$workload, rows$mode, rows$nprobe), ]
 
 make_workload_plot <- function(workload_id, full_recall_range) {
   workload_rows <- rows[
     rows$workload == unname(workload_labels[workload_id]),
   ]
   x_breaks <- if (full_recall_range) {
-    c(0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0)
+    c(0, 0.2, 0.4, 0.6, 0.8, 1.0)
   } else {
     c(0.6, 0.7, 0.8, 0.9, 0.95, 1.0)
   }
@@ -51,8 +89,11 @@ make_workload_plot <- function(workload_id, full_recall_range) {
       xintercept = c(0.90, 0.95), linetype = "dashed",
       color = "grey35", linewidth = 0.45
     ) +
-    scale_color_manual(values = c(H1Only = "#2166AC", H2Only = "#B2182B")) +
-    scale_size_continuous(range = c(1.8, 4.8), breaks = c(16, 32, 62, 96, 128, 256, 384)) +
+    scale_color_manual(values = navigation_colors, labels = navigation_labels) +
+    scale_shape_manual(values = navigation_shapes, labels = navigation_labels) +
+    scale_size_continuous(
+      range = c(1.8, 4.8), limits = probe_limits, breaks = probe_breaks
+    ) +
     scale_x_continuous(breaks = x_breaks) +
     coord_cartesian(xlim = x_limits) +
     labs(
@@ -76,6 +117,102 @@ plots <- lapply(
   }
 )
 
+draw_comparison_legend <- function() {
+  grid::grid.text(
+    "Navigation", x = 0.12, y = 0.91, just = "left",
+    gp = grid::gpar(fontface = "bold", fontsize = 10)
+  )
+  for (index in seq_along(active_modes)) {
+    mode <- active_modes[index]
+    y <- 0.83 - (index - 1) * 0.07
+    grid::grid.lines(
+      x = c(0.12, 0.25), y = c(y, y),
+      gp = grid::gpar(col = navigation_colors[[mode]], lwd = 1.5)
+    )
+    grid::grid.points(
+      x = 0.185, y = y, pch = navigation_shapes[[mode]],
+      size = grid::unit(3, "mm"),
+      gp = grid::gpar(col = navigation_colors[[mode]])
+    )
+    grid::grid.text(
+      navigation_labels[[mode]], x = 0.29, y = y, just = "left",
+      gp = grid::gpar(fontsize = 9)
+    )
+  }
+  grid::grid.text(
+    "Point size: nprobe", x = 0.12, y = 0.54, just = "left",
+    gp = grid::gpar(fontsize = 9)
+  )
+  size_scale <- ggplot_build(plots[[1]])$plot$scales$get_scales("size")
+  point_sizes <- size_scale$map(probe_breaks)
+  positions <- seq(0.18, 0.8, length.out = length(probe_breaks))
+  for (index in seq_along(probe_breaks)) {
+    grid::grid.points(
+      x = positions[index], y = 0.46, pch = 16,
+      size = grid::unit(point_sizes[index], "mm"),
+      gp = grid::gpar(col = "grey40")
+    )
+    grid::grid.text(
+      probe_breaks[index], x = positions[index], y = 0.4,
+      gp = grid::gpar(fontsize = 8)
+    )
+  }
+  notes <- c(
+    "Vertical guides: 90% / 95% recall.",
+    "100 warm-up + 900 measured queries; 1 thread."
+  )
+  if (has_hierarchy) {
+    notes <- c(
+      notes,
+      "H3: top graph; H2/H1 local-ID CSR.",
+      "Adjacent-layer ratio = 0.15; replicas = 8."
+    )
+  }
+  if (has_routing_only) {
+    notes <- c(
+      notes,
+      "Separate vectors/state; only H1/SSD yield results."
+    )
+  } else if (has_fixed_hierarchy) {
+    notes <- c(
+      notes,
+      "H3: fixed routing + bounded sparse fallback."
+    )
+  }
+  hierarchy_rows <- rows[rows$mode == "H3Hierarchy", , drop = FALSE]
+  if ("graph_signature_pruning" %in% names(hierarchy_rows)) {
+    graph_modes <- unique(na.omit(hierarchy_rows$graph_signature_pruning))
+    if (length(graph_modes) > 1) {
+      stop("select one graph-pruning mode before publishing the H3 curve")
+    }
+    if (length(graph_modes) == 1) {
+      notes <- c(notes, paste0(
+        "H2/H3 head signatures on; graph pruning ",
+        if (graph_modes[[1]]) "on." else "off."
+      ))
+    }
+  }
+  median_three <- "qps_trial_count" %in% names(hierarchy_rows) &&
+    any(hierarchy_rows$qps_trial_count == 3, na.rm = TRUE)
+  bounded_graph <- nrow(hierarchy_rows) > 0 &&
+      "top_graph_maxcheck" %in% names(hierarchy_rows) &&
+      all(!is.na(hierarchy_rows$top_graph_maxcheck)) &&
+      all(hierarchy_rows$top_graph_maxcheck == pmax(128, 2 * hierarchy_rows$nprobe))
+  if (median_three && bounded_graph) {
+    notes <- c(notes, "H3: 3-run median; MaxCheck = max(128, 2*nprobe).")
+  } else if (median_three) {
+    notes <- c(notes, "H3 QPS: median of 3 serial runs.")
+  } else if (bounded_graph) {
+    notes <- c(notes, "H3 top MaxCheck = max(128, 2*nprobe).")
+  }
+  notes <- c(notes, "Historical H1/H2 measurements kept unchanged.")
+  grid::grid.text(
+    paste(notes, collapse = "\n"),
+    x = 0.12, y = 0.36, just = c("left", "top"),
+    gp = grid::gpar(fontsize = 7.5, lineheight = 1.15)
+  )
+}
+
 draw_combined_plot <- function() {
   grid::grid.newpage()
   layout <- grid::grid.layout(
@@ -92,7 +229,11 @@ draw_combined_plot <- function() {
     layout.pos.col = 1:3
   ))
   grid::grid.text(
-    "SIFT1M H1-only vs H2-only head navigation",
+    if (has_hierarchy) {
+      "SIFT1M H1-only vs H2-only vs H3 hierarchy"
+    } else {
+      "SIFT1M H1-only vs H2-only head navigation"
+    },
     gp = grid::gpar(fontface = "bold", fontsize = 12)
   )
   grid::popViewport()
@@ -104,6 +245,12 @@ draw_combined_plot <- function() {
     print(plots[[index]], newpage = FALSE)
     grid::popViewport()
   }
+  grid::pushViewport(grid::viewport(
+    layout.pos.row = 3,
+    layout.pos.col = 3
+  ))
+  draw_comparison_legend()
+  grid::popViewport()
   grid::popViewport()
 }
 

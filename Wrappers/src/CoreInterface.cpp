@@ -6,6 +6,7 @@
 #include "inc/Helper/TenantPrefixedKeyValueIO.h"
 #include "inc/Helper/AtomicFile.h"
 #include "inc/Core/SPANN/Index.h"
+#include "inc/Core/SPANN/HeadNodeMetadata.h"
 #include "inc/Core/Common/QueryResultSet.h"
 #ifdef ROCKSDB
 #include "inc/Core/SPANN/ExtraRocksDBController.h"
@@ -2277,87 +2278,8 @@ bool SaveHeadNodeMetaFile(
     const std::shared_ptr<SPTAG::VectorIndex>& headIndex,
     std::uint64_t generationFingerprint)
 {
-    if (headIndex == nullptr || !headIndex->HasHeadNodeMeta()) return false;
-    if (headIndex->HasHeadNodeTailPS() &&
-        generationFingerprint == 0) {
-        return false;
-    }
-
-    const std::string metaPath =
-        HeadNodeMetaPath(workDir);
-    const std::string temporary =
-        metaPath + ".tmp";
-    FILE* f = fopen(temporary.c_str(), "wb");
-    if (!f) return false;
-
-    HeadNodeMetaFileHeader header{};
-    int32_t quantCols = headIndex->GetHeadNodeNumQuantCols();
-
-    const auto& widths =
-        headIndex->GetHeadNodeHierWidths();
-
-    const std::uint64_t numericDomainFingerprint =
-        headIndex
-            ->GetHeadNodeNumericDomainFingerprint();
-    header.version = kHeadNodeMetaVersionV8;
-    header.numSamples = headIndex->GetHeadNodeMetaSampleCount();
-    header.numTagsPerSample = quantCols;  // V4/V5: quantized numeric column count
-    header.stride = static_cast<int32_t>(headIndex->GetHeadNodeMetaStride());
-
-    const auto& blob = headIndex->GetHeadNodeMetaBlob();
-    int32_t wbits[SPTAG::Cache::HIER_LEVELS];
-    for (int level = 0;
-         level < SPTAG::Cache::HIER_LEVELS;
-         ++level) {
-        wbits[level] = widths.bits[level];
-    }
-    std::uint32_t flags = 0;
-    if (headIndex->HasHeadNodeOwnTags()) {
-        flags |= kHeadNodeMetaOwnTagsAvailable;
-    }
-    if (headIndex->HasHeadNodePostingHierMasks()) {
-        flags |=
-            kHeadNodeMetaPostingHierMasksAvailable;
-    }
-    if (headIndex->HasHeadNodeTailPS()) {
-        flags |=
-            kHeadNodeMetaTailSignaturesAvailable;
-    }
-    const std::uint64_t contentFingerprint =
-        ComputeHeadNodeMetaContentFingerprint(
-            header, wbits, flags,
-            numericDomainFingerprint,
-            generationFingerprint, blob);
-    bool ok = fwrite(&header, sizeof(header), 1, f) == 1;
-    ok = ok &&
-        fwrite(
-            wbits, sizeof(int32_t),
-            SPTAG::Cache::HIER_LEVELS, f) ==
-            static_cast<size_t>(
-                SPTAG::Cache::HIER_LEVELS);
-    ok = ok &&
-        fwrite(&flags, sizeof(flags), 1, f) == 1 &&
-        fwrite(
-            &numericDomainFingerprint,
-            sizeof(numericDomainFingerprint),
-            1, f) == 1 &&
-        fwrite(
-            &generationFingerprint,
-            sizeof(generationFingerprint),
-            1, f) == 1 &&
-        fwrite(
-            &contentFingerprint,
-            sizeof(contentFingerprint),
-            1, f) == 1;
-    ok = ok && fwrite(blob.data(), 1, blob.size(), f) == blob.size();
-    if (fclose(f) != 0) ok = false;
-    if (!ok ||
-        !SPTAG::Helper::AtomicReplaceFile(
-            temporary, metaPath)) {
-        std::remove(temporary.c_str());
-        return false;
-    }
-    return true;
+    return SPTAG::SPANN::SaveHeadNodeMetadataV8(
+        HeadNodeMetaPath(workDir), headIndex, generationFingerprint);
 }
 
 bool LoadHeadNodeMetaFile(
@@ -2394,6 +2316,15 @@ bool LoadHeadNodeMetaFile(
         header.numSamples < headIndex->GetNumSamples()) {
         fclose(f);
         return false;
+    }
+    if (header.version == kHeadNodeMetaVersionV8 &&
+        spannInternalIdx->HasRoutingOnlyHierarchy()) {
+        fclose(f);
+        return SPTAG::SPANN::LoadHeadNodeMetadataV8(
+            metaPath, headIndex, headIndex->GetNumSamples(), expectedGeneration,
+            [spannInternalIdx](SPTAG::SizeType head) {
+                return spannInternalIdx->GetGlobalVID(head);
+            });
     }
 
     // V3-V7 remain readable for unconstrained legacy indexes, but only V8 is
@@ -6209,7 +6140,7 @@ void TenantIndexManager::LoadTenantTagPureIndices()
     // The chunk data persists across runs because BuildSignatures explicitly
     // calls extra->Checkpoint() after writing chunks. The sidecar holds the
     // metadata (tag → chunkKeys, chunkCounts, count). Without loading it
-    // back, SearchWithACL would fall through the fast path.
+    // back, predicate search would fall through the fast path.
     //
     // When the OPQ prefilter is enabled, every single-tag query is served by
     // OPQTagPureSearch (resident codes + the canonical vid->vector store),
@@ -6346,6 +6277,27 @@ bool TenantIndexManager::SaveUnifiedStorage(const char* p_baseDir)
 
         std::string srcDir = kv.second;
         std::string dstDir = baseDir + "/tenant_" + std::to_string(tenantId);
+
+        SPTAG::Helper::IniReader sourceConfig;
+        if (sourceConfig.LoadIniFile(srcDir + "/indexloader.ini") != SPTAG::ErrorCode::Success) {
+            fprintf(stderr, "[ERROR] Missing or invalid native config for unloaded tenant %d\n", tenantId);
+            return false;
+        }
+        const bool graphlessHierarchy =
+            sourceConfig.GetParameter("Index", "IndexAlgoType", SPTAG::IndexAlgoType::Undefined) ==
+                SPTAG::IndexAlgoType::SPANN &&
+            sourceConfig.GetParameter("SelectHead", "SelectSecondLevel", false) &&
+            !sourceConfig.GetParameter("SelectHead", "BuildH1Graph", true);
+        if (graphlessHierarchy) {
+            std::shared_ptr<SPTAG::VectorIndex> native;
+            if (SPTAG::VectorIndex::LoadIndex(srcDir, native) != SPTAG::ErrorCode::Success ||
+                native == nullptr || native->SaveIndex(dstDir) != SPTAG::ErrorCode::Success) {
+                fprintf(stderr, "[ERROR] Failed to validate/export unloaded graphless tenant %d\n", tenantId);
+                return false;
+            }
+            m_tenantSpannWorkDirs[tenantId] = dstDir;
+            continue;
+        }
 
         if (srcDir == dstDir) {
             // Already in the right place (saved directly to output dir)
@@ -6896,6 +6848,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
     // consulting a process environment override.
     int directSparseMaxPostings = 320;
     bool hybridDistanceEnabled = false;
+    bool secondLevelRoutingEnabled = false;
     bool staticStorage = false;
     bool limitedTagEnabled = false;
     bool extremeSparseTagEnabled = false;
@@ -6948,6 +6901,9 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                         options != nullptr &&
                         options->m_storage ==
                             SPTAG::Storage::STATIC;
+                    secondLevelRoutingEnabled =
+                        options != nullptr &&
+                        options->m_selectSecondLevel;
                     limitedTagEnabled =
                         spann->HasLimitedTagLayout();
                     extremeSparseTagEnabled =
@@ -7045,6 +7001,8 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
         }
     }
 
+    const bool routingStatsRequired =
+        hybridDistanceEnabled || secondLevelRoutingEnabled;
     if (staticACLTagCols <= 0 ||
         staticACLTagCols > p_numTagsPerVec) {
         fprintf(
@@ -7229,7 +7187,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
             }
         }
         if (baseArtifactsOk &&
-            (!hybridDistanceEnabled || routeStatsOk) &&
+            (!routingStatsRequired || routeStatsOk) &&
             extremeSparseOk &&
             numericMetadataValid) {
             // Make sure the PS signatures are attached to the head index.
@@ -7300,7 +7258,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                 m_tenantTagRoutingStats.find(
                     p_tenantId);
             if (headMetadataValid &&
-                (!hybridDistanceEnabled ||
+                (!routingStatsRequired ||
                  (loadedStats !=
                       m_tenantTagRoutingStats.end() &&
                   !loadedStats->second.empty()))) {
@@ -7403,7 +7361,13 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                 hybridDistanceEnabled ||
                     limitedTagEnabled);
         }
-        spannInternalIdx->PopulateHeadNodeGlobalVIDsFromBundles();
+        if (!spannInternalIdx->PopulateHeadNodeGlobalVIDsFromBundles()) {
+            memoryIndex->ClearHeadNodeMeta();
+            fprintf(stderr,
+                    "[ERROR] Tenant %d: cannot populate head metadata VIDs for routing repair.\n",
+                    p_tenantId);
+            return false;
+        }
 
         if (limitedTagEnabled) {
             std::vector<int> headNodeToNode(
@@ -7681,9 +7645,13 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                 hierWidths,
                 hybridDistanceEnabled ||
                     limitedTagEnabled);
-            // Monolithic roots resolve through their head-ID map; metadata-only
-            // roots fall back to the bundle structures.
-            spannInternalIdx->PopulateHeadNodeGlobalVIDsFromBundles();
+            if (!spannInternalIdx->PopulateHeadNodeGlobalVIDsFromBundles()) {
+                memoryIndex->ClearHeadNodeMeta();
+                fprintf(stderr,
+                        "[ERROR] Tenant %d: cannot populate head metadata VIDs for signature generation.\n",
+                        p_tenantId);
+                return false;
+            }
 
             // Per-posting member-OR hierarchical mask: the dense filtered path
             // (HeadPostingHierMaskMayIntersect) keeps a posting iff at least one
@@ -7953,6 +7921,15 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                     ownMask.Insert(t, tag);
                 }
                 memoryIndex->SetHeadNodeHierMask(hid, ownMask);
+            }
+
+            if ((limitedTagEnabled || hybridDistanceEnabled) &&
+                resolved != numHeadSamples) {
+                memoryIndex->ClearHeadNodeMeta();
+                fprintf(stderr,
+                        "[ERROR] Tenant %d: refusing incomplete head metadata (%d/%d resolved VIDs).\n",
+                        p_tenantId, resolved, static_cast<int>(numHeadSamples));
+                return false;
             }
 
             if (pivotCandidate != nullptr) {
@@ -9161,7 +9138,7 @@ bool TenantIndexManager::BackfillPrimaryHeadCSR(int p_tenantId, ByteArray p_vect
         reinterpret_cast<const uint32_t*>(p_tags.Data()), p_numTagsPerVec);
 }
 
-std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
+std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
     ByteArray p_queryVector, int p_tenantId, int p_resultNum,
     ByteArray p_queryTags, int p_numTags)
 {
@@ -9214,9 +9191,6 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
     if (!EnsureTenantLoaded(p_tenantId)) return nullptr;
     auto _ck_b = s_wrapperTime ? std::chrono::high_resolution_clock::now()
                                : std::chrono::high_resolution_clock::time_point{};
-    auto wdIt = m_tenantSpannWorkDirs.find(p_tenantId);
-    if (wdIt == m_tenantSpannWorkDirs.end()) return nullptr;
-    const std::string& workDir = wdIt->second;
 
     std::shared_ptr<AnnIndex> indexPtr;
     {
@@ -9953,8 +9927,6 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
     queryHierMask.Clear();
     auto memoryIndex =
         GetMemoryIndexForInternal(internalIdx);
-    EnsureHeadNodeMetaLoaded(
-        workDir, internalIdx);
     const SPTAG::Cache::HierWidthTable queryHierWidths =
         memoryIndex != nullptr
             ? memoryIndex->GetHeadNodeHierWidths()
@@ -10323,6 +10295,15 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
     return MergeQueryResults(
         p_queryVector, p_resultNum,
         extremeSparseResult, result);
+}
+
+std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(
+    ByteArray p_queryVector, int p_tenantId, int p_resultNum,
+    ByteArray p_queryTags, int p_numTags)
+{
+    return SearchWithPredicate(
+        p_queryVector, p_tenantId, p_resultNum,
+        p_queryTags, p_numTags);
 }
 
 bool TenantIndexManager::EnsureTenantCached(int p_tenantId)

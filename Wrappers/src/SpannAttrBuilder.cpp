@@ -28,7 +28,11 @@
 #include <cstring>
 #include <cstdint>
 #include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -38,10 +42,14 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 
 #include "inc/CoreInterface.h"
 #include "inc/Core/CommonDataStructure.h"
 #include "inc/Core/VectorIndex.h"
+#include "inc/Core/SPANN/Index.h"
 #include "inc/Core/Common/IQuantizer.h"
 #include "inc/Core/SPANN/PipePQ.h"
 #include "inc/Helper/SimpleIniReader.h"
@@ -162,7 +170,7 @@ int main(int argc, char** argv) {
             std::vector<std::uint8_t> q((size_t)dim * valSize, 0);
             ByteArray query(q.data(), q.size(), false);
             ByteArray noTags(nullptr, 0, false);
-            if (!mgr.SearchWithACL(query, tenant, 10, noTags, 0)) {
+            if (!mgr.SearchWithPredicate(query, tenant, 10, noTags, 0)) {
                 fprintf(stderr, "[spannbuilder] requantization query FAILED\n");
                 return 1;
             }
@@ -190,7 +198,7 @@ int main(int argc, char** argv) {
             std::vector<std::uint8_t> q((size_t)dim * valSize, 0);
             ByteArray query(q.data(), q.size(), false);
             ByteArray noTags(nullptr, 0, false);
-            if (!verifier.SearchWithACL(query, tenant, 10, noTags, 0)) {
+            if (!verifier.SearchWithPredicate(query, tenant, 10, noTags, 0)) {
                 fprintf(stderr, "[spannbuilder] post-requantization query FAILED\n");
                 return 1;
             }
@@ -229,7 +237,7 @@ int main(int argc, char** argv) {
         std::vector<std::uint8_t> q((size_t)dim * valSize, 0);
         ByteArray query(q.data(), q.size(), false);
         ByteArray noTags(nullptr, 0, false);
-        mgr.SearchWithACL(query, tenant, 10, noTags, 0);
+        mgr.SearchWithPredicate(query, tenant, 10, noTags, 0);
         fprintf(stderr, "[spannbuilder] inpost-rbq-transform complete.\n");
         return 0;
     }
@@ -541,6 +549,199 @@ int main(int argc, char** argv) {
     const char* vecPath  = sVecPath.empty()  ? nullptr : sVecPath.c_str();
     const char* tagPath  = sTagPath.empty()  ? nullptr : sTagPath.c_str();
     const char* indexDir = sIndexDir.empty() ? nullptr : sIndexDir.c_str();
+    const bool compactHierarchy = ArgFlag(argc, argv, "--compact-hierarchy");
+    const bool materializeHierarchy = ArgFlag(argc, argv, "--materialize-hierarchy");
+    if (compactHierarchy || materializeHierarchy) {
+        const char* outputRoot = ArgVal(argc, argv, "--output-index-dir", nullptr);
+        if (!indexDir || ArgFlag(argc, argv, "--build-signatures-only") ||
+            ArgFlag(argc, argv, "--backfill-primary-head-csr") ||
+            ArgFlag(argc, argv, "--routing-only") ||
+            (compactHierarchy && materializeHierarchy) ||
+            (materializeHierarchy && (outputRoot == nullptr || *outputRoot == '\0')) ||
+            (compactHierarchy && outputRoot != nullptr)) {
+            fprintf(stderr, "[spannbuilder] Hierarchy maintenance requires IndexDirectory "
+                "and exactly one maintenance command. --materialize-hierarchy also requires "
+                "--output-index-dir pointing to a NEW output root.\n");
+            return 2;
+        }
+        const std::string tenantText = Resolve(
+            argc, argv, "--tenant", ini, "Tags", "Tenant", "0");
+        char* end = nullptr;
+        const long tenantID = std::strtol(tenantText.c_str(), &end, 10);
+        if (end == tenantText.c_str() || *end != '\0' ||
+            tenantID < 0 || tenantID >= SPTAG::MaxSize) {
+            fprintf(stderr, "[spannbuilder] Invalid hierarchy maintenance tenant.\n");
+            return 2;
+        }
+        const std::string tenantDirectory =
+            sIndexDir + "/tenant_" + std::to_string(tenantID);
+        std::shared_ptr<SPTAG::VectorIndex> index;
+        if (SPTAG::VectorIndex::LoadIndex(tenantDirectory, index) !=
+                SPTAG::ErrorCode::Success || index == nullptr) {
+            fprintf(stderr, "[spannbuilder] Hierarchy maintenance LoadIndex FAILED: %s\n",
+                tenantDirectory.c_str());
+            return 1;
+        }
+        auto* spann = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(index.get());
+        if (spann == nullptr) return 1;
+        if (compactHierarchy) {
+            fprintf(stderr, "[spannbuilder] LEGACY V2 compatibility compaction requested. "
+                "New builds use independent routing catalogs; reverse with --materialize-hierarchy.\n");
+            if (spann->CompactHierarchyVectors() != SPTAG::ErrorCode::Success) {
+                fprintf(stderr, "[spannbuilder] COMPACT-HIERARCHY FAILED\n");
+                return 1;
+            }
+            fprintf(stderr, "[spannbuilder] COMPACT-HIERARCHY done.\n");
+            return 0;
+        }
+        namespace fs = std::filesystem;
+        struct StagedOutput {
+            fs::path path;
+            ~StagedOutput() {
+                if (!path.empty()) {
+                    std::error_code ignored;
+                    fs::remove_all(path, ignored);
+                }
+            }
+        } staged;
+        try {
+            const fs::path source = fs::canonical(sIndexDir);
+            const fs::path destination = fs::weakly_canonical(fs::absolute(outputRoot));
+            const auto isWithin = [](const fs::path& child, const fs::path& parent) {
+                auto part = child.begin();
+                for (auto ancestor = parent.begin(); ancestor != parent.end(); ++ancestor, ++part)
+                    if (part == child.end() || *part != *ancestor) return false;
+                return true;
+            };
+            if (fs::exists(destination) || isWithin(source, destination) || isWithin(destination, source)) {
+                fprintf(stderr, "[spannbuilder] Output root must be new and non-overlapping.\n");
+                return 2;
+            }
+            std::ifstream sourceManifest(source / "manifest.txt");
+            if (!sourceManifest) {
+                fprintf(stderr, "[spannbuilder] Cannot read source tenant manifest.\n");
+                return 1;
+            }
+            bool foundTenant = false;
+            std::string tenantMapping;
+            std::string line;
+            while (std::getline(sourceManifest, line)) {
+                std::istringstream fields(line);
+                std::string key;
+                long mappedTenant = -1;
+                if (!(fields >> key >> mappedTenant) || mappedTenant != tenantID) continue;
+                if (key == "tenant") {
+                    std::int64_t vectorCount = -1, globalOffset = -1, headCount = -1, type = -1;
+                    if (foundTenant || !(fields >> vectorCount >> globalOffset >> headCount >> type) ||
+                        vectorCount != index->GetNumSamples() ||
+                        headCount != spann->GetMemoryIndex()->GetNumSamples()) {
+                        fprintf(stderr, "[spannbuilder] Source tenant manifest disagrees with native index.\n");
+                        return 1;
+                    }
+                    foundTenant = true;
+                } else if (key == "tenant_mapping") {
+                    std::string externalID, extra;
+                    if (!tenantMapping.empty() || !(fields >> externalID) || fields >> extra) {
+                        fprintf(stderr, "[spannbuilder] Invalid source tenant identity mapping.\n");
+                        return 1;
+                    }
+                    tenantMapping = "tenant_mapping " + std::to_string(tenantID) + " " + externalID;
+                }
+            }
+            if (!sourceManifest.eof() || !foundTenant || tenantMapping.empty()) {
+                fprintf(stderr, "[spannbuilder] Source manifest must identify the selected tenant "
+                    "and its external mapping; use the native per-tenant API for a standalone index.\n");
+                return 1;
+            }
+            fs::create_directories(destination.parent_path());
+            for (int attempt = 0; attempt < 32 && staged.path.empty(); ++attempt) {
+                fs::path candidate = destination;
+                candidate += ".materializing-root." +
+                    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+                    "." + std::to_string(attempt);
+                if (fs::create_directory(candidate)) staged.path = candidate;
+            }
+            if (staged.path.empty()) return 1;
+            const std::string tenantName = "tenant_" + std::to_string(tenantID);
+            if (spann->MaterializeHierarchyVectors((staged.path / tenantName).string()) != ErrorCode::Success) {
+                fprintf(stderr, "[spannbuilder] MATERIALIZE-HIERARCHY FAILED; source unchanged.\n");
+                return 1;
+            }
+            const std::string stagedTenant = (staged.path / tenantName).string();
+            const std::string configPath = stagedTenant + "/indexloader.ini";
+            const std::string temporaryConfig = configPath + ".root-publish";
+            Helper::IniReader tenantConfig;
+            std::shared_ptr<VectorIndex> outputIndex;
+            if (tenantConfig.LoadIniFile(configPath) != ErrorCode::Success ||
+                VectorIndex::LoadIndex(stagedTenant, outputIndex) != ErrorCode::Success ||
+                outputIndex == nullptr ||
+                outputIndex->SetParameter("IndexDirectory",
+                    (destination / tenantName).string().c_str(), "Base") != ErrorCode::Success) {
+                fprintf(stderr, "[spannbuilder] Cannot prepare the published native tenant configuration.\n");
+                return 1;
+            }
+            auto configOutput = f_createIO();
+            if (configOutput == nullptr || !configOutput->Initialize(temporaryConfig.c_str(), std::ios::out)) {
+                fprintf(stderr, "[spannbuilder] Cannot stage the published native tenant configuration.\n");
+                return 1;
+            }
+            std::string prefix;
+            for (const char* section : {"MetaData", "Index"}) {
+                if (!tenantConfig.DoesSectionExist(section)) continue;
+                prefix += std::string("[") + section + "]\n";
+                for (const auto& parameter : tenantConfig.GetParameters(section))
+                    prefix += parameter.first + "=" + parameter.second + "\n";
+                prefix += "\n";
+            }
+            const bool configWritten =
+                configOutput->WriteString(prefix.c_str()) == prefix.size() &&
+                outputIndex->SaveConfig(configOutput) == ErrorCode::Success;
+            const bool configClosed = configOutput->ShutDownAndCheck();
+            outputIndex.reset();
+            if (!configWritten || !configClosed || !Helper::AtomicReplaceFile(temporaryConfig, configPath)) {
+                fprintf(stderr, "[spannbuilder] Cannot persist the published native tenant configuration.\n");
+                return 1;
+            }
+            const fs::path manifestPath = staged.path / "manifest.txt";
+            const fs::path stagedManifest = staged.path / "manifest.txt.tmp";
+            std::ofstream manifest(stagedManifest);
+            manifest << "dimension " << index->GetFeatureDim()
+                     << "\nalgorithm SPANN\nunified_storage 1\ntotal_postings "
+                     << spann->GetMemoryIndex()->GetNumSamples()
+                     << "\ntenant " << tenantID << ' ' << index->GetNumSamples() << " 0 "
+                     << spann->GetMemoryIndex()->GetNumSamples() << " 0\n"
+                     << tenantMapping << '\n';
+            manifest.close();
+            if (!manifest ||
+                !Helper::AtomicReplaceFile(stagedManifest.string(), manifestPath.string()) ||
+                !Helper::SyncDirectoryTree(staged.path.string())) return 1;
+#if defined(__linux__) && defined(SYS_renameat2)
+            constexpr unsigned int renameNoReplace = 1U;
+            if (syscall(SYS_renameat2, AT_FDCWD, staged.path.c_str(), AT_FDCWD,
+                    destination.c_str(), renameNoReplace) != 0)
+                throw fs::filesystem_error("Cannot publish hierarchy output root",
+                    staged.path, destination, std::error_code(errno, std::generic_category()));
+#else
+            if (!fs::create_directory(destination)) return 1;
+            std::error_code publishError;
+            fs::rename(staged.path, destination, publishError);
+            if (publishError) {
+                std::error_code cleanupError;
+                fs::remove(destination, cleanupError);
+                return 1;
+            }
+#endif
+            staged.path.clear();
+            if (!Helper::SyncParentDirectory(destination.string())) return 1;
+            fprintf(stderr, "[spannbuilder] MATERIALIZE-HIERARCHY done: %s/%s "
+                "(source/H1 V8/SSD/sample IDs preserved; CSR signatures conservatively repaired).\n",
+                destination.string().c_str(), tenantName.c_str());
+            return 0;
+        } catch (const fs::filesystem_error& error) {
+            fprintf(stderr, "[spannbuilder] MATERIALIZE-HIERARCHY failed: %s\n", error.what());
+            return 1;
+        }
+    }
     if (!vecPath || !indexDir) {
         fprintf(stderr,
             "usage: spannbuilder -c <config.ini>   (native SPANN ini, single source of truth)\n"
@@ -553,7 +754,8 @@ int main(int argc, char** argv) {
             "[--posting-quant-bits <b>] [--posting-quant-file <f>] "
             "[--full-vector-file <f>] [--rerank-l <L>] [--quantize-head] [--quant-adc-only] "
             "[--ssd-start-file-gb <GB>] [--ssd-max-file-gb <GB>] [--ssd-growth-file-gb <GB>] "
-            "[--backfill-primary-head-csr]\n");
+            "[--backfill-primary-head-csr] [--compact-hierarchy] "
+            "[--materialize-hierarchy --output-index-dir <new-root>]\n");
         return 2;
     }
 

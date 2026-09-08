@@ -54,8 +54,15 @@ namespace SPTAG
             float* newWeightedCounts;
             std::function<float(const T*, const T*, DimensionType)> fComputeDistance;
             const std::shared_ptr<IQuantizer>& m_pQuantizer;
+            std::unique_ptr<std::mt19937> m_random;
 
-            KmeansArgs(int k, DimensionType dim, SizeType datasize, int threadnum, DistCalcMethod distMethod, const std::shared_ptr<IQuantizer>& quantizer = nullptr) : _K(k), _DK(k), _D(dim), _RD(dim), _TH(threadnum), _M(distMethod), m_pQuantizer(quantizer), reconstructVectors(nullptr) {                            
+            KmeansArgs(int k, DimensionType dim, SizeType datasize, int threadnum, DistCalcMethod distMethod,
+                       const std::shared_ptr<IQuantizer>& quantizer = nullptr, int randomSeed = -1)
+                : _K(k), _DK(k), _D(dim), _RD(dim), _TH(threadnum), _M(distMethod),
+                  m_pQuantizer(quantizer),
+                  m_random(randomSeed < 0 ? nullptr : std::make_unique<std::mt19937>(
+                      static_cast<std::uint32_t>(randomSeed))),
+                  reconstructVectors(nullptr) {
                 if (m_pQuantizer) {
                     _RD = m_pQuantizer->ReconstructDim();
                     fComputeDistance = m_pQuantizer->DistanceCalcSelector<T>(distMethod);
@@ -376,7 +383,9 @@ namespace SPTAG
             float lambda = 0, currDist, minClusterDist = MaxDist;
             for (int numKmeans = 0; numKmeans < tryIters; numKmeans++) {
                 for (int k = 0; k < args._DK; k++) {
-                    SizeType randid = COMMON::Utils::rand(last, first);
+                    SizeType randid = args.m_random
+                        ? std::uniform_int_distribution<SizeType>(first, last - 1)(*args.m_random)
+                        : COMMON::Utils::rand(last, first);
                     std::memcpy(args.centers + k*args._D, data[indices[randid]], sizeof(T)*args._D);
                 }
                 args.ClearCounts();
@@ -563,6 +572,7 @@ break;
                                    m_iBKTKmeansK(other.m_iBKTKmeansK), 
                                    m_iBKTLeafSize(other.m_iBKTLeafSize),
                                    m_iSamples(other.m_iSamples),
+                                   m_iRandomSeed(other.m_iRandomSeed),
                                    m_fBalanceFactor(other.m_fBalanceFactor),
                                    m_lock(new std::shared_timed_mutex),
                                    m_pQuantizer(other.m_pQuantizer),
@@ -620,7 +630,8 @@ break;
                 else {
                     localindices.assign(indices->begin(), indices->end());
                 }
-                KmeansArgs<T> args(m_iBKTKmeansK, data.C(), (SizeType)localindices.size(), numOfThreads, distMethod, m_pQuantizer);
+                KmeansArgs<T> args(m_iBKTKmeansK, data.C(), (SizeType)localindices.size(),
+                                   numOfThreads, distMethod, m_pQuantizer, m_iRandomSeed);
 
                 if (m_fBalanceFactor < 0) m_fBalanceFactor = DynamicFactorSelect(data, localindices, 0, (SizeType)localindices.size(), args, m_iSamples);
 
@@ -736,7 +747,8 @@ break;
                 }
 
                 // Create a shared KmeansArgs for DynamicFactorSelect (uses all threads)
-                KmeansArgs<T> sharedArgs(m_iBKTKmeansK, data.C(), (SizeType)localindices.size(), numOfThreads, distMethod, m_pQuantizer);
+                KmeansArgs<T> sharedArgs(m_iBKTKmeansK, data.C(), (SizeType)localindices.size(),
+                                         numOfThreads, distMethod, m_pQuantizer, m_iRandomSeed);
 
                 if (m_fBalanceFactor < 0) {
                     m_fBalanceFactor = DynamicFactorSelect(data, localindices, 0, (SizeType)localindices.size(), sharedArgs, m_iSamples);
@@ -797,7 +809,9 @@ break;
                                         // IMPORTANT: Must use full dataset size because KmeansAssign uses absolute indices
                                         // (args.label[i] where i ranges from first to last, not 0 to rangeSize).
                                         int threadsPerNode = (std::max)(1, numOfThreads / (int)levelSize);
-                                        KmeansArgs<T> localArgs(m_iBKTKmeansK, data.C(), (SizeType)localindices.size(), threadsPerNode, distMethod, m_pQuantizer);
+                                        KmeansArgs<T> localArgs(m_iBKTKmeansK, data.C(),
+                                            (SizeType)localindices.size(), threadsPerNode,
+                                            distMethod, m_pQuantizer, m_iRandomSeed);
 
                                         int dk = m_iBKTKmeansK;
                                         if (dynamicK) {
@@ -956,12 +970,16 @@ break;
             }
 
             template <typename T>
-            void InitSearchTrees(const Dataset<T>& data, std::function<float(const T*, const T*, DimensionType)> fComputeDistance, COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_space) const
+            void InitSearchTrees(const Dataset<T>& data, std::function<float(const T*, const T*, DimensionType)> fComputeDistance, COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_space,
+                const std::function<bool(SizeType)>& p_graphFilter = nullptr) const
             {
+                const auto distanceToSample = [&](SizeType id) {
+                    return fComputeDistance(p_query.GetQuantizedTarget(), data[id], data.C());
+                };
                 for (char i = 0; i < m_iTreeNumber; i++) {
                     const BKTNode& node = m_pTreeRoots[m_pTreeStart[i]];
                     if (node.childStart < 0) {
-                        p_space.m_SPTQueue.insert(NodeDistPair(m_pTreeStart[i], fComputeDistance(p_query.GetQuantizedTarget(), data[node.centerid], data.C())));
+                        p_space.m_SPTQueue.insert(NodeDistPair(m_pTreeStart[i], distanceToSample(node.centerid)));
                     } else if (m_bfs) {
                         float FactorQ = 1.1f;
                         int MaxBFSNodes = 100;
@@ -975,7 +993,7 @@ break;
                         
                         for (SizeType begin = node.childStart; begin < node.childEnd; begin++) {
                             SizeType index = m_pTreeRoots[begin].centerid;
-                            float dist = fComputeDistance(p_query.GetQuantizedTarget(), data[index], data.C());
+                            float dist = distanceToSample(index);
                             if (dist <= FactorQ * p_curr->Top().distance && p_curr->size() < MaxBFSNodes) {
                                 p_curr->insert(NodeDistPair(begin, dist));
                             }
@@ -996,12 +1014,13 @@ break;
                                     for (SizeType begin = tnode.childStart; begin < tnode.childEnd; begin++) {
                                         _mm_prefetch((const char*)(data[m_pTreeRoots[begin].centerid]), _MM_HINT_T0);
                                     }
-                                    if (!p_space.CheckAndSet(tnode.centerid)) {
+                                    if (!p_space.CheckAndSet(tnode.centerid) &&
+                                        (!p_graphFilter || p_graphFilter(tnode.centerid))) {
                                         p_space.m_NGQueue.insert(NodeDistPair(tnode.centerid, tmp.distance));
                                     }
                                     for (SizeType begin = tnode.childStart; begin < tnode.childEnd; begin++) {
                                         SizeType index = m_pTreeRoots[begin].centerid;
-                                        float dist = fComputeDistance(p_query.GetQuantizedTarget(), data[index], data.C());
+                                        float dist = distanceToSample(index);
                                         if (dist <= FactorQ * p_next->Top().distance && p_next->size() < MaxBFSNodes) {
                                             p_next->insert(NodeDistPair(begin, dist));
                                         }
@@ -1024,7 +1043,7 @@ break;
                         }
                         for (SizeType begin = node.childStart; begin < node.childEnd; begin++) {
                             SizeType index = m_pTreeRoots[begin].centerid;
-                            p_space.m_SPTQueue.insert(NodeDistPair(begin, fComputeDistance(p_query.GetQuantizedTarget(), data[index], data.C())));
+                            p_space.m_SPTQueue.insert(NodeDistPair(begin, distanceToSample(index)));
                         }
                     }
                 }
@@ -1032,8 +1051,12 @@ break;
 
             template <typename T>
             void SearchTrees(const Dataset<T>& data, std::function<float(const T*, const T*, DimensionType)> fComputeDistance, COMMON::QueryResultSet<T> &p_query,
-                COMMON::WorkSpace &p_space, const int p_limits) const
+                COMMON::WorkSpace &p_space, const int p_limits,
+                const std::function<bool(SizeType)>& p_graphFilter = nullptr) const
             {
+                const auto distanceToSample = [&](SizeType id) {
+                    return fComputeDistance(p_query.GetQuantizedTarget(), data[id], data.C());
+                };
                 while (!p_space.m_SPTQueue.empty())
                 {
                     NodeDistPair bcell = p_space.m_SPTQueue.pop();
@@ -1046,19 +1069,21 @@ break;
                         }
                         if (!p_space.CheckAndSet(tnode.centerid)) {
                             p_space.m_iNumberOfCheckedLeaves++;
-                            p_space.m_NGQueue.insert(NodeDistPair(tnode.centerid, bcell.distance));
+                            if (!p_graphFilter || p_graphFilter(tnode.centerid))
+                                p_space.m_NGQueue.insert(NodeDistPair(tnode.centerid, bcell.distance));
                         }
                     }
                     else {
                         for (SizeType begin = tnode.childStart; begin < tnode.childEnd; begin++) {
                             _mm_prefetch((const char*)(data[m_pTreeRoots[begin].centerid]), _MM_HINT_T0);
                         }
-                        if (!p_space.CheckAndSet(tnode.centerid)) {
+                        if (!p_space.CheckAndSet(tnode.centerid) &&
+                            (!p_graphFilter || p_graphFilter(tnode.centerid))) {
                             p_space.m_NGQueue.insert(NodeDistPair(tnode.centerid, bcell.distance));
                         }
                         for (SizeType begin = tnode.childStart; begin < tnode.childEnd; begin++) {
                             SizeType index = m_pTreeRoots[begin].centerid;
-                            p_space.m_SPTQueue.insert(NodeDistPair(begin, fComputeDistance(p_query.GetQuantizedTarget(), data[index], data.C())));
+                            p_space.m_SPTQueue.insert(NodeDistPair(begin, distanceToSample(index)));
                         } 
                     }
                 }
@@ -1098,6 +1123,7 @@ break;
         public:
             std::unique_ptr<std::shared_timed_mutex> m_lock;
             int m_iTreeNumber, m_iBKTKmeansK, m_iBKTLeafSize, m_iSamples, m_bfs;
+            int m_iRandomSeed = -1;
             float m_fBalanceFactor;
             std::shared_ptr<SPTAG::COMMON::IQuantizer> m_pQuantizer;
         };

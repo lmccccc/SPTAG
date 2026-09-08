@@ -15,8 +15,10 @@ DefineBKTParameter(m_pTrees.m_iBKTKmeansK, int, 32L, "BKTKmeansK")
 DefineBKTParameter(m_pTrees.m_iBKTLeafSize, int, 8L, "BKTLeafSize")
 DefineBKTParameter(m_pTrees.m_iSamples, int, 1000L, "Samples")
 DefineBKTParameter(m_pTrees.m_fBalanceFactor, float, 100.0F, "BKTLambdaFactor")
+DefineBKTParameter(m_pTrees.m_iRandomSeed, int, -1, "BKTSeed")
 
 DefineBKTParameter(m_pGraph.m_iTPTNumber, int, 32L, "TPTNumber")
+DefineBKTParameter(m_pGraph.m_iTPTSeed, int, -1, "TPTSeed")
 DefineBKTParameter(m_pGraph.m_iTPTLeafSize, int, 2000L, "TPTLeafSize")
 DefineBKTParameter(m_pGraph.m_numTopDimensionTPTSplit, int, 5L, "NumTopDimensionTpTreeSplit")
 

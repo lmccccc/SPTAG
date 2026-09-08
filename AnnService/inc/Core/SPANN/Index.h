@@ -82,6 +82,12 @@ namespace SPTAG
             virtual bool HasLimitedTagLayout() const = 0;
             virtual SizeType GetGlobalVID(SizeType vid) = 0;
             virtual bool PopulateHeadNodeGlobalVIDsFromBundles() = 0;
+            virtual ErrorCode CompactHierarchyVectors() { return ErrorCode::Undefined; }
+            // Output-only offline migration; destination must not exist or overlap the source.
+            virtual ErrorCode MaterializeHierarchyVectors(const std::string&) { return ErrorCode::Undefined; }
+            // Called only on private export/build staging directories before validation.
+            virtual ErrorCode PrepareHierarchyExport(const std::string&) { return ErrorCode::Success; }
+            virtual bool HasRoutingOnlyHierarchy() const { return false; }
             virtual void SetVectorTags(const uint32_t* tags, int numVecs, int numTagsPerVec) = 0;
             // The caller keeps this view alive until BuildIndex returns.
             virtual void SetVectorTagsView(const uint32_t* tags, int numVecs, int numTagsPerVec) = 0;
@@ -128,8 +134,11 @@ namespace SPTAG
             mutable HybridDistanceConfig m_hybridDistance;
             mutable HybridRoutingStats m_hybridRoutingStats;
             mutable LimitedTagSupport m_limitedTagSupport;
-            std::shared_ptr<VectorIndex> m_secondLevelIndex;
-            SecondLevelHeadPostings m_secondLevelPostings;
+            // One slot per configured hierarchy layer. Lower-layer indexes are
+            // build-time-only; the highest slot retains the persisted graph.
+            std::vector<std::shared_ptr<VectorIndex>> m_secondLevelIndexes;
+            std::vector<std::shared_ptr<VectorSet>> m_secondLevelCatalogs;
+            std::vector<SecondLevelHeadPostings> m_secondLevelPostings;
             mutable std::atomic<bool> m_headHybridGraphLoaded{false};
             mutable std::mutex m_headHybridGraphMutex;
             mutable std::shared_timed_mutex m_headTopologyLock;
@@ -143,15 +152,18 @@ namespace SPTAG
             // only the U_extra head vectors; H1 head GetSample lookups are resolved into
             // the per-bundle subgraph stores. Detected at load via HeadIndex/head_metaonly.bin.
             mutable bool m_metadataOnlyHeadStore = false;
-            // Graphless H1 mode retains this catalog for H2 expansion/rerank.
+            // head_metaonly.bin: V1 legacy flat/bundle, V2 disjoint, V3 routing-only.
+            std::int32_t m_hierarchyCatalogVersion = 0;
+            std::uint64_t m_hierarchyCatalogFingerprint = 0;
+            // Graphless H1 mode retains this catalog for hierarchy expansion/rerank.
             // It is deliberately separate from the metadata-only root's one
             // physical compatibility vector.
             mutable std::shared_ptr<VectorSet> m_h1CatalogVectors;
-            // Build-time H2-to-H1 CSR used only while creating graphless-H1
-            // postings. The persisted, signature-bearing CSR is built after
-            // limited-tag support has been learned from those postings.
-            std::vector<std::uint64_t> m_graphlessH2Offsets;
-            std::vector<SecondLevelHeadPostings::Member> m_graphlessH2Members;
+            // Build-time hierarchy CSR used only while creating graphless-H1
+            // postings. Persisted signatures are added after support is learned.
+            std::vector<std::vector<std::uint64_t>> m_graphlessHierarchyOffsets;
+            std::vector<std::vector<SecondLevelHeadPostings::Member>>
+                m_graphlessHierarchyMembers;
             // Precomputed H1 head-id -> resolved bundle sample pointer table. Built once at
             // load (SetupMetadataOnlyHeadStore) after every bundle is eager-loaded and
             // immutable, so the external sample resolver is a lock-free O(1) array lookup
@@ -216,6 +228,11 @@ namespace SPTAG
 
             inline std::shared_ptr<VectorIndex> GetMemoryIndex() { return m_index; }
             inline std::shared_ptr<IExtraSearcher> GetDiskIndex() { return m_extraSearcher; }
+            // Offline maintenance: the caller must quiesce searches before compaction.
+            ErrorCode CompactHierarchyVectors() override;
+            ErrorCode MaterializeHierarchyVectors(const std::string& p_directory) override;
+            ErrorCode PrepareHierarchyExport(const std::string& p_directory) override;
+            bool HasRoutingOnlyHierarchy() const override { return m_hierarchyCatalogVersion == 3; }
             inline Options* GetOptions() { return &m_options; }
             inline const std::vector<HeadBundleNodeInfo>& GetHeadBundleNodes() const { return m_headBundleNodes; }
             inline bool HasHeadBundleNodes() const { return !m_headBundleNodes.empty(); }
@@ -392,7 +409,7 @@ namespace SPTAG
             {
                 return
                     !HasMutableLimitedTagLayout() &&
-                    !IsRecoveredLimitedTagReadOnly();
+                    !IsLimitedTagMutationReadOnly();
             }
 
             ErrorCode CompleteIndexSave(
@@ -456,8 +473,23 @@ namespace SPTAG
             ErrorCode LoadLimitedTagSupport(
                 const std::string& p_baseDir);
             ErrorCode BuildSecondLevelHeadPostings();
+            ErrorCode ValidateSecondLevelSampleIDs(
+                const std::vector<std::vector<std::uint64_t>>& p_levelToLower);
             ErrorCode LoadSecondLevelIndex(
                 const std::string& p_baseDir);
+            ErrorCode LoadOwnedHierarchyCatalogs(
+                const std::string& p_baseDir,
+                const std::vector<std::vector<std::uint64_t>>& p_levelToLower,
+                const std::shared_ptr<VectorIndex>& p_topIndex,
+                std::vector<std::shared_ptr<VectorSet>>& p_catalogs) const;
+            ErrorCode FingerprintHierarchyCatalog(
+                const std::shared_ptr<VectorSet>& p_heads,
+                std::uint64_t& p_fingerprint) const;
+            ErrorCode FinalizeRoutingHierarchyStorage();
+            ErrorCode EnsureHierarchyHeadMetadata(const std::string& p_baseDir, bool p_build);
+            ErrorCode RefreshHierarchySignatures(
+                const std::vector<std::vector<std::uint64_t>>& p_levelToLower,
+                bool p_validateOnly);
             ErrorCode SearchSecondLevelHeads(
                 COMMON::QueryResultSet<T>* p_queryResults,
                 int p_graphResultNum,
@@ -465,9 +497,11 @@ namespace SPTAG
                     p_querySignature,
                 const std::function<bool(SizeType)>&
                     p_headAdmission,
-                std::uint64_t
-                    p_matchingHeadReferences,
-                int& p_scannedOut) const;
+                const LimitedTagSupport* p_headSupport,
+                int& p_scannedOut,
+                ExtraWorkSpace* p_workspace = nullptr,
+                const std::function<bool(SizeType, const float*)>& p_headPointCandidate = nullptr,
+                const std::function<bool()>& p_stopBeforeWidening = nullptr) const;
             ErrorCode LoadHeadCrossEdges() const;
             ErrorCode EnsureHeadHybridGraph();
             ErrorCode EnsureStaticTailCrossEdges();
@@ -503,6 +537,7 @@ namespace SPTAG
             {
                 // Limited H/O head and posting IDs are append-only; legacy
                 // compaction cannot preserve their support-row identity.
+                if (m_limitedTagSupport.HasExpansion()) return false;
                 if (IsRecoveredLimitedTagReadOnly()) {
                     SPTAGLIB_LOG(
                         Helper::LogLevel::LL_Error,
@@ -559,25 +594,37 @@ namespace SPTAG
 
             SizeType GetGlobalVID(SizeType vid)
             {
-                return static_cast<SizeType>(*(m_vectorTranslateMap[vid]));
+                if (vid < 0 || vid >= m_vectorTranslateMap.R() || m_vectorTranslateMap.C() != 1)
+                    return MaxSize;
+                const std::uint64_t global = *m_vectorTranslateMap[vid];
+                return global < static_cast<std::uint64_t>(MaxSize)
+                    ? static_cast<SizeType>(global) : MaxSize;
             }
 
-            // Populate the head index's head_node_meta global-VID table from the
-            // per-bundle head structures. Needed for metadata-only ("slim") head
-            // roots where the monolithic root no longer carries a full
-            // m_vectorTranslateMap (so GetGlobalVID(hid) is invalid for H1 heads);
-            // the authoritative head-id -> global-vector-id mapping then lives only
-            // in the bundle nodes. Caller must InitializeHeadNodeMeta first.
+            // Monolithic and graphless catalogs share the existing head-ID map.
+            // Only legacy bundle-backed slim roots resolve IDs from bundles.
+            // Caller must InitializeHeadNodeMeta first.
             bool PopulateHeadNodeGlobalVIDsFromBundles()
             {
                 if (m_index == nullptr || !m_index->HasHeadNodeMeta()) return false;
                 const SizeType metaCount = m_index->GetHeadNodeMetaSampleCount();
-
-                // Ordinary monolithic head indexes retain the authoritative
-                // local-head -> global-VID map. Bundle maps are only required
-                // by the metadata-only root used for partitioned head stores.
-                if (!m_metadataOnlyHeadStore &&
+                const bool requireResolvedVIDs =
+                    m_options.m_enableLimitedTagPosting ||
+                    m_options.m_enableHybridDistance;
+                if ((!m_metadataOnlyHeadStore || !m_options.m_buildH1Graph) &&
                     static_cast<SizeType>(m_vectorTranslateMap.R()) >= metaCount) {
+                    if (requireResolvedVIDs) {
+                        for (SizeType head = 0; head < metaCount; ++head) {
+                            if (*(m_vectorTranslateMap[head]) >=
+                                static_cast<std::uint64_t>(MaxSize)) {
+                                SPTAGLIB_LOG(
+                                    Helper::LogLevel::LL_Error,
+                                    "Cannot populate head metadata: head %d has an invalid canonical VID.\n",
+                                    static_cast<int>(head));
+                                return false;
+                            }
+                        }
+                    }
                     for (SizeType localHeadId = 0; localHeadId < metaCount; ++localHeadId) {
                         m_index->SetHeadNodeGlobalVID(
                             localHeadId,
@@ -585,10 +632,20 @@ namespace SPTAG
                     }
                     return true;
                 }
+                if (!m_options.m_buildH1Graph) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Cannot populate graphless head metadata: the canonical head-ID map is incomplete.\n");
+                    return false;
+                }
 
                 std::lock_guard<std::mutex> lock(m_globalVIDToBundleLocMutex);
-                if (m_globalVIDToBundleLoc.empty() || m_headBundleLocalToGlobalHIDs.empty())
+                if (m_globalVIDToBundleLoc.empty() || m_headBundleLocalToGlobalHIDs.empty()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Cannot populate head metadata: bundle ID mappings are unavailable.\n");
                     return false;
+                }
                 for (const auto& kv : m_globalVIDToBundleLoc)
                 {
                     SizeType globalVID = kv.first;
@@ -600,6 +657,18 @@ namespace SPTAG
                     SizeType globalHeadId = l2g[(size_t)local];
                     if (globalHeadId < 0 || globalHeadId >= metaCount) continue;
                     m_index->SetHeadNodeGlobalVID(globalHeadId, globalVID);
+                }
+                if (requireResolvedVIDs) {
+                    for (SizeType head = 0; head < metaCount; ++head) {
+                        const SizeType vid = m_index->GetHeadNodeGlobalVID(head);
+                        if (vid < 0 || vid == MaxSize) {
+                            SPTAGLIB_LOG(
+                                Helper::LogLevel::LL_Error,
+                                "Cannot populate head metadata: bundle head %d has no resolved VID.\n",
+                                static_cast<int>(head));
+                            return false;
+                        }
+                    }
                 }
                 return true;
             }
@@ -702,6 +771,12 @@ namespace SPTAG
                 return m_recoveredLimitedTagReadOnly;
             }
 
+            bool IsLimitedTagMutationReadOnly() const
+            {
+                return IsRecoveredLimitedTagReadOnly() ||
+                    m_limitedTagSupport.HasExpansion();
+            }
+
             bool CheckHeadIndexType();
             void SelectHeadAdjustOptions(Options& p_options, int p_vectorCount);
             int SelectHeadDynamicallyInternal(const std::shared_ptr<COMMON::BKTree> p_tree, int p_nodeID, const Options& p_opts, std::vector<SizeType>& p_selected);
@@ -784,10 +859,10 @@ namespace SPTAG
             void OpenMerge() { m_options.m_inPlace = false; }
 
             void ForceGC() { 
-                if (IsRecoveredLimitedTagReadOnly()) {
+                if (IsLimitedTagMutationReadOnly()) {
                     SPTAGLIB_LOG(
                         Helper::LogLevel::LL_Error,
-                        "Recovered limited-tag H/O generations are read-only.\n");
+                        "Recovered or O-expanded limited-tag H/O generations are immutable.\n");
                     return;
                 }
                 if (HasMutableLimitedTagLayout()) {
@@ -810,10 +885,10 @@ namespace SPTAG
             }
             
             ErrorCode Checkpoint() {
-                if (IsRecoveredLimitedTagReadOnly()) {
+                if (IsLimitedTagMutationReadOnly()) {
                     SPTAGLIB_LOG(
                         Helper::LogLevel::LL_Error,
-                        "Recovered limited-tag H/O generations cannot be checkpointed in place.\n");
+                        "Recovered or O-expanded limited-tag H/O generations cannot be mutated by checkpointing.\n");
                     return ErrorCode::Undefined;
                 }
                 if (!MutableLimitedTagConfigurationIntact()) {
@@ -869,10 +944,10 @@ namespace SPTAG
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Only Support KV Extra Update\n");
                     return ErrorCode::Fail;
                 }
-                if (IsRecoveredLimitedTagReadOnly()) {
+                if (IsLimitedTagMutationReadOnly()) {
                     SPTAGLIB_LOG(
                         Helper::LogLevel::LL_Error,
-                        "Recovered limited-tag H/O generations are read-only.\n");
+                        "Recovered or O-expanded limited-tag H/O generations are immutable.\n");
                     return ErrorCode::Undefined;
                 }
                 if (HasMutableLimitedTagLayout()) {

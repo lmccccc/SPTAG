@@ -109,6 +109,12 @@ public:
             p_hash, &p_id, sizeof(p_id));
     }
 
+    static std::uint64_t AddContentFingerprint(
+        std::uint64_t p_hash, const void* p_data, size_t p_bytes)
+    {
+        return HashBytes(p_hash, p_data, p_bytes);
+    }
+
     bool Initialize(
         SizeType p_firstLevelHeadCount,
         SizeType p_secondLevelHeadCount,

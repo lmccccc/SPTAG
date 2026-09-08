@@ -497,7 +497,7 @@ int main(int argc, char** argv)
                             scenario.orTagCount) *
                             sizeof(std::uint32_t),
                         false);
-                    return manager.SearchWithACL(
+                    return manager.SearchWithPredicate(
                         queryBytes, options.tenant,
                         options.topk, tagBytes,
                         scenario.orTagCount);
@@ -511,7 +511,7 @@ int main(int argc, char** argv)
                         static_cast<size_t>(row[0]) *
                             sizeof(std::uint32_t),
                         false);
-                    return manager.SearchWithACL(
+                    return manager.SearchWithPredicate(
                         queryBytes, options.tenant,
                         options.topk, dnfBytes, -1);
                 }
@@ -533,7 +533,7 @@ int main(int argc, char** argv)
                         reinterpret_cast<std::uint8_t*>(dnf.data()),
                         dnf.size() * sizeof(std::uint32_t),
                         false);
-                    return manager.SearchWithACL(
+                    return manager.SearchWithPredicate(
                         queryBytes, options.tenant, options.topk, dnfBytes, -1);
                 }
                 std::uint32_t tag = scenario.tagColumn >= 0
@@ -543,7 +543,7 @@ int main(int argc, char** argv)
                     reinterpret_cast<std::uint8_t*>(&tag),
                     scenario.tagColumn >= 0 ? sizeof(tag) : 0,
                     false);
-                return manager.SearchWithACL(
+                return manager.SearchWithPredicate(
                     queryBytes,
                     options.tenant,
                     options.topk,
@@ -561,7 +561,8 @@ int main(int argc, char** argv)
             std::uint64_t matchedPostings = 0;
             std::uint64_t uniqueMatchedPostings = 0;
             std::uint64_t scannedVectors = 0;
-            std::uint64_t matchedVectorOccurrences = 0;
+            std::uint64_t matchedVectors = 0;
+            std::uint64_t dedupSkippedVectors = 0;
             std::uint64_t uniqueMatchedVectors = 0;
             std::uint64_t distanceComputations = 0;
             std::uint64_t postingPageReads = 0;
@@ -575,7 +576,8 @@ int main(int argc, char** argv)
                 matchedPostings += postingStats.m_matchedPostings;
                 uniqueMatchedPostings += postingStats.m_uniqueMatchedPostings;
                 scannedVectors += postingStats.m_scannedVectors;
-                matchedVectorOccurrences += postingStats.m_matchedVectors;
+                matchedVectors += postingStats.m_matchedVectors;
+                dedupSkippedVectors += postingStats.m_dedupSkippedVectors;
                 uniqueMatchedVectors += postingStats.m_uniqueMatchedVectors;
                 postingPageReads += postingStats.m_postingPageReads;
                 postingLogicalBytes += postingStats.m_postingLogicalBytes;
@@ -614,6 +616,11 @@ int main(int argc, char** argv)
             const auto ratio = [](std::uint64_t numerator, std::uint64_t denominator) {
                 return denominator == 0 ? 0.0 : static_cast<double>(numerator) / static_cast<double>(denominator);
             };
+            if (dedupSkippedVectors > scannedVectors) {
+                throw std::runtime_error("Duplicate scan count exceeds scanned records");
+            }
+            const std::uint64_t uniqueScannedVectors =
+                scannedVectors - dedupSkippedVectors;
 
             std::cout << "{"
                       << "\"engine\":\"static_per_tag_bkt\","
@@ -622,7 +629,7 @@ int main(int argc, char** argv)
                       << "\"measure_offset\":" << options.measureOffset << ","
                       << "\"value_type\":\"" << options.valueType << "\","
                       << "\"search_ini\":\"" << activeSearchIni << "\","
-                      << "\"search_api\":\"" << (options.directSearch ? "Search" : "SearchWithACL") << "\","
+                      << "\"search_api\":\"" << (options.directSearch ? "Search" : "SearchWithPredicate") << "\","
                       << "\"filter_column\":" << scenario.tagColumn << ","
                       << "\"or_tag_count\":" << scenario.orTagCount << ","
                       << "\"dnf_and_columns\":"
@@ -633,26 +640,25 @@ int main(int argc, char** argv)
                       << "\"qps\":" << static_cast<double>(measuredQueries) / elapsed << ","
                       << "\"mean_latency_ms\":" << 1000.0 * elapsed / measuredQueries << ","
                       << "\"postings_per_query\":" << perQuery(readPostings) << ","
-                      << "\"matched_postings_per_query\":" << perQuery(matchedPostings) << ","
+                      << "\"contributing_postings_per_query\":" << perQuery(matchedPostings) << ","
                       << "\"unique_matched_postings_per_query\":" << perQuery(uniqueMatchedPostings) << ","
                       << "\"scanned_vectors_per_query\":" << perQuery(scannedVectors) << ","
-                      << "\"matched_vector_occurrences_per_query\":"
-                      << perQuery(matchedVectorOccurrences) << ","
+                      << "\"unique_scanned_vectors_per_query\":" << perQuery(uniqueScannedVectors) << ","
+                      << "\"matched_vectors_per_query\":"
+                      << perQuery(matchedVectors) << ","
                       << "\"unique_matched_vectors_per_query\":" << perQuery(uniqueMatchedVectors) << ","
                       << "\"distance_computations_per_query\":"
                       << perQuery(distanceComputations) << ","
                       << "\"dedup_skipped_vectors_per_query\":"
-                      << perQuery(matchedVectorOccurrences > distanceComputations
-                              ? matchedVectorOccurrences - distanceComputations
-                              : 0) << ","
-                      << "\"match_rate\":" << ratio(matchedVectorOccurrences, scannedVectors) << ","
-                      << "\"unique_match_rate\":" << ratio(uniqueMatchedVectors, scannedVectors) << ","
+                      << perQuery(dedupSkippedVectors) << ","
+                      << "\"match_rate\":" << ratio(matchedVectors, uniqueScannedVectors) << ","
+                      << "\"unique_match_rate\":" << ratio(uniqueMatchedVectors, uniqueScannedVectors) << ","
                       << "\"unique_vectors_per_loaded_posting\":"
                       << ratio(uniqueMatchedVectors, readPostings) << ","
                       << "\"unique_vectors_per_contributing_posting\":"
                       << ratio(uniqueMatchedVectors, uniqueMatchedPostings) << ","
-                      << "\"replica_occurrence_to_unique_ratio\":"
-                      << ratio(matchedVectorOccurrences, uniqueMatchedVectors) << ","
+                      << "\"scanned_occurrence_to_unique_ratio\":"
+                      << ratio(scannedVectors, uniqueScannedVectors) << ","
                       << "\"posting_page_reads_per_query\":" << perQuery(postingPageReads) << ","
                       << "\"posting_logical_bytes_per_query\":" << perQuery(postingLogicalBytes) << ","
                       << "\"posting_physical_bytes_per_query\":" << perQuery(postingPhysicalBytes) << ","

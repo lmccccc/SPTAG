@@ -80,6 +80,7 @@ namespace SPTAG {
             std::string m_uExtraIDFile;
             bool m_parallelBKTBuild;
             bool m_selectSecondLevel;
+            int m_secondLevelHierarchyLevels;
             double m_secondLevelRatio;
             std::string m_secondLevelHeadVectorFile;
             std::string m_secondLevelHeadIDFile;
@@ -92,6 +93,8 @@ namespace SPTAG {
             double m_secondLevelSignatureMinSelectivity;
             double m_secondLevelSignatureMaxSelectivity;
             int m_secondLevelMaxCheck;
+            bool m_secondLevelGraphSignaturePruning;
+            std::string m_secondLevelPrefetchMode;
             int m_sparseFallbackMaxHeads;
             int m_sparseFallbackMaxPostingPages;
             std::string m_headNavigationMode;
@@ -99,6 +102,7 @@ namespace SPTAG {
             // Section 3: for build head
             bool m_buildHead;
             bool m_buildH1Graph;
+            bool m_compactHierarchyVectors; // Legacy V2 option: accepted on load, rejected by fresh builds.
 
             // Section 4: for build ssd and search ssd
             bool m_enableSSD;
@@ -117,6 +121,9 @@ namespace SPTAG {
             int m_limitedTagSlotsPerHead;
             int m_limitedTagVoteHeadCount;
             int m_limitedTagMinHeadCount;
+            bool m_enableLimitedTagSupportExpansion;
+            std::uint64_t m_limitedTagMaxExtraSupports;
+            int m_limitedTagMaxExpandedPostingPages;
             bool m_enableExtremeSparseTag;
             int m_extremeSparseTagMinCount;
             std::string m_extremeSparseTagFile;

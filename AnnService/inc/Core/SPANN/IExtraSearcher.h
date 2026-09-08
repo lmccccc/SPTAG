@@ -8,6 +8,7 @@
 
 #include "inc/Core/VectorIndex.h"
 #include "inc/Core/Common/VersionLabel.h"
+#include "inc/Core/SPANN/SecondLevelHierarchy.h"
 #include "inc/Helper/AsyncFileReader.h"
 #include "inc/Helper/KeyValueIO.h"
 #include "inc/Helper/VectorSetReader.h"
@@ -163,12 +164,15 @@ namespace SPTAG {
 
         struct ExtraWorkSpace : public SPTAG::COMMON::IWorkSpace
         {
+            SecondLevelHierarchyDetail::SearchWorkspace m_hierarchy;
             struct PostingProbeStats {
                 std::uint64_t m_readPostings = 0;
                 std::uint64_t m_matchedPostings = 0;
                 std::uint64_t m_prePSPostings = 0;
                 std::uint64_t m_scannedVectors = 0;
+                // Matched counts describe first-visit contributions, not all replicas.
                 std::uint64_t m_matchedVectors = 0;
+                std::uint64_t m_dedupSkippedVectors = 0;
                 std::uint64_t m_uniqueMatchedPostings = 0;
                 std::uint64_t m_uniqueMatchedVectors = 0;
                 std::uint64_t m_primaryHeadCandidates = 0;
@@ -188,6 +192,7 @@ namespace SPTAG {
                     m_prePSPostings = 0;
                     m_scannedVectors = 0;
                     m_matchedVectors = 0;
+                    m_dedupSkippedVectors = 0;
                     m_uniqueMatchedPostings = 0;
                     m_uniqueMatchedVectors = 0;
                     m_primaryHeadCandidates = 0;
@@ -737,9 +742,17 @@ namespace SPTAG {
             virtual bool HasHybridPurePostings() const { return false; }
             virtual bool LimitedTagPostingRegionsReady() const { return false; }
             virtual int GetPostingCount() const { return -1; }
+            virtual int GetPostingVectorCount(
+                SizeType /*p_postingID*/, bool /*p_pureRegion*/) const { return -1; }
             virtual double GetPostingAvgRecords(bool /*p_useHybrid*/ = false) const { return -1.0; }
             virtual double GetPostingAvgPages(bool /*p_useHybrid*/ = false) const { return -1.0; }
             virtual int GetPostingPageCount(SizeType /*p_postingID*/) const { return -1; }
+            virtual int GetPostingPageCount(
+                SizeType p_postingID,
+                bool /*p_pureRegion*/) const
+            {
+                return GetPostingPageCount(p_postingID);
+            }
             virtual double GetPostingAvgBytes(bool /*p_useHybrid*/ = false) const { return -1.0; }
             virtual int GetPostingBufferBytes(bool /*p_useHybrid*/ = false) const { return -1; }
         };

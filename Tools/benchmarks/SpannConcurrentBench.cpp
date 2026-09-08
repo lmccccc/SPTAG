@@ -1,6 +1,6 @@
 // Native concurrent benchmark for the tenant-aware SPANN unfilter path.
 //
-// This deliberately invokes TenantIndexManager::SearchWithACL rather than the
+// This deliberately invokes TenantIndexManager::SearchWithPredicate rather than the
 // generic AnnIndex batch API, so it measures the same unfilter-tail path as
 // the canonical filtered-curve runner without Python's GIL.
 
@@ -359,7 +359,7 @@ TrialResult RunConcurrentTrial(TenantIndexManager& manager,
             if (queryIndex >= end) return;
 
             const auto start = std::chrono::steady_clock::now();
-            const auto result = manager.SearchWithACL(
+            const auto result = manager.SearchWithPredicate(
                 ByteArray(const_cast<std::uint8_t*>(
                               queries.values.data() + queryIndex * queries.dimension),
                           queries.dimension,
@@ -536,14 +536,14 @@ int main(int argc, char** argv)
         // The first warmup query initializes the lazy search structures before
         // workers concurrently enter the loaded manager. It counts toward each
         // trial's advertised warmup total.
-        const auto preflight = manager.SearchWithACL(
+        const auto preflight = manager.SearchWithPredicate(
             ByteArray(queries.values.data(), queries.dimension, false),
             options.tenant,
             options.topk,
             ByteArray(&emptyTag, 0, false),
             0);
         if (preflight == nullptr) {
-            std::cerr << "Preflight SearchWithACL failed\n";
+            std::cerr << "Preflight SearchWithPredicate failed\n";
             return 1;
         }
 
@@ -562,7 +562,7 @@ int main(int argc, char** argv)
         std::cout << std::fixed << std::setprecision(6)
                   << "RESULT {"
                   << "\"engine\":\"spann\","
-                  << "\"path\":\"SearchWithACL-unfilter\","
+                  << "\"path\":\"SearchWithPredicate-unfilter\","
                   << "\"nprobe\":" << ReadNprobe() << ","
                   << "\"threads\":" << result.threads << ","
                   << "\"trial_order\":" << trialOrder << ","

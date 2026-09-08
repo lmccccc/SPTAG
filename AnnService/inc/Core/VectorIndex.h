@@ -62,7 +62,7 @@ public:
     {
         return SearchIndex(p_results, p_searchDeleted);
     }
-    
+
     virtual std::shared_ptr<ResultIterator> GetIterator(const void* p_target, bool p_searchDeleted = false, std::function<bool(const ByteArray&)> p_filterFunc = nullptr, int p_maxCheck = 0) const = 0;
 
     virtual ErrorCode SearchIndexIterativeNext(QueryResult& p_query, COMMON::WorkSpace* workSpace, int p_batch, int& resultCount, bool p_isFirst, bool p_searchDeleted) const = 0;
@@ -83,6 +83,17 @@ public:
         QueryResult& p_query,
         std::function<bool(SizeType)> p_resultFilter,
         int p_maxCheck = 0,
+        bool p_searchDeleted = false) const
+    {
+        return ErrorCode::Undefined;
+    }
+
+    // Unlike result-only filtering, this can remove graph bridges. Tree
+    // partitions remain searchable; only graph seeds and edges are filtered.
+    virtual ErrorCode SearchIndexWithTraversalFilter(
+        QueryResult& p_query,
+        const std::function<bool(SizeType)>& p_filter,
+        int p_maxCheck,
         bool p_searchDeleted = false) const
     {
         return ErrorCode::Undefined;
@@ -272,6 +283,13 @@ public:
             const Cache::HierWidthTable& p_hierWidths,
             bool p_includeTailPS);
 
+        bool AdoptHeadNodeMeta(
+            SizeType p_numSamples,
+            int p_numQuantCols,
+            const Cache::HierWidthTable& p_hierWidths,
+            bool p_includeTailPS,
+            std::vector<std::uint8_t>&& p_blob);
+
         static bool TryComputeHeadNodeMetaStride(int p_numQuantCols, size_t& p_stride);
 
         static bool TryComputeHeadNodeMetaStride(
@@ -421,6 +439,7 @@ public:
             uint64_t m_prePSPostings = 0;
             uint64_t m_scannedVectors = 0;
             uint64_t m_matchedVectors = 0;
+            uint64_t m_dedupSkippedVectors = 0;
             uint64_t m_uniqueMatchedPostings = 0;
             uint64_t m_uniqueMatchedVectors = 0;
             uint64_t m_primaryHeadCandidates = 0;
@@ -435,6 +454,7 @@ public:
 
             uint64_t FalsePositivePostings() const
             {
+                // Legacy name: all-duplicate postings also contribute no new match.
                 return (m_readPostings >= m_matchedPostings) ? (m_readPostings - m_matchedPostings) : 0;
             }
         };
@@ -532,7 +552,8 @@ public:
                                                    uint64_t p_rerankReadRequests = 0,
                                                    uint64_t p_rerankPhysicalBytes = 0,
                                                    uint64_t p_uniqueMatchedPostings = 0,
-                                                   uint64_t p_uniqueMatchedVectors = 0);
+                                                   uint64_t p_uniqueMatchedVectors = 0,
+                                                   uint64_t p_dedupSkippedVectors = 0);
 
         static PostingScanStats GetThreadLocalPostingScanStats();
 
@@ -548,6 +569,12 @@ public:
 
   private:
     ErrorCode SaveIndexConfig(std::shared_ptr<Helper::DiskIO> p_configOut);
+
+    bool InitializeHeadNodeMetaLayout(
+        SizeType p_numSamples,
+        int p_numQuantCols,
+        const Cache::HierWidthTable& p_hierWidths,
+        bool p_includeTailPS);
 
 protected:
     bool m_bReady = false;

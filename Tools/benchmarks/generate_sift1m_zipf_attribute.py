@@ -20,7 +20,6 @@ from generate_tenant_tag_scenario import zipf_counts
 
 DEFAULT_BASE = Path("/home/v-mochengli/datasets/sift1m/sift/sift_base.fvecs")
 DEFAULT_OUTPUT = Path("/datadisk/yfcc_fast/sptag_sift1m_zipf200")
-MAX_ATTRIBUTE_CARDINALITY = 200
 DEFAULT_CONFIG = Path(__file__).with_name(
     "build_spann_attr_sift1m_zipf200_limited_tag.ini"
 )
@@ -91,13 +90,13 @@ def main() -> None:
     args = parse_args()
     if not args.base_file.is_file():
         raise FileNotFoundError(args.base_file)
-    if not 1 <= args.attribute_cardinality <= MAX_ATTRIBUTE_CARDINALITY:
+    dimension, vector_count = fvecs_info(args.base_file)
+    if not 1 <= args.attribute_cardinality <= vector_count:
         raise ValueError(
-            f"attribute-cardinality must be in [1, {MAX_ATTRIBUTE_CARDINALITY}]"
+            f"attribute-cardinality must be in [1, {vector_count}]"
         )
     if not np.isfinite(args.zipf_exponent) or args.zipf_exponent <= 0:
         raise ValueError("zipf-exponent must be finite and positive")
-    dimension, vector_count = fvecs_info(args.base_file)
     if (vector_count, dimension) != (1_000_000, 128):
         raise ValueError(
             f"Expected canonical SIFT1M shape (1000000, 128), got "

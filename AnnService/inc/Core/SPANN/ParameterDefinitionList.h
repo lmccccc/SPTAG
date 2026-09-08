@@ -69,6 +69,7 @@ DefineSelectHeadParameter(m_dualPoolAugment, bool, false, "DualPoolAugment")
 DefineSelectHeadParameter(m_dualPoolExtraRatio, double, 0.1, "DualPoolExtraRatio")
 DefineSelectHeadParameter(m_uExtraIDFile, std::string, std::string(), "UExtraIDFile")
 DefineSelectHeadParameter(m_selectSecondLevel, bool, false, "SelectSecondLevel")
+DefineSelectHeadParameter(m_secondLevelHierarchyLevels, int, 2, "SecondLevelHierarchyLevels")
 DefineSelectHeadParameter(m_secondLevelRatio, double, 0.05, "SecondLevelRatio")
 DefineSelectHeadParameter(m_secondLevelHeadVectorFile, std::string, std::string("SPTAGSecondLevelHeadVectors.bin"), "SecondLevelHeadVectors")
 DefineSelectHeadParameter(m_secondLevelHeadIDFile, std::string, std::string("SPTAGSecondLevelHeadVectorIDs.bin"), "SecondLevelHeadVectorIDs")
@@ -77,6 +78,8 @@ DefineSelectHeadParameter(m_secondLevelHeadIndexFolder, std::string, std::string
 DefineSelectHeadParameter(m_secondLevelPostingFile, std::string, std::string("second_level_head_postings.bin"), "SecondLevelPostingFile")
 DefineSelectHeadParameter(m_secondLevelGenerationFingerprint, std::string, std::string(), "SecondLevelGenerationFingerprint")
 DefineSelectHeadParameter(m_buildH1Graph, bool, true, "BuildH1Graph")
+// Retained for V2 indexloader.ini compatibility; new builds must leave this false.
+DefineSelectHeadParameter(m_compactHierarchyVectors, bool, false, "CompactHierarchyVectors")
 #endif
 
 #ifdef DefineBuildHeadParameter
@@ -102,6 +105,9 @@ DefineSSDParameter(m_limitedTagColumn, int, 0, "LimitedTagColumn")
 DefineSSDParameter(m_limitedTagSlotsPerHead, int, 2, "LimitedTagSlotsPerHead")
 DefineSSDParameter(m_limitedTagVoteHeadCount, int, 2, "LimitedTagVoteHeadCount")
 DefineSSDParameter(m_limitedTagMinHeadCount, int, 8, "LimitedTagMinHeadCount")
+DefineSSDParameter(m_enableLimitedTagSupportExpansion, bool, false, "EnableLimitedTagSupportExpansion")
+DefineSSDParameter(m_limitedTagMaxExtraSupports, std::uint64_t, 0, "LimitedTagMaxExtraSupports")
+DefineSSDParameter(m_limitedTagMaxExpandedPostingPages, int, 32, "LimitedTagMaxExpandedPostingPages")
 DefineSSDParameter(m_enableExtremeSparseTag, bool, false, "EnableExtremeSparseTag")
 DefineSSDParameter(m_extremeSparseTagMinCount, int, 10, "ExtremeSparseTagMinCount")
 DefineSSDParameter(m_extremeSparseTagFile, std::string, std::string("extreme_sparse_tags.bin"), "ExtremeSparseTagFile")
@@ -111,6 +117,8 @@ DefineSSDParameter(m_secondLevelInitialProbeRatio, double, 1.0, "SecondLevelInit
 DefineSSDParameter(m_secondLevelSignatureMinSelectivity, double, 0.0, "SecondLevelSignatureMinSelectivity")
 DefineSSDParameter(m_secondLevelSignatureMaxSelectivity, double, 1.0, "SecondLevelSignatureMaxSelectivity")
 DefineSSDParameter(m_secondLevelMaxCheck, int, 112, "SecondLevelMaxCheck") // Mutable
+DefineSSDParameter(m_secondLevelGraphSignaturePruning, bool, false, "SecondLevelGraphSignaturePruning") // Mutable
+DefineSSDParameter(m_secondLevelPrefetchMode, std::string, std::string("Rolling16"), "SecondLevelPrefetchMode")
 DefineSSDParameter(m_sparseFallbackMaxHeads, int, 0, "SparseFallbackMaxHeads")
 DefineSSDParameter(m_sparseFallbackMaxPostingPages, int, 0, "SparseFallbackMaxPostingPages")
 DefineSSDParameter(m_headNavigationMode, std::string, std::string("Auto"), "HeadNavigationMode") // Mutable

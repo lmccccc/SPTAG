@@ -179,6 +179,9 @@ add_executable(spannaclbench ${PROJECT_SOURCE_DIR}/Tools/benchmarks/SpannAclBenc
 target_include_directories(spannaclbench PRIVATE ${PROJECT_SOURCE_DIR}/Wrappers)
 target_link_libraries(spannaclbench SPTAGLibStatic ${Boost_LIBRARIES} ${RocksDB_LIBRARIES} ${uring_LIBRARIES} ${TBB_LIBRARIES} ${SPDK_LIBRARIES})
 
+add_executable(spannsupportaudit ${PROJECT_SOURCE_DIR}/Tools/benchmarks/InspectLimitedTagCoverage.cpp)
+target_link_libraries(spannsupportaudit SPTAGLibStatic ${Boost_LIBRARIES} ${RocksDB_LIBRARIES} ${uring_LIBRARIES} ${TBB_LIBRARIES} ${SPDK_LIBRARIES})
+
 # Offline RaBitQ2 in-posting code-sidecar encoders. rabitq2_encode loads the full
 # float matrix into RAM (small/legacy); rabitq2_encode_stream streams the base file
 # in chunks and is value-type-aware (Int8/UInt8/Float) so it scales to 1B vectors.

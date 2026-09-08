@@ -329,11 +329,18 @@ public:
         int p_numTagsPerVec, bool p_withMetaIndex,
         bool p_normalized);
 
-    // Search with ACL tag filter: PS hard reject + NS soft navigation.
-    // p_queryTags: ByteArray of uint32_t allowed tag IDs.
-    std::shared_ptr<QueryResult> SearchWithACL(ByteArray p_queryVector, int p_tenantId,
-                                                int p_resultNum,
-                                                ByteArray p_queryTags, int p_numTags);
+    // Search with a flat tag predicate or an encoded DNF predicate.
+    // p_numTags < 0 identifies the self-describing DNF encoding.
+    std::shared_ptr<QueryResult> SearchWithPredicate(
+        ByteArray p_queryVector, int p_tenantId,
+        int p_resultNum, ByteArray p_queryPredicate,
+        int p_numPredicateValues);
+
+    // Compatibility alias for existing callers.
+    std::shared_ptr<QueryResult> SearchWithACL(
+        ByteArray p_queryVector, int p_tenantId,
+        int p_resultNum, ByteArray p_queryTags,
+        int p_numTags);
 
     // Set posting storage backend: "FILEIO" (default) or "ROCKSDBIO"
     void SetStorageBackend(const char* backend) { m_storageBackend = std::string(backend); }
@@ -388,7 +395,7 @@ private:
         std::shared_ptr<SPTAG::Cache::TagPurePosting>>> m_tenantTagPurePostings;
 
     // Cached KV-store handle per tenant for the tag-pure path. Populated at
-    // BuildSignatures time. Used by the SearchWithACL fast path to issue
+    // BuildSignatures time. Used by the predicate-search fast path to issue
     // MultiGet without re-resolving the SPANN index pointer chain.
     std::map<int, std::shared_ptr<SPTAG::Helper::KeyValueIO>> m_tenantTagPureKV;
 
@@ -556,7 +563,7 @@ private:
 
     // Load per-tenant tagpure_meta.bin sidecars into m_tenantTagPurePostings.
     // Also resolves and caches the KV store handle + page budget needed by
-    // the SearchWithACL fast path. Mirrors LoadTenantSparseIndices.
+    // the predicate-search fast path. Mirrors LoadTenantSparseIndices.
     void LoadTenantTagPureIndices();
 
     // Reload exact per-tag selectivity statistics used by hybrid cost routing.
