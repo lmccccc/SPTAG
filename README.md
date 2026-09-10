@@ -237,20 +237,22 @@ This fork adds production-grade multi-tenant support on top of SPANN:
   `head_cross_edges.bin` runtime suffix rather than a second graph store.
   Hybrid mode requires `ExcludeHead=true` so global head VIDs remain
   available for deterministic suffix validation after reload.
-- **Trailing numeric attributes**: if tags include numeric columns after categorical
-  ACL columns, set `[BuildSSDIndex] StaticACLTagCols=<categorical-column-count>`
-  (SIFT tags5 uses `4`). The default `0` checks every tag column and is only safe
-  when their value domains do not overlap. The same prefix defines STM1's
-  hierarchical posting-mask inputs.
-- **Optional posting prefilter**: `[SearchSSDIndex] EnableHierPostingFilter=true`
-  uses independent member-OR signatures for `H` and `O`, so each route is
-  pruned against the records it actually scans. Categorical columns use
-  per-column masks; numeric columns use independent 256-bucket quantized
+- **Original-order tag schema**: `[Tags] ColumnTypes` lists every column as
+  `categorical` or `numeric`, with no categorical-prefix requirement.
+  Library setters use `BuildSSDIndex.ColumnTypes`. Flat value matching examines
+  categorical columns only; column-qualified DNF uses original indices.
+  Existing prefix-layout metadata remains readable without reinterpreting old rows.
+- **Automatic posting prefilter**: validated metadata supplies independent
+  member-OR signatures for `H` and `O`, so each route is
+  pruned against the records it actually scans. Flat ACL uses column-agnostic
+  masks because categorical domains may overlap or appear in any order.
+  Column-qualified DNF uses per-column masks; numeric columns use independent 256-bucket quantized
   masks. Both are conservative I/O hints; exact per-vector DNF checking
   remains authoritative.
-- **Hierarchical routing**: org/dept/team/project tags route head-bundle search;
-  sparse predicates retain the normal fallback path when a direct sparse sidecar
-  is unavailable.
+- **Spatial hierarchical routing**: one global H1..H5 hierarchy uses a top-level
+  graph and signed CSR descent. Attribute signatures provide conservative
+  filtering hints, not attribute-owned partitions; sparse predicates retain
+  ordinary support/H/O fallback.
 - **No unsupported predicate fallback**: static STM1 rejects arbitrary metadata
   callbacks and DNF predicates rather than returning approximate filter results.
 
@@ -281,34 +283,21 @@ workload and storage path. They are not a performance contract for the current
 native-INI STM1/static or in-posting-quantized configurations. Reproduce
 current numbers with the committed INI and native benchmark commands above.
 
-### Dual-Pool Head Index — Usage Modes
+### Global Spatial Hierarchy and Filter Metadata
 
-> The environment-variable commands below are retained for historical ablations.
-> The supported build/demo path is the native `.ini` workflow in
-> [docs/Experiment_Workflow.md](docs/Experiment_Workflow.md); do not use
-> `SPTAG_*` environment variables to override build or search parameters.
+Current attribute indexes use one global spatial hierarchy. Per-tag head
+selection, attribute pivot planning and tag-to-bundle routing have been removed.
+Use the native INI workflow in [docs/Experiment_Workflow.md](docs/Experiment_Workflow.md).
+Old organization settings fail explicitly; see the migration note in
+[Tools/benchmarks/README.md](Tools/benchmarks/README.md).
 
-The per-tag **dual-pool** head index (bundle subgraphs + cross-edges + optional
-U_extra augmentation) shares a **single binary** with the vanilla build; all modes
-are selected via env vars and build-script arguments:
-
-| Mode | Head selection | Subgraphs | U_extra | Build command |
-| ---- | -------------- | --------- | ------- | ------------- |
-| **A. Vanilla** | `BKT` (global ratio) | 1 global | — | `build_tenant0_baseline.py --ratio R` |
-| **B. Dual-pool** | `PerTagBKT` | `--group-target N` + cross-edges | — | `build_tenant0_pertag.py --final-ratio R --group-target N` |
-| **C. Dual-pool + U_extra** | `PerTagBKT` | `N` + reverse H1→U_extra edges | `SPTAG_DUAL_POOL_AUGMENT=1` | Mode B + `SPTAG_DUAL_POOL_EXTRA_RATIO=0.10` |
-
-> Note: `--group-target 1` + no U_extra is **not** vanilla — head selection is still
-> per-tag. True vanilla also requires `selectType = BKT`.
-
-Modes B/C also run `augmentheadgraph` to build cross-subgraph edges. See
-**[docs/MultiTenant_DualPool_Usage.md](docs/MultiTenant_DualPool_Usage.md)** for
-full commands, the asymmetric-edge U_extra design, the slim head store, and the
-complete environment-variable reference.
+Categorical/numeric records, exact filters, support assignments, H/O regions
+and signed spatial hierarchy CSR remain supported. Generic physical bundles
+and optional cross-edges/tails remain for geometry and upstream CRUD.
 
 #### Unfilter enhancement layers
 
-For good **unfiltered** recall/QPS on a partitioned (PerTagBKT + ACL hierarchy)
+For good **unfiltered** recall/QPS on a physical multi-bundle
 index, build the cross-graph stitch plus H1 unfilter-tail replicas. U_extra is
 optional and defaults OFF in canonical SPACEV configs after ablation showed no
 recall gain once H1 tails are enabled. Without cross-graph/tail, unfilter
@@ -341,11 +330,15 @@ Tools/benchmarks/run_spann_attr_build.sh [config.ini]   # launcher derives paths
   `PostingQuantizerFile`/`PipePQPivotsFile`, `FullVectorFile`, `RerankL`,
   `StartFileSizeGB`/`MaxFileSizeGB`)
   flows through the native `SetSSDBuildParam` path.
-- `[SelectHead]`/`[BuildHead]`/`[MultiTenant]` carry ACL routing, hierarchy
-  widths, numeric columns, and the three unfilter layers. `[SearchSSDIndex]`
+- `[SelectHead]`/`[BuildHead]` carry spatial hierarchy and graph settings.
+  `[Tags] ColumnTypes=categorical,numeric` defines every original column;
+  types may be interleaved and width is derived. `LimitedTagColumn` is an
+  absolute categorical column index, not a partition identifier. `[SearchSSDIndex]`
   carries persisted query behavior such as `InternalResultNum`
   (internally `SearchInternalResultNum`),
-  `EnableUnfilterTail`, and `EnableHierPostingFilter`.
+  and `EnableUnfilterTail`. Validated posting prefiltering is automatic.
+  Retired partition/EST settings and duplicate `[MultiTenant]` aliases are
+  rejected; see the [reduced configuration](Tools/benchmarks/README.md#reduced-filtering-configuration).
 - Comments MUST start with `;`; an explicit CLI flag overrides any ini value.
 
 See **AGENTS.md → "Build Config — Native `.ini`"** for the full key→engine mapping.

@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "inc/Helper/VectorSetReaders/TxtReader.h"
+#include "inc/Helper/VectorSetReaders/DefaultReader.h"
 #include "inc/Core/VectorIndex.h"
 #include "inc/Helper/CommonHelper.h"
 #include "inc/Helper/StringConvert.h"
@@ -11,7 +12,7 @@ using namespace SPTAG;
 using namespace SPTAG::Helper;
 
 TxtVectorReader::TxtVectorReader(std::shared_ptr<ReaderOptions> p_options)
-    : VectorSetReader(p_options), m_subTaskBlocksize(0)
+    : VectorSetReader(p_options), m_subTaskCount(0), m_subTaskBlocksize(0)
 {
     std::string tempFolder("tempfolder");
     if (!direxists(tempFolder.c_str()))
@@ -29,6 +30,9 @@ TxtVectorReader::TxtVectorReader(std::shared_ptr<ReaderOptions> p_options)
 
 TxtVectorReader::~TxtVectorReader()
 {
+    for (std::uint32_t i = 0; i < m_subTaskCount; ++i)
+        for (const auto& path : {m_vectorOutput, m_metadataConentOutput, m_metadataIndexOutput})
+            remove((path + "_" + std::to_string(i) + ".tmp").c_str());
     if (fileexists(m_vectorOutput.c_str()))
     {
         remove(m_vectorOutput.c_str());
@@ -47,6 +51,11 @@ TxtVectorReader::~TxtVectorReader()
 
 ErrorCode TxtVectorReader::LoadFile(const std::string &p_filePaths)
 {
+    if (m_options->m_dimension <= 0 || m_options->m_threadNum == 0 ||
+        GetValueTypeSize(m_options->m_inputValueType) == 0 ||
+        static_cast<std::uint64_t>(m_options->m_dimension) *
+            GetValueTypeSize(m_options->m_inputValueType) > static_cast<std::uint64_t>(MaxSize))
+        return ErrorCode::DimensionSizeMismatch;
     const auto &files = GetFileSizes(p_filePaths);
     std::vector<std::function<ErrorCode()>> subWorks;
     subWorks.reserve(files.size() * m_options->m_threadNum);
@@ -91,6 +100,7 @@ ErrorCode TxtVectorReader::LoadFile(const std::string &p_filePaths)
     std::vector<std::thread> mythreads;
     mythreads.reserve(m_options->m_threadNum);
     std::atomic_size_t sent(0);
+    std::atomic<ErrorCode> failure(ErrorCode::Success);
     for (int tid = 0; tid < m_options->m_threadNum; tid++)
     {
         mythreads.emplace_back([&, tid]() {
@@ -103,7 +113,7 @@ ErrorCode TxtVectorReader::LoadFile(const std::string &p_filePaths)
                     ErrorCode code = subWorks[i]();
                     if (ErrorCode::Success != code)
                     {
-                        throw std::runtime_error("LoadFileInternal failed");
+                        failure.store(code);
                     }
                 }
                 else
@@ -118,6 +128,7 @@ ErrorCode TxtVectorReader::LoadFile(const std::string &p_filePaths)
         t.join();
     }
     mythreads.clear();
+    if (failure.load() != ErrorCode::Success) return failure.load();
     m_waitSignal.Wait();
 
     return MergeData();
@@ -125,46 +136,12 @@ ErrorCode TxtVectorReader::LoadFile(const std::string &p_filePaths)
 
 std::shared_ptr<VectorSet> TxtVectorReader::GetVectorSet(SizeType start, SizeType end) const
 {
-    auto ptr = f_createIO();
-    if (ptr == nullptr || !ptr->Initialize(m_vectorOutput.c_str(), std::ios::binary | std::ios::in))
-    {
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to read file %s.\n", m_vectorOutput.c_str());
-        throw std::runtime_error("Failed to read vectorset file");
-    }
-
-    SizeType row;
-    DimensionType col;
-    if (ptr->ReadBinary(sizeof(SizeType), (char *)&row) != sizeof(SizeType))
-    {
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to read VectorSet!\n");
-        throw std::runtime_error("Failed to read vectorset file");
-    }
-    if (ptr->ReadBinary(sizeof(DimensionType), (char *)&col) != sizeof(DimensionType))
-    {
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to read VectorSet!\n");
-        throw std::runtime_error("Failed to read vectorset file");
-    }
-
-    if (start > row)
-        start = row;
-    if (end < 0 || end > row)
-        end = row;
-    std::uint64_t totalRecordVectorBytes =
-        ((std::uint64_t)GetValueTypeSize(m_options->m_inputValueType)) * (end - start) * col;
-    ByteArray vectorSet;
-    if (totalRecordVectorBytes > 0)
-    {
-        vectorSet = ByteArray::Alloc(totalRecordVectorBytes);
-        char *vecBuf = reinterpret_cast<char *>(vectorSet.Data());
-        std::uint64_t offset = ((std::uint64_t)GetValueTypeSize(m_options->m_inputValueType)) * start * col +
-                               +sizeof(SizeType) + sizeof(DimensionType);
-        if (ptr->ReadBinary(totalRecordVectorBytes, vecBuf, offset) != totalRecordVectorBytes)
-        {
-            SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to read VectorSet!\n");
-            throw std::runtime_error("Failed to read vectorset file");
-        }
-    }
-    return std::shared_ptr<VectorSet>(new BasicVectorSet(vectorSet, m_options->m_inputValueType, col, end - start));
+    DefaultVectorReader reader(m_options);
+    if (reader.LoadFile(m_vectorOutput) != ErrorCode::Success)
+        throw std::runtime_error("Failed opening converted TXT input");
+    auto vectors = reader.GetVectorSet(start, end);
+    m_sourceCount = reader.SourceCount();
+    return vectors;
 }
 
 std::shared_ptr<MetadataSet> TxtVectorReader::GetMetadataSet() const
@@ -264,6 +241,7 @@ ErrorCode TxtVectorReader::LoadFileInternal(const std::string &p_filePath, std::
             return ErrorCode::FailedParseValue;
         }
 
+        if (recordCount == MaxSize) return ErrorCode::FailedParseValue;
         ++recordCount;
         if (output->WriteBinary(vectorByteSize, (char *)vector.get()) != vectorByteSize ||
             meta->WriteBinary(tabIndex, currentLine.get()) != tabIndex ||
@@ -281,7 +259,10 @@ ErrorCode TxtVectorReader::LoadFileInternal(const std::string &p_filePath, std::
         return ErrorCode::DiskIOFail;
     }
 
-    m_totalRecordCount += recordCount;
+    SizeType previous = m_totalRecordCount.load();
+    do {
+        if (previous > MaxSize - recordCount) return ErrorCode::FailedParseValue;
+    } while (!m_totalRecordCount.compare_exchange_weak(previous, previous + recordCount));
     m_subTaskRecordCount[p_subTaskID] = recordCount;
     m_totalRecordVectorBytes += recordCount * vectorByteSize;
 

@@ -80,7 +80,6 @@ namespace
 constexpr std::uint32_t kHeadBundleManifestMagic = 0x48424D46U;
 constexpr std::int32_t kHeadBundleManifestVersion = 2;
 
-constexpr std::int32_t kHeadNodeRoutingIndexVersion = 1;
 constexpr int kRequiredHybridBaseGraphDegree = 32;
 constexpr int kRequiredHybridGraphDegree = 16;
 
@@ -105,7 +104,7 @@ bool ValidHybridRouteConfig(const Options& p_options)
             0.0f;
 }
 
-bool ValidSecondLevelRouteConfig(
+bool ValidHierarchyNavigationConfig(
     const Options& p_options)
 {
     const bool validNavigationMode =
@@ -119,36 +118,9 @@ bool ValidSecondLevelRouteConfig(
         validNavigationMode &&
         std::isfinite(
             p_options
-                .m_secondLevelRouteSelectivityThreshold) &&
-        p_options
-                .m_secondLevelRouteSelectivityThreshold >=
-            0.0f &&
-        p_options
-                .m_secondLevelRouteSelectivityThreshold <=
-            1.0f &&
-        std::isfinite(
-            p_options
                 .m_secondLevelInitialProbeRatio) &&
         p_options.m_secondLevelInitialProbeRatio > 0.0 &&
         p_options.m_secondLevelInitialProbeRatio <= 1.0 &&
-        std::isfinite(
-            p_options
-                .m_secondLevelSignatureMinSelectivity) &&
-        std::isfinite(
-            p_options
-                .m_secondLevelSignatureMaxSelectivity) &&
-        p_options
-                .m_secondLevelSignatureMinSelectivity >=
-            0.0f &&
-        p_options
-                .m_secondLevelSignatureMaxSelectivity <=
-            1.0f &&
-        p_options
-                .m_secondLevelSignatureMinSelectivity <
-            p_options
-                .m_secondLevelSignatureMaxSelectivity &&
-        p_options.m_sparseFallbackMaxHeads >= 0 &&
-        p_options.m_sparseFallbackMaxPostingPages >= 0 &&
         p_options.m_secondLevelMaxCheck > 0;
 }
 
@@ -312,64 +284,14 @@ std::uint64_t NewHybridBuildGeneration(
         : generation;
 }
 
-struct HeadNodeRoutingIndexFileHeader {
-    std::int32_t version;
-    std::int32_t pivotLevel;
-    std::int32_t nodeCount;
-    std::int32_t numHeadSamples;
-    std::int32_t numTagMappings;
-};
-
-static bool LoadUpdateRoutingNodes(const std::string& indexDir, const std::string& headIndexFolder,
-                                   int& pivotLevel,
-                                   std::unordered_map<std::uint32_t, std::vector<int>>& tagToNodes)
-{
-    pivotLevel = -1;
-    tagToNodes.clear();
-    FILE* file = fopen((indexDir + FolderSep + headIndexFolder + FolderSep + "tag_node_index.bin").c_str(), "rb");
-    if (file == nullptr) return false;
-
-    HeadNodeRoutingIndexFileHeader header {};
-    bool ok = fread(&header, sizeof(header), 1, file) == 1 &&
-              header.version == kHeadNodeRoutingIndexVersion &&
-              header.pivotLevel >= 0 && header.nodeCount >= 0 &&
-              header.numHeadSamples >= 0 && header.numTagMappings >= 0;
-    for (int node = 0; ok && node < header.nodeCount; ++node) {
-        std::int32_t count = 0;
-        ok = fread(&count, sizeof(count), 1, file) == 1 && count >= 0;
-        if (ok && count > 0) {
-            std::vector<std::uint32_t> ignored(static_cast<size_t>(count));
-            ok = fread(ignored.data(), sizeof(std::uint32_t), ignored.size(), file) == ignored.size();
-        }
-    }
-    for (int mapping = 0; ok && mapping < header.numTagMappings; ++mapping) {
-        std::uint32_t tag = 0;
-        std::int32_t count = 0;
-        ok = fread(&tag, sizeof(tag), 1, file) == 1 &&
-             fread(&count, sizeof(count), 1, file) == 1 && count >= 0;
-        if (!ok) break;
-        std::vector<int> nodes(static_cast<size_t>(count));
-        if (count > 0) {
-            ok = fread(nodes.data(), sizeof(std::int32_t), nodes.size(), file) == nodes.size();
-        }
-        if (ok) tagToNodes.emplace(tag, std::move(nodes));
-    }
-    fclose(file);
-    if (!ok) {
-        tagToNodes.clear();
-        return false;
-    }
-    pivotLevel = header.pivotLevel;
-    return true;
-}
-
-// SelectHead checkpoint ('HSST'): persists the PerTagBKT-derived in-memory state
+// SelectHead checkpoint ('HSST'): persists the spatial head-selection in-memory state
 // (node head selections, per-bundle U_extra, node/primary vector assignments, head
 // vector owners, head roles) so a failed BuildHead/BuildSSDIndex can be restarted
 // WITHOUT re-running the expensive head-selection BKT k-means. Enabled by
 // SPTAG_PERSIST_SELECTHEAD=1; resumed by additionally setting SPTAG_RESUME_BUILD=1.
 constexpr std::uint32_t kHeadSelectStateMagic = 0x54535348U; // 'HSST'
 constexpr std::int32_t  kHeadSelectStateVersion = 1;
+constexpr std::uint32_t kHierarchyRatioCheckpointMagic = 0x54415248U; // 'HRAT'
 
 struct HeadSelectStateHeader {
     std::uint32_t magic;
@@ -629,15 +551,11 @@ bool ValidLimitedTagArtifactLayout(
     const Options& p_options)
 {
     if (!p_options.m_enableLimitedTagPosting)
-        return !p_options.m_enableExtremeSparseTag;
+        return true;
 
     std::vector<std::string> published = {
         p_options.m_limitedTagSupportFile};
-    if (p_options.m_enableExtremeSparseTag)
-    {
-        published.push_back(
-            p_options.m_extremeSparseTagFile);
-    }
+
     std::vector<std::string> publishedNames;
     publishedNames.reserve(published.size() * 2);
     for (const std::string& artifact : published)
@@ -813,7 +731,6 @@ bool ValidSecondLevelArtifactLayout(
         p_options.m_deleteIDFile,
         p_options.m_ssdIndex,
         p_options.m_limitedTagSupportFile,
-        p_options.m_extremeSparseTagFile,
         p_options.m_fullDeletedIDFile,
         p_options.m_KVFile,
         p_options.m_ssdMappingFile,
@@ -1307,16 +1224,6 @@ template <typename T> ErrorCode Index<T>::SaveLoadedHeadBundles(const std::strin
 
     const std::string bundleBaseDir = baseDir;
     const size_t bundleCount = m_headBundleNodes.size();
-    if (bundleCount > 1) {
-        const std::string sourceRouting = sourceHeadDir + FolderSep + "tag_node_index.bin";
-        const std::string targetRouting = targetHeadDir + FolderSep + "tag_node_index.bin";
-        if (!CopyFileAtomically(sourceRouting, targetRouting)) {
-            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                         "[TaggedUpdate] failed to checkpoint routing map %s.\n",
-                         sourceRouting.c_str());
-            return ErrorCode::FailedCreateFile;
-        }
-    }
     const bool rootOnlyBundle = !m_metadataOnlyHeadStore && bundleCount == 1 &&
         m_headBundleNodes.front().headIndexRelativePath == m_options.m_headIndexFolder;
     if (rootOnlyBundle) {
@@ -1490,6 +1397,14 @@ template <typename T> ErrorCode Index<T>::SaveHeadSelectState(const std::string&
         ok = fwrite(m_pendingHeadRoles.data(), 1, static_cast<size_t>(header.headRolesCount), f) ==
              static_cast<size_t>(header.headRolesCount);
     }
+    // V1 checkpoints did not identify the upper-layer selection policy. Never
+    // reuse their heads under the shared-ratio policy without explicit evidence.
+    if (ok && m_options.m_selectSecondLevel) {
+        const std::int32_t levels = m_options.m_secondLevelHierarchyLevels;
+        ok = fwrite(&kHierarchyRatioCheckpointMagic, sizeof(kHierarchyRatioCheckpointMagic), 1, f) == 1 &&
+             fwrite(&m_options.m_ratio, sizeof(m_options.m_ratio), 1, f) == 1 &&
+             fwrite(&levels, sizeof(levels), 1, f) == 1;
+    }
 
     if (ok) ok = (fflush(f) == 0);
     fclose(f);
@@ -1546,6 +1461,25 @@ template <typename T> ErrorCode Index<T>::LoadHeadSelectState(const std::string&
         }
     }
 
+    if (ok && m_options.m_selectSecondLevel) {
+        std::uint32_t magic = 0;
+        double ratio = 0;
+        std::int32_t levels = 0;
+        const bool matches =
+            fread(&magic, sizeof(magic), 1, f) == 1 &&
+            fread(&ratio, sizeof(ratio), 1, f) == 1 &&
+            fread(&levels, sizeof(levels), 1, f) == 1 &&
+            magic == kHierarchyRatioCheckpointMagic &&
+            std::isfinite(ratio) && ratio == m_options.m_ratio &&
+            levels == m_options.m_secondLevelHierarchyLevels;
+        if (!matches) {
+            fclose(f);
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                "Hierarchy SelectHead checkpoint lacks shared-ratio provenance or differs from "
+                "Ratio/HierarchyLevels. Resume is unsafe; use ResumeBuild=0 and fresh output paths.\n");
+            return ErrorCode::FailedParseValue;
+        }
+    }
     fclose(f);
     return ok ? ErrorCode::Success : ErrorCode::Fail;
 }
@@ -2384,7 +2318,7 @@ ErrorCode Index<T>::LoadHeadHybridGraph() const
     }
 
     float vectorWeight = 1.0f;
-    int degree = 16;
+    constexpr int degree = kRequiredHybridGraphDegree;
     int candidateCount = 128;
     Helper::Convert::ConvertStringTo<float>(
         GetParameter(
@@ -2392,22 +2326,12 @@ ErrorCode Index<T>::LoadHeadHybridGraph() const
         vectorWeight);
     Helper::Convert::ConvertStringTo<int>(
         GetParameter(
-            "HybridGraphDegree", "BuildSSDIndex").c_str(),
-        degree);
-    Helper::Convert::ConvertStringTo<int>(
-        GetParameter(
             "HybridCandidateCount",
             "BuildSSDIndex").c_str(),
         candidateCount);
     std::string configError;
     HybridDistanceConfig distance;
-    if (degree != kRequiredHybridGraphDegree) {
-        SPTAGLIB_LOG(
-            Helper::LogLevel::LL_Error,
-            "HybridGraphDegree must be %d, got %d.\n",
-            kRequiredHybridGraphDegree, degree);
-        return ErrorCode::Fail;
-    }
+
     if (!ValidHybridRouteConfig(m_options)) {
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
@@ -2730,9 +2654,7 @@ ErrorCode Index<T>::LoadLimitedTagSupport(
         return ErrorCode::Success;
     }
     const int categoricalColumns =
-        m_options.m_staticACLTagCols > 0
-        ? m_options.m_staticACLTagCols
-        : m_options.m_numTagsPerVec;
+        static_cast<int>(m_options.Schema().categorical.size());
     if (!ValidLimitedTagArtifactLayout(m_options) ||
         m_options.m_enableHybridDistance ||
         m_extraSearcher == nullptr ||
@@ -2741,8 +2663,7 @@ ErrorCode Index<T>::LoadLimitedTagSupport(
         m_options.m_numTagsPerVec <= 0 ||
         categoricalColumns <= 0 ||
         m_options.m_limitedTagColumn < 0 ||
-        m_options.m_limitedTagColumn >=
-            categoricalColumns ||
+        !m_options.Schema().IsCategorical(m_options.m_limitedTagColumn) ||
         m_options.m_limitedTagColumn >=
             m_options.m_numTagsPerVec ||
         !LimitedTagSupport::IsSupportedSlotCount(
@@ -2773,7 +2694,6 @@ ErrorCode Index<T>::LoadLimitedTagSupport(
             path,
             m_index->GetNumSamples(),
             m_options.m_limitedTagSlotsPerHead,
-            m_options.m_limitedTagVoteHeadCount,
             m_options.m_limitedTagMinHeadCount,
             m_options.m_limitedTagColumn,
             m_options.m_numTagsPerVec,
@@ -2788,14 +2708,10 @@ ErrorCode Index<T>::LoadLimitedTagSupport(
     if (m_limitedTagSupport.HasExpansion() !=
             m_options.m_enableLimitedTagSupportExpansion ||
         (m_limitedTagSupport.HasExpansion() &&
-         (m_options.m_limitedTagMaxExtraSupports == 0 ||
-          m_limitedTagSupport.MaxExtraSupports() !=
-              m_options.m_limitedTagMaxExtraSupports ||
-          m_options.m_minHeadsPerTag != 0 ||
-          m_options.m_limitedTagMaxExpandedPostingPages <= 0)))
+         m_options.m_minHeadsPerTag != 0))
     {
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-            "Limited-tag O-based support expansion does not match its native configuration/budget.\n");
+            "Limited-tag O-based support expansion does not match its native configuration.\n");
         return ErrorCode::Fail;
     }
     {
@@ -2905,7 +2821,7 @@ ErrorCode Index<T>::EnsureHierarchyHeadMetadata(
         static_cast<std::size_t>(columns) * sizeof(std::uint32_t) +
         static_cast<std::size_t>(m_options.m_dim) * sizeof(T);
     const int categoricalColumns =
-        m_options.m_staticACLTagCols > 0 ? m_options.m_staticACLTagCols : columns;
+        static_cast<int>(m_options.Schema().categorical.size());
     if (categoricalColumns > columns) return ErrorCode::Fail;
     const Cache::HierWidthTable widths = Cache::HierWidths();
     m_index->InitializeHeadNodeMeta(headCount, 0, widths, true);
@@ -2952,7 +2868,7 @@ ErrorCode Index<T>::EnsureHierarchyHeadMetadata(
                         static_cast<std::size_t>(column) * sizeof(tag), sizeof(tag));
                     if (tag != tags[static_cast<std::size_t>(member) * columns + column])
                         return ErrorCode::Fail;
-                    if (column < categoricalColumns)
+                    if (m_options.Schema().IsCategorical(column))
                     {
                         (offset < pureBytes ? pure : tail).Insert(tag);
                         if (offset < pureBytes) postingMask.Insert(column, tag, widths);
@@ -3044,8 +2960,8 @@ ErrorCode Index<T>::RefreshHierarchySignatures(
         const SizeType lowerCount = postings.FirstLevelHeadCount();
         if (!postings.Initialize(lowerCount, count, m_options.m_secondLevelReplicaCount,
                 lowerFingerprint, m_limitedTagSupport.ContentFingerprint(),
-                m_options.m_secondLevelSignatureMinSelectivity,
-                m_options.m_secondLevelSignatureMaxSelectivity, p_levelToLower[level],
+                postings.SignatureMinSelectivity(),
+                postings.SignatureMaxSelectivity(), p_levelToLower[level],
                 std::move(offsets), std::move(members), std::move(signatures), &error))
         {
             SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
@@ -3167,10 +3083,7 @@ ErrorCode Index<T>::BuildSecondLevelHeadPostings()
             if (m_limitedTagSupport
                     .TagSelectivityInRange(
                         entry.first,
-                        m_options
-                            .m_secondLevelSignatureMinSelectivity,
-                        m_options
-                            .m_secondLevelSignatureMaxSelectivity))
+                        0.0, 1.0))
                 ++eligibleTagCount;
             else
                 ++excludedTagCount;
@@ -3407,10 +3320,7 @@ ErrorCode Index<T>::BuildSecondLevelHeadPostings()
                 lowerIDFingerprint,
                 m_limitedTagSupport
                     .ContentFingerprint(),
-                m_options
-                    .m_secondLevelSignatureMinSelectivity,
-                m_options
-                    .m_secondLevelSignatureMaxSelectivity,
+                0.0, 1.0,
                 upperToLower,
                 std::move(offsets),
                 std::move(members),
@@ -3493,12 +3403,7 @@ ErrorCode Index<T>::BuildSecondLevelHeadPostings()
                 ->GetNumSamples()),
         m_options
             .m_secondLevelHeadIndexFolder.c_str(),
-        static_cast<double>(
-            m_options
-                .m_secondLevelSignatureMinSelectivity),
-        static_cast<double>(
-            m_options
-                .m_secondLevelSignatureMaxSelectivity),
+        0.0, 1.0,
         static_cast<unsigned long long>(
             eligibleTagCount),
         static_cast<unsigned long long>(
@@ -4345,7 +4250,7 @@ ErrorCode Index<T>::LoadSecondLevelIndex(
                 m_options
                     .m_secondLevelPostingFile,
                 level);
-        if (!m_secondLevelPostings[offset].Load(
+        if (!m_secondLevelPostings[offset].LoadPersisted(
                 postingPath,
                 lowerCount,
                 m_secondLevelCatalogs[offset]
@@ -4355,10 +4260,6 @@ ErrorCode Index<T>::LoadSecondLevelIndex(
                 lowerIDFingerprint,
                 m_limitedTagSupport
                     .ContentFingerprint(),
-                m_options
-                    .m_secondLevelSignatureMinSelectivity,
-                m_options
-                    .m_secondLevelSignatureMaxSelectivity,
                 generations[offset],
                 levelToLowerIDs[offset],
                 &error))
@@ -4368,6 +4269,14 @@ ErrorCode Index<T>::LoadSecondLevelIndex(
                 "Cannot load hierarchy level %d postings %s: %s\n",
                 level, postingPath.c_str(),
                 error.c_str());
+            return ErrorCode::Fail;
+        }
+        if (offset > 0 &&
+            (m_secondLevelPostings[offset].SignatureMinSelectivity() !=
+                 m_secondLevelPostings.front().SignatureMinSelectivity() ||
+             m_secondLevelPostings[offset].SignatureMaxSelectivity() !=
+                 m_secondLevelPostings.front().SignatureMaxSelectivity())) {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Hierarchy layers have inconsistent persisted signature domains.\n");
             return ErrorCode::Fail;
         }
         SPTAGLIB_LOG(
@@ -4414,8 +4323,7 @@ ErrorCode Index<T>::SearchSecondLevelHeads(
     const LimitedTagSupport* p_headSupport,
     int& p_scannedOut,
     ExtraWorkSpace* p_workspace,
-    const std::function<bool(SizeType, const float*)>& p_headPointCandidate,
-    const std::function<bool()>& p_stopBeforeWidening) const
+    const std::function<bool(SizeType, const float*)>& p_headPointCandidate) const
 {
     p_scannedOut = 0;
     g_secondLevelProfile = SecondLevelSearchProfile();
@@ -4441,7 +4349,7 @@ ErrorCode Index<T>::SearchSecondLevelHeads(
             m_options.m_secondLevelPrefetchMode.c_str(), "Rolling16"))
     {
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-            "SecondLevelPrefetchMode must be Rolling16 or Batch64.\n");
+            "HierarchyPrefetchMode must be Rolling16 or Batch64.\n");
         return ErrorCode::FailedParseValue;
     }
     const ErrorCode status = SearchSecondLevelHierarchy(
@@ -4462,7 +4370,6 @@ ErrorCode Index<T>::SearchSecondLevelHeads(
         p_headPointCandidate,
         p_workspace != nullptr ? &p_workspace->m_hierarchy : nullptr,
         batchVectorPrefetch,
-        p_stopBeforeWidening,
         m_options.m_secondLevelGraphSignaturePruning);
     if (status != ErrorCode::Success) return status;
 
@@ -4552,7 +4459,7 @@ ErrorCode Index<T>::EnsureHeadHybridGraph()
     }
 
     float vectorWeight = 1.0f;
-    int degree = 16;
+    constexpr int degree = kRequiredHybridGraphDegree;
     int candidateCount = 128;
     Helper::Convert::ConvertStringTo<float>(
         GetParameter(
@@ -4560,21 +4467,11 @@ ErrorCode Index<T>::EnsureHeadHybridGraph()
         vectorWeight);
     Helper::Convert::ConvertStringTo<int>(
         GetParameter(
-            "HybridGraphDegree", "BuildSSDIndex").c_str(),
-        degree);
-    Helper::Convert::ConvertStringTo<int>(
-        GetParameter(
             "HybridCandidateCount", "BuildSSDIndex").c_str(),
         candidateCount);
     HybridDistanceConfig distance;
     std::string error;
-    if (degree != kRequiredHybridGraphDegree) {
-        SPTAGLIB_LOG(
-            Helper::LogLevel::LL_Error,
-            "HybridGraphDegree must be %d, got %d.\n",
-            kRequiredHybridGraphDegree, degree);
-        return ErrorCode::Fail;
-    }
+
     if (candidateCount <= 0 ||
         !HybridDistanceConfig::Parse(
             GetParameter(
@@ -5604,6 +5501,26 @@ template <typename T> void Index<T>::SetQuantizer(std::shared_ptr<SPTAG::COMMON:
 
 template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader)
 {
+    const auto legacyArtifactParameter = [](const std::string& name, const std::string& value, bool& handled) {
+        const bool seed = Helper::StrUtils::StrEqualIgnoreCase(name.c_str(), "BKTSeed") ||
+            Helper::StrUtils::StrEqualIgnoreCase(name.c_str(), "TPTSeed");
+        const bool domain = Helper::StrUtils::StrEqualIgnoreCase(name.c_str(), "HierarchySignatureMinSelectivity") ||
+            Helper::StrUtils::StrEqualIgnoreCase(name.c_str(), "HierarchySignatureMaxSelectivity") ||
+            Helper::StrUtils::StrEqualIgnoreCase(name.c_str(), "SecondLevelSignatureMinSelectivity") ||
+            Helper::StrUtils::StrEqualIgnoreCase(name.c_str(), "SecondLevelSignatureMaxSelectivity");
+        handled = seed || domain;
+        if (!handled) return ErrorCode::Success;
+        double parsed;
+        if (!Helper::Convert::ConvertStringTo<double>(value.c_str(), parsed) || !std::isfinite(parsed) ||
+            (domain && (parsed < 0.0 || parsed > 1.0)) ||
+            (seed && (parsed < -1 || parsed > MaxSize || std::floor(parsed) != parsed)))
+            return ErrorCode::FailedParseValue;
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Warning,
+            "Legacy %s=%s is read-only provenance: saved geometry is unchanged; "
+            "signature domain comes from authenticated CSR headers, new builds use full coverage and upstream RNG behavior.\n",
+            name.c_str(), value.c_str());
+        return ErrorCode::Success;
+    };
     IndexAlgoType algoType = p_reader.GetParameter("Base", "IndexAlgoType", IndexAlgoType::Undefined);
     VectorValueType valueType = p_reader.GetParameter("Base", "ValueType", VectorValueType::Undefined);
     if ((m_index = CreateInstance(algoType, valueType)) == nullptr)
@@ -5615,7 +5532,16 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
         auto parameters = p_reader.GetParameters(sections[i].c_str());
         for (auto iter = parameters.begin(); iter != parameters.end(); iter++)
         {
-            SetParameter(iter->first.c_str(), iter->second.c_str(), sections[i].c_str());
+            bool legacy = false;
+            const auto legacyStatus = legacyArtifactParameter(iter->first, iter->second, legacy);
+            if (legacyStatus != ErrorCode::Success) return legacyStatus;
+            if (legacy) continue;
+            const char* canonical = Options::CanonicalParameter(sections[i].c_str(), iter->first.c_str());
+            if (!Helper::StrUtils::StrEqualIgnoreCase(canonical, iter->first.c_str()) &&
+                p_reader.DoesParameterExist(sections[i].c_str(), canonical))
+                continue; // Canonical keys win over deprecated aliases.
+            const auto status = SetParameter(iter->first.c_str(), iter->second.c_str(), sections[i].c_str());
+            if (status != ErrorCode::Success) return status;
         }
     }
 
@@ -5623,6 +5549,13 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
     // settings. SetParameter maps its aliases to mutable SSD options.
     for (const auto& entry : p_reader.GetParameters("SearchSSDIndex"))
     {
+        bool legacy = false;
+        const auto legacyStatus = legacyArtifactParameter(entry.first, entry.second, legacy);
+        if (legacyStatus != ErrorCode::Success) return legacyStatus;
+        if (legacy) continue;
+        const char* canonical = Options::CanonicalParameter("SearchSSDIndex", entry.first.c_str());
+        if (!Helper::StrUtils::StrEqualIgnoreCase(canonical, entry.first.c_str()) &&
+            p_reader.DoesParameterExist("SearchSSDIndex", canonical)) continue;
         const ErrorCode ret = SetParameter(
             entry.first.c_str(), entry.second.c_str(),
             "SearchSSDIndex");
@@ -5647,15 +5580,12 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
     }
     std::vector<std::uint64_t>
         secondLevelGenerations;
-    if (!ValidSecondLevelRouteConfig(m_options))
+    if (!ValidHierarchyNavigationConfig(m_options))
     {
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
-            "SecondLevelRouteSelectivityThreshold must be in [0,1], "
-            "SecondLevelInitialProbeRatio must be in (0,1], "
-            "SecondLevelSignature selectivity must satisfy 0<=min<max<=1, "
-            "SparseFallback limits must be nonnegative, "
-            "SecondLevelMaxCheck must be positive, and HeadNavigationMode "
+            "HierarchyInitialProbeRatio must be in (0,1], "
+            "HierarchyMaxCheck must be positive, and HeadNavigationMode "
             "must be Auto, H1Only, or H2Only.\n");
         return ErrorCode::FailedParseValue;
     }
@@ -5663,9 +5593,8 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
         (!m_options.m_enableLimitedTagPosting ||
          m_options.m_secondLevelHierarchyLevels < 2 ||
          !std::isfinite(
-             m_options.m_secondLevelRatio) ||
-         m_options.m_secondLevelRatio <= 0.0 ||
-         m_options.m_secondLevelRatio >= 1.0 ||
+             m_options.m_ratio) ||
+         !m_options.ValidateHierarchyRatio() ||
          m_options.m_secondLevelReplicaCount <= 0 ||
          m_options.m_secondLevelHeadVectorFile.empty() ||
          m_options.m_secondLevelHeadIDFile.empty() ||
@@ -5711,6 +5640,7 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
 
 template <typename T> ErrorCode Index<T>::LoadIndexDataFromMemory(const std::vector<ByteArray> &p_indexBlobs)
 {
+    if (!m_options.ValidateTagSchema(true)) return ErrorCode::FailedParseValue;
     LatchMutableLimitedTagLayout();
     m_recoveredLimitedTagReadOnly =
         m_recoveredLimitedTagReadOnly ||
@@ -5778,6 +5708,7 @@ template <typename T> ErrorCode Index<T>::LoadIndexDataFromMemory(const std::vec
 template <typename T>
 ErrorCode Index<T>::LoadIndexData(const std::vector<std::shared_ptr<Helper::DiskIO>> &p_indexStreams)
 {
+    if (!m_options.ValidateTagSchema(true)) return ErrorCode::FailedParseValue;
     LatchMutableLimitedTagLayout();
     m_recoveredLimitedTagReadOnly =
         m_recoveredLimitedTagReadOnly ||
@@ -5970,6 +5901,8 @@ bool Index<T>::BuildPrimaryHeadCSRBackfill(const void* vectors, SizeType vectorC
                                            const uint32_t* tags, int numTagsPerVec)
 {
     if (vectors == nullptr || tags == nullptr || vectorCount <= 0 || numTagsPerVec < 5 ||
+        (!m_options.m_columnTypes.empty() &&
+         m_options.Schema().text != "categorical,categorical,categorical,categorical,numeric") ||
         m_headBundleNodes.empty() || m_loadedHeadBundleIndexes.empty()) {
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
                      "[PrimaryHeadCSR] backfill requires vectors, five tags, and loaded head bundles.\n");
@@ -6148,6 +6081,8 @@ bool Index<T>::BuildPrimaryHeadCSRBackfill(const void* vectors, SizeType vectorC
 
 template <typename T> ErrorCode Index<T>::SaveConfig(std::shared_ptr<Helper::DiskIO> p_configOut)
 {
+    if (!m_options.ValidateTagSchema()) return ErrorCode::FailedParseValue;
+    if (!m_options.ValidateHierarchyRatio()) return ErrorCode::FailedParseValue;
     IOSTRING(p_configOut, WriteString, "[Base]\n");
 #define DefineBasicParameter(VarName, VarType, DefaultValue, RepresentStr)                                             \
     IOSTRING(p_configOut, WriteString,                                                                                 \
@@ -6182,6 +6117,10 @@ template <typename T> ErrorCode Index<T>::SaveConfig(std::shared_ptr<Helper::Dis
 
     Helper::Convert::ConvertStringTo<int>(m_index->GetParameter("HashTableExponent").c_str(), m_options.m_hashExp);
     auto buildSSDParameterValue = [this](const char* p_name, const std::string& p_fallback) {
+        if (Helper::StrUtils::StrEqualIgnoreCase(p_name, "ColumnTypes") ||
+            Helper::StrUtils::StrEqualIgnoreCase(p_name, "TagSchemaVersion") ||
+            Helper::StrUtils::StrEqualIgnoreCase(p_name, "TagSchemaFingerprint"))
+            return p_fallback;
         for (const auto& parameter : m_buildSSDParameters)
         {
             if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(parameter.first.c_str(), p_name))
@@ -6193,6 +6132,7 @@ template <typename T> ErrorCode Index<T>::SaveConfig(std::shared_ptr<Helper::Dis
     };
     IOSTRING(p_configOut, WriteString, "[BuildSSDIndex]\n");
 #define DefineSSDParameter(VarName, VarType, DefaultValue, RepresentStr)                                               \
+    if (m_options.m_columnTypes.empty() || std::string(RepresentStr) != "StaticACLTagCols")                             \
     IOSTRING(p_configOut, WriteString,                                                                                 \
              (std::string(RepresentStr) + std::string("=") +                                                          \
               buildSSDParameterValue(RepresentStr, SPTAG::Helper::Convert::ConvertToString(m_options.VarName)) +       \
@@ -6287,6 +6227,17 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     const SPTAG::Cache::DNFPredicate* queryDNF = threadLocalSearchContext != nullptr
         ? threadLocalSearchContext->DNF()
         : nullptr;
+    if (queryDNF != nullptr && !m_options.m_columnTypes.empty()) {
+        const auto& schema = m_options.Schema();
+        for (const auto& clause : queryDNF->clauses)
+            for (const auto& literal : clause.lits)
+                if (literal.col >= static_cast<std::uint32_t>(schema.Width()) ||
+                    literal.kind != (schema.IsCategorical(literal.col) ? 0 : 1) ||
+                    (literal.kind == 0 && literal.op != Cache::DNF_EQ)) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "DNF literal disagrees with tag ColumnTypes.\n");
+                    return ErrorCode::FailedParseValue;
+                }
+    }
     const float filterSelectivity = threadLocalSearchContext != nullptr
         ? threadLocalSearchContext->m_filterSelectivity
         : 1.0f;
@@ -6337,17 +6288,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 return queryDNF->Matches(
                     attributes, attributeCount);
             }
-            const int categoricalColumns =
-                (std::max)(
-                    0,
-                    (std::min)(
-                        m_options.m_staticACLTagCols > 0
-                        ? m_options.m_staticACLTagCols
-                        : attributeCount,
-                        attributeCount));
-            for (int column = 0;
-                 column < categoricalColumns;
-                 ++column) {
+            for (int column : m_options.Schema().categorical) {
                 for (int query = 0;
                      query < numQueryTags;
                      ++query) {
@@ -6402,10 +6343,13 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     const bool forceH1Navigation = requestedH1Navigation;
     const bool forceH2Navigation =
         requestedH2Navigation || graphlessH1;
+    const bool useHierarchyNavigation =
+        !forceH1Navigation &&
+        (forceH2Navigation || m_options.m_selectSecondLevel);
 
     // ═══ Sparse tag fast path: skip graph search, read postings directly ═══
     if (!forceH1Navigation &&
-        !forceH2Navigation &&
+        !useHierarchyNavigation &&
         !directPostingIDs.empty() &&
         m_extraSearcher != nullptr)
     {
@@ -6797,52 +6741,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
 
         postingTarget = aggregatePostingTarget;
 
-        // For broad routed queries that span multiple bundle nodes, derive the
-        // total budget from the sum of child-node budgets instead of relying
-        // only on one aggregate local-selectivity estimate, then keep a
-        // configurable fraction after merge by trimming the tail budget.
-        // UnifiedNprobeBudget makes all routed
-        // queries (including multi-subindex) trust the single aggregate budget,
-        // which matches the unified cross-subgraph PQ search and avoids
-        // amplifying nprobe by the number of routed subindexes.
-        if (candidateNodes.size() > 1 && !m_options.m_unifiedNprobeBudget) {
-            const double configuredKeepRatio = m_options.m_multiNodeBudgetKeepRatio;
-            const double multiNodeBudgetKeepRatio =
-                (std::isfinite(configuredKeepRatio) &&
-                 configuredKeepRatio > 0.0 &&
-                 configuredKeepRatio <= 1.0)
-                    ? configuredKeepRatio
-                    : 0.60;
-            long long summedChildPostingTarget = 0;
-            for (int nodeId : candidateNodes)
-            {
-                const auto& nodeInfo = m_headBundleNodes[static_cast<size_t>(nodeId)];
-                if (nodeInfo.postingCount == 0) {
-                    continue;
-                }
 
-                double nodeTenantSize = (nodeInfo.assignmentCount > 0)
-                    ? static_cast<double>(nodeInfo.assignmentCount)
-                    : globalAvgPosting * static_cast<double>(nodeInfo.postingCount);
-                double nodeSelectivity = static_cast<double>(filterSelectivity);
-                if (nodeTenantSize > 0.0 && globalTenantSize > 0.0) {
-                    nodeSelectivity *= (globalTenantSize / nodeTenantSize);
-                }
-
-                summedChildPostingTarget += static_cast<long long>(computeAdaptivePostingTargetForScope(
-                    nodeTenantSize,
-                    nodeInfo.postingCount,
-                    nodeSelectivity));
-            }
-
-            if (summedChildPostingTarget > 0) {
-                int trimmedChildPostingTarget = static_cast<int>(std::ceil(
-                    static_cast<double>(summedChildPostingTarget) * multiNodeBudgetKeepRatio));
-                trimmedChildPostingTarget = std::max(nprobeBase, trimmedChildPostingTarget);
-                postingTarget = std::min(static_cast<int>(postingCountCap),
-                                         std::max(aggregatePostingTarget, trimmedChildPostingTarget));
-            }
-        }
     }
 
     if (m_options.m_logAdaptiveNprobe && adaptiveFilteredNprobeEnabled) {
@@ -7108,79 +7007,21 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
 
     ErrorCode ret;
     bool usedHeadBundleSearch = false;
-    // Primary-head CSR owns an independent one-vector-per-head assignment.
-    // Its exact attributes are evaluated after graph navigation, so the old
-    // physical-posting tag mask must not remove a primary owner before CSR
-    // expansion.
-    const bool secondLevelSelectivityEligible =
-        useLimitedTagPure &&
-        m_options.m_selectSecondLevel &&
-        std::isfinite(routeSelectivity) &&
-        routeSelectivity >= 0.0f &&
-        routeSelectivity <
-            m_options
-                .m_secondLevelRouteSelectivityThreshold;
-    Cache::PostingBitmask
-        secondLevelQuerySignature;
-    secondLevelQuerySignature.Clear();
-    bool allSecondLevelAnchorsRepresented = false;
-    bool allSecondLevelAnchorsDense = false;
-    if (useLimitedTagPure &&
-        m_options.m_selectSecondLevel &&
-        !forceH1Navigation)
+    Cache::PostingBitmask hierarchyQuerySignature;
+    hierarchyQuerySignature.Clear();
+    if (useLimitedTagPure && useHierarchyNavigation)
     {
         if (m_secondLevelPostings.empty() ||
-            !m_secondLevelPostings.front().Loaded())
+            std::any_of(m_secondLevelPostings.begin(), m_secondLevelPostings.end(),
+                [](const SecondLevelHeadPostings& layer) { return !layer.Loaded(); }))
         {
             SPTAGLIB_LOG(
                 Helper::LogLevel::LL_Error,
-                "Second-level signatures requested before hierarchy postings are loaded.\n");
+                "Hierarchy signatures requested before hierarchy postings are loaded.\n");
             return ErrorCode::Fail;
         }
-        const auto& signatureLayer =
-            m_secondLevelPostings.front();
-        allSecondLevelAnchorsRepresented =
-            !limitedTagQueryValues.empty();
-        allSecondLevelAnchorsDense =
-            !limitedTagQueryValues.empty();
-        for (std::uint32_t tag :
-             limitedTagQueryValues)
-        {
-            if (!m_limitedTagSupport
-                     .TagSelectivityInRange(
-                         tag,
-                         signatureLayer.SignatureMinSelectivity(),
-                         signatureLayer.SignatureMaxSelectivity()))
-            {
-                allSecondLevelAnchorsRepresented =
-                    false;
-            }
-            if (!m_limitedTagSupport
-                     .TagSelectivityInRange(
-                         tag,
-                         signatureLayer.SignatureMaxSelectivity(),
-                         1.0))
-            {
-                allSecondLevelAnchorsDense = false;
-            }
-            secondLevelQuerySignature.Insert(tag);
-        }
-    }
-    const bool useSecondLevelBySelectivity =
-        !forceH1Navigation &&
-        (forceH2Navigation ||
-         (!hasExactFilter &&
-          m_options.m_selectSecondLevel) ||
-         (secondLevelSelectivityEligible &&
-          allSecondLevelAnchorsRepresented) ||
-         (useLimitedTagPure &&
-          m_options.m_selectSecondLevel &&
-          allSecondLevelAnchorsDense));
-    // Selectivity may choose a legacy route, but never disables H2/H3 head
-    // signatures or H1 own-key admission on an anchored H-prefix query.
-    if (forceH2Navigation && !useLimitedTagPure)
-    {
-        secondLevelQuerySignature.Clear();
+        hierarchyQuerySignature = BuildHierarchyQuerySignature(
+            limitedTagQueryValues, m_limitedTagSupport, m_secondLevelPostings);
     }
     const std::function<bool(SizeType)>
         secondLevelHeadAdmission =
@@ -7202,14 +7043,9 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     {
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Info,
-            "LimitedRoute: selectivity=%.6f threshold=%.6f route=%s.\n",
-            static_cast<double>(routeSelectivity),
-            static_cast<double>(
-                m_options
-                    .m_secondLevelRouteSelectivityThreshold),
-            useSecondLevelBySelectivity
-                ? "H2"
-                : "H1");
+            "LimitedRoute: route=%s signature_pruning=%d.\n",
+            useHierarchyNavigation ? "hierarchy" : "H1",
+            hierarchyQuerySignature.Popcount() > 0 ? 1 : 0);
     }
     auto _phT0 = s_phaseTime ? std::chrono::high_resolution_clock::now()
                              : std::chrono::high_resolution_clock::time_point{};
@@ -7219,7 +7055,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     std::vector<std::pair<float, SizeType>>* headPointResults = nullptr;
     std::function<bool(SizeType, const float*)> admitHeadPoint;
     bool invalidHeadPoint = false;
-    if (useSecondLevelBySelectivity && m_extraSearcher != nullptr)
+    if (useHierarchyNavigation && m_extraSearcher != nullptr)
     {
         hierarchyWorkspace = m_workSpaceFactory->GetWorkSpace();
         if (!hierarchyWorkspace)
@@ -7281,49 +7117,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         }
     }
 
-    bool boundedFallbackChecked = false;
-    bool boundedFallbackReady = false;
-    const std::vector<SizeType>* boundedFallbackAllHeads = nullptr;
-    std::vector<SizeType> boundedFallbackHeads;
-    std::uint64_t boundedFallbackPages = 0;
-    const auto prepareBoundedFallback = [&]() -> bool {
-        if (boundedFallbackChecked) return boundedFallbackReady;
-        boundedFallbackChecked = true;
-        if (!useLimitedTagPure || limitedTagQueryValues.size() != 1 ||
-            m_options.m_sparseFallbackMaxHeads <= 0 ||
-            m_options.m_sparseFallbackMaxPostingPages <= 0 || m_extraSearcher == nullptr)
-            return false;
-        const auto found = m_limitedTagSupport.TagHeads().find(limitedTagQueryValues.front());
-        if (found == m_limitedTagSupport.TagHeads().end() ||
-            found->second.size() > static_cast<size_t>(m_options.m_sparseFallbackMaxHeads) ||
-            found->second.size() > static_cast<size_t>(graphResultNum))
-            return false;
-        boundedFallbackHeads.reserve(found->second.size());
-        for (SizeType head : found->second)
-        {
-            if (head < 0 || head >= m_vectorTranslateMap.R())
-            {
-                invalidHeadPoint = true;
-                return false;
-            }
-            if (!m_extraSearcher->CheckValidPosting(head)) continue;
-            const int pages = m_extraSearcher->GetPostingPageCount(head, true);
-            if (pages < 0 || pages > m_options.m_sparseFallbackMaxPostingPages ||
-                boundedFallbackPages > static_cast<std::uint64_t>(
-                    m_options.m_sparseFallbackMaxPostingPages - pages))
-                return false;
-            boundedFallbackPages += static_cast<std::uint64_t>(pages);
-            boundedFallbackHeads.push_back(head);
-        }
-        boundedFallbackAllHeads = &found->second;
-        boundedFallbackReady = !boundedFallbackAllHeads->empty();
-        return boundedFallbackReady;
-    };
-    const std::function<bool()> stopBeforeWidening = [&]() {
-        return admitHeadPoint && prepareBoundedFallback();
-    };
-
-    if (useSecondLevelBySelectivity)
+    if (useHierarchyNavigation)
     {
         const auto secondLevelStart =
             s_phaseTime
@@ -7333,10 +7127,10 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         int scanned = 0;
         ret = SearchSecondLevelHeads(
             p_queryResults, graphResultNum,
-            secondLevelQuerySignature,
+            hierarchyQuerySignature,
             secondLevelHeadAdmission,
             useLimitedTagPure ? &m_limitedTagSupport : nullptr,
-            scanned, hierarchyState, admitHeadPoint, stopBeforeWidening);
+            scanned, hierarchyState, admitHeadPoint);
         if (invalidHeadPoint)
         {
             SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
@@ -7347,14 +7141,10 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         {
             SPTAGLIB_LOG(
                 Helper::LogLevel::LL_Error,
-                "Second-level limited-tag head routing failed.\n");
+                "Hierarchy head navigation failed.\n");
             return ret;
         }
-        if (scanned > 0 ||
-            (useLimitedTagPure &&
-             limitedTagQueryValues.size() == 1 &&
-             m_options.m_sparseFallbackMaxHeads > 0 &&
-             m_options.m_sparseFallbackMaxPostingPages > 0))
+        if (m_options.m_logAdaptiveNprobe)
         {
             int admitted = 0;
             for (; admitted < graphResultNum;
@@ -7367,94 +7157,12 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                     result->VID < 0)
                     break;
             }
-            bool usedSparseFallback = false;
-            if (admitted < graphResultNum && prepareBoundedFallback())
-            {
-                // An underfilled descent retains every scored routing head.
-                // Reuse those distances; upper layers own no result/cache state.
-                if (hierarchyState != nullptr)
-                {
-                    auto& previousHeads = hierarchyState->m_hierarchy.m_headNearest;
-                    std::sort(previousHeads.begin(), previousHeads.end(),
-                        [](const auto& left, const auto& right) { return left.second < right.second; });
-                }
-                const auto headDistance = [&](SizeType head) {
-                    if (hierarchyState != nullptr)
-                    {
-                        const auto& previousHeads = hierarchyState->m_hierarchy.m_headNearest;
-                        const auto found = std::lower_bound(
-                            previousHeads.begin(), previousHeads.end(), head,
-                            [](const auto& point, SizeType id) { return point.second < id; });
-                        if (found != previousHeads.end() && found->second == head)
-                            return found->first;
-                    }
-                    const void* sample = head >= 0 && head < m_index->GetNumSamples()
-                        ? m_index->GetSample(head) : nullptr;
-                    if (sample == nullptr)
-                    {
-                        invalidHeadPoint = true;
-                        return MaxDist;
-                    }
-                    const float distance = m_index->ComputeDistance(
-                        p_queryResults->GetQuantizedTarget(), sample);
-                    if (admitHeadPoint) admitHeadPoint(head, &distance);
-                    return distance;
-                };
-                p_queryResults->Reset();
-                size_t nextPostingHead = 0;
-                for (SizeType head : *boundedFallbackAllHeads)
-                {
-                    const bool hasPosting = nextPostingHead < boundedFallbackHeads.size() &&
-                        boundedFallbackHeads[nextPostingHead] == head;
-                    if (!hasPosting)
-                    {
-                        if (admitHeadPoint) admitHeadPoint(head, nullptr);
-                        continue;
-                    }
-                    p_queryResults->AddPoint(head, headDistance(head));
-                    ++nextPostingHead;
-                }
-                if (invalidHeadPoint)
-                {
-                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                        "Bounded hierarchy fallback encountered an invalid canonical head.\n");
-                    return ErrorCode::Fail;
-                }
-                p_queryResults->SortResult();
-                usedSparseFallback = true;
-                admitted = static_cast<int>(boundedFallbackHeads.size());
-                scanned = (std::max)(scanned, admitted);
-                if (m_options.m_logAdaptiveNprobe)
-                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
-                        "Sparse H1 fallback for tag %u added %zu valid support heads "
-                        "and scans %zu postings (%llu pages).\n",
-                        limitedTagQueryValues.front(), boundedFallbackHeads.size(),
-                        boundedFallbackHeads.size(),
-                        static_cast<unsigned long long>(boundedFallbackPages));
-            }
-            if (invalidHeadPoint)
-            {
-                SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                    "Bounded hierarchy fallback has an invalid support head mapping.\n");
-                return ErrorCode::Fail;
-            }
             if (admitted < graphResultNum)
             {
-                if (forceH2Navigation)
-                {
-                    if (m_options
-                            .m_logAdaptiveNprobe)
-                    {
-                        SPTAGLIB_LOG(
-                            Helper::LogLevel::LL_Info,
-                            "H2-only navigation returned %d/%d H1 candidates%s.\n",
-                            admitted,
-                            graphResultNum,
-                            usedSparseFallback
-                                ? " after bounded sparse fallback"
-                                : " without H1 completion");
-                    }
-                }
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Info,
+                    "Hierarchy navigation returned %d/%d H1 candidates without H1 completion.\n",
+                    admitted, graphResultNum);
             }
         }
         if (s_phaseTime)
@@ -7528,7 +7236,6 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             const bool useCrossEdges = canUseHeadBundle && unfiltered &&
                 candidateNodes.size() > 1 &&
                 !m_headCrossEdgesDirty.load(std::memory_order_acquire) &&
-                !m_options.m_disableCrossSubgraph &&
                 !m_options.m_disableCrossEdges &&
                 LoadHeadCrossEdges() == ErrorCode::Success &&
                 m_headInlineCrossEdgeSize > 0 &&
@@ -7898,10 +7605,11 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                         }
                     }
                 }
-                // Legacy head-only metadata stores categorical own-tags only.
-                // Without raw hybrid attributes a numeric predicate cannot
-                // safely admit a coarse graph candidate.
-                if (queryDNF->HasNumericLiteral()) return false;
+                // Only explicit-schema head metadata includes raw numeric own
+                // values; legacy categorical-only metadata must not admit them.
+                if (queryDNF->HasNumericLiteral() &&
+                    (m_options.m_columnTypes.empty() ||
+                     m_options.m_numTagsPerVec > SPTAG::Cache::HIER_LEVELS)) return false;
                 if (m_index == nullptr || !m_index->HasHeadNodeMeta() ||
                     !m_index->IsHeadNodeHeadOnly(localHid)) {
                     return false;
@@ -7942,11 +7650,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                         for (int query = 0;
                              query < numQueryTags;
                              ++query) {
-                            for (int column = 0;
-                                 column <
-                                     m_hybridHeadGraph
-                                         .m_numTagColumns;
-                                 ++column) {
+                            for (int column : m_options.Schema().categorical) {
                                 if (attributes[column] ==
                                     queryTags[query]) {
                                     return true;
@@ -7956,6 +7660,16 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                         return false;
                     }
                 }
+            }
+            if (!m_options.m_columnTypes.empty() && m_index != nullptr &&
+                m_index->HasHeadNodeMeta() && m_index->IsHeadNodeHeadOnly(localHid)) {
+                const auto* own = m_index->GetHeadNodeHierMask(localHid);
+                if (own == nullptr) return false;
+                for (int column : m_options.Schema().categorical)
+                    if (column < Cache::HIER_LEVELS)
+                        for (int query = 0; query < numQueryTags; ++query)
+                            if (own->tag[column] == queryTags[query]) return true;
+                return false;
             }
             return m_index != nullptr &&
                    m_index->HasHeadNodeMeta() &&
@@ -8355,7 +8069,6 @@ ErrorCode Index<T>::SearchIndexWithFilter(QueryResult &p_query, std::function<bo
             LoadHeadCrossEdges() == ErrorCode::Success &&
             m_headInlineCrossEdgeSize > 0 &&
             m_headInlineCrossEdgeTotal > 0 &&
-            !m_options.m_disableCrossSubgraph &&
             !m_options.m_disableCrossEdges;
         if (useCrossEdges) {
             headSearchStatus = SearchHeadBundleCrossEdgesNative(
@@ -8841,13 +8554,16 @@ void Index<T>::SelectHeadDynamically(const std::shared_ptr<COMMON::BKTree> p_tre
 template <typename T>
 template <typename InternalDataType>
 bool Index<T>::SelectHeadsFromData(COMMON::Dataset<InternalDataType>& p_data,
-                                   Options& p_options,
-                                   const std::vector<int>* p_perVectorTags,
+                                   Options& p_config,
                                    std::vector<SizeType>& p_selected,
                                    const char* p_stage,
                                    bool p_fallbackToFirst,
                                    const std::vector<SizeType>* p_candidateIndices)
 {
+    // Small candidate sets round up to one head. Keep that local adjustment
+    // from changing the configured ratio for the next layer or SaveConfig.
+    Options selectionOptions = p_config;
+    Options& p_options = p_config.m_selectSecondLevel ? selectionOptions : p_config;
     const SizeType candidateCount =
         p_candidateIndices == nullptr
             ? p_data.R()
@@ -8883,6 +8599,11 @@ bool Index<T>::SelectHeadsFromData(COMMON::Dataset<InternalDataType>& p_data,
                 : (*p_candidateIndices)[
                       static_cast<size_t>(p_local)];
         };
+    if (p_config.m_selectSecondLevel)
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+            "%s: hierarchy input=%d Ratio=%.12g target=%d (minimum one head).\n",
+            p_stage, candidateCount, p_config.m_ratio,
+            std::max(1, static_cast<int>(std::round(candidateCount * p_config.m_ratio))));
     SelectHeadAdjustOptions(p_options, candidateCount);
     p_selected.clear();
 
@@ -8958,107 +8679,6 @@ bool Index<T>::SelectHeadsFromData(COMMON::Dataset<InternalDataType>& p_data,
             bkt, candidateCount, p_options,
             p_selected, p_candidateIndices);
     }
-    else if (Helper::StrUtils::StrEqualIgnoreCase(
-                 p_options.m_selectType.c_str(), "PerTagBKT"))
-    {
-        const bool sourceAlignedTags =
-            p_perVectorTags != nullptr &&
-            p_perVectorTags->size() ==
-                static_cast<size_t>(p_data.R());
-        const bool candidateAlignedTags =
-            p_perVectorTags != nullptr &&
-            p_perVectorTags->size() ==
-                static_cast<size_t>(candidateCount);
-        if (p_perVectorTags == nullptr ||
-            (!sourceAlignedTags &&
-             !candidateAlignedTags))
-        {
-            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                         "%s: PerTagBKT requires one local tag per vector\n",
-                         p_stage);
-            return false;
-        }
-
-        const double configuredRatio =
-            p_options.m_ratioExplicitlySet ? p_options.m_ratio : 0.016;
-        const double perTagTarget =
-            std::min(0.9, std::clamp(configuredRatio, 1e-5, 0.9));
-        std::map<int, std::vector<SizeType>> tagGroups;
-        for (SizeType local = 0;
-             local < candidateCount; ++local)
-        {
-            const SizeType source = sourceIndex(local);
-            const int tag =
-                (*p_perVectorTags)[
-                    sourceAlignedTags
-                        ? static_cast<size_t>(source)
-                        : static_cast<size_t>(local)];
-            if (tag >= 0)
-            {
-                tagGroups[tag].push_back(source);
-            }
-        }
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
-                     "%s: PerTagBKT has %zu distinct tag values\n",
-                     p_stage, tagGroups.size());
-
-        std::vector<SizeType> initialHeads;
-        for (auto& group : tagGroups)
-        {
-            std::vector<SizeType>& subIndexes = group.second;
-            int subSize = static_cast<int>(subIndexes.size());
-            if (subSize <= 1)
-            {
-                if (subSize == 1)
-                    initialHeads.push_back(static_cast<int>(subIndexes[0]));
-                continue;
-            }
-
-            Options groupOptions = p_options;
-            groupOptions.m_ratio = perTagTarget;
-            groupOptions.m_iSamples =
-                std::min(groupOptions.m_iSamples, subSize);
-            SelectHeadAdjustOptions(groupOptions, subSize);
-
-            std::shared_ptr<COMMON::BKTree> bkt =
-                std::make_shared<COMMON::BKTree>();
-            bkt->m_iBKTKmeansK = groupOptions.m_iBKTKmeansK;
-            bkt->m_iBKTLeafSize = groupOptions.m_iBKTLeafSize;
-            bkt->m_iSamples = groupOptions.m_iSamples;
-            bkt->m_iTreeNumber = groupOptions.m_iTreeNumber;
-            bkt->m_fBalanceFactor = groupOptions.m_fBalanceFactor;
-            bkt->m_pQuantizer = nullptr;
-            if (groupOptions.m_parallelBKTBuild)
-                bkt->BuildTreesParallel<InternalDataType>(
-                    p_data, groupOptions.m_distCalcMethod,
-                    groupOptions.m_iSelectHeadNumberOfThreads,
-                    &subIndexes, nullptr, true);
-            else
-                bkt->BuildTrees<InternalDataType>(
-                    p_data, groupOptions.m_distCalcMethod,
-                    groupOptions.m_iSelectHeadNumberOfThreads,
-                    &subIndexes, nullptr, true);
-
-            std::vector<SizeType> subSelected;
-            SelectHeadDynamically(
-                bkt, subSize, groupOptions,
-                subSelected, &subIndexes);
-            if (subSelected.empty())
-                subSelected.push_back(subIndexes[0]);
-            initialHeads.insert(
-                initialHeads.end(), subSelected.begin(), subSelected.end());
-        }
-
-        p_options.m_ratio = perTagTarget;
-        p_selected.swap(initialHeads);
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
-                     "%s: PerTagBKT selected %zu heads "
-                     "(target=%.3f%%, achieved=%.3f%%)\n",
-                     p_stage, p_selected.size(),
-                     100.0 * perTagTarget,
-                     100.0 * p_selected.size() /
-                         candidateCount);
-    }
     else
     {
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
@@ -9093,6 +8713,7 @@ template <typename T>
 template <typename InternalDataType>
 bool Index<T>::SelectHeadInternal(std::shared_ptr<Helper::VectorSetReader> &p_reader)
 {
+    if (!Options::ValidateNativeEnvironment()) return false;
     std::shared_ptr<VectorSet> vectorset = p_reader->GetVectorSet();
     if (m_options.m_distCalcMethod == DistCalcMethod::Cosine && !p_reader->IsNormalized())
         vectorset->Normalize(m_options.m_iSelectHeadNumberOfThreads);
@@ -9103,44 +8724,9 @@ bool Index<T>::SelectHeadInternal(std::shared_ptr<Helper::VectorSetReader> &p_re
                                            vectorset->Count() + 1, (InternalDataType *)vectorset->GetData());
 
     auto t1 = std::chrono::high_resolution_clock::now();
-    std::vector<int> perVectorTags;
-    if (Helper::StrUtils::StrEqualIgnoreCase(
-            m_options.m_selectType.c_str(), "PerTagBKT"))
-    {
-        if (m_options.m_perVectorTagsFile.empty())
-        {
-            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                         "PerTagBKT requires [SelectHead] PerVectorTagsFile\n");
-            return false;
-        }
-        std::ifstream input(m_options.m_perVectorTagsFile);
-        if (!input.good())
-        {
-            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                         "PerTagBKT failed to open %s\n",
-                         m_options.m_perVectorTagsFile.c_str());
-            return false;
-        }
-        perVectorTags.reserve(static_cast<size_t>(data.R()));
-        int tag = -1;
-        while (perVectorTags.size() < static_cast<size_t>(data.R()) &&
-               (input >> tag))
-        {
-            perVectorTags.push_back(tag);
-        }
-        if (perVectorTags.size() != static_cast<size_t>(data.R()))
-        {
-            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                         "PerTagBKT tag file has %zu entries, expected %d\n",
-                         perVectorTags.size(), data.R());
-            return false;
-        }
-    }
-
     std::vector<SizeType> selected;
     if (!SelectHeadsFromData(
             data, m_options,
-            perVectorTags.empty() ? nullptr : &perVectorTags,
             selected, "H1 SelectHead", false))
         return false;
 
@@ -9371,8 +8957,7 @@ bool Index<T>::SelectHeadInternal(std::shared_ptr<Helper::VectorSetReader> &p_re
     if (m_options.m_selectSecondLevel)
     {
         Options secondLevelOptions = m_options;
-        secondLevelOptions.m_ratio = m_options.m_secondLevelRatio;
-        secondLevelOptions.m_ratioExplicitlySet = true;
+        secondLevelOptions.m_ratio = m_options.m_ratio;
         secondLevelOptions.m_headVectorCount = 0;
         secondLevelOptions.m_saveBKT = false;
         // Coarse routing is spatial only. Predicate support is summarized
@@ -9394,7 +8979,7 @@ bool Index<T>::SelectHeadInternal(std::shared_ptr<Helper::VectorSetReader> &p_re
                 " SelectHead";
             if (!SelectHeadsFromData(
                     data, secondLevelOptions,
-                    nullptr, levelSelected,
+                    levelSelected,
                     stage.c_str(), true,
                     &previousSelected))
                 return false;
@@ -9669,6 +9254,7 @@ bool Index<T>::SelectHeadInternal(std::shared_ptr<Helper::VectorSetReader> &p_re
 
 template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Helper::VectorSetReader> &p_reader)
 {
+    if (!m_options.ValidateTagSchema()) return ErrorCode::FailedParseValue;
     LatchMutableLimitedTagLayout();
     if (m_options.m_compactHierarchyVectors)
     {
@@ -9678,15 +9264,12 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
             "an explicit legacy compatibility operation on an existing index.\n");
         return ErrorCode::FailedParseValue;
     }
-    if (!ValidSecondLevelRouteConfig(m_options))
+    if (!ValidHierarchyNavigationConfig(m_options))
     {
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
-            "SecondLevelRouteSelectivityThreshold must be in [0,1], "
-            "SecondLevelInitialProbeRatio must be in (0,1], "
-            "SecondLevelSignature selectivity must satisfy 0<=min<max<=1, "
-            "SparseFallback limits must be nonnegative, "
-            "SecondLevelMaxCheck must be positive, and HeadNavigationMode "
+            "HierarchyInitialProbeRatio must be in (0,1], "
+            "HierarchyMaxCheck must be positive, and HeadNavigationMode "
             "must be Auto, H1Only, or H2Only.\n");
         return ErrorCode::FailedParseValue;
     }
@@ -9713,9 +9296,8 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
          !m_options.m_enableSSD ||
          !m_options.m_enableLimitedTagPosting ||
          m_options.m_secondLevelHierarchyLevels < 2 ||
-         !std::isfinite(m_options.m_secondLevelRatio) ||
-         m_options.m_secondLevelRatio <= 0.0 ||
-         m_options.m_secondLevelRatio >= 1.0 ||
+         !m_options.ValidateHierarchyRatio() ||
+         m_options.m_headVectorCount != 0 ||
          m_options.m_secondLevelReplicaCount <= 0 ||
          m_options.m_secondLevelHeadVectorFile.empty() ||
          m_options.m_secondLevelHeadIDFile.empty() ||
@@ -9724,8 +9306,9 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
             "Second-level routing requires SelectHead/BuildHead/SSD and "
-            "limited-tag mode, 0 < SecondLevelRatio < 1, a positive "
-            "hierarchy level count and replica count, a route-selectivity threshold in [0,1], and "
+            "limited-tag mode, 0 < Ratio < 1 shared by every layer, a positive "
+            "hierarchy level count and replica count, Count=0 (Ratio is authoritative), "
+            "a route-selectivity threshold in [0,1], and "
             "distinct non-empty graph/posting artifacts.\n");
         return ErrorCode::FailedParseValue;
     }
@@ -9793,9 +9376,7 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
         return ErrorCode::FailedParseValue;
     }
     const int limitedCategoricalColumns =
-        m_options.m_staticACLTagCols > 0
-        ? m_options.m_staticACLTagCols
-        : m_options.m_numTagsPerVec;
+        static_cast<int>(m_options.Schema().categorical.size());
     if (m_options.m_enableLimitedTagPosting &&
         (m_options.m_indexAlgoType != IndexAlgoType::BKT ||
          m_options.m_storage != Storage::STATIC ||
@@ -9804,14 +9385,10 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
          limitedCategoricalColumns >
              m_options.m_numTagsPerVec ||
          m_options.m_limitedTagColumn < 0 ||
-         m_options.m_limitedTagColumn >=
-             limitedCategoricalColumns ||
+         !m_options.Schema().IsCategorical(m_options.m_limitedTagColumn) ||
          !m_options.m_excludehead ||
          !LimitedTagSupport::IsSupportedSlotCount(
              m_options.m_limitedTagSlotsPerHead) ||
-         m_options.m_limitedTagVoteHeadCount <= 0 ||
-         m_options.m_limitedTagVoteHeadCount >
-             m_options.m_internalResultNum ||
          m_options.m_limitedTagMinHeadCount <= 0 ||
          m_options.m_replicaCount <= 0 ||
          m_options.m_tailReplicaCount != 0 ||
@@ -9832,31 +9409,18 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
             "ExcludeHead=true, a positive support-slot count "
             "(self plus zero or more external tags), "
             "positive replica/support parameters with "
-            "LimitedTagVoteHeadCount<=InternalResultNum, TailReplicaCount=0, "
+            "TailReplicaCount=0, "
             "one batch/file, and no compression, rearrangement, ordered pages, "
             "or posting quantizer.\n");
         return ErrorCode::FailedParseValue;
     }
-    if (m_options.m_enableExtremeSparseTag &&
-        (!m_options.m_enableLimitedTagPosting ||
-        m_options.m_extremeSparseTagFile.empty() ||
-        m_options.m_extremeSparseTagMinCount <= 0)) {
-        SPTAGLIB_LOG(
-            Helper::LogLevel::LL_Error,
-            "Extreme-sparse tag routing requires limited-tag mode, a file name, "
-            "and a positive ExtremeSparseTagMinCount.\n");
-        return ErrorCode::FailedParseValue;
-    }
+
     if (m_options.m_enableLimitedTagSupportExpansion &&
         (!m_options.m_enableLimitedTagPosting ||
-         m_options.m_minHeadsPerTag != 0 ||
-         m_options.m_limitedTagMaxExtraSupports == 0 ||
-         m_options.m_limitedTagMaxExpandedPostingPages <= 0))
+         m_options.m_minHeadsPerTag != 0))
     {
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-            "O-based support expansion requires limited-tag mode, MinHeadsPerTag=0, "
-            "a positive LimitedTagMaxExtraSupports budget, and a positive "
-            "LimitedTagMaxExpandedPostingPages limit.\n");
+            "O-based support expansion requires limited-tag mode and MinHeadsPerTag=0.\n");
         return ErrorCode::FailedParseValue;
     }
     if (m_options.m_minHeadsPerTag < 0) {
@@ -9901,7 +9465,9 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
     if (SpannEnvFlagOn("SPTAG_PERSIST_SELECTHEAD") && SpannEnvFlagOn("SPTAG_RESUME_BUILD")) {
         const std::string statePath = HeadSelectStatePath(m_options, m_options.m_indexDirectory);
         if (fileexists(statePath.c_str())) {
-            if (LoadHeadSelectState(statePath) == ErrorCode::Success) {
+            const auto checkpointStatus = LoadHeadSelectState(statePath);
+            if (checkpointStatus == ErrorCode::FailedParseValue) return checkpointStatus;
+            if (checkpointStatus == ErrorCode::Success) {
                 resumedSelectHead = true;
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
                              "Resume: loaded SelectHead checkpoint %s (nodes=%zu, headRoles=%zu); "
@@ -10010,7 +9576,7 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
             "BuildH1Graph=false requires unquantized STATIC H1 catalog "
-            "build with SelectSecondLevel enabled and no U_extra heads.\n");
+            "build with HierarchyEnabled=true and no U_extra heads.\n");
         return ErrorCode::FailedParseValue;
     }
     bool resumedCompletedBundleHeads = false;
@@ -10701,7 +10267,7 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
                 static_cast<std::uint64_t>(
                     m_options.m_limitedTagMinHeadCount);
             const std::uint64_t generation =
-                NewHybridBuildGeneration(content);
+                NewHybridBuildGeneration(content ^ 0x52455441494e4544ULL);
             m_options.m_limitedTagGenerationFingerprint =
                 std::to_string(generation);
             m_extraSearcher
@@ -11153,6 +10719,24 @@ ErrorCode Index<T>::RefineIndex(const std::vector<std::shared_ptr<Helper::DiskIO
 
 template <typename T> ErrorCode Index<T>::SetParameter(const char *p_param, const char *p_value, const char *p_section)
 {
+    if (!p_param || !p_value || !p_section) return ErrorCode::Fail;
+    if (Options::IsRemovedParameter(p_param) ||
+        Options::IsRemovedSectionAlias(p_section, p_param))
+        return m_options.SetParameter(p_section, p_param, p_value);
+    p_param = Options::CanonicalParameter(p_section, p_param);
+    if ((m_bReady || Helper::StrUtils::StrEqualIgnoreCase(p_section, "SearchSSDIndex")) &&
+        (Helper::StrUtils::StrEqualIgnoreCase(p_param, "ColumnTypes") ||
+         Helper::StrUtils::StrEqualIgnoreCase(p_param, "TagSchemaVersion") ||
+         Helper::StrUtils::StrEqualIgnoreCase(p_param, "TagSchemaFingerprint") ||
+         Helper::StrUtils::StrEqualIgnoreCase(p_param, "NumTagsPerVec") ||
+         Helper::StrUtils::StrEqualIgnoreCase(p_param, "StaticACLTagCols") ||
+         Helper::StrUtils::StrEqualIgnoreCase(p_param, "LimitedTagColumn"))) {
+        if (m_options.GetParameter("BuildSSDIndex", p_param) != p_value) {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                "Tag schema and its original key column are immutable after construction; rebuild to change them.\n");
+            return ErrorCode::FailedParseValue;
+        }
+    }
     auto storeParameter = [](std::vector<std::pair<std::string, std::string>>& p_parameters,
                              const char* p_name,
                              const char* p_newValue) {
@@ -11170,7 +10754,7 @@ template <typename T> ErrorCode Index<T>::SetParameter(const char *p_param, cons
     if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_section, "SearchSSDIndex"))
     {
         if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(
-                p_param, "SecondLevelInitialProbeRatio"))
+                p_param, "HierarchyInitialProbeRatio"))
         {
             double ratio = 0.0;
             if (!SPTAG::Helper::Convert::ConvertStringTo<double>(
@@ -11180,7 +10764,7 @@ template <typename T> ErrorCode Index<T>::SetParameter(const char *p_param, cons
             {
                 SPTAGLIB_LOG(
                     Helper::LogLevel::LL_Error,
-                    "SecondLevelInitialProbeRatio must be in (0,1].\n");
+                    "HierarchyInitialProbeRatio must be in (0,1].\n");
                 return ErrorCode::FailedParseValue;
             }
         }
@@ -11224,8 +10808,7 @@ template <typename T> ErrorCode Index<T>::SetParameter(const char *p_param, cons
                 m_options.GetParameter("BuildSSDIndex", runtimeParam);
             storeParameter(m_buildSSDParameters, runtimeParam, buildValue.c_str());
         }
-        m_options.SetParameter("BuildSSDIndex", runtimeParam, p_value);
-        return ErrorCode::Success;
+        return m_options.SetParameter("BuildSSDIndex", runtimeParam, p_value);
     }
 
     if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_section, "BuildSSDIndex"))
@@ -11248,14 +10831,8 @@ template <typename T> ErrorCode Index<T>::SetParameter(const char *p_param, cons
     }
     else
     {
-        m_options.SetParameter(p_section, p_param, p_value);
-        double configuredRatio = 0.0;
-        if (p_section != nullptr && p_param != nullptr && p_value != nullptr
-            && SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_section, "SelectHead")
-            && SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_param, "Ratio")
-            && SPTAG::Helper::Convert::ConvertStringTo<double>(p_value, configuredRatio)) {
-            m_options.m_ratioExplicitlySet = true;
-        }
+        const auto status = m_options.SetParameter(p_section, p_param, p_value);
+        if (status != ErrorCode::Success) return status;
     }
     if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_param, "DistCalcMethod"))
     {
@@ -11279,6 +10856,7 @@ template <typename T> ErrorCode Index<T>::SetParameter(const char *p_param, cons
 
 template <typename T> std::string Index<T>::GetParameter(const char *p_param, const char *p_section) const
 {
+    p_param = Options::CanonicalParameter(p_section, p_param);
     if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_section, "SearchSSDIndex"))
     {
         const char* canonicalParam = p_param;
@@ -14059,12 +13637,6 @@ ErrorCode Index<T>::AddIndexWithTags(const void* p_data, SizeType p_vectorNum,
         float distance = std::numeric_limits<float>::max();
     };
 
-    auto findBundleSlot = [&](int nodeId) -> int {
-        for (size_t slot = 0; slot < m_headBundleNodes.size(); ++slot) {
-            if (m_headBundleNodes[slot].nodeId == nodeId) return static_cast<int>(slot);
-        }
-        return -1;
-    };
     const bool useBundleRuntime = !m_headBundleNodes.empty() &&
                                   (m_headBundleNodes.size() > 1 || m_metadataOnlyHeadStore);
     const bool limitedTagInsert =
@@ -14074,7 +13646,6 @@ ErrorCode Index<T>::AddIndexWithTags(const void* p_data, SizeType p_vectorNum,
          m_options.m_tailReplicaCount != 0 ||
          m_options.m_enableWAL ||
          m_options.m_selectSecondLevel ||
-         m_options.m_enableExtremeSparseTag ||
          m_options.m_enablePrimaryHeadBypass ||
          !m_extraSearcher
               ->SupportsLimitedTagUpdates() ||
@@ -14105,8 +13676,6 @@ ErrorCode Index<T>::AddIndexWithTags(const void* p_data, SizeType p_vectorNum,
         return ErrorCode::Fail;
     }
 
-    int routingPivotLevel = -1;
-    std::unordered_map<std::uint32_t, std::vector<int>> tagToNodes;
     const std::string routingBaseDir =
         limitedTagInsert &&
                 !m_mutableLimitedTagIndexDirectory.empty()
@@ -14114,14 +13683,6 @@ ErrorCode Index<T>::AddIndexWithTags(const void* p_data, SizeType p_vectorNum,
             : (m_options.m_recovery
                    ? m_options.m_persistentBufferPath
                    : m_options.m_indexDirectory);
-    if (useBundleRuntime && m_headBundleNodes.size() > 1 &&
-        !LoadUpdateRoutingNodes(routingBaseDir, m_options.m_headIndexFolder,
-                                routingPivotLevel, tagToNodes)) {
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                     "[TaggedUpdate] multi-bundle index is missing a valid tag_node_index.bin routing map.\n");
-        return ErrorCode::Fail;
-    }
-
     auto collectCandidates =
         [&](const T* vector, int bundleSlot, int requestCount,
             std::vector<HeadCandidate>& output,
@@ -14408,36 +13969,31 @@ ErrorCode Index<T>::AddIndexWithTags(const void* p_data, SizeType p_vectorNum,
                 continue;
             }
 
-            int pureBundleSlot = -1;
-            if (useBundleRuntime) {
-                if (m_headBundleNodes.size() == 1) {
-                    pureBundleSlot = 0;
-                } else {
-                    if (routingPivotLevel < 0 || routingPivotLevel >= p_numTagsPerVec) {
-                        return ErrorCode::Fail;
-                    }
-                    const auto routeIt = tagToNodes.find(tags[routingPivotLevel]);
-                    if (routeIt == tagToNodes.end() || routeIt->second.size() != 1) {
-                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                                     "[TaggedUpdate] tag %u does not resolve to one bundle at pivot level %d.\n",
-                                     tags[routingPivotLevel], routingPivotLevel);
-                        return ErrorCode::Fail;
-                    }
-                    pureBundleSlot = findBundleSlot(routeIt->second.front());
-                    if (pureBundleSlot < 0) return ErrorCode::Fail;
-                }
-            }
-
             std::vector<HeadCandidate> pureCandidates;
-            ErrorCode ret = collectCandidates(
-                vector, pureBundleSlot,
-                pureRequestCount, pureCandidates,
-                nullptr);
+            ErrorCode ret = ErrorCode::Success;
+            if (useBundleRuntime) {
+                for (size_t slot = 0; slot < m_headBundleNodes.size(); ++slot) {
+                    ret = collectCandidates(vector, static_cast<int>(slot),
+                                            pureRequestCount, pureCandidates, nullptr);
+                    if (ret != ErrorCode::Success) return ret;
+                }
+            } else {
+                ret = collectCandidates(vector, -1, pureRequestCount, pureCandidates, nullptr);
+            }
             if (ret != ErrorCode::Success) return ret;
             std::sort(pureCandidates.begin(), pureCandidates.end(),
                       [](const HeadCandidate& left, const HeadCandidate& right) {
-                          return left.distance < right.distance;
+                          return left.distance != right.distance
+                              ? left.distance < right.distance : left.global < right.global;
                       });
+            // Existing physical bundles keep pure replicas local to the nearest
+            // spatial bundle; attributes only filter records, never select owners.
+            if (useBundleRuntime && !pureCandidates.empty()) {
+                const int owner = pureCandidates.front().bundleSlot;
+                pureCandidates.erase(std::remove_if(pureCandidates.begin(), pureCandidates.end(),
+                    [owner](const HeadCandidate& head) { return head.bundleSlot != owner; }),
+                    pureCandidates.end());
+            }
 
             std::vector<HeadCandidate> pureHeads;
             ret = selectRNGHeads(

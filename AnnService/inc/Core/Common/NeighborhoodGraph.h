@@ -37,7 +37,6 @@ namespace SPTAG
             NeighborhoodGraph() : m_iGraphSize(0),
                 m_iRuntimeEdgeSuffixSize(0),
                 m_iTPTNumber(32),
-                m_iTPTSeed(-1),
                 m_iTPTLeafSize(2000),
                 m_iSamples(1000),
                 m_numTopDimensionTPTSplit(5),
@@ -154,7 +153,7 @@ namespace SPTAG
 #else
             template <typename T>
             void PartitionByTptree(VectorIndex* index, std::vector<SizeType>& indices, const SizeType first, const SizeType last,
-                std::vector<std::pair<SizeType, SizeType>>& leaves, std::mt19937* random = nullptr)
+                std::vector<std::pair<SizeType, SizeType>>& leaves)
             {
                 if (index->m_pQuantizer)
                 {
@@ -162,7 +161,7 @@ namespace SPTAG
                     {
 #define DefineVectorValueType(Name, Type) \
 case VectorValueType::Name: \
-PartitionByTptreeCore<T, Type>(index, indices, first, last, leaves, random); \
+PartitionByTptreeCore<T, Type>(index, indices, first, last, leaves); \
 break;
 
 #include "inc/Core/DefinitionList.h"
@@ -173,13 +172,13 @@ break;
                 }
                 else
                 {
-                    PartitionByTptreeCore<T, T>(index, indices, first, last, leaves, random);
+                    PartitionByTptreeCore<T, T>(index, indices, first, last, leaves);
                 }
             }
 
             template <typename T, typename R>
             void PartitionByTptreeCore(VectorIndex* index, std::vector<SizeType>& indices, const SizeType first, const SizeType last,
-                std::vector<std::pair<SizeType, SizeType>>& leaves, std::mt19937* random = nullptr)
+                std::vector<std::pair<SizeType, SizeType>>& leaves)
             {
                 if (last - first <= m_iTPTLeafSize)
                 {
@@ -250,9 +249,7 @@ break;
                             float sumweight = 0;
                             for (int j = 0; j < m_numTopDimensionTPTSplit; j++)
                             {
-                                const auto draw = random != nullptr
-                                    ? (*random)() : static_cast<std::uint32_t>(rand());
-                                weight[j] = float(draw % 10000) / 5000.0f - 1.0f;
+                                weight[j] = float(rand() % 10000) / 5000.0f - 1.0f;
                                 sumweight += weight[j] * weight[j];
                             }
                             sumweight = sqrt(sumweight);
@@ -324,8 +321,8 @@ break;
                         bestweight.clear();
                     }
 
-                    PartitionByTptreeCore<T, R>(index, indices, first, splitidx - 1, leaves, random);
-                    PartitionByTptreeCore<T, R>(index, indices, splitidx, last, leaves, random);
+                    PartitionByTptreeCore<T, R>(index, indices, first, splitidx - 1, leaves);
+                    PartitionByTptreeCore<T, R>(index, indices, splitidx, last, leaves);
                 }
             }
 
@@ -357,24 +354,13 @@ break;
                                 i = sent.fetch_add(1);
                                 if (i < m_iTPTNumber)
                                 {
-                                    if (m_iTPTSeed < 0) {
-                                        Sleep(i * 100);
-                                        std::srand(clock());
-                                    }
+                                    Sleep(i * 100);
+                                    std::srand(clock());
                                     for (SizeType j = 0; j < m_iGraphSize; j++)
                                         TptreeDataIndices[i][j] = j;
-                                    if (m_iTPTSeed >= 0) {
-                                        std::mt19937 seeded(
-                                            static_cast<std::uint32_t>(m_iTPTSeed) +
-                                            static_cast<std::uint32_t>(i));
-                                        std::shuffle(TptreeDataIndices[i].begin(), TptreeDataIndices[i].end(), seeded);
-                                        PartitionByTptree<T>(index, TptreeDataIndices[i], 0,
-                                            m_iGraphSize - 1, TptreeLeafNodes[i], &seeded);
-                                    } else {
-                                        std::shuffle(TptreeDataIndices[i].begin(), TptreeDataIndices[i].end(), rg);
-                                        PartitionByTptree<T>(index, TptreeDataIndices[i], 0,
-                                            m_iGraphSize - 1, TptreeLeafNodes[i]);
-                                    }
+                                    std::shuffle(TptreeDataIndices[i].begin(), TptreeDataIndices[i].end(), rg);
+                                    PartitionByTptree<T>(index, TptreeDataIndices[i], 0,
+                                        m_iGraphSize - 1, TptreeLeafNodes[i]);
                                     SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Finish Getting Leaves for Tree %d\n", i);
                                 }
                                 else
@@ -917,7 +903,7 @@ break;
             COMMON::Dataset<SizeType> m_pNeighborhoodGraph;
             FineGrainedLock m_dataUpdateLock;
         public:
-            int m_iTPTNumber, m_iTPTSeed, m_iTPTLeafSize, m_iSamples, m_numTopDimensionTPTSplit;
+            int m_iTPTNumber, m_iTPTLeafSize, m_iSamples, m_numTopDimensionTPTSplit;
             DimensionType m_iNeighborhoodSize;
             float m_fNeighborhoodScale, m_fCEFScale, m_fRNGFactor;
             int m_iRefineIter, m_iCEF, m_iAddCEF, m_iMaxCheckForRefineGraph, m_iGPUGraphType, m_iGPURefineSteps,

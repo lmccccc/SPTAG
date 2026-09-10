@@ -1,3 +1,5 @@
+> Historical experiment record: attribute pivot partitioning and PerTagBKT are now removed. The old grouping commands below require the historical revision; do not run them with the current builder. Current builds use global spatial selection and exact attribute filtering.
+
 # Multi-Tenant Dual-Pool SPANN — Usage Modes
 
 > **Historical ablation reference.** These commands predate the native sectioned

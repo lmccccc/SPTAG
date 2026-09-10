@@ -523,6 +523,8 @@ namespace SPTAG::SPANN {
                                  SizeType headCount)
         {
             if (m_numTagsPerVec < 5 ||
+                (!m_opt->m_columnTypes.empty() &&
+                 m_opt->Schema().text != "categorical,categorical,categorical,categorical,numeric") ||
                 m_vectorTags.size() < static_cast<size_t>(fullCount) * static_cast<size_t>(m_numTagsPerVec)) {
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
                              "[PrimaryHeadCSR] requires four categorical tags plus one numeric attribute.\n");
@@ -770,26 +772,7 @@ namespace SPTAG::SPANN {
                 range.SetContiguousRecordRange(
                     0, scanBegin, scanEnd, p_recordBytes);
 
-                if (pageLimit > 0 && range.m_readPageCount > pageLimit) {
-                    range.m_readPageCount = pageLimit;
-                    const std::int64_t readableBytes =
-                        static_cast<std::int64_t>(
-                            range.m_readStartPage +
-                            range.m_readPageCount) *
-                        PageSize;
-                    const int readableRecords = readableBytes <= 0
-                        ? 0
-                        : static_cast<int>(
-                              readableBytes /
-                              p_recordBytes);
-                    range.m_scanEnd =
-                        (std::min)(range.m_scanEnd,
-                                   readableRecords);
-                    if (range.m_scanEnd <= range.m_scanBegin) {
-                        range.m_scanEnd = range.m_scanBegin;
-                        range.m_readPageCount = 0;
-                    }
-                }
+                range.LimitContiguousPages(pageLimit, 0, p_recordBytes);
 
                 const size_t postingBytes =
                     static_cast<size_t>(total) *
@@ -881,7 +864,7 @@ namespace SPTAG::SPANN {
                 !m_inpostRbq &&
                 m_inpostQuantBits == 0;
         }
-        // Used by the build path (PerTagBKT head selection) to write the sidecar.
+        // Used by the build path (spatial head selection) to write the sidecar.
         inline void SetPureCount(const SizeType& headID, int pure_count) {
             if (RejectRecoveredLimitedTagWrite(
                     "SetPureCount")) {
@@ -4318,7 +4301,8 @@ namespace SPTAG::SPANN {
                         } else {
                             for (int t = 0; t < m_numTagsPerVec && !m; t++)
                                 for (int qi = 0; qi < p_exWorkSpace->m_numQueryTags && !m; qi++)
-                                    if (vt[t] == p_exWorkSpace->m_queryTags[qi]) m = true;
+                                    if (m_opt->Schema().IsCategorical(t) &&
+                                        vt[t] == p_exWorkSpace->m_queryTags[qi]) m = true;
                         }
                         if (m) { int p = (int)(((size_t)i * m_vectorInfoSize) >> PageSizeEx); if (p < numPages) trueNeed[p] = 1; }
                     }
@@ -4418,6 +4402,7 @@ namespace SPTAG::SPANN {
                         tagMatch = false;
                         const uint32_t* vecTags = reinterpret_cast<const uint32_t*>(vectorInfo + sizeof(int) + sizeof(uint8_t));
                         for (int ti = 0; ti < m_numTagsPerVec && !tagMatch; ti++) {
+                            if (!m_opt->Schema().IsCategorical(ti)) continue;
                             for (int qi = 0; qi < p_exWorkSpace->m_numQueryTags && !tagMatch; qi++) {
                                 if (vecTags[ti] == p_exWorkSpace->m_queryTags[qi]) tagMatch = true;
                             }
@@ -8095,7 +8080,7 @@ namespace SPTAG::SPANN {
                         for (int d = 0; d < m_opt->m_dim; d++) vf[d] = (float)v[d];
                         q->QuantizeVector(vf.data(), &codes[(size_t)vid * M], false);
                         const uint32_t* vt = reinterpret_cast<const uint32_t*>(e + sizeof(int) + sizeof(uint8_t));
-                        for (int t = 0; t < m_numTagsPerVec; t++) tagVids[vt[t]].push_back(vid);
+                        for (int t : m_opt->Schema().categorical) tagVids[vt[t]].push_back(vid);
                     }
                     // Append the inline OPQ code after the meta prefix. The code is
                     // computed on a vid's first sight (above); repeats reference the
@@ -9079,7 +9064,8 @@ namespace SPTAG::SPANN {
                             const uint32_t* vt = reinterpret_cast<const uint32_t*>(e + sizeof(int) + sizeof(uint8_t));
                             for (int ti = 0; ti < m_numTagsPerVec && !tagMatch; ti++)
                                 for (int qi = 0; qi < p_exWorkSpace->m_numQueryTags && !tagMatch; qi++)
-                                    if (vt[ti] == p_exWorkSpace->m_queryTags[qi]) tagMatch = true;
+                                    if (m_opt->Schema().IsCategorical(ti) &&
+                                        vt[ti] == p_exWorkSpace->m_queryTags[qi]) tagMatch = true;
                             if (!tagMatch) continue;
                         }
                         if (trackStatsOPQ) ++p_exWorkSpace->m_postingProbeStats.m_matchedVectors;
@@ -9191,7 +9177,8 @@ namespace SPTAG::SPANN {
                         const uint32_t* vt = reinterpret_cast<const uint32_t*>(e + sizeof(int) + sizeof(uint8_t));
                         for (int ti = 0; ti < m_numTagsPerVec && !tagMatch; ti++)
                             for (int qi = 0; qi < p_exWorkSpace->m_numQueryTags && !tagMatch; qi++)
-                                if (vt[ti] == p_exWorkSpace->m_queryTags[qi]) tagMatch = true;
+                                if (m_opt->Schema().IsCategorical(ti) &&
+                                    vt[ti] == p_exWorkSpace->m_queryTags[qi]) tagMatch = true;
                         if (!tagMatch) continue;
                     }
                     if (trackStatsOPQ) ++p_exWorkSpace->m_postingProbeStats.m_matchedVectors;

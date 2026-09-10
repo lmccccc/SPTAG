@@ -6,9 +6,9 @@
 // This is the C++ analog of the Python demo build_yfcc_facetA.py /
 // build_5col.py: it drives the EXACT same attribute pipeline
 // (TenantIndexManager::BuildFromDataWithTagsSingleTenant -> tag-view posting
-// embedding + PerTagBKT head selection + ACL pivot routing + numeric quant
-// signatures) but without the Python/SWIG layer. It mmaps the vector and tag
-// files and avoids per-vector tenant metadata/routing objects.
+// embedding + global spatial head selection + exact categorical/numeric
+// signatures) but without the Python/SWIG layer. Native readers own vector IO;
+// DEFAULT input can be mapped read-only without a duplicate corpus.
 //
 // Attribute/routing configuration comes from the native sectioned INI. Standard
 // SPANN sections are staged directly into the core parameter system; a small
@@ -16,12 +16,11 @@
 // bridge until those extensions gain native option fields.
 //
 // Usage:
-//   spannbuilder --vectors <file> --vec-offset <bytes> --n <count> --dim <D>
-//     --value-type Int8|UInt8|Float
-//     --tags <file> --tags-offset <bytes> --num-tags-per-vec <K>
-//     --index-dir <out> [--tenant 0] [--storage-backend FILEIO|ROCKSDBIO]
-//     [--build-signatures] [--with-meta-index] [--normalized]
-//     [--share-build-ownership]
+//   spannbuilder --vectors <file> [--vector-size <prefix>] [--dim <D>]
+//     --value-type Int8|UInt8|Float --vector-type DEFAULT|TXT|XVEC
+//     --tags <headerless-u32-file> --num-tags-per-vec <K>
+//     --index-dir <out> [--storage-backend FILEIO|ROCKSDBIO]
+//     [--build-signatures] [--normalized true|false]
 
 #include <cstdio>
 #include <cstdlib>
@@ -53,47 +52,18 @@
 #include "inc/Core/Common/IQuantizer.h"
 #include "inc/Core/SPANN/PipePQ.h"
 #include "inc/Helper/SimpleIniReader.h"
+#include "inc/Helper/VectorSetReader.h"
+#include "inc/Helper/NativeAttributeReader.h"
+#include "inc/Helper/NpyAttributeReader.h"
+#include <limits>
 
 using namespace SPTAG;
 
 namespace {
 
-struct MappedFile {
-    void* base = nullptr;
-    size_t length = 0;
-    int fd = -1;
-    bool Map(const std::string& path) {
-        fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) { fprintf(stderr, "[spannbuilder] open failed: %s\n", path.c_str()); return false; }
-        struct stat st;
-        if (::fstat(fd, &st) != 0) { fprintf(stderr, "[spannbuilder] fstat failed: %s\n", path.c_str()); return false; }
-        length = (size_t)st.st_size;
-        base = ::mmap(nullptr, length, PROT_READ, MAP_SHARED, fd, 0);
-        if (base == MAP_FAILED) { fprintf(stderr, "[spannbuilder] mmap failed: %s\n", path.c_str()); base = nullptr; return false; }
-        // The build accesses vectors by SHUFFLED index (BKT head selection,
-        // graph build, posting assignment) -- i.e. effectively RANDOM, not
-        // sequential. MADV_SEQUENTIAL was actively harmful here: it triggers
-        // aggressive readahead (each random 100-byte fault dragged in ~45 KB)
-        // AND frees pages behind the read pointer, so on a 100 GB base that
-        // does not fully fit in page cache every random access re-faulted from
-        // disk -> ~9x read amplification / thrashing (818 GB read for a 100 GB
-        // file in the first SelectHead pass). MADV_RANDOM disables readahead
-        // and page-dropping, so the working set accumulates in cache instead.
-        ::madvise(base, length, MADV_RANDOM);
-        return true;
-    }
-    ~MappedFile() {
-        if (base) ::munmap(base, length);
-        if (fd >= 0) ::close(fd);
-    }
-};
-
 size_t ValueTypeSize(const std::string& vt) {
-    if (vt == "Float" || vt == "float") return 4;
-    if (vt == "Int16" || vt == "Int8" || vt == "UInt8" || vt == "int16" || vt == "int8" || vt == "uint8") {
-        return (vt == "Int16" || vt == "int16") ? 2 : 1;
-    }
-    return 0;
+    VectorValueType type;
+    return Helper::Convert::ConvertStringTo(vt.c_str(), type) ? GetValueTypeSize(type) : 0;
 }
 
 const char* ArgVal(int argc, char** argv, const char* key, const char* def) {
@@ -102,6 +72,13 @@ const char* ArgVal(int argc, char** argv, const char* key, const char* def) {
 }
 bool ArgFlag(int argc, char** argv, const char* key) {
     for (int i = 1; i < argc; ++i) if (std::strcmp(argv[i], key) == 0) return true;
+    return false;
+}
+bool HasArgument(int argc, char** argv, const char* key) {
+    const size_t length = std::strlen(key);
+    for (int i = 1; i < argc; ++i)
+        if (std::strncmp(argv[i], key, length) == 0 &&
+            (argv[i][length] == '\0' || argv[i][length] == '=')) return true;
     return false;
 }
 
@@ -113,35 +90,101 @@ bool ArgFlag(int argc, char** argv, const char* key) {
 std::string Resolve(int argc, char** argv, const char* cliKey,
                     const Helper::IniReader* ini, const char* section, const char* key,
                     const char* def) {
-    if (const char* c = ArgVal(argc, argv, cliKey, nullptr)) return std::string(c);
+    if (cliKey != nullptr)
+        if (const char* c = ArgVal(argc, argv, cliKey, nullptr)) return std::string(c);
     if (ini && ini->DoesParameterExist(section, key))
         return ini->GetParameter<std::string>(section, key, std::string(def ? def : ""));
     return std::string(def ? def : "");
 }
 bool ResolveFlag(int argc, char** argv, const char* cliKey,
                  const Helper::IniReader* ini, const char* section, const char* key) {
-    if (ArgFlag(argc, argv, cliKey)) return true;
+    if (cliKey != nullptr && ArgFlag(argc, argv, cliKey)) return true;
     if (ini && ini->DoesParameterExist(section, key)) {
         std::string v = ini->GetParameter<std::string>(section, key, std::string("false"));
         return v == "1" || v == "true" || v == "True" || v == "yes" || v == "on";
     }
     return false;
 }
-// Bridge a wrapper-only routing setting to its existing consumer. Native
-// SPANN SelectHead/BuildHead/BuildSSDIndex settings must be staged directly
-// instead of passing through the process environment.
-void IniEnv(const Helper::IniReader* ini, const char* section, const char* key, const char* env) {
-    if (!ini || !ini->DoesParameterExist(section, key)) return;
-    std::string v = ini->GetParameter<std::string>(section, key, std::string());
-    if (v.empty()) return;
-    ::setenv(env, v.c_str(), 1);
-    fprintf(stderr, "[spannbuilder][cfg] %s = %s   (from [%s] %s)\n",
-            env, v.c_str(), section, key);
+
+int NativeInteger(const std::string& text, const char* key, int minimum)
+{
+    char* end = nullptr;
+    errno = 0;
+    const long long value = std::strtoll(text.c_str(), &end, 10);
+    if (errno || end == text.c_str() || *end || value < minimum || value > MaxSize)
+        throw std::runtime_error(std::string("Invalid ") + key + ": " + text);
+    return static_cast<int>(value);
 }
 
+struct NativeVectorInput {
+    std::shared_ptr<VectorSet> vectors;
+    bool normalized;
+    SizeType sourceRows;
+};
+
+NativeVectorInput ReadVectors(int argc, char** argv, const Helper::IniReader* ini,
+                              const char* path, const std::string& valueType)
+{
+    VectorValueType element;
+    VectorFileType container;
+    const auto fileType = Resolve(argc, argv, "--vector-type", ini, "Base", "VectorType", "DEFAULT");
+    if (!Helper::Convert::ConvertStringTo(valueType.c_str(), element))
+        throw std::runtime_error("Invalid ValueType; expected Int8, UInt8, Int16 or Float");
+    if (!Helper::Convert::ConvertStringTo(fileType.c_str(), container))
+        throw std::runtime_error("Invalid VectorType; expected DEFAULT, TXT or XVEC. Legacy raw inputs must be migrated explicitly");
+    const int dimension = NativeInteger(Resolve(argc, argv, "--dim", ini, "Base", "Dim", "0"), "Dim", 0);
+    if (HasArgument(argc, argv, "--vector-size") &&
+        ArgVal(argc, argv, "--vector-size", nullptr) == nullptr)
+        throw std::runtime_error("Native --vector-size requires an integer value");
+    const int limit = NativeInteger(Resolve(argc, argv, "--vector-size", ini, "Base", "VectorSize", "-1"), "VectorSize", -1);
+    if (limit == 0 || (container != VectorFileType::DEFAULT && dimension == 0))
+        throw std::runtime_error("VectorSize must be -1 or positive; TXT/XVEC require Dim");
+    auto options = std::make_shared<Helper::ReaderOptions>(element, dimension, container,
+        Resolve(argc, argv, "--vector-delimiter", ini, "Base", "VectorDelimiter", "|"));
+    const char* normalizedArgument = ArgVal(argc, argv, "--normalized", nullptr);
+    if (normalizedArgument == nullptr) normalizedArgument = ArgVal(argc, argv, "-norm", nullptr);
+    if ((HasArgument(argc, argv, "--normalized") || HasArgument(argc, argv, "-norm")) &&
+        normalizedArgument == nullptr)
+        throw std::runtime_error("Native --normalized/-norm requires a boolean value");
+    const std::string normalized = normalizedArgument != nullptr ? normalizedArgument :
+        Resolve(argc, argv, nullptr, ini, "Base", "Normalized", "false");
+    if (!Helper::Convert::ConvertStringTo(normalized.c_str(), options->m_normalized))
+        throw std::runtime_error("Invalid native reader Normalized boolean");
+    options->m_readOnlyMapped = true;
+    auto reader = Helper::VectorSetReader::CreateInstance(options);
+    if (!reader || reader->LoadFile(path) != ErrorCode::Success)
+        throw std::runtime_error("Failed loading native vector input");
+    auto vectors = reader->GetVectorSet(0, limit);
+    if (!vectors || vectors->Count() <= 0)
+        throw std::runtime_error("Native vector input is empty");
+    return {vectors, reader->IsNormalized(), reader->SourceCount()};
+}
 } // namespace
 
-int main(int argc, char** argv) {
+int Run(int argc, char** argv) {
+    if (!SPANN::Options::ValidateNativeEnvironment()) return 2;
+    const bool tenantMaintenance =
+        ArgFlag(argc, argv, "--compact-hierarchy") || ArgFlag(argc, argv, "--materialize-hierarchy") ||
+        ArgFlag(argc, argv, "--inpost-opq-requantize") || ArgFlag(argc, argv, "--inpost-rbq-transform");
+    if (!tenantMaintenance && HasArgument(argc, argv, "--tenant"))
+        throw std::runtime_error("--tenant was removed from bulk input; the bulk model has native tenant 0");
+    for (const char* removed : {"--routing-only", "--out-group", "--group-col", "--posting-quant-bits",
+                                "--vec-offset", "--vector-offset", "--vector-count",
+                                "--tag-offset", "--tags-offset", "--limited-tag-max-extra-supports",
+                                "--sparse-fallback-max-heads", "--sparse-fallback-max-posting-pages",
+                                "--static-acl-tag-cols", "--bkt-seed", "--tpt-seed",
+                                "--hierarchy-signature-min-selectivity", "--hierarchy-signature-max-selectivity",
+                                "--second-level-signature-min-selectivity", "--second-level-signature-max-selectivity",
+                                "--with-meta-index", "--share-build-ownership"}) {
+        if (HasArgument(argc, argv, removed)) {
+            fprintf(stderr, "[spannbuilder] %s was removed; use canonical native options.\n", removed);
+            return 2;
+        }
+        if (HasArgument(argc, argv, "--n") && !ArgFlag(argc, argv, "--merge-tags5")) {
+            fprintf(stderr, "[spannbuilder] --n was removed for vectors; use native --vector-size prefix (-1 = all).\n");
+            return 2;
+        }
+    }
     // --- Same-stride PipePQ -> OPQ posting rewrite for a cloned index ---
     // The clone's native indexloader.ini must set PostingQuantizer=OPQ,
     // PostingQuantM to the source PipePQ width, RequantizeFromPipePQ=true, and
@@ -243,7 +286,7 @@ int main(int argc, char** argv) {
     }
 
     // --- OPQ code generation mode (C++ analog of AnnService/src/Quantizer/main.cpp) ---
-    // Encodes a raw vector file into the in-posting OPQ code sidecar
+    // Encodes native vector input into the in-posting OPQ code sidecar
     // (opq_codes_m<M>.bin) that the SPANN build consumes (config
     // [BuildSSDIndex] PostingQuantizerFile). Mimics the original Quantizer main
     // (IQuantizer::LoadIQuantizer + per-vector QuantizeVector) but follows the
@@ -257,20 +300,19 @@ int main(int argc, char** argv) {
         const char* vectors  = ArgVal(argc, argv, "--vectors", nullptr);
         const char* quantF   = ArgVal(argc, argv, "--quantizer", nullptr);
         const char* outF     = ArgVal(argc, argv, "--out", nullptr);
-        const int   dim      = (int)std::strtol(ArgVal(argc, argv, "--dim", "0"), nullptr, 10);
-        const long  vecOff   = std::strtol(ArgVal(argc, argv, "--vec-offset", "8"), nullptr, 10);
-        const long  nArg     = std::strtol(ArgVal(argc, argv, "--n", "-1"), nullptr, 10);
         const int   threads  = (int)std::strtol(ArgVal(argc, argv, "--threads", "1"), nullptr, 10);
         const std::string valueType = ArgVal(argc, argv, "--value-type", "Int8");
-        if (!vectors || !quantF || !outF || dim <= 0 || threads <= 0) {
+        if (!vectors || !quantF || !outF || threads <= 0) {
             fprintf(stderr, "usage: spannbuilder --gen-opq-codes --vectors <base.i8bin> "
                             "--quantizer <opq_quantizer.bin> --out <opq_codes_m<M>.bin> "
-                            "--dim <D> [--vec-offset 8] [--n <count>] [--threads 1] "
+                            "[--dim <D>] [--vector-type DEFAULT|TXT|XVEC] [--vector-size <count>] [--threads 1] "
                             "[--value-type Int8]\n");
             return 2;
         }
         const size_t valSize = ValueTypeSize(valueType);
         if (valSize == 0) { fprintf(stderr, "[spannbuilder] bad value-type\n"); return 2; }
+        auto vectorSet = ReadVectors(argc, argv, nullptr, vectors, valueType).vectors;
+        const int dim = vectorSet->Dimension();
 
         // Load the OPQ quantizer exactly like Quantizer/main.cpp.
         auto fp = SPTAG::f_createIO();
@@ -286,22 +328,11 @@ int main(int argc, char** argv) {
                     quantizer->ReconstructDim(), dim);
             return 1;
         }
-        fprintf(stderr, "[spannbuilder][gen-opq-codes] M=%d dim=%d valueType=%s vec-offset=%ld\n",
-                M, dim, valueType.c_str(), vecOff);
-
-        MappedFile mf;
-        if (!mf.Map(vectors)) return 1;
-#ifndef _MSC_VER
-        // Code generation walks the base sequentially; override MappedFile's
-        // build-oriented random-access hint so the kernel can readahead.
-        ::madvise(mf.base, mf.length, MADV_SEQUENTIAL);
-#endif
+        fprintf(stderr, "[spannbuilder][gen-opq-codes] M=%d dim=%d valueType=%s\n",
+                M, dim, valueType.c_str());
         const size_t recBytes = (size_t)dim * valSize;
-        const size_t avail = (mf.length > (size_t)vecOff) ? (mf.length - (size_t)vecOff) : 0;
-        long N = (long)(avail / recBytes);
-        if (nArg >= 0 && nArg < N) N = nArg;
-        if (N <= 0) { fprintf(stderr, "[spannbuilder] no vectors (avail=%zu rec=%zu)\n", avail, recBytes); return 1; }
-        const char* basePtr = static_cast<const char*>(mf.base) + vecOff;
+        const long N = vectorSet->Count();
+        const char* basePtr = static_cast<const char*>(vectorSet->GetData());
 
         const size_t outputBytes = static_cast<size_t>(N) * M;
         const int outFd = open(outF, O_RDWR | O_CREAT | O_TRUNC, 0644);
@@ -334,13 +365,13 @@ int main(int argc, char** argv) {
                     const char* rec = basePtr + static_cast<size_t>(i) * recBytes;
                     // Widen raw values without normalization; this is the same
                     // convention used by the in-posting OPQ build path.
-                    if (valueType == "Float" || valueType == "float") {
+                    if (vectorSet->GetValueType() == VectorValueType::Float) {
                         const auto* v = reinterpret_cast<const float*>(rec);
                         for (int d = 0; d < dim; ++d) vf[d] = v[d];
                     } else if (valSize == 2) {
                         const auto* v = reinterpret_cast<const std::int16_t*>(rec);
                         for (int d = 0; d < dim; ++d) vf[d] = static_cast<float>(v[d]);
-                    } else if (valueType == "UInt8" || valueType == "uint8") {
+                    } else if (vectorSet->GetValueType() == VectorValueType::UInt8) {
                         const auto* v = reinterpret_cast<const std::uint8_t*>(rec);
                         for (int d = 0; d < dim; ++d) vf[d] = static_cast<float>(v[d]);
                     } else {
@@ -379,20 +410,19 @@ int main(int argc, char** argv) {
         const char* vectors = ArgVal(argc, argv, "--vectors", nullptr);
         const char* pivots = ArgVal(argc, argv, "--pivots", nullptr);
         const char* outF = ArgVal(argc, argv, "--out", nullptr);
-        const int dim = (int)std::strtol(ArgVal(argc, argv, "--dim", "0"), nullptr, 10);
         const int M = (int)std::strtol(ArgVal(argc, argv, "--posting-quant-m", "0"), nullptr, 10);
-        const long vecOff = std::strtol(ArgVal(argc, argv, "--vec-offset", "8"), nullptr, 10);
-        const long nArg = std::strtol(ArgVal(argc, argv, "--n", "-1"), nullptr, 10);
         const std::string valueType = ArgVal(argc, argv, "--value-type", "Int8");
-        if (!vectors || !pivots || !outF || dim <= 0 || M <= 0) {
+        if (!vectors || !pivots || !outF || M <= 0) {
             fprintf(stderr, "usage: spannbuilder --gen-pipepq-codes --vectors <base.i8bin> "
                             "--pivots <pipeann_pq_pivots.bin> --out <pipepq_codes_m<M>.bin> "
-                            "--dim <D> --posting-quant-m <M> [--vec-offset 8] [--n <count>] "
+                            "[--dim <D>] --posting-quant-m <M> [--vector-type DEFAULT|TXT|XVEC] [--vector-size <count>] "
                             "[--value-type Int8]\n");
             return 2;
         }
         const size_t valSize = ValueTypeSize(valueType);
         if (valSize == 0) { fprintf(stderr, "[spannbuilder] bad value-type\n"); return 2; }
+        auto vectorSet = ReadVectors(argc, argv, nullptr, vectors, valueType).vectors;
+        const int dim = vectorSet->Dimension();
 
         SPTAG::SPANN::PipePQTable table;
         if (!table.Load(pivots, M) || table.Dim() != dim) {
@@ -401,14 +431,9 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        MappedFile mf;
-        if (!mf.Map(vectors)) return 1;
         const size_t recBytes = (size_t)dim * valSize;
-        const size_t avail = (mf.length > (size_t)vecOff) ? (mf.length - (size_t)vecOff) : 0;
-        long N = (long)(avail / recBytes);
-        if (nArg >= 0 && nArg < N) N = nArg;
-        if (N <= 0) { fprintf(stderr, "[spannbuilder] no vectors (avail=%zu rec=%zu)\n", avail, recBytes); return 1; }
-        const char* basePtr = static_cast<const char*>(mf.base) + vecOff;
+        const long N = vectorSet->Count();
+        const char* basePtr = static_cast<const char*>(vectorSet->GetData());
 
         FILE* out = std::fopen(outF, "wb");
         if (!out) { fprintf(stderr, "[spannbuilder] cannot open out: %s\n", outF); return 1; }
@@ -422,13 +447,13 @@ int main(int argc, char** argv) {
             const long e = std::min<long>(s + (long)CHUNK, N);
             for (long i = s; i < e; ++i) {
                 const char* rec = basePtr + (size_t)i * recBytes;
-                if (valueType == "Float" || valueType == "float") {
+                if (vectorSet->GetValueType() == VectorValueType::Float) {
                     const float* v = reinterpret_cast<const float*>(rec);
                     for (int d = 0; d < dim; ++d) vf[d] = v[d];
                 } else if (valSize == 2) {
                     const std::int16_t* v = reinterpret_cast<const std::int16_t*>(rec);
                     for (int d = 0; d < dim; ++d) vf[d] = (float)v[d];
-                } else if (valueType == "UInt8" || valueType == "uint8") {
+                } else if (vectorSet->GetValueType() == VectorValueType::UInt8) {
                     const std::uint8_t* v = reinterpret_cast<const std::uint8_t*>(rec);
                     for (int d = 0; d < dim; ++d) vf[d] = (float)v[d];
                 } else {
@@ -449,68 +474,61 @@ int main(int argc, char** argv) {
     //     .npy attribute arrays (C++, no Python). Reads tags.npy [N,acl] uint32 +
     //     num_attr.npy [N] int32 and writes:
     //       --out-tags5  : raw uint32 [N, acl+1] = [acl cols | numeric], row-major
-    //       --out-group  : the routing-key column (default col 0), one int per line
     //     (.npy v1.0: magic 6B + ver 2B + hlen(u16) + header; data at 10+hlen.) ---
     if (ArgFlag(argc, argv, "--merge-tags5")) {
         const char* tagsNpy = ArgVal(argc, argv, "--tags-npy", nullptr);
         const char* numNpy  = ArgVal(argc, argv, "--num-npy", nullptr);
         const char* outT    = ArgVal(argc, argv, "--out-tags5", nullptr);
-        const char* outG    = ArgVal(argc, argv, "--out-group", nullptr);
-        const int aclCols   = (int)std::strtol(ArgVal(argc, argv, "--acl-cols", "4"), nullptr, 10);
-        const int groupCol  = (int)std::strtol(ArgVal(argc, argv, "--group-col", "0"), nullptr, 10);
-        const long nArg     = std::strtol(ArgVal(argc, argv, "--n", "-1"), nullptr, 10);
-        if (!tagsNpy || !numNpy || !outT || !outG || aclCols <= 0) {
+        for (const char* key : {"--acl-cols", "--n"})
+            if (HasArgument(argc, argv, key) && !ArgVal(argc, argv, key, nullptr))
+                throw std::runtime_error(std::string(key) + " requires an integer value");
+        const int aclCols = NativeInteger(ArgVal(argc, argv, "--acl-cols", "4"), "acl-cols", 1);
+        const long nArg = NativeInteger(ArgVal(argc, argv, "--n", "-1"), "n", -1);
+        if (nArg == 0 || aclCols == MaxSize)
+            throw std::runtime_error("Invalid NPY merge count/column width");
+        if (!tagsNpy || !numNpy || !outT || aclCols <= 0) {
             fprintf(stderr, "usage: spannbuilder --merge-tags5 --tags-npy <tags.npy> "
                             "--num-npy <num_attr.npy> --out-tags5 <tags5.u32> "
-                            "--out-group <group.txt> [--acl-cols 4] [--group-col 0] [--n <count>]\n");
+                            "[--acl-cols 4] [--n <count>]\n");
             return 2;
         }
-        auto npyData = [](const MappedFile& mf, size_t* outOff) -> bool {
-            if (mf.length < 10) return false;
-            const unsigned char* p = static_cast<const unsigned char*>(mf.base);
-            if (std::memcmp(p, "\x93NUMPY", 6) != 0) return false;
-            const size_t hlen = (size_t)p[8] | ((size_t)p[9] << 8);
-            *outOff = 10 + hlen;
-            return true;
-        };
-        MappedFile mt, mn;
-        if (!mt.Map(tagsNpy) || !mn.Map(numNpy)) return 1;
-        size_t tOff = 0, nOff = 0;
-        if (!npyData(mt, &tOff) || !npyData(mn, &nOff)) { fprintf(stderr, "[spannbuilder] bad .npy header\n"); return 1; }
-        const auto* tags = reinterpret_cast<const std::uint32_t*>(static_cast<const char*>(mt.base) + tOff);
-        const auto* nums = reinterpret_cast<const std::int32_t*>(static_cast<const char*>(mn.base) + nOff);
-        long N = (long)((mn.length - nOff) / sizeof(std::int32_t));
-        const long Nt = (long)((mt.length - tOff) / (sizeof(std::uint32_t) * (size_t)aclCols));
-        if (Nt < N) N = Nt;
-        if (nArg >= 0 && nArg < N) N = nArg;
-        if (groupCol < 0 || groupCol >= aclCols) { fprintf(stderr, "[spannbuilder] bad group-col\n"); return 1; }
-        fprintf(stderr, "[spannbuilder][merge-tags5] N=%ld aclCols=%d -> 5col=%d group-col=%d\n",
-                N, aclCols, aclCols + 1, groupCol);
+        const auto mt = Helper::ReadNpyAttributes(tagsNpy, aclCols, false);
+        const auto mn = Helper::ReadNpyAttributes(numNpy, 1, true);
+        if (mt.rows != mn.rows || nArg > mt.rows)
+            throw std::runtime_error("NPY row counts disagree or requested prefix exceeds source");
+        const long N = nArg < 0 ? mt.rows : nArg;
+        Helper::NativeAttributeBytes(N, static_cast<std::uint64_t>(aclCols) + 1);
+        const auto* tags = reinterpret_cast<const std::uint32_t*>(mt.data.Data());
+        const auto* nums = reinterpret_cast<const std::int32_t*>(mn.data.Data());
+        for (long i = 0; i < N; ++i)
+            if (nums[i] < 0) throw std::runtime_error("Numeric NPY values must fit native uint32 without signed wraparound");
+        if (std::filesystem::exists(outT) &&
+            (std::filesystem::equivalent(outT, tagsNpy) || std::filesystem::equivalent(outT, numNpy)))
+            throw std::runtime_error("NPY merge output must not overwrite its inputs");
+        fprintf(stderr, "[spannbuilder][merge-tags5] N=%ld categoricalCols=%d -> recordCols=%d\n",
+                N, aclCols, aclCols + 1);
 
         FILE* fT = std::fopen(outT, "wb");
-        FILE* fG = std::fopen(outG, "wb");
-        if (!fT || !fG) { fprintf(stderr, "[spannbuilder] cannot open outputs\n"); return 1; }
+        if (!fT) { fprintf(stderr, "[spannbuilder] cannot open output\n"); return 1; }
         const int W = aclCols + 1;
-        const size_t CHUNK = 1u << 20;
+        const size_t CHUNK = std::max<size_t>(1, (1u << 20) / W);
         std::vector<std::uint32_t> rowbuf(CHUNK * (size_t)W);
-        std::string gbuf; gbuf.reserve(CHUNK * 8);
-        char numtmp[16];
         for (long s = 0; s < N; s += (long)CHUNK) {
             const long e = std::min<long>(s + (long)CHUNK, N);
-            gbuf.clear();
             for (long i = s; i < e; ++i) {
                 std::uint32_t* dst = &rowbuf[(size_t)(i - s) * W];
                 const std::uint32_t* src = &tags[(size_t)i * aclCols];
                 for (int c = 0; c < aclCols; ++c) dst[c] = src[c];
                 dst[aclCols] = (std::uint32_t)nums[i];
-                int len = std::snprintf(numtmp, sizeof(numtmp), "%u\n", src[groupCol]);
-                gbuf.append(numtmp, len);
             }
-            std::fwrite(rowbuf.data(), sizeof(std::uint32_t), (size_t)(e - s) * W, fT);
-            std::fwrite(gbuf.data(), 1, gbuf.size(), fG);
+            const size_t count = (size_t)(e - s) * W;
+            if (std::fwrite(rowbuf.data(), sizeof(std::uint32_t), count, fT) != count) {
+                std::fclose(fT);
+                throw std::runtime_error("Failed writing native tag merge output");
+            }
             fprintf(stderr, "\r[spannbuilder][merge-tags5] %ld/%ld", e, N);
         }
-        std::fclose(fT); std::fclose(fG);
+        if (std::fclose(fT) != 0) throw std::runtime_error("Failed closing native tag merge output");
         fprintf(stderr, "\n[spannbuilder][merge-tags5] done.\n");
         return 0;
     }
@@ -533,13 +551,52 @@ int main(int argc, char** argv) {
             }
             ini = &iniStore;
             fprintf(stderr, "[spannbuilder] config = %s\n", cfg);
+            for (const char* section : {"MultiTenant", "SelectHead", "BuildHead",
+                                        "BuildSSDIndex", "SearchSSDIndex", "Base", "Tags", "Build"}) {
+                for (const auto& kv : ini->GetParameters(section)) {
+                    if (Helper::StrUtils::StrEqualIgnoreCase(kv.first.c_str(), "StaticACLTagCols")) {
+                        fprintf(stderr, "[spannbuilder] Use [Tags] ColumnTypes to specify every original attribute column.\n");
+                        return 2;
+                    }
+                    if (Helper::StrUtils::StrEqualIgnoreCase(kv.first.c_str(), "ColumnTypes") &&
+                        !Helper::StrUtils::StrEqualIgnoreCase(section, "Tags"))
+                        throw std::runtime_error("Specify ColumnTypes only in [Tags]");
+                    if (Helper::StrUtils::StrEqualIgnoreCase(kv.first.c_str(), "VectorOffset") ||
+                        Helper::StrUtils::StrEqualIgnoreCase(kv.first.c_str(), "VectorCount") ||
+                        Helper::StrUtils::StrEqualIgnoreCase(kv.first.c_str(), "WithMetaIndex") ||
+                        Helper::StrUtils::StrEqualIgnoreCase(kv.first.c_str(), "ShareBuildOwnership") ||
+                        (!tenantMaintenance && Helper::StrUtils::StrEqualIgnoreCase(section, "Tags") &&
+                         Helper::StrUtils::StrEqualIgnoreCase(kv.first.c_str(), "Tenant")) ||
+                        (!tenantMaintenance &&
+                         (Helper::StrUtils::StrEqualIgnoreCase(section, "BuildSSDIndex") ||
+                          Helper::StrUtils::StrEqualIgnoreCase(section, "SearchSSDIndex")) &&
+                         Helper::StrUtils::StrEqualIgnoreCase(kv.first.c_str(), "NumTagsPerVec")) ||
+                        SPANN::Options::IsRemovedParameter(kv.first.c_str()) ||
+                        SPANN::Options::IsRemovedSectionAlias(section, kv.first.c_str()) ||
+                        ((Helper::StrUtils::StrEqualIgnoreCase(kv.first.c_str(), "SelectHeadType") ||
+                          Helper::StrUtils::StrEqualIgnoreCase(kv.first.c_str(), "SelectType")) &&
+                         Helper::StrUtils::StrEqualIgnoreCase(kv.second.c_str(), "PerTagBKT"))) {
+                        fprintf(stderr, "[spannbuilder] [%s] %s was removed; use canonical native options.\n",
+                                section, kv.first.c_str());
+                        return 2;
+                    }
+                }
+            }
+            SPANN::Options hierarchyOptions;
+            for (const auto& kv : ini->GetParameters("SelectHead")) {
+                const char* canonical = SPANN::Options::CanonicalParameter("SelectHead", kv.first.c_str());
+                if (!Helper::StrUtils::StrEqualIgnoreCase(canonical, kv.first.c_str()) &&
+                    ini->DoesParameterExist("SelectHead", canonical)) continue;
+                if (hierarchyOptions.SetParameter("SelectHead", canonical, kv.second.c_str()) != ErrorCode::Success)
+                    return 2;
+            }
+            if (!hierarchyOptions.ValidateHierarchyRatio()) return 2;
+            if (hierarchyOptions.m_selectSecondLevel &&
+                (hierarchyOptions.m_secondLevelHierarchyLevels < 2 || hierarchyOptions.m_headVectorCount != 0)) {
+                fprintf(stderr, "[spannbuilder] HierarchyLevels must be >=2 and Count must be 0; use Ratio.\n");
+                return 2;
+            }
 
-            // Wrapper-only multi-tenant ACL routing + numeric attribute layout.
-            IniEnv(ini, "MultiTenant", "ACLCols",                 "SPTAG_ACL_COLS");
-            IniEnv(ini, "MultiTenant", "HierLevelWidths",         "SPTAG_HIER_LEVEL_WIDTHS");
-            IniEnv(ini, "MultiTenant", "NumericCols",             "SPTAG_NUMERIC_COLS");
-            IniEnv(ini, "MultiTenant", "PivotForceNodeCount",     "SPTAG_PIVOT_FORCE_NODE_COUNT");
-            IniEnv(ini, "MultiTenant", "DisablePivotEstimator",   "SPTAG_DISABLE_PIVOT_ESTIMATOR");
         }
     }
 
@@ -555,7 +612,6 @@ int main(int argc, char** argv) {
         const char* outputRoot = ArgVal(argc, argv, "--output-index-dir", nullptr);
         if (!indexDir || ArgFlag(argc, argv, "--build-signatures-only") ||
             ArgFlag(argc, argv, "--backfill-primary-head-csr") ||
-            ArgFlag(argc, argv, "--routing-only") ||
             (compactHierarchy && materializeHierarchy) ||
             (materializeHierarchy && (outputRoot == nullptr || *outputRoot == '\0')) ||
             (compactHierarchy && outputRoot != nullptr)) {
@@ -745,11 +801,11 @@ int main(int argc, char** argv) {
     if (!vecPath || !indexDir) {
         fprintf(stderr,
             "usage: spannbuilder -c <config.ini>   (native SPANN ini, single source of truth)\n"
-            "   or: spannbuilder --vectors <f> --vec-offset <b> --n <N> --dim <D> "
-            "--value-type Int8|UInt8|Float [--tags <f> --tags-offset <b> "
-            "--num-tags-per-vec <K>] --index-dir <out> [--tenant 0] "
+            "   or: spannbuilder --vectors <f> --vector-type DEFAULT|TXT|XVEC [--vector-size <N>] [--dim <D>] "
+            "--value-type Int8|UInt8|Float [--tags <headerless-u32-file> "
+            "--column-types categorical,numeric] --index-dir <out> "
             "[--storage-backend FILEIO|ROCKSDBIO] [--build-signatures] "
-            "[--with-meta-index] [--normalized] [--share-build-ownership] "
+            "[--normalized true|false] "
             "[--posting-quantizer None|RaBitQ|OPQ|PipePQ] [--posting-quant-m <B>] "
             "[--posting-quant-bits <b>] [--posting-quant-file <f>] "
             "[--full-vector-file <f>] [--rerank-l <L>] [--quantize-head] [--quant-adc-only] "
@@ -759,84 +815,93 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    const size_t vecOffset = (size_t)std::strtoull(Resolve(argc, argv, "--vec-offset",        ini, "Base", "VectorOffset",   "0").c_str(), nullptr, 10);
-    const size_t tagOffset = (size_t)std::strtoull(Resolve(argc, argv, "--tags-offset",       ini, "Tags", "TagOffset",      "0").c_str(), nullptr, 10);
-    const long long nArg   = std::strtoll(        Resolve(argc, argv, "--n",                  ini, "Base", "VectorCount",    "0").c_str(), nullptr, 10);
-    const int dim          = (int)std::strtol(    Resolve(argc, argv, "--dim",                ini, "Base", "Dim",            "0").c_str(), nullptr, 10);
-    const int numTagsPerVec= (int)std::strtol(    Resolve(argc, argv, "--num-tags-per-vec",   ini, "Tags", "NumTagsPerVec",  "0").c_str(), nullptr, 10);
-    const int tenant       = (int)std::strtol(    Resolve(argc, argv, "--tenant",             ini, "Tags", "Tenant",         "0").c_str(), nullptr, 10);
-    const std::string valueType     = Resolve(argc, argv, "--value-type",      ini, "Base", "VectorType", "Int8");
+    if (HasArgument(argc, argv, "--num-tags-per-vec") &&
+        !ArgVal(argc, argv, "--num-tags-per-vec", nullptr))
+        throw std::runtime_error("--num-tags-per-vec requires an integer value");
+    const std::string columnTypes = Resolve(argc, argv, "--column-types",
+        ini, "Tags", "ColumnTypes", "");
+    if (tagPath && columnTypes.empty())
+        throw std::runtime_error("TagFile requires [Tags] ColumnTypes for every original column");
+    const auto tagSchema = TagSchema::Parse(columnTypes, columnTypes.empty() ? 0 : -1);
+    const int numTagsPerVec = NativeInteger(Resolve(argc, argv, "--num-tags-per-vec",
+        ini, "Tags", "NumTagsPerVec", std::to_string(tagSchema.Width()).c_str()), "NumTagsPerVec", 0);
+    if (numTagsPerVec != tagSchema.Width())
+        throw std::runtime_error("NumTagsPerVec must equal the ColumnTypes width");
+    for (const char* section : {"BuildSSDIndex", "SearchSSDIndex"}) {
+        if (tagSchema.Width() > 0 &&
+            ((ini && ini->DoesParameterExist(section, "LimitedTagColumn")) ||
+             (Helper::StrUtils::StrEqualIgnoreCase(section, "BuildSSDIndex") &&
+              ResolveFlag(argc, argv, nullptr, ini, "BuildSSDIndex", "EnableLimitedTagPosting")))) {
+            const int key = NativeInteger(Resolve(argc, argv, nullptr, ini, section,
+                "LimitedTagColumn", "0"), "LimitedTagColumn", 0);
+            if (!tagSchema.IsCategorical(key))
+                throw std::runtime_error("LimitedTagColumn must identify a categorical original column");
+            if (Helper::StrUtils::StrEqualIgnoreCase(section, "SearchSSDIndex") &&
+                key != NativeInteger(Resolve(argc, argv, nullptr, ini, "BuildSSDIndex",
+                    "LimitedTagColumn", "0"), "LimitedTagColumn", 0))
+                throw std::runtime_error("Search overlay cannot change the constructed tag key column");
+        }
+    }
+    constexpr int tenant = 0;
+    const std::string valueType     = Resolve(argc, argv, "--value-type",      ini, "Base", "ValueType", "Float");
     const std::string storageBackend= Resolve(argc, argv, "--storage-backend", ini, "BuildSSDIndex", "Storage", "FILEIO");
     const bool buildSignatures = ResolveFlag(argc, argv, "--build-signatures", ini, "Build", "BuildSignatures");
-    const bool withMetaIndex   = ResolveFlag(argc, argv, "--with-meta-index",  ini, "Build", "WithMetaIndex");
-    const bool normalized      = ResolveFlag(argc, argv, "--normalized",       ini, "Base",  "Normalized");
-    const bool shareBuildOwnership =
-        ResolveFlag(argc, argv, "--share-build-ownership", ini, "Build", "ShareBuildOwnership");
     const std::string distCalcMethod =
         Resolve(argc, argv, "--dist-calc-method", ini, "Base", "DistCalcMethod", "Cosine");
+    DistCalcMethod metric;
+    if (!Helper::Convert::ConvertStringTo(distCalcMethod.c_str(), metric))
+        throw std::runtime_error("Invalid DistCalcMethod");
     const bool hasTags = tagPath != nullptr || numTagsPerVec > 0;
+    if (!hasTags && (buildSignatures || ArgFlag(argc, argv, "--build-signatures-only")))
+        throw std::runtime_error("BuildSignatures requires tags; no-tag/unfiltered builds can omit it");
 
     const size_t valSize = ValueTypeSize(valueType);
-    if (valSize == 0 || dim <= 0 || (hasTags && (tagPath == nullptr || numTagsPerVec <= 0))) {
+    if (valSize == 0 || (hasTags && (tagPath == nullptr || numTagsPerVec <= 0))) {
         fprintf(stderr, "[spannbuilder] invalid value-type/dim/tag configuration\n");
         return 2;
     }
-    if (tenant != 0 || withMetaIndex) {
-        fprintf(stderr,
-                "[spannbuilder] the bulk build path requires Tenant=0 and "
-                "WithMetaIndex=false\n");
-        return 2;
-    }
-    if (shareBuildOwnership && !normalized &&
-        (distCalcMethod == "Cosine" || distCalcMethod == "cosine")) {
-        fprintf(stderr,
-                "[spannbuilder] ShareBuildOwnership requires Base.Normalized=true for Cosine input; "
-                "the build normalizes unnormalized vectors in place.\n");
-        return 2;
-    }
-
-    MappedFile vecMap, tagMap;
-    if (!vecMap.Map(vecPath) || (hasTags && !tagMap.Map(tagPath))) return 1;
-
-    // Infer N from the vector file if not given (file_size - offset) / (dim*valSize).
-    long long n = nArg;
-    if (n <= 0) {
-        n = (long long)((vecMap.length - vecOffset) / ((size_t)dim * valSize));
-    }
+    if (std::getenv("SPTAG_BUILD_SHARE_OWNERSHIP"))
+        throw std::runtime_error("SPTAG_BUILD_SHARE_OWNERSHIP was removed from bulk input; ownership is derived automatically");
+    auto input = ReadVectors(argc, argv, ini, vecPath, valueType);
+    auto vectorSet = input.vectors;
+    const bool normalized = input.normalized;
+    const int dim = vectorSet->Dimension();
+    const long long n = vectorSet->Count();
     const size_t vecBytes = (size_t)n * dim * valSize;
-    const size_t tagBytes = hasTags ? (size_t)n * numTagsPerVec * sizeof(uint32_t) : 0;
-    if (vecOffset + vecBytes > vecMap.length) {
-        fprintf(stderr, "[spannbuilder] vector file too small: need %zu have %zu\n",
-                vecOffset + vecBytes, vecMap.length);
-        return 1;
-    }
-    if (hasTags && tagOffset + tagBytes > tagMap.length) {
-        fprintf(stderr, "[spannbuilder] tag file too small: need %zu have %zu\n",
-                tagOffset + tagBytes, tagMap.length);
-        return 1;
-    }
+    ByteArray tags = hasTags ? Helper::ReadNativeAttributes(
+        tagPath, vectorSet->Count(), input.sourceRows, numTagsPerVec) : ByteArray();
 
     fprintf(stderr,
         "[spannbuilder] N=%lld dim=%d valueType=%s tagsPerVec=%d tenant=%d backend=%s\n"
-        "               vectors=%s (+%zu, %.2f GB)  tags=%s (+%zu)\n"
+        "               vectors=%s (native reader, %.2f GB)  tags=%s (headerless uint32)\n"
         "               buildSignatures=%d index-dir=%s\n",
         n, dim, valueType.c_str(), numTagsPerVec, tenant, storageBackend.c_str(),
-        vecPath, vecOffset, vecBytes / 1e9, hasTags ? tagPath : "<none>", tagOffset,
+        vecPath, vecBytes / 1e9, hasTags ? tagPath : "<none>",
         (int)buildSignatures, indexDir);
 
-    // Zero-copy borrowed views over the mmapped regions (ownership=false).
-    std::uint8_t* vecPtr = reinterpret_cast<std::uint8_t*>(vecMap.base) + vecOffset;
+    // vectorSet owns the native reader's mapping/allocation through build and save.
+    std::uint8_t* vecPtr = static_cast<std::uint8_t*>(vectorSet->GetData());
     ByteArray vectors(vecPtr, vecBytes, false);
-    ByteArray tags;
-    if (hasTags) {
-        std::uint8_t* tagPtr = reinterpret_cast<std::uint8_t*>(tagMap.base) + tagOffset;
-        tags = ByteArray(tagPtr, tagBytes, false);
+
+    if (ArgFlag(argc, argv, "--build-signatures-only") ||
+        ArgFlag(argc, argv, "--backfill-primary-head-csr")) {
+        Helper::IniReader saved;
+        const std::string savedPath = sIndexDir + "/tenant_" + std::to_string(tenant) + "/indexloader.ini";
+        if (saved.LoadIniFile(savedPath) != ErrorCode::Success ||
+            saved.GetParameter<int>("Base", "Dim", 0) != dim ||
+            saved.GetParameter<int>("BuildSSDIndex", "NumTagsPerVec", 0) != numTagsPerVec ||
+            saved.GetParameter<int>("BuildSSDIndex", "LimitedTagColumn", 0) !=
+                NativeInteger(Resolve(argc, argv, nullptr, ini, "BuildSSDIndex",
+                    "LimitedTagColumn", "0"), "LimitedTagColumn", 0) ||
+            TagSchema::Parse(saved.GetParameter<std::string>("BuildSSDIndex", "ColumnTypes", ""),
+                numTagsPerVec, saved.GetParameter<int>("BuildSSDIndex", "StaticACLTagCols", 0)).text != tagSchema.text ||
+            !Helper::StrUtils::StrEqualIgnoreCase(
+                saved.GetParameter<std::string>("Base", "ValueType", "").c_str(), valueType.c_str()))
+            throw std::runtime_error("Native input dimension/ValueType/attribute schema disagrees with saved index");
     }
 
-    // Cosine normalization mutates input vectors, while these mappings are read-only.
-    setenv("SPTAG_BUILD_SHARE_OWNERSHIP", shareBuildOwnership ? "1" : "0", 1);
-
     TenantIndexManager mgr(dim, "SPANN", valueType.c_str());
+    mgr.SetSSDBuildParam("ColumnTypes", tagSchema.text.c_str());
     if (storageBackend != "FILEIO") mgr.SetStorageBackend(storageBackend.c_str());
 
     // Native build sections are staged before BuildFromDataWithTags creates the
@@ -856,7 +921,9 @@ int main(int argc, char** argv) {
         const bool hasNativeSelectType =
             ini->DoesParameterExist("SelectHead", "SelectHeadType");
         for (const auto& kv : ini->GetParameters("SelectHead")) {
-            std::string name = kv.first;
+            std::string name = SPANN::Options::CanonicalParameter("SelectHead", kv.first.c_str());
+            if (!Helper::StrUtils::StrEqualIgnoreCase(name.c_str(), kv.first.c_str()) &&
+                ini->DoesParameterExist("SelectHead", name.c_str())) continue;
             if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(name.c_str(), "SelectType")) {
                 if (hasNativeSelectType) {
                     fprintf(stderr,
@@ -876,61 +943,25 @@ int main(int argc, char** argv) {
                     kv.first.c_str(), kv.second.c_str());
         }
 
-        // These historical [MultiTenant] names are now staged into native
-        // SelectHead options, so PerTagBKT and U_extra no longer depend on env.
-        auto stageMultiTenantSelectHead = [&](const char* source, const char* target) {
-            if (!ini->DoesParameterExist("MultiTenant", source)) return;
-            if (ini->DoesParameterExist("SelectHead", target)) {
-                fprintf(stderr,
-                        "[spannbuilder][cfg] ignoring legacy [MultiTenant] %s; "
-                        "[SelectHead] %s is authoritative\n",
-                        source, target);
-                return;
-            }
-            const std::string value = ini->GetParameter<std::string>(
-                "MultiTenant", source, std::string());
-            mgr.SetBuildParam(target, value.c_str(), "SelectHead");
-            fprintf(stderr, "[spannbuilder][cfg] [MultiTenant] %s = %s -> [SelectHead] %s\n",
-                    source, value.c_str(), target);
-        };
-        stageMultiTenantSelectHead("PerVectorTagsFile", "PerVectorTagsFile");
-        stageMultiTenantSelectHead("DualPoolAugment", "DualPoolAugment");
-        stageMultiTenantSelectHead("DualPoolExtraRatio", "DualPoolExtraRatio");
-        stageMultiTenantSelectHead("UExtraIDFile", "UExtraIDFile");
-
-        // Cross-edge construction became a native BuildSSDIndex phase. Preserve
-        // existing sectioned configs while letting an explicit native value win.
-        auto stageMultiTenantBuildSSD = [&](const char* source, const char* target) {
-            if (!ini->DoesParameterExist("MultiTenant", source)) return;
-            if (ini->DoesParameterExist("BuildSSDIndex", target)) {
-                fprintf(stderr,
-                        "[spannbuilder][cfg] ignoring legacy [MultiTenant] %s; "
-                        "[BuildSSDIndex] %s is authoritative\n",
-                        source, target);
-                return;
-            }
-            const std::string value = ini->GetParameter<std::string>(
-                "MultiTenant", source, std::string());
-            mgr.SetSSDBuildParam(target, value.c_str());
-            fprintf(stderr,
-                    "[spannbuilder][cfg] [MultiTenant] %s = %s -> [BuildSSDIndex] %s\n",
-                    source, value.c_str(), target);
-        };
-        stageMultiTenantBuildSSD("CrossEdges", "CrossEdges");
-        stageMultiTenantBuildSSD("CrossExtraEdges", "CrossExtraEdges");
     }
+
+    // The native metric also determines whether the bulk path needs a mutable copy.
+    mgr.SetBuildParam("DistCalcMethod", distCalcMethod.c_str(), "Base");
 
     // Native [BuildSSDIndex] section: apply every param through the SPANN parameter
     // system (SetSSDBuildParam -> staged m_extraSSDBuildParams -> SetBuildParam at
     // build, CoreInterface.cpp). This is the same mechanism the classic IndexBuilder
     // uses, so ReplicaCount / PostingPageLimit / StartFileSizeGB / MaxFileSizeGB /
-    // GrowthFileSizeGB / PostingQuantizer / PostingQuantM / PostingQuantBits /
+    // GrowthFileSizeGB / PostingQuantizer / PostingQuantM /
     // PostingQuantizerFile / FullVectorFile / RerankL / QuantizeHead / QuantADCOnly
     // all flow from the ini. ("Storage" is handled above via SetStorageBackend.)
     if (ini) {
         for (const auto& kv : ini->GetParameters("BuildSSDIndex")) {
             if (kv.first == "storage") continue;
-            mgr.SetSSDBuildParam(kv.first.c_str(), kv.second.c_str());
+            const char* canonical = SPANN::Options::CanonicalParameter("BuildSSDIndex", kv.first.c_str());
+            if (!Helper::StrUtils::StrEqualIgnoreCase(canonical, kv.first.c_str()) &&
+                ini->DoesParameterExist("BuildSSDIndex", canonical)) continue;
+            mgr.SetSSDBuildParam(canonical, kv.second.c_str());
             fprintf(stderr, "[spannbuilder][cfg] [BuildSSDIndex] %s = %s\n",
                     kv.first.c_str(), kv.second.c_str());
         }
@@ -939,7 +970,10 @@ int main(int argc, char** argv) {
         // applies them only after each SPANN tenant finishes building and before
         // its first Save, so they cannot change construction behavior.
         for (const auto& kv : ini->GetParameters("SearchSSDIndex")) {
-            mgr.SetSearchParam(kv.first.c_str(), kv.second.c_str(), "SearchSSDIndex");
+            const char* canonical = SPANN::Options::CanonicalParameter("SearchSSDIndex", kv.first.c_str());
+            if (!Helper::StrUtils::StrEqualIgnoreCase(canonical, kv.first.c_str()) &&
+                ini->DoesParameterExist("SearchSSDIndex", canonical)) continue;
+            mgr.SetSearchParam(canonical, kv.second.c_str(), "SearchSSDIndex");
             fprintf(stderr, "[spannbuilder][cfg] queued [SearchSSDIndex] %s = %s\n",
                     kv.first.c_str(), kv.second.c_str());
         }
@@ -952,8 +986,6 @@ int main(int argc, char** argv) {
         if (pq) mgr.SetSSDBuildParam("PostingQuantizer", pq);
         const char* pqm = ArgVal(argc, argv, "--posting-quant-m", nullptr);     // OPQ code bytes
         if (pqm) mgr.SetSSDBuildParam("PostingQuantM", pqm);
-        const char* pqb = ArgVal(argc, argv, "--posting-quant-bits", nullptr);  // RaBitQ bits/dim
-        if (pqb) mgr.SetSSDBuildParam("PostingQuantBits", pqb);
         const char* pqf = ArgVal(argc, argv, "--posting-quant-file", nullptr);  // code sidecar
         if (pqf) mgr.SetSSDBuildParam("PostingQuantizerFile", pqf);
         const char* fvf = ArgVal(argc, argv, "--full-vector-file", nullptr);    // cold-rerank base
@@ -983,7 +1015,7 @@ int main(int argc, char** argv) {
             return 2;
         }
         fprintf(stderr, "[spannbuilder] PRIMARY-HEAD-CSR: LoadAll(%s) ...\n", indexDir);
-        if (!mgr.LoadAll(indexDir)) {
+        if (!mgr.LoadAll(indexDir) || mgr.GetTenantVectorCount(tenant) != n) {
             fprintf(stderr, "[spannbuilder] PRIMARY-HEAD-CSR LoadAll FAILED\n");
             return 1;
         }
@@ -995,57 +1027,32 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[spannbuilder] PRIMARY-HEAD-CSR done.\n");
         return 0;
     }
+
     if (ArgFlag(argc, argv, "--build-signatures-only")) {
         if (!hasTags) {
             fprintf(stderr, "[spannbuilder] BUILD-SIGNATURES-ONLY requires tags\n");
             return 2;
         }
-        if (!mgr.LoadAllForSignatureRepair(indexDir)) {
+        if (!mgr.LoadAll(indexDir) || mgr.GetTenantVectorCount(tenant) != n) {
             fprintf(stderr, "[spannbuilder] BUILD-SIGNATURES-ONLY LoadAll FAILED\n");
             return 1;
         }
-        if (!mgr.BuildSignaturesWithVectors(
+        if (!mgr.BuildSignatures(
                 tenant, tags, static_cast<int>(n),
-                numTagsPerVec, vectors)) {
+                numTagsPerVec)) {
             fprintf(stderr, "[spannbuilder] BUILD-SIGNATURES-ONLY BuildSignatures FAILED\n");
             return 1;
         }
         fprintf(stderr, "[spannbuilder] BUILD-SIGNATURES-ONLY done.\n");
         return 0;
     }
-    const bool routingOnly = ArgFlag(argc, argv, "--routing-only") ||
-                             (std::getenv("SPTAG_ROUTING_ONLY") != nullptr);
-    if (routingOnly) {
-        if (!hasTags) {
-            fprintf(stderr, "[spannbuilder] ROUTING-ONLY requires tags\n");
-            return 2;
-        }
-        // Repair mode: the index store already exists on disk; only (re)generate
-        // the query-time tag->bundle-node routing sidecar (tag_node_index.bin).
-        // Skips the full SPANN rebuild and BuildSignatures' posting scan.
-        setenv("SPTAG_ROUTING_ONLY", "1", 1);
-        fprintf(stderr, "[spannbuilder] ROUTING-ONLY: LoadAll(%s) ...\n", indexDir);
-        if (!mgr.LoadAll(indexDir)) {
-            fprintf(stderr, "[spannbuilder] ROUTING-ONLY LoadAll FAILED\n");
-            return 1;
-        }
-        fprintf(stderr, "[spannbuilder] ROUTING-ONLY: BuildSignatures ...\n");
-        if (!mgr.BuildSignaturesWithVectors(
-                tenant, tags, (SizeType)n,
-                numTagsPerVec, vectors)) {
-            fprintf(stderr, "[spannbuilder] ROUTING-ONLY BuildSignatures FAILED\n");
-            return 1;
-        }
-        fprintf(stderr, "[spannbuilder] ROUTING-ONLY done.\n");
-        return 0;
-    }
     bool ok = hasTags
         ? mgr.BuildFromDataWithTagsSingleTenant(
               vectors, tenant, static_cast<SizeType>(n), tags,
-              numTagsPerVec, withMetaIndex, normalized)
+              numTagsPerVec, false, normalized)
         : mgr.BuildFromDataSingleTenant(
               vectors, tenant, static_cast<SizeType>(n),
-              withMetaIndex, normalized);
+              false, normalized);
     if (!ok) {
         fprintf(stderr, "[spannbuilder] %s FAILED\n",
                 hasTags ? "BuildFromDataWithTagsSingleTenant"
@@ -1059,9 +1066,9 @@ int main(int argc, char** argv) {
             return 2;
         }
         fprintf(stderr, "[spannbuilder] BuildSignatures (numeric quant) ...\n");
-        if (!mgr.BuildSignaturesWithVectors(
+        if (!mgr.BuildSignatures(
                 tenant, tags, (SizeType)n,
-                numTagsPerVec, vectors)) {
+                numTagsPerVec)) {
             fprintf(stderr, "[spannbuilder] BuildSignatures FAILED\n");
             return 1;
         }
@@ -1074,4 +1081,14 @@ int main(int argc, char** argv) {
     }
     fprintf(stderr, "[spannbuilder] done.\n");
     return 0;
+}
+
+int main(int argc, char** argv)
+{
+    try {
+        return Run(argc, argv);
+    } catch (const std::exception& error) {
+        fprintf(stderr, "[spannbuilder] %s\n", error.what());
+        return 2;
+    }
 }

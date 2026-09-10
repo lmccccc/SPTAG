@@ -347,19 +347,6 @@ bool LoadNumericMetaFile(
     return true;
 }
 
-bool IsSafeArtifactFileName(
-    const std::string& p_name)
-{
-    if (p_name.empty()) return false;
-    const std::filesystem::path path(p_name);
-    return !path.is_absolute() &&
-        !path.has_root_path() &&
-        !path.has_parent_path() &&
-        path.filename() == path &&
-        path != "." &&
-        path != "..";
-}
-
 std::uint64_t MakeTagRoutingKey(
     std::uint32_t column,
     std::uint32_t tag)
@@ -624,126 +611,6 @@ std::string ReadBuildSSDIndexValue(
     return std::string();
 }
 
-bool AddMissingBuildSSDIndexValue(
-    const std::string& path,
-    const std::string& key,
-    const std::string& value)
-{
-    std::ifstream input(path, std::ios::binary);
-    if (!input || key.empty() || value.empty()) return false;
-    const std::string content(
-        (std::istreambuf_iterator<char>(input)),
-        std::istreambuf_iterator<char>());
-    if (input.bad()) return false;
-    input.close();
-
-    const auto normalized = [](std::string text) {
-        const size_t begin =
-            text.find_first_not_of(" \t\r\n");
-        const size_t end =
-            text.find_last_not_of(" \t\r\n");
-        text = begin == std::string::npos
-            ? std::string()
-            : text.substr(begin, end - begin + 1);
-        std::transform(
-            text.begin(), text.end(), text.begin(),
-            [](unsigned char item) {
-                return static_cast<char>(
-                    std::tolower(item));
-            });
-        return text;
-    };
-    const std::string normalizedKey = normalized(key);
-    bool inBuildSSDIndex = false;
-    bool foundBuildSSDIndex = false;
-    size_t insertion = std::string::npos;
-    for (size_t begin = 0; begin <= content.size();)
-    {
-        const size_t newline = content.find('\n', begin);
-        const size_t end = newline == std::string::npos
-            ? content.size()
-            : newline;
-        std::string line =
-            content.substr(begin, end - begin);
-        const std::string trimmed = normalized(line);
-        if (!trimmed.empty() && trimmed.front() == '[')
-        {
-            const size_t close = trimmed.find(']');
-            const std::string section =
-                close == std::string::npos
-                ? std::string()
-                : trimmed.substr(1, close - 1);
-            if (inBuildSSDIndex)
-            {
-                insertion = begin;
-                break;
-            }
-            inBuildSSDIndex =
-                section == "buildssdindex";
-            foundBuildSSDIndex =
-                foundBuildSSDIndex ||
-                inBuildSSDIndex;
-        }
-        else if (inBuildSSDIndex &&
-                 !trimmed.empty() &&
-                 trimmed.front() != ';')
-        {
-            const size_t equal = trimmed.find('=');
-            if (equal != std::string::npos &&
-                normalized(
-                    trimmed.substr(0, equal)) ==
-                    normalizedKey)
-            {
-                return false;
-            }
-        }
-        if (newline == std::string::npos) break;
-        begin = newline + 1;
-    }
-    if (!foundBuildSSDIndex) return false;
-    if (insertion == std::string::npos)
-        insertion = content.size();
-
-    const std::string lineEnding =
-        content.find("\r\n") != std::string::npos
-        ? "\r\n"
-        : "\n";
-    std::string addition;
-    if (insertion == content.size() &&
-        !content.empty() &&
-        content.back() != '\n')
-    {
-        addition += lineEnding;
-    }
-    addition += key + "=" + value + lineEnding;
-
-    const std::string temporary = path + ".tmp";
-    std::ofstream output(
-        temporary,
-        std::ios::binary | std::ios::trunc);
-    if (!output) return false;
-    output.write(
-        content.data(),
-        static_cast<std::streamsize>(insertion));
-    output.write(
-        addition.data(),
-        static_cast<std::streamsize>(
-            addition.size()));
-    output.write(
-        content.data() + insertion,
-        static_cast<std::streamsize>(
-            content.size() - insertion));
-    output.close();
-    if (!output ||
-        !SPTAG::Helper::AtomicReplaceFile(
-            temporary, path))
-    {
-        std::remove(temporary.c_str());
-        return false;
-    }
-    return true;
-}
-
 bool IniEnablesHybridDistance(const std::string& path)
 {
     std::string value = ReadBuildSSDIndexValue(
@@ -855,7 +722,8 @@ bool BuildStaticPostingHierMasks(const std::string& p_snapshotPath,
                                  std::vector<std::uint64_t>*
                                      p_tailNumericMasks = nullptr,
                                  std::uint64_t
-                                     p_expectedGeneration = 0)
+                                     p_expectedGeneration = 0,
+                                 const SPTAG::TagSchema* p_schema = nullptr)
 {
     constexpr std::uint32_t kStaticMetadataMagic = 0x314D5453U; // "STM1"
     constexpr int kHeaderV1IntCount = 9;
@@ -928,7 +796,10 @@ bool BuildStaticPostingHierMasks(const std::string& p_snapshotPath,
                     p_expectedGeneration));
         return false;
     }
-    const int aclTagCount = p_aclTagCount > 0 ? p_aclTagCount : tagCount;
+    const int aclTagCount = p_schema != nullptr ? static_cast<int>(p_schema->categorical.size()) :
+        (p_aclTagCount > 0 ? p_aclTagCount : tagCount);
+    const auto schema = p_schema != nullptr ? *p_schema :
+        SPTAG::TagSchema::Parse("", tagCount, aclTagCount);
     const int numericColumnCount =
         p_quantParams == nullptr
             ? 0
@@ -1084,7 +955,7 @@ bool BuildStaticPostingHierMasks(const std::string& p_snapshotPath,
             }
             for (int i = 0; i < list.elementCount; ++i) {
                 const char* record = records + static_cast<size_t>(i) * static_cast<size_t>(recordBytes);
-                for (int tagColumn = 0; tagColumn < aclTagCount; ++tagColumn) {
+                for (int tagColumn : schema.categorical) {
                     std::uint32_t tag = 0;
                     std::memcpy(&tag, record + sizeof(std::int32_t) +
                                       static_cast<size_t>(tagColumn) * sizeof(tag),
@@ -1124,8 +995,7 @@ bool BuildStaticPostingHierMasks(const std::string& p_snapshotPath,
                         record +
                             sizeof(std::int32_t) +
                             static_cast<size_t>(
-                                aclTagCount +
-                                numericColumn) *
+                                schema.numeric[numericColumn]) *
                                 sizeof(value),
                         sizeof(value));
                     const int bucket =
@@ -1223,7 +1093,8 @@ float EstimateQueryVectorSelectivity(
     int numericBaseColumn,
     const SPTAG::Cache::NumQuantParam*
         numericParams,
-    size_t numericParamCount)
+    size_t numericParamCount,
+    const SPTAG::TagSchema* schema = nullptr)
 {
     if (tenantSize <= 0 || tagStats == nullptr) {
         return 1.0f;
@@ -1312,15 +1183,15 @@ float EstimateQueryVectorSelectivity(
                 numericRanges;
             for (const auto& literal : clause.lits) {
                 if (literal.kind == 0 ||
-                    static_cast<int>(literal.col) <
-                        numericBaseColumn ||
+                    (schema != nullptr ? schema->NumericLane(literal.col) < 0 :
+                     static_cast<int>(literal.col) < numericBaseColumn) ||
                     numericParams == nullptr) {
                     continue;
                 }
                 const size_t numericIndex =
                     static_cast<size_t>(
-                        static_cast<int>(literal.col) -
-                        numericBaseColumn);
+                        schema != nullptr ? schema->NumericLane(literal.col) :
+                        static_cast<int>(literal.col) - numericBaseColumn);
                 if (numericIndex >=
                     numericParamCount) {
                     continue;
@@ -1389,9 +1260,8 @@ float EstimateQueryVectorSelectivity(
                  numericRanges) {
                 const size_t numericIndex =
                     static_cast<size_t>(
-                        static_cast<int>(
-                            numeric.first) -
-                        numericBaseColumn);
+                        schema != nullptr ? schema->NumericLane(numeric.first) :
+                        static_cast<int>(numeric.first) - numericBaseColumn);
                 const auto& domain =
                     numericParams[numericIndex];
                 const long double selected =
@@ -1561,109 +1431,6 @@ float EstimateQueryVectorSelectivity(
     return static_cast<float>(unionSelectivity);
 }
 
-struct PivotEstimatorLevelData {
-    std::vector<uint32_t> uniqueTags;
-    std::vector<int> counts;
-    std::unordered_map<uint32_t, uint32_t> parentByTag;
-};
-
-struct PivotEstimatorCandidate {
-    int pivotLevel = -1;
-    int nodeCount = 0;
-    double latencyCost = 0.0;
-    double recallPenalty = 0.0;
-    double totalCost = std::numeric_limits<double>::infinity();
-    std::vector<std::vector<uint32_t>> nodePivotTags;
-    std::vector<int> nodeSizes;
-};
-
-std::string JsonEscape(const std::string& input)
-{
-    std::string out;
-    out.reserve(input.size() + 8);
-    for (char ch : input)
-    {
-        switch (ch)
-        {
-        case '\\': out += "\\\\"; break;
-        case '"': out += "\\\""; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
-        default: out.push_back(ch); break;
-        }
-    }
-    return out;
-}
-
-bool ParseLevelWeights(const std::string& csv, int levelCount, std::vector<double>& outWeights)
-{
-    outWeights.clear();
-    if (levelCount <= 0) return false;
-
-    if (csv.empty()) {
-        outWeights.assign(levelCount, 1.0 / static_cast<double>(levelCount));
-        return true;
-    }
-
-    std::stringstream ss(csv);
-    std::string token;
-    while (std::getline(ss, token, ','))
-    {
-        if (token.empty()) continue;
-        try {
-            outWeights.push_back(std::stod(token));
-        }
-        catch (...) {
-            return false;
-        }
-    }
-
-    if (static_cast<int>(outWeights.size()) != levelCount) return false;
-
-    double sum = 0.0;
-    for (double value : outWeights)
-    {
-        if (value < 0.0) return false;
-        sum += value;
-    }
-    if (sum <= 0.0) return false;
-
-    for (double& value : outWeights)
-    {
-        value /= sum;
-    }
-    return true;
-}
-
-bool TryGetAncestorTag(uint32_t tag,
-                       int fromLevel,
-                       int targetLevel,
-                       const std::vector<PivotEstimatorLevelData>& levelData,
-                       uint32_t& ancestorTag)
-{
-    ancestorTag = tag;
-    if (fromLevel == targetLevel) return true;
-    if (fromLevel < targetLevel || fromLevel < 0 || targetLevel < 0 ||
-        fromLevel >= static_cast<int>(levelData.size()) ||
-        targetLevel >= static_cast<int>(levelData.size())) {
-        return false;
-    }
-
-    uint32_t currentTag = tag;
-    for (int level = fromLevel; level > targetLevel; --level)
-    {
-        const auto parentIt = levelData[level].parentByTag.find(currentTag);
-        if (parentIt == levelData[level].parentByTag.end()) {
-            return false;
-        }
-        currentTag = parentIt->second;
-    }
-
-    ancestorTag = currentTag;
-    return true;
-}
-
 } // namespace
 
 namespace {
@@ -1816,12 +1583,11 @@ bool ValidateDNFColumns(
     SPTAG::Cache::DNFPredicate& p_predicate,
     DNFBlobEncoding p_encoding,
     int p_attributeCount,
-    int p_categoricalColumns,
+    const SPTAG::TagSchema& p_schema,
     std::string& p_error)
 {
     if (p_attributeCount <= 0 ||
-        p_categoricalColumns <= 0 ||
-        p_categoricalColumns > p_attributeCount)
+        p_schema.Width() != p_attributeCount)
     {
         p_error = "loaded index has invalid attribute metadata";
         return false;
@@ -1839,9 +1605,7 @@ bool ValidateDNFColumns(
                 return false;
             }
             const std::uint8_t expectedKind =
-                literal.col <
-                    static_cast<std::uint32_t>(
-                        p_categoricalColumns)
+                p_schema.IsCategorical(static_cast<int>(literal.col))
                 ? 0
                 : 1;
             if (p_encoding == DNFBlobEncoding::Version3)
@@ -1867,265 +1631,6 @@ bool ValidateDNFColumns(
         }
     }
     return true;
-}
-
-bool SearchExtremeSparseTagStore(
-    const SPTAG::Cache::ExtremeSparseTagStore& p_store,
-    const std::shared_ptr<SPTAG::VectorIndex>& p_index,
-    ByteArray p_queryVector,
-    int p_resultNum,
-    const std::vector<std::uint32_t>& p_sparseTags,
-    const std::uint32_t* p_flatTags,
-    int p_flatTagCount,
-    int p_categoricalColumns,
-    const SPTAG::Cache::DNFPredicate* p_dnf,
-    std::shared_ptr<QueryResult>& p_result,
-    std::string& p_error)
-{
-    p_result.reset();
-    if (p_index == nullptr || p_queryVector.Data() == nullptr ||
-        p_resultNum <= 0 || p_sparseTags.empty())
-    {
-        p_error =
-            "invalid extreme-sparse search parameters";
-        return false;
-    }
-    std::vector<std::uint8_t> records;
-    std::uint64_t recordCount = 0;
-    if (!p_store.Read(
-            p_sparseTags, records, recordCount, &p_error))
-    {
-        return false;
-    }
-    const size_t recordBytes = p_store.RecordBytes();
-    const size_t attributeBytes =
-        static_cast<size_t>(p_store.AttributeCount()) *
-        sizeof(std::uint32_t);
-    const size_t vectorOffset =
-        sizeof(std::int32_t) + attributeBytes;
-    if (recordBytes !=
-            vectorOffset + p_store.VectorBytes() ||
-        recordCount >
-            (std::numeric_limits<size_t>::max)() /
-                recordBytes ||
-        records.size() !=
-            static_cast<size_t>(recordCount) *
-                recordBytes)
-    {
-        p_error =
-            "invalid extreme-sparse query record layout";
-        return false;
-    }
-
-    using Candidate =
-        std::pair<float, SPTAG::SizeType>;
-    std::priority_queue<Candidate> top;
-    std::vector<std::uint32_t> attributes(
-        p_store.AttributeCount());
-    std::vector<std::uint32_t> vectorStorage(
-        (p_store.VectorBytes() +
-         sizeof(std::uint32_t) - 1) /
-        sizeof(std::uint32_t));
-    int distanceComputations = 0;
-    for (std::uint64_t record = 0;
-         record < recordCount; ++record)
-    {
-        const std::uint8_t* row =
-            records.data() +
-            static_cast<size_t>(record) * recordBytes;
-        std::int32_t vectorID = -1;
-        std::memcpy(
-            &vectorID, row, sizeof(vectorID));
-        if (vectorID < 0 ||
-            !p_index->ContainSample(vectorID))
-        {
-            continue;
-        }
-        std::memcpy(
-            attributes.data(),
-            row + sizeof(vectorID),
-            attributeBytes);
-        bool matches = true;
-        if (p_dnf != nullptr && !p_dnf->Empty())
-        {
-            matches = p_dnf->Matches(
-                attributes.data(),
-                static_cast<int>(
-                    p_store.AttributeCount()));
-        }
-        else if (p_flatTags != nullptr &&
-                 p_flatTagCount > 0)
-        {
-            matches = false;
-            const int columns =
-                (std::max)(
-                    0,
-                    (std::min)(
-                        p_categoricalColumns,
-                        static_cast<int>(
-                            p_store.AttributeCount())));
-            for (int column = 0;
-                 column < columns && !matches;
-                 ++column)
-            {
-                for (int query = 0;
-                     query < p_flatTagCount;
-                     ++query)
-                {
-                    if (attributes[
-                            static_cast<size_t>(
-                                column)] ==
-                        p_flatTags[query])
-                    {
-                        matches = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if (!matches) continue;
-
-        std::memcpy(
-            vectorStorage.data(),
-            row + vectorOffset,
-            p_store.VectorBytes());
-        float distance = p_index->ComputeDistance(
-            p_queryVector.Data(),
-            vectorStorage.data());
-        if (p_index->GetDistCalcMethod() ==
-            SPTAG::DistCalcMethod::Cosine)
-        {
-            float base = 1.0f;
-            switch (p_index->GetVectorValueType())
-            {
-            case SPTAG::VectorValueType::Int8:
-                base = static_cast<float>(
-                    (std::numeric_limits<
-                         std::int8_t>::max)());
-                break;
-            case SPTAG::VectorValueType::UInt8:
-                base = static_cast<float>(
-                    (std::numeric_limits<
-                         std::uint8_t>::max)());
-                break;
-            case SPTAG::VectorValueType::Int16:
-                base = static_cast<float>(
-                    (std::numeric_limits<
-                         std::int16_t>::max)());
-                break;
-            default:
-                break;
-            }
-            distance = p_index->AccurateDistance(
-                p_queryVector.Data(),
-                vectorStorage.data()) *
-                base * base;
-        }
-        ++distanceComputations;
-        const Candidate candidate(
-            distance,
-            static_cast<SPTAG::SizeType>(
-                vectorID));
-        if (static_cast<int>(top.size()) <
-            p_resultNum)
-        {
-            top.push(candidate);
-        }
-        else if (candidate < top.top())
-        {
-            top.pop();
-            top.push(candidate);
-        }
-    }
-
-    std::vector<Candidate> ordered;
-    ordered.reserve(top.size());
-    while (!top.empty())
-    {
-        ordered.push_back(top.top());
-        top.pop();
-    }
-    std::sort(ordered.begin(), ordered.end());
-    p_result = std::make_shared<QueryResult>(
-        p_queryVector.Data(), p_resultNum, false);
-    p_result->Reset();
-    for (size_t result = 0;
-         result < ordered.size(); ++result)
-    {
-        p_result->SetResult(
-            static_cast<int>(result),
-            ordered[result].second,
-            ordered[result].first);
-    }
-    p_result->SetScanned(distanceComputations);
-    SPTAG::VectorIndex::ResetThreadLocalPostingScanStats();
-    return true;
-}
-
-std::shared_ptr<QueryResult> MergeQueryResults(
-    ByteArray p_queryVector,
-    int p_resultNum,
-    const std::shared_ptr<QueryResult>& p_left,
-    const std::shared_ptr<QueryResult>& p_right)
-{
-    if (p_left == nullptr) return p_right;
-    if (p_right == nullptr) return p_left;
-    std::unordered_map<SPTAG::SizeType, float> best;
-    best.reserve(
-        static_cast<size_t>(p_resultNum) * 4 + 1);
-    const auto collect =
-        [&best](const std::shared_ptr<QueryResult>& p_source) {
-            for (int index = 0;
-                 index < p_source->GetResultNum();
-                 ++index)
-            {
-                const auto* result =
-                    p_source->GetResult(index);
-                if (result == nullptr || result->VID < 0 ||
-                    !std::isfinite(result->Dist))
-                {
-                    continue;
-                }
-                const auto found = best.find(result->VID);
-                if (found == best.end() ||
-                    result->Dist < found->second)
-                {
-                    best[result->VID] = result->Dist;
-                }
-            }
-        };
-    collect(p_left);
-    collect(p_right);
-    std::vector<std::pair<float, SPTAG::SizeType>>
-        ordered;
-    ordered.reserve(best.size());
-    for (const auto& entry : best)
-    {
-        ordered.emplace_back(
-            entry.second, entry.first);
-    }
-    std::sort(ordered.begin(), ordered.end());
-    if (ordered.size() >
-        static_cast<size_t>(p_resultNum))
-    {
-        ordered.resize(
-            static_cast<size_t>(p_resultNum));
-    }
-    auto merged = std::make_shared<QueryResult>(
-        p_queryVector.Data(), p_resultNum, false);
-    merged->Reset();
-    for (size_t index = 0;
-         index < ordered.size(); ++index)
-    {
-        merged->SetResult(
-            static_cast<int>(index),
-            ordered[index].second,
-            ordered[index].first);
-    }
-    merged->SetScanned(
-        (std::max)(0, p_left->GetScanned()) +
-        (std::max)(0, p_right->GetScanned()));
-    return merged;
 }
 
 } // namespace
@@ -2200,33 +1705,6 @@ std::uint64_t ComputeHeadNodeMetaContentFingerprint(
             hash, p_blob.data(), p_blob.size());
     }
     return hash;
-}
-
-// Parse SPTAG_HIER_LEVEL_WIDTHS (comma-separated per-column bit widths, e.g.
-// "256,64,64,128,64") into a build-local layout.
-SPTAG::Cache::HierWidthTable HierWidthsFromEnv()
-{
-    SPTAG::Cache::HierWidthTable table;
-    const char* e = std::getenv("SPTAG_HIER_LEVEL_WIDTHS");
-    if (e == nullptr || e[0] == '\0') {
-        return table;
-    }
-    int widths[SPTAG::Cache::HIER_LEVELS];
-    for (int l = 0; l < SPTAG::Cache::HIER_LEVELS; ++l) widths[l] = SPTAG::Cache::HIER_LEVEL_BITS;
-    int n = 0;
-    const char* p = e;
-    while (*p != '\0' && n < SPTAG::Cache::HIER_LEVELS) {
-        widths[n++] = atoi(p);
-        const char* comma = strchr(p, ',');
-        if (comma == nullptr) break;
-        p = comma + 1;
-    }
-    table.Set(widths, n);
-    fprintf(stderr, "[INFO] Hier mask widths: bits=[%d,%d,%d,%d,%d] totalWords=%d (%zu B/head)\n",
-            table.bits[0], table.bits[1], table.bits[2], table.bits[3],
-            table.bits[4], table.totalWords,
-            SPTAG::Cache::HierPostingMaskBytes(table));
-    return table;
 }
 
 std::string HeadNodeMetaPath(const std::string& workDir)
@@ -2650,802 +2128,6 @@ bool EnsureHeadNodeMetaLoaded(const std::string& workDir, const std::shared_ptr<
         return true;
     }
     return LoadPostingSignaturesIntoHeadIndex(workDir, internalIndex);
-}
-
-constexpr int32_t kHeadNodeRoutingIndexVersion = 2;
-
-struct HeadNodeRoutingIndexFileHeader {
-    int32_t version;
-    int32_t pivotLevel;
-    int32_t nodeCount;
-    int32_t numHeadSamples;
-    int32_t numTagMappings;
-};
-
-struct PivotEstimatorComputation {
-    std::vector<PivotEstimatorLevelData> levelData;
-    std::vector<double> levelWeights;
-    std::vector<PivotEstimatorCandidate> candidates;
-};
-
-constexpr double kGreedyLeafMinLocalSelectivity = 0.05;
-
-struct LeafGreedyPlanEntry {
-    uint32_t leafTag = 0;
-    int leafCount = 0;
-    std::vector<uint32_t> ancestorPath;
-};
-
-std::string HeadNodeRoutingIndexPath(const std::string& workDir)
-{
-    return workDir + "/HeadIndex/tag_node_index.bin";
-}
-
-void BuildNodeByPivotTag(const PivotEstimatorCandidate& candidate,
-                         std::unordered_map<uint32_t, int>& nodeByPivotTag)
-{
-    nodeByPivotTag.clear();
-    for (int nodeId = 0; nodeId < candidate.nodeCount; ++nodeId)
-    {
-        if (nodeId < 0 || nodeId >= static_cast<int>(candidate.nodePivotTags.size())) continue;
-        for (uint32_t pivotTag : candidate.nodePivotTags[nodeId])
-        {
-            nodeByPivotTag[pivotTag] = nodeId;
-        }
-    }
-}
-
-void CollectNodesForTag(int tagLevel,
-                        uint32_t tag,
-                        const PivotEstimatorCandidate& candidate,
-                        const std::vector<PivotEstimatorLevelData>& levelData,
-                        const std::unordered_map<uint32_t, int>& nodeByPivotTag,
-                        std::vector<int>& outNodes)
-{
-    std::unordered_set<int> touchedNodes;
-
-    if (tagLevel < candidate.pivotLevel)
-    {
-        for (const auto& nodePivotTags : candidate.nodePivotTags)
-        {
-            for (uint32_t pivotTag : nodePivotTags)
-            {
-                uint32_t ancestor = 0;
-                if (TryGetAncestorTag(pivotTag, candidate.pivotLevel, tagLevel, levelData, ancestor) &&
-                    ancestor == tag)
-                {
-                    auto nodeIt = nodeByPivotTag.find(pivotTag);
-                    if (nodeIt != nodeByPivotTag.end()) {
-                        touchedNodes.insert(nodeIt->second);
-                    }
-                }
-            }
-        }
-    }
-    else if (tagLevel == candidate.pivotLevel)
-    {
-        auto nodeIt = nodeByPivotTag.find(tag);
-        if (nodeIt != nodeByPivotTag.end()) {
-            touchedNodes.insert(nodeIt->second);
-        }
-    }
-    else
-    {
-        uint32_t ancestorPivot = 0;
-        if (TryGetAncestorTag(tag, tagLevel, candidate.pivotLevel, levelData, ancestorPivot)) {
-            auto nodeIt = nodeByPivotTag.find(ancestorPivot);
-            if (nodeIt != nodeByPivotTag.end()) {
-                touchedNodes.insert(nodeIt->second);
-            }
-        }
-    }
-
-    outNodes.assign(touchedNodes.begin(), touchedNodes.end());
-    std::sort(outNodes.begin(), outNodes.end());
-}
-
-// Compute latencyCost / recallPenalty / totalCost / nodeSizes for `candidate`,
-// given the candidate's `nodePivotTags` (leaf-level tag sets) and `pivotLevel`.
-// Used both for the legacy single-shot candidate and for per-step Huffman
-// snapshots in the tree-aware merge below.
-void EvaluatePivotEstimatorCandidateCost(PivotEstimatorCandidate& candidate,
-                                         const std::vector<PivotEstimatorLevelData>& levelData,
-                                         const std::vector<double>& levelWeights,
-                                         int numTagsPerVec,
-                                         double totalVectors,
-                                         double recallTarget,
-                                         double lambdaRecall,
-                                         double estimatedRecall)
-{
-    std::unordered_map<uint32_t, int> nodeByPivotTag;
-    BuildNodeByPivotTag(candidate, nodeByPivotTag);
-
-    const int leafLevel = numTagsPerVec - 1;
-    std::unordered_map<uint32_t, int> leafTagCount;
-    if (leafLevel >= 0 && leafLevel < static_cast<int>(levelData.size())) {
-        const auto& leafTags = levelData[leafLevel].uniqueTags;
-        const auto& leafCounts = levelData[leafLevel].counts;
-        leafTagCount.reserve(leafTags.size());
-        for (size_t i = 0; i < leafTags.size() && i < leafCounts.size(); ++i) {
-            leafTagCount[leafTags[i]] = leafCounts[i];
-        }
-    }
-
-    candidate.nodeSizes.assign(candidate.nodeCount, 0);
-    for (int nid = 0; nid < candidate.nodeCount && nid < static_cast<int>(candidate.nodePivotTags.size()); ++nid)
-    {
-        int sz = 0;
-        for (uint32_t pivotTag : candidate.nodePivotTags[nid]) {
-            auto it = leafTagCount.find(pivotTag);
-            if (it != leafTagCount.end()) sz += it->second;
-        }
-        candidate.nodeSizes[nid] = sz;
-    }
-
-    double latencyCost = 0.0;
-    for (int queryLevel = 0; queryLevel < numTagsPerVec; ++queryLevel)
-    {
-        double levelCost = 0.0;
-        const auto& qTags = levelData[queryLevel].uniqueTags;
-        const auto& qCounts = levelData[queryLevel].counts;
-        for (size_t qIdx = 0; qIdx < qTags.size(); ++qIdx)
-        {
-            std::vector<int> touchedNodes;
-            CollectNodesForTag(queryLevel, qTags[qIdx], candidate, levelData, nodeByPivotTag, touchedNodes);
-            if (touchedNodes.empty()) continue;
-
-            // Sum per-node search cost (each touched subindex runs its own graph
-            // traversal). Using sum(log2(node_size)) instead of log2(sum_sizes)
-            // captures per-node IO + traversal overhead and penalises over-fragmentation.
-            double tagLatency = 0.0;
-            for (int nodeId : touchedNodes)
-            {
-                if (nodeId >= 0 && nodeId < static_cast<int>(candidate.nodeSizes.size())) {
-                    double nodeSize = static_cast<double>(candidate.nodeSizes[nodeId]);
-                    if (nodeSize > 0.0) {
-                        tagLatency += std::log2(nodeSize + 1.0);
-                    }
-                }
-            }
-            if (tagLatency <= 0.0) continue;
-
-            double probability = static_cast<double>(qCounts[qIdx]) / totalVectors;
-            levelCost += probability * tagLatency;
-        }
-        if (queryLevel < static_cast<int>(levelWeights.size())) {
-            latencyCost += levelWeights[queryLevel] * levelCost;
-        }
-    }
-
-    candidate.latencyCost = latencyCost;
-    candidate.recallPenalty = lambdaRecall * std::max(0.0, recallTarget - estimatedRecall);
-    candidate.totalCost = candidate.latencyCost + candidate.recallPenalty;
-}
-
-bool BuildPivotEstimatorComputation(const uint32_t* tags,
-                                    int numVectors,
-                                    int numTagsPerVec,
-                                    int maxNodes,
-                                    double recallTarget,
-                                    double lambdaRecall,
-                                    double estimatedRecall,
-                                    const std::string& weightsCsv,
-                                    PivotEstimatorComputation& out)
-{
-    out = PivotEstimatorComputation();
-    if (tags == nullptr || numVectors <= 0 || numTagsPerVec <= 0) {
-        return false;
-    }
-
-    (void)maxNodes;
-
-    out.levelData.resize(numTagsPerVec);
-    for (int level = 0; level < numTagsPerVec; ++level)
-    {
-        std::unordered_map<uint32_t, int> levelCounts;
-        levelCounts.reserve(static_cast<size_t>(numVectors) / 4 + 8);
-        std::unordered_map<uint32_t, uint32_t> parentByTag;
-        if (level > 0) {
-            parentByTag.reserve(static_cast<size_t>(numVectors) / 4 + 8);
-        }
-
-        for (int vectorId = 0; vectorId < numVectors; ++vectorId)
-        {
-            const size_t vectorOffset = static_cast<size_t>(vectorId) * static_cast<size_t>(numTagsPerVec);
-            uint32_t tag = tags[vectorOffset + static_cast<size_t>(level)];
-            levelCounts[tag] += 1;
-
-            if (level > 0)
-            {
-                uint32_t parentTag = tags[vectorOffset + static_cast<size_t>(level - 1)];
-                auto parentIt = parentByTag.find(tag);
-                if (parentIt == parentByTag.end()) {
-                    parentByTag.emplace(tag, parentTag);
-                } else if (parentIt->second != parentTag) {
-                    return false;
-                }
-            }
-        }
-
-        std::vector<std::pair<uint32_t, int>> pairs(levelCounts.begin(), levelCounts.end());
-        std::sort(pairs.begin(), pairs.end(), [](const auto& left, const auto& right) { return left.first < right.first; });
-
-        out.levelData[level].uniqueTags.reserve(pairs.size());
-        out.levelData[level].counts.reserve(pairs.size());
-        for (size_t i = 0; i < pairs.size(); ++i)
-        {
-            out.levelData[level].uniqueTags.push_back(pairs[i].first);
-            out.levelData[level].counts.push_back(pairs[i].second);
-        }
-        if (level > 0) {
-            out.levelData[level].parentByTag = std::move(parentByTag);
-        }
-    }
-
-    if (!ParseLevelWeights(weightsCsv, numTagsPerVec, out.levelWeights)) {
-        out.levelWeights.assign(numTagsPerVec, 1.0 / static_cast<double>(numTagsPerVec));
-    }
-
-    const double totalVectors = static_cast<double>(numVectors);
-
-    const int leafLevel = numTagsPerVec - 1;
-    const auto& leafTags = out.levelData[leafLevel].uniqueTags;
-    const auto& leafCounts = out.levelData[leafLevel].counts;
-    if (leafTags.empty() || leafTags.size() != leafCounts.size()) {
-        return false;
-    }
-
-    std::vector<LeafGreedyPlanEntry> leafEntries;
-    leafEntries.reserve(leafTags.size());
-    for (size_t idx = 0; idx < leafTags.size(); ++idx)
-    {
-        if (leafCounts[idx] <= 0) {
-            continue;
-        }
-
-        LeafGreedyPlanEntry entry;
-        entry.leafTag = leafTags[idx];
-        entry.leafCount = leafCounts[idx];
-        entry.ancestorPath.resize(static_cast<size_t>(numTagsPerVec));
-
-        bool validPath = true;
-        for (int level = 0; level <= leafLevel; ++level)
-        {
-            uint32_t ancestorTag = 0;
-            if (!TryGetAncestorTag(entry.leafTag, leafLevel, level, out.levelData, ancestorTag)) {
-                validPath = false;
-                break;
-            }
-            entry.ancestorPath[static_cast<size_t>(level)] = ancestorTag;
-        }
-
-        if (!validPath) {
-            return false;
-        }
-
-        leafEntries.emplace_back(std::move(entry));
-    }
-
-    if (leafEntries.empty()) {
-        return false;
-    }
-
-    // ----- Tree-aware Huffman greedy merge -----
-    // Each "group" starts as a single leaf and lives at `currentLevel`. At every
-    // step we pop the globally smallest group, find the smallest mergeable
-    // sibling (same parent at currentLevel-1), and merge them. When no sibling
-    // remains under that parent, the group is left aside; after all merges at
-    // currentLevel are done, surviving groups are promoted to currentLevel-1.
-    // After each individual merge we snapshot the partition into out.candidates
-    // so that FindBestPivotEstimatorCandidate picks the lowest-cost stopping
-    // point under the configured cost model.
-    struct HuffGroup {
-        int level;                       // current depth (leafLevel..0)
-        uint32_t anchorTag;              // tag value at `level` representing this group
-        int size;                        // total vector count
-        std::vector<uint32_t> leafTags;  // leaf-level tags covered
-        bool alive;
-    };
-
-    std::vector<HuffGroup> groups;
-    groups.reserve(leafEntries.size());
-    for (const auto& le : leafEntries) {
-        HuffGroup g;
-        g.level = leafLevel;
-        g.anchorTag = le.leafTag;
-        g.size = le.leafCount;
-        g.leafTags = { le.leafTag };
-        g.alive = true;
-        groups.push_back(std::move(g));
-    }
-
-    auto ancestorAt = [&](uint32_t tag, int fromLevel, int targetLevel) -> uint32_t {
-        if (fromLevel == targetLevel) return tag;
-        uint32_t a = tag;
-        TryGetAncestorTag(tag, fromLevel, targetLevel, out.levelData, a);
-        return a;
-    };
-
-    // Build a candidate snapshot from currently-alive groups and evaluate cost.
-    auto snapshotCandidate = [&]() {
-        PivotEstimatorCandidate cand;
-        cand.pivotLevel = leafLevel;
-        cand.nodePivotTags.reserve(groups.size());
-        for (const auto& g : groups) {
-            if (!g.alive) continue;
-            std::vector<uint32_t> tagsCopy = g.leafTags;
-            std::sort(tagsCopy.begin(), tagsCopy.end());
-            cand.nodePivotTags.push_back(std::move(tagsCopy));
-        }
-        cand.nodeCount = static_cast<int>(cand.nodePivotTags.size());
-        if (cand.nodeCount > 0) {
-            EvaluatePivotEstimatorCandidateCost(cand, out.levelData, out.levelWeights,
-                                                numTagsPerVec, totalVectors,
-                                                recallTarget, lambdaRecall, estimatedRecall);
-            out.candidates.push_back(std::move(cand));
-        }
-    };
-
-    // Snapshot the initial state (every leaf is its own node).
-    snapshotCandidate();
-
-    int currentLevel = leafLevel;
-    while (currentLevel >= 0)
-    {
-        // Bucket alive groups at currentLevel by parent at currentLevel-1.
-        // At currentLevel == 0 (top org-level) everyone shares a virtual root,
-        // so we collapse them into a single bucket and keep merging until one.
-        constexpr uint32_t kVirtualRootTag = std::numeric_limits<uint32_t>::max();
-        std::unordered_map<uint32_t, std::unordered_set<int>> sibBuckets;
-        for (int i = 0; i < static_cast<int>(groups.size()); ++i) {
-            if (!groups[i].alive || groups[i].level != currentLevel) continue;
-            uint32_t parentTag = (currentLevel == 0)
-                ? kVirtualRootTag
-                : ancestorAt(groups[i].anchorTag, currentLevel, currentLevel - 1);
-            sibBuckets[parentTag].insert(i);
-        }
-
-        // Global min-heap of alive groups at currentLevel by size, breaking ties by idx.
-        using HeapEntry = std::tuple<int, int, int>;  // (size, version, idx)
-        std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
-        std::vector<int> version(groups.size(), 0);
-        for (int i = 0; i < static_cast<int>(groups.size()); ++i) {
-            if (groups[i].alive && groups[i].level == currentLevel)
-                heap.emplace(groups[i].size, 0, i);
-        }
-
-        while (!heap.empty()) {
-            HeapEntry top = heap.top(); heap.pop();
-            int sz = std::get<0>(top);
-            int ver = std::get<1>(top);
-            int idx = std::get<2>(top);
-            if (!groups[idx].alive || groups[idx].level != currentLevel) continue;
-            if (ver != version[idx] || groups[idx].size != sz) continue;  // stale entry
-
-            uint32_t parentTag = (currentLevel == 0)
-                ? kVirtualRootTag
-                : ancestorAt(groups[idx].anchorTag, currentLevel, currentLevel - 1);
-            auto bIt = sibBuckets.find(parentTag);
-            if (bIt == sibBuckets.end()) continue;
-            auto& sibSet = bIt->second;
-
-            // Find smallest alive sibling (excluding idx).
-            int bestSib = -1;
-            int bestSibSize = std::numeric_limits<int>::max();
-            for (int s : sibSet) {
-                if (s == idx) continue;
-                if (!groups[s].alive || groups[s].level != currentLevel) continue;
-                if (groups[s].size < bestSibSize) {
-                    bestSibSize = groups[s].size;
-                    bestSib = s;
-                }
-            }
-            if (bestSib < 0) {
-                // Sole survivor under this parent at this level → cannot merge
-                // further here; remove from bucket so we stop revisiting it.
-                sibSet.erase(idx);
-                continue;
-            }
-
-            // Merge bestSib into idx.
-            groups[idx].size += groups[bestSib].size;
-            groups[idx].leafTags.insert(groups[idx].leafTags.end(),
-                                        groups[bestSib].leafTags.begin(),
-                                        groups[bestSib].leafTags.end());
-            groups[bestSib].alive = false;
-            sibSet.erase(bestSib);
-
-            // Re-push the grown group; bump its version so older entries become stale.
-            version[idx] += 1;
-            heap.emplace(groups[idx].size, version[idx], idx);
-
-            snapshotCandidate();
-        }
-
-        if (currentLevel == 0) break;
-
-        // Promote remaining alive groups to the parent level.
-        for (auto& g : groups) {
-            if (!g.alive || g.level != currentLevel) continue;
-            uint32_t newAnchor = ancestorAt(g.anchorTag, currentLevel, currentLevel - 1);
-            g.level = currentLevel - 1;
-            g.anchorTag = newAnchor;
-        }
-        currentLevel -= 1;
-    }
-
-    return !out.candidates.empty();
-}
-
-const PivotEstimatorCandidate* FindBestPivotEstimatorCandidate(const std::vector<PivotEstimatorCandidate>& candidates)
-{
-    if (candidates.empty()) return nullptr;
-
-    // Optional override: SPTAG_PIVOT_FORCE_NODE_COUNT=N pins the chosen
-    // candidate to the snapshot whose nodeCount is N (smallest |diff| wins).
-    // Useful for ablations (e.g. N=1 reproduces a single-shard "original"
-    // layout while keeping the node-aware code path warm).
-    const char* envForce = std::getenv("SPTAG_PIVOT_FORCE_NODE_COUNT");
-    if (envForce != nullptr && envForce[0] != '\0') {
-        int target = std::atoi(envForce);
-        if (target > 0) {
-            const PivotEstimatorCandidate* pick = &candidates.front();
-            int bestDiff = std::abs(pick->nodeCount - target);
-            for (const auto& c : candidates) {
-                int d = std::abs(c.nodeCount - target);
-                if (d < bestDiff) { bestDiff = d; pick = &c; }
-            }
-            return pick;
-        }
-    }
-
-    const PivotEstimatorCandidate* best = &candidates.front();
-    for (const auto& candidate : candidates)
-    {
-        if (candidate.totalCost < best->totalCost) {
-            best = &candidate;
-        }
-    }
-    return best;
-}
-
-void BuildTagToNodeIndexForCandidate(const PivotEstimatorCandidate& candidate,
-                                     const std::vector<PivotEstimatorLevelData>& levelData,
-                                     std::unordered_map<uint32_t, std::vector<int>>& tagToNodes)
-{
-    tagToNodes.clear();
-
-    std::unordered_map<uint32_t, int> nodeByPivotTag;
-    BuildNodeByPivotTag(candidate, nodeByPivotTag);
-
-    for (int level = 0; level < static_cast<int>(levelData.size()); ++level)
-    {
-        for (uint32_t tag : levelData[level].uniqueTags)
-        {
-            std::vector<int> nodes;
-            CollectNodesForTag(level, tag, candidate, levelData, nodeByPivotTag, nodes);
-            if (!nodes.empty()) {
-                auto& merged = tagToNodes[tag];
-                merged.insert(
-                    merged.end(),
-                    nodes.begin(), nodes.end());
-            }
-        }
-    }
-    for (auto& entry : tagToNodes) {
-        auto& nodes = entry.second;
-        std::sort(nodes.begin(), nodes.end());
-        nodes.erase(
-            std::unique(nodes.begin(), nodes.end()),
-            nodes.end());
-    }
-}
-
-void BuildNodeVectorAssignmentsForTagToNodes(const uint32_t* tags,
-                                             int numVectors,
-                                             int numTagsPerVec,
-                                             const std::unordered_map<uint32_t, std::vector<int>>& tagToNodes,
-                                             int nodeCount,
-                                             std::vector<std::vector<int>>& nodeVectors)
-{
-    nodeVectors.clear();
-    if (tags == nullptr || numVectors <= 0 || numTagsPerVec <= 0 || nodeCount <= 0) {
-        return;
-    }
-
-    nodeVectors.assign(nodeCount, std::vector<int>());
-    for (int vectorId = 0; vectorId < numVectors; ++vectorId)
-    {
-        std::unordered_set<int> touchedNodes;
-        const size_t vectorOffset = static_cast<size_t>(vectorId) * static_cast<size_t>(numTagsPerVec);
-        for (int tagIdx = 0; tagIdx < numTagsPerVec; ++tagIdx)
-        {
-            auto tagIt = tagToNodes.find(tags[vectorOffset + static_cast<size_t>(tagIdx)]);
-            if (tagIt == tagToNodes.end()) {
-                continue;
-            }
-
-            touchedNodes.insert(tagIt->second.begin(), tagIt->second.end());
-        }
-
-        if (touchedNodes.empty()) {
-            continue;
-        }
-
-        for (int nodeId : touchedNodes)
-        {
-            if (nodeId >= 0 && nodeId < nodeCount) {
-                nodeVectors[static_cast<size_t>(nodeId)].push_back(vectorId);
-            }
-        }
-    }
-}
-
-void BuildPrimaryNodeVectorAssignmentsForCandidate(const PivotEstimatorCandidate& candidate,
-                                                   const uint32_t* tags,
-                                                   int numVectors,
-                                                   int numTagsPerVec,
-                                                   std::vector<std::vector<int>>& nodeVectors)
-{
-    nodeVectors.clear();
-    if (tags == nullptr || numVectors <= 0 || numTagsPerVec <= 0 || candidate.nodeCount <= 0) {
-        return;
-    }
-
-    std::unordered_map<uint32_t, int> nodeByPivotTag;
-    BuildNodeByPivotTag(candidate, nodeByPivotTag);
-
-    nodeVectors.assign(candidate.nodeCount, std::vector<int>());
-    for (int vectorId = 0; vectorId < numVectors; ++vectorId)
-    {
-        uint32_t pivotTag = tags[static_cast<size_t>(vectorId) * static_cast<size_t>(numTagsPerVec) + static_cast<size_t>(candidate.pivotLevel)];
-        auto nodeIt = nodeByPivotTag.find(pivotTag);
-        if (nodeIt == nodeByPivotTag.end()) {
-            continue;
-        }
-
-        int nodeId = nodeIt->second;
-        if (nodeId >= 0 && nodeId < candidate.nodeCount) {
-            nodeVectors[static_cast<size_t>(nodeId)].push_back(vectorId);
-        }
-    }
-}
-
-void BuildHeadNodeToNodeIndexForCandidate(const PivotEstimatorCandidate& candidate,
-                                          const uint32_t* tags,
-                                          int numVectors,
-                                          int numTagsPerVec,
-                                          const std::shared_ptr<SPTAG::VectorIndex>& memoryIndex,
-                                          SPTAG::SPANN::ISPANNIndex* spannInternalIdx,
-                                          std::vector<int>& headNodeToNode)
-{
-    headNodeToNode.clear();
-    if (tags == nullptr || numVectors <= 0 || numTagsPerVec <= 0 || memoryIndex == nullptr || spannInternalIdx == nullptr) {
-        return;
-    }
-
-    std::unordered_map<uint32_t, int> nodeByPivotTag;
-    BuildNodeByPivotTag(candidate, nodeByPivotTag);
-
-    const SizeType numHeadSamples = memoryIndex->GetNumSamples();
-    headNodeToNode.assign(numHeadSamples, -1);
-    const bool useMeta = memoryIndex->HasHeadNodeMeta();
-    for (SizeType hid = 0; hid < numHeadSamples; ++hid)
-    {
-        SizeType globalVID = useMeta ? memoryIndex->GetHeadNodeGlobalVID(hid)
-                                     : spannInternalIdx->GetGlobalVID(hid);
-        if (globalVID == SPTAG::MaxSize || globalVID >= static_cast<SizeType>(numVectors)) {
-            continue;
-        }
-
-        uint32_t pivotTag = tags[static_cast<size_t>(globalVID) * static_cast<size_t>(numTagsPerVec) + static_cast<size_t>(candidate.pivotLevel)];
-        auto nodeIt = nodeByPivotTag.find(pivotTag);
-        if (nodeIt != nodeByPivotTag.end()) {
-            headNodeToNode[hid] = nodeIt->second;
-        }
-    }
-}
-
-bool TryCollectRoutingNodesForQuery(const std::unordered_map<uint32_t, std::vector<int>>& tagToNodes,
-                                    const uint32_t* queryTags,
-                                    int numQueryTags,
-                                    std::vector<int>& outNodes)
-{
-    outNodes.clear();
-    if (queryTags == nullptr || numQueryTags <= 0) {
-        return false;
-    }
-
-    std::unordered_set<int> unionNodes;
-    for (int idx = 0; idx < numQueryTags; ++idx)
-    {
-        auto tagIt = tagToNodes.find(queryTags[idx]);
-        if (tagIt == tagToNodes.end() || tagIt->second.empty()) {
-            outNodes.clear();
-            return false;
-        }
-
-        unionNodes.insert(tagIt->second.begin(), tagIt->second.end());
-    }
-
-    outNodes.assign(unionNodes.begin(), unionNodes.end());
-    std::sort(outNodes.begin(), outNodes.end());
-    return !outNodes.empty();
-}
-
-bool TryCollectRoutingNodesForDNF(
-    const std::unordered_map<uint32_t, std::vector<int>>& tagToNodes,
-    const SPTAG::Cache::DNFPredicate& dnf,
-    std::vector<int>& outNodes)
-{
-    outNodes.clear();
-    if (dnf.Empty()) return false;
-
-    std::unordered_set<int> unionNodes;
-    for (const auto& clause : dnf.clauses) {
-        std::unordered_set<int> clauseNodes;
-        bool constrained = false;
-        for (const auto& literal : clause.lits) {
-            if (literal.kind != 0) continue;
-            if (literal.op != SPTAG::Cache::DNF_EQ) {
-                outNodes.clear();
-                return false;
-            }
-            const auto tag = tagToNodes.find(literal.val);
-            if (tag == tagToNodes.end() || tag->second.empty()) {
-                outNodes.clear();
-                return false;
-            }
-            if (!constrained) {
-                clauseNodes.insert(
-                    tag->second.begin(), tag->second.end());
-                constrained = true;
-                continue;
-            }
-            std::unordered_set<int> intersection;
-            for (int node : tag->second) {
-                if (clauseNodes.count(node) != 0) {
-                    intersection.insert(node);
-                }
-            }
-            clauseNodes.swap(intersection);
-        }
-        if (!constrained || clauseNodes.empty()) {
-            outNodes.clear();
-            return false;
-        }
-        unionNodes.insert(
-            clauseNodes.begin(), clauseNodes.end());
-    }
-
-    outNodes.assign(unionNodes.begin(), unionNodes.end());
-    std::sort(outNodes.begin(), outNodes.end());
-    return !outNodes.empty();
-}
-
-bool SaveHeadNodeRoutingIndexFile(const std::string& workDir,
-                                  int pivotLevel,
-                                  const std::vector<std::vector<uint32_t>>& nodePivotTags,
-                                  const std::unordered_map<uint32_t, std::vector<int>>& tagToNodes,
-                                  const std::vector<int>& headNodeToNode)
-{
-    std::string path = HeadNodeRoutingIndexPath(workDir);
-    FILE* f = fopen(path.c_str(), "wb");
-    if (!f) return false;
-
-    HeadNodeRoutingIndexFileHeader header{};
-    header.version = kHeadNodeRoutingIndexVersion;
-    header.pivotLevel = pivotLevel;
-    header.nodeCount = static_cast<int32_t>(nodePivotTags.size());
-    header.numHeadSamples = static_cast<int32_t>(headNodeToNode.size());
-    header.numTagMappings = static_cast<int32_t>(tagToNodes.size());
-
-    bool ok = fwrite(&header, sizeof(header), 1, f) == 1;
-    for (const auto& tagsForNode : nodePivotTags)
-    {
-        int32_t tagCount = static_cast<int32_t>(tagsForNode.size());
-        ok = ok && fwrite(&tagCount, sizeof(tagCount), 1, f) == 1;
-        if (tagCount > 0) {
-            ok = ok && fwrite(tagsForNode.data(), sizeof(uint32_t), tagCount, f) == static_cast<size_t>(tagCount);
-        }
-    }
-
-    std::vector<std::pair<uint32_t, std::vector<int>>> mappings(tagToNodes.begin(), tagToNodes.end());
-    std::sort(mappings.begin(), mappings.end(), [](const auto& left, const auto& right) { return left.first < right.first; });
-    for (auto& [tag, nodes] : mappings)
-    {
-        std::sort(nodes.begin(), nodes.end());
-        nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
-
-        int32_t nodeCount = static_cast<int32_t>(nodes.size());
-        ok = ok && fwrite(&tag, sizeof(tag), 1, f) == 1;
-        ok = ok && fwrite(&nodeCount, sizeof(nodeCount), 1, f) == 1;
-        if (nodeCount > 0) {
-            ok = ok && fwrite(nodes.data(), sizeof(int32_t), nodeCount, f) == static_cast<size_t>(nodeCount);
-        }
-    }
-
-    if (!headNodeToNode.empty()) {
-        ok = ok && fwrite(headNodeToNode.data(), sizeof(int32_t), headNodeToNode.size(), f) == headNodeToNode.size();
-    }
-    fclose(f);
-    return ok;
-}
-
-bool LoadHeadNodeRoutingIndexFile(const std::string& workDir,
-                                  int& pivotLevel,
-                                  int& nodeCount,
-                                  std::vector<std::vector<uint32_t>>& nodePivotTags,
-                                  std::unordered_map<uint32_t, std::vector<int>>& tagToNodes,
-                                  std::vector<int>& headNodeToNode)
-{
-    pivotLevel = -1;
-    nodeCount = 0;
-    nodePivotTags.clear();
-    tagToNodes.clear();
-    headNodeToNode.clear();
-
-    std::string path = HeadNodeRoutingIndexPath(workDir);
-    FILE* f = fopen(path.c_str(), "rb");
-    if (!f) return false;
-
-    HeadNodeRoutingIndexFileHeader header{};
-    bool ok = fread(&header, sizeof(header), 1, f) == 1;
-    if (!ok || header.version != kHeadNodeRoutingIndexVersion || header.nodeCount < 0 ||
-        header.numHeadSamples < 0 || header.numTagMappings < 0) {
-        fclose(f);
-        return false;
-    }
-
-    pivotLevel = header.pivotLevel;
-    nodeCount = header.nodeCount;
-    nodePivotTags.assign(header.nodeCount, std::vector<uint32_t>());
-    for (int nodeId = 0; nodeId < header.nodeCount; ++nodeId)
-    {
-        int32_t tagCount = 0;
-        ok = fread(&tagCount, sizeof(tagCount), 1, f) == 1;
-        if (!ok || tagCount < 0) {
-            fclose(f);
-            return false;
-        }
-        nodePivotTags[nodeId].resize(tagCount);
-        if (tagCount > 0) {
-            ok = fread(nodePivotTags[nodeId].data(), sizeof(uint32_t), tagCount, f) == static_cast<size_t>(tagCount);
-            if (!ok) {
-                fclose(f);
-                return false;
-            }
-        }
-    }
-
-    for (int mappingId = 0; mappingId < header.numTagMappings; ++mappingId)
-    {
-        uint32_t tag = 0;
-        int32_t mappingNodeCount = 0;
-        ok = fread(&tag, sizeof(tag), 1, f) == 1;
-        ok = ok && fread(&mappingNodeCount, sizeof(mappingNodeCount), 1, f) == 1;
-        if (!ok || mappingNodeCount < 0) {
-            fclose(f);
-            return false;
-        }
-
-        std::vector<int> nodes(mappingNodeCount);
-        if (mappingNodeCount > 0) {
-            ok = fread(nodes.data(), sizeof(int32_t), mappingNodeCount, f) == static_cast<size_t>(mappingNodeCount);
-            if (!ok) {
-                fclose(f);
-                return false;
-            }
-        }
-        tagToNodes.emplace(tag, std::move(nodes));
-    }
-
-    headNodeToNode.resize(header.numHeadSamples);
-    if (header.numHeadSamples > 0) {
-        ok = fread(headNodeToNode.data(), sizeof(int32_t), header.numHeadSamples, f) == static_cast<size_t>(header.numHeadSamples);
-    }
-    fclose(f);
-    return ok;
 }
 
 AnnIndex::AnnIndex(DimensionType p_dimension)
@@ -4061,13 +2743,6 @@ TenantIndexManager::~TenantIndexManager()
     m_tenantPostingOffsets.clear();
     m_tenantHeadCounts.clear();
     m_tenantTagRoutingStats.clear();
-    m_tenantPivotLevels.clear();
-    m_tenantPivotNodeCounts.clear();
-    m_tenantNodePivotTags.clear();
-    m_tenantPlannedNodeVectors.clear();
-    m_tenantPlannedPrimaryNodeVectors.clear();
-    m_tenantTagToNodes.clear();
-    m_tenantHeadNodeToNode.clear();
 
     // Shut the shared RocksDB down only after every tenant index (which holds
     // a TenantPrefixedKeyValueIO referencing the shared DB through a
@@ -4217,6 +2892,29 @@ std::shared_ptr<AnnIndex> TenantIndexManager::LoadSpannWithSharedDB(const std::s
 bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata, SizeType p_vectorNum,
                                        bool p_withMetaIndex, bool p_normalized)
 {
+    if (!SPTAG::SPANN::Options::ValidateNativeEnvironment()) return false;
+    const auto removedSetting = [](const char* name, const char* value, const char* section) {
+        return SPTAG::SPANN::Options::IsRemovedParameter(name) ||
+            SPTAG::SPANN::Options::IsRemovedSectionAlias(section, name) ||
+            ((SPTAG::Helper::StrUtils::StrEqualIgnoreCase(name, "SelectHeadType") ||
+              SPTAG::Helper::StrUtils::StrEqualIgnoreCase(name, "SelectType")) &&
+             SPTAG::Helper::StrUtils::StrEqualIgnoreCase(value, "PerTagBKT"));
+    };
+    for (const auto& parameter : m_pendingBuildParams) {
+        if (removedSetting(std::get<0>(parameter).c_str(), std::get<1>(parameter).c_str(),
+                           std::get<2>(parameter).c_str())) {
+            fprintf(stderr, "[ERROR] %s was removed; use canonical native options.\n",
+                    std::get<0>(parameter).c_str());
+            return false;
+        }
+    }
+    for (const auto& parameter : m_extraSSDBuildParams) {
+        if (removedSetting(parameter.first.c_str(), parameter.second.c_str(), "BuildSSDIndex")) {
+            fprintf(stderr, "[ERROR] %s was removed; use canonical native options.\n",
+                    parameter.first.c_str());
+            return false;
+        }
+    }
     if (p_vectorNum == 0 || m_dimension == 0 || p_vectors.Length() != p_vectorNum * m_inputVectorSize)
     {
         return false;
@@ -4231,16 +2929,10 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
     m_tenantSpannWorkDirs.clear();
     m_tenantTagRoutingStats.clear();
     m_tenantSparseIdx.clear();
-    m_tenantExtremeSparseTagStores.clear();
     m_tenantTagPurePostings.clear();
     m_tenantTagPureKV.clear();
     m_tenantTagLevelOffsets.clear();
     m_tenantNumericMeta.clear();
-    m_tenantPivotLevels.clear();
-    m_tenantPivotNodeCounts.clear();
-    m_tenantNodePivotTags.clear();
-    m_tenantTagToNodes.clear();
-    m_tenantHeadNodeToNode.clear();
     m_tenantGlobalIndices.clear();
 
     const bool singleTenantBulk = m_buildSingleTenantId >= 0;
@@ -4335,15 +3027,9 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
         const size_t totalVectorSize =
             static_cast<size_t>(tenantVecCount) * m_inputVectorSize;
 
-        // Zero-copy fast path (SPTAG_BUILD_SHARE_OWNERSHIP=1): when this tenant's
-        // vectors are already a contiguous slice of the caller-provided p_vectors
-        // buffer (the common single-tenant 1B-scale case where every vector maps
-        // to tenant 0 in order), borrow that slice directly instead of allocating
-        // and memcpy'ing a full duplicate. Combined with SetShareBuildOwnership
-        // (which forwards p_shareOwnership=true to the core BuildIndex) this avoids
-        // two full copies of the vector data (wrapper + core), each ~93 GB at 1B
-        // int8 vectors. The borrowed p_vectors buffer (a numpy memmap passed via
-        // the SWIG buffer protocol) must stay alive for the duration of the build.
+        // Bulk borrowing follows the native mutability contract, not an override.
+        // The legacy override remains available only to the general metadata API.
+        // Borrowed caller storage must stay alive through build/save.
         static const bool kShareOwnership = []() {
             const char* e = std::getenv("SPTAG_BUILD_SHARE_OWNERSHIP");
             return e != nullptr && e[0] != '\0' && e[0] != '0';
@@ -4352,9 +3038,7 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             !p_normalized &&
             SPTAG::Helper::StrUtils::StrEqualIgnoreCase(
                 distMethod.c_str(), "Cosine");
-        bool contiguous =
-            (singleTenantBulk && !buildMayMutateVectors) ||
-            kShareOwnership;
+        bool contiguous = singleTenantBulk ? !buildMayMutateVectors : kShareOwnership;
         for (size_t i = 1; contiguous && i < vectorRanges.size(); ++i) {
             if (vectorRanges[i].first != vectorRanges[i - 1].first + m_inputVectorSize) {
                 contiguous = false;
@@ -4379,6 +3063,9 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                 out += vec.second;
             }
             tenantVectors = ByteArray(tenantVectorBuffer, totalVectorSize, true);
+            if (singleTenantBulk)
+                fprintf(stderr, "[INFO] Tenant %d: mutable native normalization copy (%zu bytes)\n",
+                    tenantId, totalVectorSize);
         }
 
         ByteArray tenantMetadata;
@@ -4472,228 +3159,15 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                                 limitedTagColumn);
                 }
             }
-            const char* skipPivotEnv = std::getenv("SPTAG_DISABLE_PIVOT_ESTIMATOR");
-            const bool skipPivot = skipPivotEnv != nullptr &&
-                (skipPivotEnv[0] == '1' ||
-                 SPTAG::Helper::StrUtils::StrEqualIgnoreCase(skipPivotEnv, "true") ||
-                 SPTAG::Helper::StrUtils::StrEqualIgnoreCase(skipPivotEnv, "yes") ||
-                 SPTAG::Helper::StrUtils::StrEqualIgnoreCase(skipPivotEnv, "on"));
-            if (skipPivot) {
-                fprintf(stderr, "[INFO] Tenant %d: SPTAG_DISABLE_PIVOT_ESTIMATOR set, skipping node-aware planning\n", tenantId);
+            if (limitedTagPostingEnabled &&
+                (!limitedTagColumnValid || limitedTagColumn < 0 ||
+                 limitedTagColumn >= m_buildNumTagsPerVec ||
+                 tenantLocalTagCount != static_cast<size_t>(tenantVecCount) *
+                                            m_buildNumTagsPerVec)) {
+                fprintf(stderr, "[ERROR] Tenant %d: invalid limited-tag attribute layout\n", tenantId);
+                return false;
             }
-            if (hybridDistanceEnabled) {
-                auto& globalAssignments =
-                    m_tenantPlannedNodeVectors[
-                        tenantId];
-                globalAssignments.assign(1, {});
-                globalAssignments[0].reserve(
-                    static_cast<size_t>(
-                        tenantVecCount));
-                for (SizeType vectorId = 0;
-                     vectorId < tenantVecCount;
-                     ++vectorId) {
-                    globalAssignments[0].push_back(
-                        vectorId);
-                }
-                m_tenantPlannedPrimaryNodeVectors[
-                    tenantId] = globalAssignments;
-                m_tenantPivotLevels[tenantId] = -1;
-                m_tenantPivotNodeCounts[tenantId] = 1;
-                m_tenantNodePivotTags[tenantId] = {
-                    std::vector<std::uint32_t>()};
-                auto& tagToNodes =
-                    m_tenantTagToNodes[tenantId];
-                tagToNodes.clear();
-                for (size_t tagIndex = 0;
-                     tagIndex < tenantLocalTagCount;
-                     ++tagIndex) {
-                    tagToNodes[tenantLocalTags[tagIndex]] = {0};
-                }
-                fprintf(
-                    stderr,
-                    "[INFO] Tenant %d: hybrid distance uses one global "
-                    "head/posting node over all %d vectors; attribute pivot "
-                    "partitioning is disabled\n",
-                    tenantId, tenantVecCount);
-            } else if (limitedTagPostingEnabled) {
-                const size_t expectedTagCount =
-                    static_cast<size_t>(tenantVecCount) *
-                    static_cast<size_t>(m_buildNumTagsPerVec);
-                if (!limitedTagColumnValid ||
-                    limitedTagColumn < 0 ||
-                    limitedTagColumn >= m_buildNumTagsPerVec ||
-                    tenantLocalTagCount != expectedTagCount) {
-                    fprintf(
-                        stderr,
-                        "[ERROR] Tenant %d: invalid LimitedTagColumn=%d "
-                        "for %d attributes (%zu/%zu tag values loaded)\n",
-                        tenantId, limitedTagColumn,
-                        m_buildNumTagsPerVec,
-                        tenantLocalTagCount,
-                        expectedTagCount);
-                    return false;
-                }
-                m_tenantPivotLevels[tenantId] = -1;
-                m_tenantPivotNodeCounts[tenantId] = 1;
-                m_tenantNodePivotTags[tenantId] = {
-                    std::vector<std::uint32_t>()};
-                auto& tagToNodes =
-                    m_tenantTagToNodes[tenantId];
-                tagToNodes.clear();
-                for (SizeType vectorId = 0;
-                     vectorId < tenantVecCount;
-                     ++vectorId) {
-                    const std::uint32_t tag =
-                        tenantLocalTags[
-                            static_cast<size_t>(vectorId) *
-                                static_cast<size_t>(
-                                    m_buildNumTagsPerVec) +
-                            static_cast<size_t>(
-                                limitedTagColumn)];
-                    tagToNodes[tag] = {0};
-                }
-                fprintf(
-                    stderr,
-                    "[INFO] Tenant %d: limited-tag posting uses one global "
-                    "head graph with self-plus-one support from column %d; "
-                    "attribute pivot partitioning is disabled\n",
-                    tenantId, limitedTagColumn);
-            } else if (!skipPivot && tenantLocalTagCount != 0) {
-                // Routing/bundle planning must consider only the CATEGORICAL tag
-                // columns. Numeric attributes are inlined as the last
-                // SPTAG_NUMERIC_COLS columns (raw, high-cardinality values); if
-                // fed to the hierarchy pivot estimator they masquerade as deep
-                // hierarchy levels with ~unique values, collapsing the plan to a
-                // single bundle. Build a categorical-only view (first
-                // numBaseCols columns) for all three planning calls. The actual
-                // SPANN build below still uses the full m_buildNumTagsPerVec tags.
-                int numNumericCols = 0;
-                if (const char* e = std::getenv("SPTAG_NUMERIC_COLS")) numNumericCols = atoi(e);
-                if (numNumericCols < 0) numNumericCols = 0;
-                if (numNumericCols > m_buildNumTagsPerVec) numNumericCols = m_buildNumTagsPerVec;
-                const int numBaseCols = m_buildNumTagsPerVec - numNumericCols;
-
-                // Categorical columns that drive routing/bundle planning. By
-                // default all categorical columns participate (the legacy ACL
-                // containment-chain assumption). When the categorical columns are
-                // INDEPENDENT facets that do not form a containment chain (e.g.
-                // YFCC year/month/camera), feeding >1 of them to the pivot
-                // estimator makes it either collapse the plan or fail the
-                // unique-parent check. Two knobs select the routing columns; the
-                // remaining categorical columns stay filter-only signatures (hier
-                // mask + exact DNF), like numeric columns are kept out of routing:
-                //   * SPTAG_ACL_COLS=c0,c1,..  -> explicit, possibly NON-CONTIGUOUS
-                //     column list, projected in the given order (level i = col[i]).
-                //     Required when the ACL chain is not a leading prefix, e.g.
-                //     YFCC country(col0) -> us_state(col4) => SPTAG_ACL_COLS=0,4.
-                //   * SPTAG_ROUTING_COLS=K     -> leading-K columns (legacy). Used
-                //     only when SPTAG_ACL_COLS is unset.
-                // Column indices are clamped to [0, numBaseCols); out-of-range or
-                // duplicate entries are dropped.
-                std::vector<int> routingCols;
-                if (const char* e = std::getenv("SPTAG_ACL_COLS")) {
-                    const char* p = e;
-                    while (*p != '\0') {
-                        int c = atoi(p);
-                        if (c >= 0 && c < numBaseCols) {
-                            bool dup = false;
-                            for (int existing : routingCols) if (existing == c) { dup = true; break; }
-                            if (!dup) routingCols.push_back(c);
-                        }
-                        const char* comma = strchr(p, ',');
-                        if (comma == nullptr) break;
-                        p = comma + 1;
-                    }
-                }
-                if (routingCols.empty()) {
-                    int numRoutingCols = numBaseCols;
-                    if (const char* e = std::getenv("SPTAG_ROUTING_COLS")) {
-                        int k = atoi(e);
-                        if (k > 0) numRoutingCols = (k < numBaseCols) ? k : numBaseCols;
-                    }
-                    for (int t = 0; t < numRoutingCols; ++t) routingCols.push_back(t);
-                }
-
-                const uint32_t* planTags = tenantLocalTags;
-                int planNumTags = m_buildNumTagsPerVec;
-                std::vector<uint32_t> catOnlyTags;
-                const int numRoutingCols = static_cast<int>(routingCols.size());
-                bool identityProjection = (numRoutingCols == m_buildNumTagsPerVec);
-                if (identityProjection)
-                    for (int t = 0; t < numRoutingCols; ++t)
-                        if (routingCols[t] != t) { identityProjection = false; break; }
-                if (numRoutingCols > 0 && !identityProjection) {
-                    catOnlyTags.resize(static_cast<size_t>(tenantVecCount) * static_cast<size_t>(numRoutingCols));
-                    for (int i = 0; i < tenantVecCount; ++i)
-                        for (int t = 0; t < numRoutingCols; ++t)
-                            catOnlyTags[static_cast<size_t>(i) * numRoutingCols + t] =
-                                tenantLocalTags[static_cast<size_t>(i) * m_buildNumTagsPerVec + routingCols[t]];
-                    planTags = catOnlyTags.data();
-                    planNumTags = numRoutingCols;
-                    std::string colList;
-                    for (size_t t = 0; t < routingCols.size(); ++t)
-                        colList += (t ? "," : "") + std::to_string(routingCols[t]);
-                    fprintf(stderr,
-                            "[INFO] Tenant %d: routing-node planning on %d categorical cols [%s] "
-                            "(of %d base, %d numeric)\n",
-                            tenantId, numRoutingCols, colList.c_str(), numBaseCols, numNumericCols);
-                }
-
-                PivotEstimatorComputation pivotComputation;
-                const PivotEstimatorCandidate* pivotCandidate = nullptr;
-                if (BuildPivotEstimatorComputation(planTags,
-                                                   static_cast<int>(tenantVecCount),
-                                                   planNumTags,
-                                                   0,
-                                                   0.99,
-                                                   10.0,
-                                                   1.0,
-                                                   std::string(),
-                                                   pivotComputation)) {
-                    pivotCandidate = FindBestPivotEstimatorCandidate(pivotComputation.candidates);
-                }
-
-                if (pivotCandidate != nullptr) {
-                    m_tenantPivotLevels[tenantId] = pivotCandidate->pivotLevel;
-                    m_tenantPivotNodeCounts[tenantId] = pivotCandidate->nodeCount;
-                    m_tenantNodePivotTags[tenantId] = pivotCandidate->nodePivotTags;
-                    BuildTagToNodeIndexForCandidate(*pivotCandidate,
-                                                    pivotComputation.levelData,
-                                                    m_tenantTagToNodes[tenantId]);
-                    BuildPrimaryNodeVectorAssignmentsForCandidate(*pivotCandidate,
-                                                                  planTags,
-                                                                  static_cast<int>(tenantVecCount),
-                                                                  planNumTags,
-                                                                  m_tenantPlannedPrimaryNodeVectors[tenantId]);
-
-                    // Keep tree-structured tag-to-node merges for query routing, but
-                    // partition postings by the pivot-layer owner only so vectors are
-                    // evenly distributed across nodes instead of being replicated by
-                    // higher-level ancestor tags.
-                    m_tenantPlannedNodeVectors[tenantId] = m_tenantPlannedPrimaryNodeVectors[tenantId];
-
-                    fprintf(stderr,
-                            "[INFO] Tenant %d: planned %d routing nodes before SPANN build\n",
-                            tenantId,
-                            pivotCandidate->nodeCount);
-                }
-            }
-
-            auto planIt = m_tenantPlannedNodeVectors.find(tenantId);
-            auto primaryPlanIt = m_tenantPlannedPrimaryNodeVectors.find(tenantId);
-            bool hasNodeAwarePlan = (planIt != m_tenantPlannedNodeVectors.end() && !planIt->second.empty());
-
-            int64_t postingAssignmentCount = static_cast<int64_t>(tenantVecCount);
-            if (hasNodeAwarePlan) {
-                int64_t plannedAssignmentTotal = 0;
-                for (const auto& nodeAssignments : planIt->second) {
-                    plannedAssignmentTotal += static_cast<int64_t>(nodeAssignments.size());
-                }
-
-                if (plannedAssignmentTotal > 0) {
-                    postingAssignmentCount = plannedAssignmentTotal;
-                }
-            }
+            const int64_t postingAssignmentCount = tenantVecCount;
 
             // SPANN scratch/work directory (head index + postings written here
             // during build, then SaveAll copies to the final index dir). Defaults
@@ -4825,10 +3299,7 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                    + static_cast<int64_t>(m_buildNumTagsPerVec) * 4 + 64);
             int64_t estimatedBytes = postingAssignmentCount * perVecBytes * 10LL;
                 int startFileSizeGB = std::max(1, (int)(estimatedBytes / (1024LL * 1024LL * 1024LL)) + 1);
-                if (hasNodeAwarePlan) {
-                startFileSizeGB = std::max(startFileSizeGB, 4);
-                }
-                int maxFileSizeGB = std::max(startFileSizeGB * 3, hasNodeAwarePlan ? 32 : 10);
+                int maxFileSizeGB = std::max(startFileSizeGB * 3, 10);
             if (!explicitStart) {
                 tenantIndex->SetBuildParam("StartFileSizeGB", std::to_string(startFileSizeGB).c_str(), "BuildSSDIndex");
             }
@@ -4915,11 +3386,13 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                         m_buildNumTagsPerVec);
                 }
             }
-            if (hasNodeAwarePlan) {
-                tenantIndex->SetNodeVectorAssignments(planIt->second);
-            }
-            if (primaryPlanIt != m_tenantPlannedPrimaryNodeVectors.end() && !primaryPlanIt->second.empty()) {
-                tenantIndex->SetPrimaryNodeVectorAssignments(primaryPlanIt->second);
+            if (hybridDistanceEnabled) {
+                // Hybrid graph construction requires an explicit global owner.
+                std::vector<std::vector<int>> globalAssignments(1);
+                globalAssignments.front().resize(tenantVecCount);
+                std::iota(globalAssignments.front().begin(), globalAssignments.front().end(), 0);
+                tenantIndex->SetNodeVectorAssignments(globalAssignments);
+                tenantIndex->SetPrimaryNodeVectorAssignments(globalAssignments);
             }
 
             // Shared RocksDB: when enabled, inject a tenant-prefixed wrapper
@@ -4932,7 +3405,9 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                 if (!InjectSharedDB(tenantIndex, tenantId)) return false;
             }
 
-            tenantIndex->SetShareBuildOwnership(borrowedVectors);
+            // Bulk SPANN saves/releases this index before tenantVectors dies.
+            // A mutable normalization copy can therefore also be borrowed by core.
+            tenantIndex->SetShareBuildOwnership(borrowedVectors || singleTenantBulk);
             buildOk = tenantIndex->Build(tenantVectors, tenantVecCount, p_normalized);
             m_tenantSpannWorkDirs[tenantId] = spannWorkDir;
             fprintf(stderr, "[INFO] Tenant %d: SPANN build (%d vectors)\n", tenantId, tenantVecCount);
@@ -5439,102 +3914,6 @@ ByteArray TenantIndexManager::
     return payload;
 }
 
-ByteArray TenantIndexManager::EstimatePivotBuildPlan(ByteArray p_tags,
-                                                     int p_numVectors,
-                                                     int p_numTagsPerVec,
-                                                     int p_maxNodes,
-                                                     float p_recallTarget,
-                                                     float p_lambdaRecall,
-                                                     float p_estimatedRecall,
-                                                     ByteArray p_levelWeightsCsv) const
-{
-    if (p_numVectors <= 0 || p_numTagsPerVec <= 0 || p_tags.Data() == nullptr) {
-        return ByteArray();
-    }
-
-    size_t expectedBytes = static_cast<size_t>(p_numVectors) * static_cast<size_t>(p_numTagsPerVec) * sizeof(uint32_t);
-    if (p_tags.Length() < expectedBytes) {
-        return ByteArray();
-    }
-
-    std::string weightsCsv;
-    if (p_levelWeightsCsv.Data() != nullptr && p_levelWeightsCsv.Length() > 0) {
-        weightsCsv.assign(reinterpret_cast<const char*>(p_levelWeightsCsv.Data()), p_levelWeightsCsv.Length());
-    }
-
-    PivotEstimatorComputation computation;
-    if (!BuildPivotEstimatorComputation(reinterpret_cast<const uint32_t*>(p_tags.Data()),
-                                        p_numVectors,
-                                        p_numTagsPerVec,
-                                        p_maxNodes,
-                                        std::clamp(static_cast<double>(p_recallTarget), 0.01, 1.0),
-                                        std::max(0.0, static_cast<double>(p_lambdaRecall)),
-                                        std::clamp(static_cast<double>(p_estimatedRecall), 0.0, 1.0),
-                                        weightsCsv,
-                                        computation)) {
-        return ByteArray();
-    }
-
-    const PivotEstimatorCandidate* best = FindBestPivotEstimatorCandidate(computation.candidates);
-    if (best == nullptr) return ByteArray();
-
-    std::ostringstream json;
-    json << "{";
-    json << "\"planner_strategy\":\"greedy_leaf_packing\",";
-    json << "\"min_local_selectivity\":" << kGreedyLeafMinLocalSelectivity << ",";
-    json << "\"num_vectors\":" << p_numVectors << ",";
-    json << "\"num_levels\":" << p_numTagsPerVec << ",";
-    json << "\"requested_max_nodes\":" << p_maxNodes << ",";
-    json << "\"recall_target\":" << std::clamp(static_cast<double>(p_recallTarget), 0.01, 1.0) << ",";
-    json << "\"lambda_recall\":" << std::max(0.0, static_cast<double>(p_lambdaRecall)) << ",";
-    json << "\"estimated_recall\":" << std::clamp(static_cast<double>(p_estimatedRecall), 0.0, 1.0) << ",";
-    json << "\"best_plan\":{";
-    json << "\"pivot_level\":" << best->pivotLevel << ",";
-    json << "\"node_count\":" << best->nodeCount << ",";
-    json << "\"latency_cost\":" << best->latencyCost << ",";
-    json << "\"recall_penalty\":" << best->recallPenalty << ",";
-    json << "\"total_cost\":" << best->totalCost << "},";
-    json << "\"candidates\":[";
-    for (size_t idx = 0; idx < computation.candidates.size(); ++idx)
-    {
-        const auto& candidate = computation.candidates[idx];
-        if (idx > 0) json << ",";
-        json << "{";
-        json << "\"pivot_level\":" << candidate.pivotLevel << ",";
-        json << "\"node_count\":" << candidate.nodeCount << ",";
-        json << "\"latency_cost\":" << candidate.latencyCost << ",";
-        json << "\"recall_penalty\":" << candidate.recallPenalty << ",";
-        json << "\"total_cost\":" << candidate.totalCost << ",";
-        json << "\"node_sizes\":[";
-        for (size_t i = 0; i < candidate.nodeSizes.size(); ++i) {
-            if (i > 0) json << ",";
-            json << candidate.nodeSizes[i];
-        }
-        json << "],";
-        json << "\"node_pivot_tags\":[";
-        for (size_t node = 0; node < candidate.nodePivotTags.size(); ++node)
-        {
-            if (node > 0) json << ",";
-            json << "[";
-            for (size_t tagIdx = 0; tagIdx < candidate.nodePivotTags[node].size(); ++tagIdx)
-            {
-                if (tagIdx > 0) json << ",";
-                json << candidate.nodePivotTags[node][tagIdx];
-            }
-            json << "]";
-        }
-        json << "]";
-        json << "}";
-    }
-    json << "]";
-    json << "}";
-
-    const std::string payload = json.str();
-    ByteArray output = ByteArray::Alloc(payload.size());
-    std::memcpy(output.Data(), payload.data(), payload.size());
-    return output;
-}
-
 bool TenantIndexManager::SaveAll(const char* p_baseDir)
 {
     m_baseStoragePath = std::string(p_baseDir);
@@ -5620,11 +3999,6 @@ bool TenantIndexManager::LoadAll(const char* p_baseDir)
     m_tenantIndexPaths.clear();
     m_tenantSpannWorkDirs.clear();
     m_tenantTagRoutingStats.clear();
-    m_tenantPivotLevels.clear();
-    m_tenantPivotNodeCounts.clear();
-    m_tenantNodePivotTags.clear();
-    m_tenantTagToNodes.clear();
-    m_tenantHeadNodeToNode.clear();
 
     // Clear tenant ID mapping
     {
@@ -5721,32 +4095,9 @@ bool TenantIndexManager::LoadAll(const char* p_baseDir)
         }
         if (!LoadTenantTagRoutingStats()) return false;
         LoadTenantSparseIndices();
-        if (!LoadTenantExtremeSparseTagStores()) return false;
         LoadTenantTagPureIndices();
         return true;
     }
-}
-
-bool TenantIndexManager::LoadAllForSignatureRepair(
-    const char* p_baseDir)
-{
-    const bool previous =
-        m_allowExtremeSparseTagRepairLoad;
-    m_allowExtremeSparseTagRepairLoad = true;
-    bool loaded = false;
-    try
-    {
-        loaded = LoadAll(p_baseDir);
-    }
-    catch (...)
-    {
-        m_allowExtremeSparseTagRepairLoad =
-            previous;
-        throw;
-    }
-    m_allowExtremeSparseTagRepairLoad =
-        previous;
-    return loaded;
 }
 
 bool TenantIndexManager::LoadTenantTagRoutingStats()
@@ -5912,228 +4263,6 @@ void TenantIndexManager::LoadTenantSparseIndices()
     }
 }
 
-bool TenantIndexManager::LoadTenantExtremeSparseTagStores()
-{
-    // Extreme tags are served through the regular promoted-head H1/H2 path.
-    // Keep legacy sidecars optional while the separate direct-serving route is
-    // disabled, so the native EST build policy does not require its artifact.
-    constexpr bool kEnableExtremeSparseTagRoute = false;
-    if (!kEnableExtremeSparseTagRoute) {
-        m_tenantExtremeSparseTagStores.clear();
-        return true;
-    }
-
-    for (const auto& entry : m_tenantSpannWorkDirs)
-    {
-        const int tenantId = entry.first;
-        const std::string iniPath =
-            entry.second + "/indexloader.ini";
-        bool enabled = false;
-        const std::string enabledText =
-            ReadBuildSSDIndexValue(
-                iniPath, "EnableExtremeSparseTag");
-        if (!enabledText.empty() &&
-            !SPTAG::Helper::Convert::ConvertStringTo<bool>(
-                enabledText.c_str(), enabled))
-        {
-            fprintf(
-                stderr,
-                "[ERROR] Tenant %d: invalid EnableExtremeSparseTag=%s\n",
-                tenantId, enabledText.c_str());
-            return false;
-        }
-        if (!enabled)
-        {
-            m_tenantExtremeSparseTagStores.erase(
-                tenantId);
-            continue;
-        }
-
-        std::string fileName =
-            ReadBuildSSDIndexValue(
-                iniPath, "ExtremeSparseTagFile");
-        if (fileName.empty() ||
-            fileName == "Undefined!")
-        {
-            fileName = "extreme_sparse_tags.bin";
-        }
-        if (!IsSafeArtifactFileName(fileName))
-        {
-            fprintf(
-                stderr,
-                "[ERROR] Tenant %d: unsafe ExtremeSparseTagFile=%s\n",
-                tenantId, fileName.c_str());
-            return false;
-        }
-        int keyColumn = 0;
-        int attributeCount = 0;
-        int slotsPerHead = 0;
-        int minTagCount = 0;
-        std::uint64_t generationFingerprint = 0;
-        const std::string keyColumnText =
-            ReadBuildSSDIndexValue(
-                iniPath, "LimitedTagColumn");
-        const std::string attributeCountText =
-            ReadBuildSSDIndexValue(
-                iniPath, "NumTagsPerVec");
-        const std::string generationText =
-            ReadBuildSSDIndexValue(
-                iniPath,
-                "LimitedTagGenerationFingerprint");
-        const std::string slotsPerHeadText =
-            ReadBuildSSDIndexValue(
-                iniPath,
-                "LimitedTagSlotsPerHead");
-        std::string minTagCountText =
-            ReadBuildSSDIndexValue(
-                iniPath,
-                "ExtremeSparseTagMinCount");
-        if (minTagCountText.empty() &&
-            m_allowExtremeSparseTagRepairLoad)
-        {
-            bool hasRepairValue = false;
-            for (auto parameter =
-                     m_extraSSDBuildParams.rbegin();
-                 parameter !=
-                     m_extraSSDBuildParams.rend();
-                 ++parameter)
-            {
-                if (SPTAG::Helper::StrUtils::
-                        StrEqualIgnoreCase(
-                            parameter->first.c_str(),
-                            "ExtremeSparseTagMinCount"))
-                {
-                    minTagCountText =
-                        parameter->second;
-                    hasRepairValue = true;
-                    break;
-                }
-            }
-            if (!hasRepairValue)
-            {
-                minTagCountText = std::to_string(
-                    SPTAG::SPANN::Options()
-                        .m_extremeSparseTagMinCount);
-            }
-            int repairMinTagCount = 0;
-            if (!SPTAG::Helper::Convert::
-                    ConvertStringTo<int>(
-                        minTagCountText.c_str(),
-                        repairMinTagCount) ||
-                repairMinTagCount <= 0 ||
-                !AddMissingBuildSSDIndexValue(
-                    iniPath,
-                    "ExtremeSparseTagMinCount",
-                    minTagCountText))
-            {
-                fprintf(
-                    stderr,
-                    "[ERROR] Tenant %d: cannot migrate missing "
-                    "ExtremeSparseTagMinCount for EST repair\n",
-                    tenantId);
-                return false;
-            }
-            fprintf(
-                stderr,
-                "[WARN] Tenant %d: migrated legacy EST config "
-                "with ExtremeSparseTagMinCount=%d\n",
-                tenantId, repairMinTagCount);
-        }
-        if ((!keyColumnText.empty() &&
-             !SPTAG::Helper::Convert::ConvertStringTo<int>(
-                 keyColumnText.c_str(), keyColumn)) ||
-            attributeCountText.empty() ||
-            !SPTAG::Helper::Convert::ConvertStringTo<int>(
-                attributeCountText.c_str(),
-                attributeCount) ||
-            generationText.empty() ||
-            !SPTAG::Helper::Convert::
-                ConvertStringTo<std::uint64_t>(
-                   generationText.c_str(),
-                   generationFingerprint) ||
-            slotsPerHeadText.empty() ||
-            !SPTAG::Helper::Convert::ConvertStringTo<int>(
-                slotsPerHeadText.c_str(),
-                slotsPerHead) ||
-            minTagCountText.empty() ||
-            !SPTAG::Helper::Convert::ConvertStringTo<int>(
-                minTagCountText.c_str(),
-                minTagCount) ||
-            keyColumn < 0 || attributeCount <= 0 ||
-            keyColumn >= attributeCount ||
-            generationFingerprint == 0 ||
-            !SPTAG::SPANN::LimitedTagSupport::
-                IsSupportedSlotCount(slotsPerHead) ||
-            minTagCount <= 0)
-        {
-            fprintf(
-                stderr,
-                "[ERROR] Tenant %d: invalid extreme-sparse attribute layout\n",
-                tenantId);
-            return false;
-        }
-        const auto vectorCount =
-            m_tenantVectorCounts.find(tenantId);
-        const auto headCount =
-            m_tenantHeadCounts.find(tenantId);
-        if (vectorCount ==
-                m_tenantVectorCounts.end() ||
-            vectorCount->second <= 0 ||
-            headCount == m_tenantHeadCounts.end() ||
-            headCount->second <= 0)
-        {
-            return false;
-        }
-        const std::string path =
-            entry.second + "/" + fileName;
-        auto store = std::make_shared<
-            SPTAG::Cache::ExtremeSparseTagStore>();
-        std::string error;
-        if (!store->Load(path, &error) ||
-            !store->ValidateExpected(
-                m_valueType,
-                static_cast<std::uint32_t>(
-                    m_dimension),
-                static_cast<std::uint32_t>(
-                    attributeCount),
-                static_cast<std::uint32_t>(
-                    keyColumn),
-                static_cast<std::uint64_t>(
-                    vectorCount->second),
-                generationFingerprint,
-                static_cast<std::uint64_t>(
-                    minTagCount),
-                static_cast<std::uint64_t>(
-                    headCount->second),
-                static_cast<std::uint32_t>(
-                    slotsPerHead),
-                &error))
-        {
-            if (m_allowExtremeSparseTagRepairLoad)
-            {
-                m_tenantExtremeSparseTagStores.erase(
-                   tenantId);
-                fprintf(
-                   stderr,
-                   "[WARN] Tenant %d: deferring invalid extreme-sparse "
-                   "tag store repair for %s: %s\n",
-                   tenantId, path.c_str(),
-                   error.c_str());
-                continue;
-            }
-            fprintf(
-                stderr,
-                "[ERROR] Tenant %d: cannot load %s: %s\n",
-                tenantId, path.c_str(),
-                error.c_str());
-            return false;
-        }
-        m_tenantExtremeSparseTagStores[
-            tenantId] = std::move(store);
-    }
-    return true;
-}
-
 void TenantIndexManager::LoadTenantTagPureIndices()
 {
     // Tag-pure chunks live inside the SPANN KV store (FileIO mapping / RocksDB).
@@ -6286,7 +4415,8 @@ bool TenantIndexManager::SaveUnifiedStorage(const char* p_baseDir)
         const bool graphlessHierarchy =
             sourceConfig.GetParameter("Index", "IndexAlgoType", SPTAG::IndexAlgoType::Undefined) ==
                 SPTAG::IndexAlgoType::SPANN &&
-            sourceConfig.GetParameter("SelectHead", "SelectSecondLevel", false) &&
+            sourceConfig.GetParameter("SelectHead", "HierarchyEnabled",
+                sourceConfig.GetParameter("SelectHead", "SelectSecondLevel", false)) &&
             !sourceConfig.GetParameter("SelectHead", "BuildH1Graph", true);
         if (graphlessHierarchy) {
             std::shared_ptr<SPTAG::VectorIndex> native;
@@ -6352,7 +4482,6 @@ bool TenantIndexManager::LoadUnifiedStorage(const char* p_baseDir)
 
     if (!LoadTenantTagRoutingStats()) return false;
     LoadTenantSparseIndices();
-    if (!LoadTenantExtremeSparseTagStores()) return false;
     LoadTenantTagPureIndices();
 
     return true;
@@ -6363,6 +4492,7 @@ void TenantIndexManager::SetBuildParam(const char* p_name, const char* p_value, 
     if (p_name == nullptr || p_value == nullptr || p_section == nullptr) {
         return;
     }
+    p_name = SPTAG::SPANN::Options::CanonicalParameter(p_section, p_name);
 
     bool updated = false;
     for (auto& pendingParam : m_pendingBuildParams)
@@ -6390,6 +4520,7 @@ void TenantIndexManager::SetSearchParam(const char* p_name, const char* p_value,
     if (p_name == nullptr || p_value == nullptr || p_section == nullptr) {
         return;
     }
+    p_name = SPTAG::SPANN::Options::CanonicalParameter(p_section, p_name);
 
     std::unique_lock<std::shared_mutex> wlock(m_tenantIndicesMutex);
     bool updated = false;
@@ -6575,45 +4706,7 @@ bool TenantIndexManager::EnsureTenantLoaded(int p_tenantId)
     m_lruMap[p_tenantId] = std::prev(m_lruList.end());
 
     EnsureHeadNodeMetaLoaded(loadPath, indexPtr->GetInternalIndex());
-    if (indexType == TenantIndexType::SPANN) {
-        EnsureTenantPivotIndexLoaded(p_tenantId);
-    }
 
-    return true;
-}
-
-bool TenantIndexManager::EnsureTenantPivotIndexLoaded(int p_tenantId)
-{
-    if (m_tenantPivotLevels.count(p_tenantId) &&
-        m_tenantPivotNodeCounts.count(p_tenantId) &&
-        m_tenantNodePivotTags.count(p_tenantId) &&
-        m_tenantTagToNodes.count(p_tenantId) &&
-        m_tenantHeadNodeToNode.count(p_tenantId)) {
-        return true;
-    }
-
-    auto wdIt = m_tenantSpannWorkDirs.find(p_tenantId);
-    if (wdIt == m_tenantSpannWorkDirs.end()) return false;
-
-    int pivotLevel = -1;
-    int nodeCount = 0;
-    std::vector<std::vector<uint32_t>> nodePivotTags;
-    std::unordered_map<uint32_t, std::vector<int>> tagToNodes;
-    std::vector<int> headNodeToNode;
-    if (!LoadHeadNodeRoutingIndexFile(wdIt->second,
-                                      pivotLevel,
-                                      nodeCount,
-                                      nodePivotTags,
-                                      tagToNodes,
-                                      headNodeToNode)) {
-        return false;
-    }
-
-    m_tenantPivotLevels[p_tenantId] = pivotLevel;
-    m_tenantPivotNodeCounts[p_tenantId] = nodeCount;
-    m_tenantNodePivotTags[p_tenantId] = std::move(nodePivotTags);
-    m_tenantTagToNodes[p_tenantId] = std::move(tagToNodes);
-    m_tenantHeadNodeToNode[p_tenantId] = std::move(headNodeToNode);
     return true;
 }
 
@@ -6804,22 +4897,10 @@ void TenantIndexManager::EvictIfNeeded()
 // ============================================================================
 
 bool TenantIndexManager::BuildSignatures(
-    int p_tenantId, ByteArray p_tags,
-    int p_numVectors, int p_numTagsPerVec)
-{
-    return BuildSignaturesWithVectors(
-        p_tenantId, p_tags, p_numVectors,
-        p_numTagsPerVec, ByteArray());
-}
-
-bool TenantIndexManager::BuildSignaturesWithVectors(
     int p_tenantId, ByteArray p_tags, int p_numVectors,
-    int p_numTagsPerVec, ByteArray p_vectors)
+    int p_numTagsPerVec)
 {
-    // Extreme-sparse tags are represented by promoted regular heads. The
-    // historical EST sidecar remains readable only for index compatibility;
-    // it must never select a separate serving path.
-    constexpr bool kEnableExtremeSparseTagRoute = false;
+    if (!SPTAG::SPANN::Options::ValidateNativeEnvironment()) return false;
     const uint32_t* p_tagsPtr = reinterpret_cast<const uint32_t*>(p_tags.Data());
     if (p_tagsPtr == nullptr || p_numVectors <= 0 ||
         p_numTagsPerVec <= 0 ||
@@ -6848,20 +4929,13 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
     // consulting a process environment override.
     int directSparseMaxPostings = 320;
     bool hybridDistanceEnabled = false;
-    bool secondLevelRoutingEnabled = false;
     bool staticStorage = false;
     bool limitedTagEnabled = false;
-    bool extremeSparseTagEnabled = false;
-    bool logExtremeSparseTagRoute = false;
     int limitedTagColumn = 0;
-    int limitedTagSlotsPerHead = 2;
-    int extremeSparseTagMinCount = 10;
-    int extremeSparseTagStorageCoverageTarget = 4096;
     int staticACLTagCols = p_numTagsPerVec;
+    SPTAG::TagSchema tagSchema = SPTAG::TagSchema::Parse("", p_numTagsPerVec);
     std::uint64_t limitedTagGenerationFingerprint = 0;
     std::uint64_t signatureGenerationFingerprint = 0;
-    std::string extremeSparseTagFile =
-        "extreme_sparse_tags.bin";
     std::string primaryPostingFile =
         "SPTAGFullList.bin";
     if (!EnsureTenantLoaded(p_tenantId)) return false;
@@ -6901,36 +4975,13 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                         options != nullptr &&
                         options->m_storage ==
                             SPTAG::Storage::STATIC;
-                    secondLevelRoutingEnabled =
-                        options != nullptr &&
-                        options->m_selectSecondLevel;
                     limitedTagEnabled =
                         spann->HasLimitedTagLayout();
-                    extremeSparseTagEnabled =
-                        kEnableExtremeSparseTagRoute &&
-                        options != nullptr &&
-                        options->m_enableExtremeSparseTag;
-                    logExtremeSparseTagRoute =
-                        options != nullptr &&
-                        options->m_logExtremeSparseTagRoute;
                     if (options != nullptr) {
                         limitedTagColumn =
                             options->m_limitedTagColumn;
-                        limitedTagSlotsPerHead =
-                            options
-                                ->m_limitedTagSlotsPerHead;
-                        extremeSparseTagMinCount =
-                            options
-                                ->m_extremeSparseTagMinCount;
-                        extremeSparseTagStorageCoverageTarget =
-                            (std::max)(
-                                options
-                                    ->m_searchInternalResultNum,
-                                options->m_maxCheck);
-                        staticACLTagCols =
-                            options->m_staticACLTagCols > 0
-                            ? options->m_staticACLTagCols
-                            : p_numTagsPerVec;
+                        tagSchema = options->Schema();
+                        staticACLTagCols = static_cast<int>(tagSchema.categorical.size());
                         SPTAG::Helper::Convert::
                             ConvertStringTo<std::uint64_t>(
                                 options
@@ -6948,13 +4999,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                                         .c_str(),
                                     signatureGenerationFingerprint);
                         }
-                        if (!options
-                                 ->m_extremeSparseTagFile
-                                 .empty()) {
-                            extremeSparseTagFile =
-                                options
-                                    ->m_extremeSparseTagFile;
-                        }
+
                     }
                     if (options != nullptr &&
                         !options->m_ssdIndex.empty()) {
@@ -6964,57 +5009,44 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                 }
                 if (limitedTagEnabled &&
                     (limitedTagColumn < 0 ||
-                     limitedTagColumn >= staticACLTagCols ||
-                     staticACLTagCols <= 0 ||
+                     !tagSchema.IsCategorical(limitedTagColumn) ||
+                     staticACLTagCols < 0 ||
                      staticACLTagCols > p_numTagsPerVec)) {
                     fprintf(
                         stderr,
-                        "[ERROR] Tenant %d: LimitedTagColumn=%d / StaticACLTagCols=%d "
+                        "[ERROR] Tenant %d: LimitedTagColumn=%d / categorical count=%d "
                         "is invalid for %d attributes\n",
                         p_tenantId, limitedTagColumn,
                         staticACLTagCols, p_numTagsPerVec);
                     return false;
                 }
-                if (extremeSparseTagEnabled &&
-                    (!limitedTagEnabled || !staticStorage ||
-                     p_vectors.Data() == nullptr ||
-                     p_vectors.Length() !=
-                         static_cast<size_t>(p_numVectors) *
-                             m_inputVectorSize ||
-                     !SPTAG::SPANN::LimitedTagSupport::
-                         IsSupportedSlotCount(
-                             limitedTagSlotsPerHead) ||
-                     extremeSparseTagMinCount <= 0 ||
-                     extremeSparseTagStorageCoverageTarget <= 0 ||
-                     limitedTagGenerationFingerprint == 0 ||
-                     !IsSafeArtifactFileName(
-                         extremeSparseTagFile))) {
-                    fprintf(
-                        stderr,
-                        "[ERROR] Tenant %d: extreme-sparse tag build requires the complete "
-                        "raw vector matrix and valid native limited-tag options\n",
-                        p_tenantId);
-                    return false;
-                }
-                (void)logExtremeSparseTagRoute;
+
             }
         }
     }
 
-    const bool routingStatsRequired =
-        hybridDistanceEnabled || secondLevelRoutingEnabled;
-    if (staticACLTagCols <= 0 ||
+    if (p_numTagsPerVec != tagSchema.Width()) {
+        fprintf(
+            stderr,
+            "[ERROR] Tenant %d: BuildSignatures attribute width=%d "
+            "does not match index schema width=%d\n",
+            p_tenantId, p_numTagsPerVec, tagSchema.Width());
+        return false;
+    }
+
+    const bool routingStatsRequired = hybridDistanceEnabled;
+    if (staticACLTagCols < 0 ||
         staticACLTagCols > p_numTagsPerVec) {
         fprintf(
             stderr,
-            "[ERROR] Tenant %d: StaticACLTagCols=%d is invalid for %d "
+            "[ERROR] Tenant %d: categorical count=%d is invalid for %d "
             "attribute columns\n",
             p_tenantId, staticACLTagCols,
             p_numTagsPerVec);
         return false;
     }
     const int signatureNumericColumns =
-        p_numTagsPerVec - staticACLTagCols;
+        static_cast<int>(tagSchema.numeric.size());
     std::vector<SPTAG::Cache::NumQuantParam>
         signatureNumericParams(
             static_cast<size_t>(
@@ -7033,7 +5065,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                 p_tagsPtr[
                     static_cast<size_t>(vector) *
                         p_numTagsPerVec +
-                    staticACLTagCols + column];
+                    tagSchema.numeric[column]];
             auto& parameter =
                 signatureNumericParams[
                     static_cast<size_t>(column)];
@@ -7058,8 +5090,6 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
         const std::string tagPurePath = workDir + "/tagpure_meta.bin";
         const std::string routeStatsPath =
             workDir + "/tag_routing_stats.bin";
-        const std::string extremeSparsePath =
-            workDir + "/" + extremeSparseTagFile;
         const std::string headMetaPath =
             workDir + "/HeadIndex/head_node_meta.bin";
         bool sigOk     = stat(sigPath.c_str(),     &st) == 0;
@@ -7073,54 +5103,6 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
             sigOk = existingSignatures.Load(
                 sigPath,
                 signatureGenerationFingerprint);
-        }
-        bool extremeSparseOk =
-            !extremeSparseTagEnabled;
-        if (extremeSparseTagEnabled &&
-            stat(extremeSparsePath.c_str(), &st) == 0)
-        {
-            const auto expectedHeadCount =
-                m_tenantHeadCounts.find(p_tenantId);
-            SPTAG::Cache::ExtremeSparseTagStore
-                existingStore;
-            std::string existingStoreError;
-            extremeSparseOk =
-                expectedHeadCount !=
-                    m_tenantHeadCounts.end() &&
-                expectedHeadCount->second > 0 &&
-                existingStore.Load(
-                    extremeSparsePath,
-                    &existingStoreError) &&
-                existingStore.ValidateExpected(
-                    m_valueType,
-                    static_cast<std::uint32_t>(
-                        m_dimension),
-                    static_cast<std::uint32_t>(
-                        p_numTagsPerVec),
-                    static_cast<std::uint32_t>(
-                        limitedTagColumn),
-                    static_cast<std::uint64_t>(
-                        p_numVectors),
-                    limitedTagGenerationFingerprint,
-                    static_cast<std::uint64_t>(
-                        extremeSparseTagMinCount),
-                    static_cast<std::uint64_t>(
-                        expectedHeadCount->second),
-                    static_cast<std::uint32_t>(
-                        limitedTagSlotsPerHead),
-                    &existingStoreError) &&
-                existingStore.CoverageTarget() ==
-                    static_cast<std::uint32_t>(
-                        extremeSparseTagStorageCoverageTarget);
-            if (!extremeSparseOk)
-            {
-                fprintf(
-                    stderr,
-                    "[INFO] Tenant %d: rebuilding stale extreme-sparse "
-                    "tag store: %s\n",
-                    p_tenantId,
-                    existingStoreError.c_str());
-            }
         }
         bool headMetaOk =
             stat(headMetaPath.c_str(), &st) == 0;
@@ -7188,7 +5170,6 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
         }
         if (baseArtifactsOk &&
             (!routingStatsRequired || routeStatsOk) &&
-            extremeSparseOk &&
             numericMetadataValid) {
             // Make sure the PS signatures are attached to the head index.
             if (!EnsureTenantLoaded(p_tenantId)) {
@@ -7247,9 +5228,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
             // tag-pure + sparse metadata is loaded by LoadAll; touch the
             // loaders again for safety (idempotent — skips already-loaded).
             LoadTenantSparseIndices();
-            if (!LoadTenantExtremeSparseTagStores()) {
-                return false;
-            }
+
             LoadTenantTagPureIndices();
             if (!LoadTenantTagRoutingStats()) {
                 return false;
@@ -7265,11 +5244,10 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                 fprintf(stderr,
                         "[INFO] Tenant %d: BuildSignatures short-circuit "
                         "(static=%d headmeta=%d sig=%d sparse=%d tagpure=%d "
-                        "routeStats=%d extremeSparse=%d on disk)\n",
+                        "routeStats=%d on disk)\n",
                         p_tenantId, (int)staticStorage, (int)headMetaOk,
                         (int)sigOk, (int)sparseOk,
-                        (int)tagPureOk, (int)routeStatsOk,
-                        (int)extremeSparseOk);
+                        (int)tagPureOk, (int)routeStatsOk);
                 return true;
             }
             fprintf(stderr,
@@ -7295,221 +5273,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
     if (numHeads <= 0) return false;
 
     const auto hierWidths =
-        HierWidthsFromEnv();
-
-    if (limitedTagEnabled) {
-        m_tenantPivotLevels[p_tenantId] = -1;
-        m_tenantPivotNodeCounts[p_tenantId] = 1;
-        m_tenantNodePivotTags[p_tenantId] = {
-            std::vector<std::uint32_t>()};
-        auto& tagToNodes =
-            m_tenantTagToNodes[p_tenantId];
-        tagToNodes.clear();
-        tagToNodes.reserve(256);
-        for (int vector = 0;
-             vector < p_numVectors;
-             ++vector) {
-            const std::uint32_t tag =
-                p_tagsPtr[
-                    static_cast<size_t>(vector) *
-                        p_numTagsPerVec +
-                    static_cast<size_t>(
-                        limitedTagColumn)];
-            if (tagToNodes.find(tag) ==
-                tagToNodes.end()) {
-                tagToNodes[tag] = {0};
-            }
-        }
-    }
-
-    // ── Routing-only fast path (SPTAG_ROUTING_ONLY=1) ───────────────────────
-    // Regenerate ONLY the query-time routing sidecar (tag_node_index.bin) from
-    // the loaded head index + per-vector tags, skipping the expensive posting
-    // scan / sparse / tag-pure artifacts. Used to repair an index whose build
-    // finished the SPANN store but crashed before the full BuildSignatures step
-    // (so the per-tag -> bundle-node routing table was never written and every
-    // filtered query fans out to all nodes). Honors SPTAG_PIVOT_FORCE_NODE_COUNT
-    // / SPTAG_HIER_LEVEL_WIDTHS so the recomputed pivot partition matches the
-    // one used at build time.
-    if (std::getenv("SPTAG_ROUTING_ONLY") != nullptr) {
-        EnsureTenantLoaded(p_tenantId);
-        std::shared_ptr<AnnIndex> idxPtr;
-        {
-            std::shared_lock<std::shared_mutex> rlock(m_tenantIndicesMutex);
-            auto it = m_tenantIndices.find(p_tenantId);
-            if (it != m_tenantIndices.end()) idxPtr = it->second;
-        }
-        if (!idxPtr) return false;
-        auto internalIdx = idxPtr->GetInternalIndex();
-        auto memoryIndex = GetMemoryIndexForInternal(internalIdx);
-        auto* spannInternalIdx = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(internalIdx.get());
-        if (memoryIndex == nullptr || spannInternalIdx == nullptr) return false;
-
-        SizeType numHeadSamples = memoryIndex->GetNumSamples();
-        if (numHeadSamples < (SizeType)numHeads) numHeadSamples = (SizeType)numHeads;
-        // Preserve the full signature metadata when routing is repaired after a
-        // successful signature pass. Reinitializing it would discard the
-        // persisted posting masks and numeric signatures before saving the
-        // refreshed bundle-node assignments.
-        const bool preserveHeadNodeMeta =
-            memoryIndex->HasHeadNodeMeta() &&
-            memoryIndex->GetHeadNodeMetaSampleCount() >= numHeadSamples;
-        if (!preserveHeadNodeMeta) {
-            memoryIndex->InitializeHeadNodeMeta(
-                numHeadSamples, 0,
-                hierWidths,
-                hybridDistanceEnabled ||
-                    limitedTagEnabled);
-        }
-        if (!spannInternalIdx->PopulateHeadNodeGlobalVIDsFromBundles()) {
-            memoryIndex->ClearHeadNodeMeta();
-            fprintf(stderr,
-                    "[ERROR] Tenant %d: cannot populate head metadata VIDs for routing repair.\n",
-                    p_tenantId);
-            return false;
-        }
-
-        if (limitedTagEnabled) {
-            std::vector<int> headNodeToNode(
-                static_cast<size_t>(
-                    numHeadSamples),
-                0);
-            m_tenantHeadNodeToNode[
-                p_tenantId] =
-                headNodeToNode;
-            for (SizeType hid = 0;
-                 hid < numHeadSamples;
-                 ++hid) {
-                memoryIndex
-                    ->SetHeadNodeBundleNodeId(
-                        hid, 0);
-            }
-            const bool routingOk =
-                SaveHeadNodeRoutingIndexFile(
-                    workDir, -1,
-                    m_tenantNodePivotTags[
-                        p_tenantId],
-                    m_tenantTagToNodes[
-                        p_tenantId],
-                    headNodeToNode);
-            bool metaOk = true;
-            if (preserveHeadNodeMeta) {
-                metaOk = SaveHeadNodeMetaFile(
-                    workDir, memoryIndex,
-                    signatureGenerationFingerprint);
-            }
-            const bool ok = routingOk && metaOk;
-            fprintf(
-                stderr,
-                "[INFO] Tenant %d: ROUTING_ONLY wrote single-node "
-                "limited-tag routing (heads=%zu tagMappings=%zu ok=%d)\n",
-                p_tenantId,
-                headNodeToNode.size(),
-                m_tenantTagToNodes[
-                    p_tenantId].size(),
-                static_cast<int>(ok));
-            return ok;
-        }
-
-        // Reproduce the build-time routing-column projection so the recomputed
-        // pivot partition (and thus node numbering) matches the physical layout.
-        // The last SPTAG_NUMERIC_COLS columns are numeric attributes that do NOT
-        // form a tag hierarchy; feeding them to the estimator fails its
-        // parent-uniqueness check. SPTAG_ACL_COLS selects the categorical routing
-        // columns (identity 0..numBaseCols-1 by default). Mirrors lines ~2206-2268.
-        int numNumericCols = 0;
-        if (const char* e = std::getenv("SPTAG_NUMERIC_COLS")) numNumericCols = atoi(e);
-        if (numNumericCols < 0) numNumericCols = 0;
-        if (numNumericCols > p_numTagsPerVec) numNumericCols = p_numTagsPerVec;
-        const int numBaseCols = p_numTagsPerVec - numNumericCols;
-        std::vector<int> routingCols;
-        if (const char* e = std::getenv("SPTAG_ACL_COLS")) {
-            std::stringstream ss(e);
-            std::string tok;
-            while (std::getline(ss, tok, ',')) {
-                int c = atoi(tok.c_str());
-                if (c >= 0 && c < numBaseCols) {
-                    bool dup = false;
-                    for (int existing : routingCols) if (existing == c) { dup = true; break; }
-                    if (!dup) routingCols.push_back(c);
-                }
-            }
-        }
-        if (routingCols.empty()) {
-            int numRoutingCols = numBaseCols;
-            if (const char* e = std::getenv("SPTAG_ROUTING_COLS")) {
-                int k = atoi(e);
-                if (k > 0) numRoutingCols = (k < numBaseCols) ? k : numBaseCols;
-            }
-            for (int t = 0; t < numRoutingCols; ++t) routingCols.push_back(t);
-        }
-        const int numRoutingCols = static_cast<int>(routingCols.size());
-        const uint32_t* planTags = p_tagsPtr;
-        int planNumTags = p_numTagsPerVec;
-        std::vector<uint32_t> catOnlyTags;
-        bool identityProjection = (numRoutingCols == p_numTagsPerVec);
-        if (identityProjection)
-            for (int t = 0; t < numRoutingCols; ++t)
-                if (routingCols[t] != t) { identityProjection = false; break; }
-        if (numRoutingCols > 0 && !identityProjection) {
-            catOnlyTags.resize(static_cast<size_t>(p_numVectors) * static_cast<size_t>(numRoutingCols));
-            for (SizeType i = 0; i < (SizeType)p_numVectors; ++i)
-                for (int t = 0; t < numRoutingCols; ++t)
-                    catOnlyTags[static_cast<size_t>(i) * numRoutingCols + t] =
-                        p_tagsPtr[static_cast<size_t>(i) * p_numTagsPerVec + routingCols[t]];
-            planTags = catOnlyTags.data();
-            planNumTags = numRoutingCols;
-        }
-        fprintf(stderr, "[INFO] Tenant %d: ROUTING_ONLY planning on %d categorical cols "
-                "(of %d base, %d numeric)\n", p_tenantId, numRoutingCols, numBaseCols, numNumericCols);
-
-        PivotEstimatorComputation pivotComputation;
-        const PivotEstimatorCandidate* pivotCandidate = nullptr;
-        if (BuildPivotEstimatorComputation(planTags, p_numVectors, planNumTags,
-                                           0, 0.99, 10.0, 1.0, std::string(), pivotComputation)) {
-            pivotCandidate = FindBestPivotEstimatorCandidate(pivotComputation.candidates);
-        }
-        if (pivotCandidate == nullptr) {
-            fprintf(stderr, "[ERROR] Tenant %d: ROUTING_ONLY pivot estimation failed\n", p_tenantId);
-            return false;
-        }
-        m_tenantPivotLevels[p_tenantId] = pivotCandidate->pivotLevel;
-        m_tenantPivotNodeCounts[p_tenantId] = pivotCandidate->nodeCount;
-        m_tenantNodePivotTags[p_tenantId] = pivotCandidate->nodePivotTags;
-        BuildTagToNodeIndexForCandidate(*pivotCandidate, pivotComputation.levelData,
-                                        m_tenantTagToNodes[p_tenantId]);
-        std::vector<int> headNodeToNode;
-        BuildHeadNodeToNodeIndexForCandidate(*pivotCandidate, planTags, p_numVectors,
-                                             planNumTags, memoryIndex, spannInternalIdx,
-                                             headNodeToNode);
-        m_tenantHeadNodeToNode[p_tenantId] = headNodeToNode;
-        const bool routingOk = SaveHeadNodeRoutingIndexFile(workDir, pivotCandidate->pivotLevel,
-                                                            pivotCandidate->nodePivotTags,
-                                                            m_tenantTagToNodes[p_tenantId],
-                                                            headNodeToNode);
-        bool metaOk = true;
-        if (preserveHeadNodeMeta) {
-            for (SizeType hid = 0; hid < numHeadSamples; ++hid) {
-                const int16_t nodeId =
-                    (hid < static_cast<SizeType>(headNodeToNode.size()) &&
-                     headNodeToNode[hid] >= 0)
-                    ? static_cast<int16_t>(headNodeToNode[hid])
-                    : static_cast<int16_t>(-1);
-                memoryIndex->SetHeadNodeBundleNodeId(hid, nodeId);
-            }
-            metaOk = SaveHeadNodeMetaFile(
-                workDir, memoryIndex,
-                signatureGenerationFingerprint);
-        }
-        const bool ok = routingOk && metaOk;
-        fprintf(stderr,
-                "[INFO] Tenant %d: ROUTING_ONLY wrote tag_node_index.bin%s "
-                "pivotLevel=%d nodeCount=%d heads=%zu tagMappings=%zu ok=%d\n",
-                p_tenantId, preserveHeadNodeMeta ? " and refreshed head_node_meta.bin" : "",
-                pivotCandidate->pivotLevel, pivotCandidate->nodeCount,
-                headNodeToNode.size(), m_tenantTagToNodes[p_tenantId].size(), (int)ok);
-        return ok;
-    }
+        SPTAG::Cache::HierWidthTable();
 
     // ── Non-FILEIO posting store (e.g. Storage=STATIC/ROCKSDBIO) fast path ──
     // When the posting store is not a FILEIO block file, the ssdinfo / ssdmapping
@@ -7540,13 +5304,9 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
             auto* spannInternalIdx = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(internalIdx.get());
             if (memoryIndex == nullptr || spannInternalIdx == nullptr) return false;
 
-            const auto* staticOptions = spannInternalIdx->GetOptions();
-            const int staticACLTagCols =
-                staticOptions != nullptr && staticOptions->m_staticACLTagCols > 0
-                ? staticOptions->m_staticACLTagCols
-                : p_numTagsPerVec;
-            if (staticACLTagCols <= 0 || staticACLTagCols > p_numTagsPerVec) {
-                fprintf(stderr, "[ERROR] Tenant %d: StaticACLTagCols=%d is invalid for %d tag columns.\n",
+            const int staticACLTagCols = static_cast<int>(tagSchema.categorical.size());
+            if (staticACLTagCols < 0 || staticACLTagCols > p_numTagsPerVec) {
+                fprintf(stderr, "[ERROR] Tenant %d: categorical count=%d is invalid for %d tag columns.\n",
                         p_tenantId, staticACLTagCols, p_numTagsPerVec);
                 return false;
             }
@@ -7572,72 +5332,20 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
             // tag_level_offsets.bin covers categorical hierarchy columns only.
             // Numeric columns are range-filter attributes, not hierarchy levels.
             {
-                const int numBaseCols = staticACLTagCols;
-                std::vector<uint32_t> levelMin(numBaseCols, std::numeric_limits<uint32_t>::max());
+                std::vector<uint32_t> levelMin(p_numTagsPerVec, std::numeric_limits<uint32_t>::max());
                 for (int vid = 0; vid < p_numVectors; ++vid)
-                    for (int t = 0; t < numBaseCols; ++t) {
+                    for (int t : tagSchema.categorical) {
                         uint32_t tag = p_tagsPtr[(size_t)vid * p_numTagsPerVec + t];
                         if (tag < levelMin[t]) levelMin[t] = tag;
                     }
                 m_tenantTagLevelOffsets[p_tenantId] = levelMin;
                 const std::string offPath = workDir + "/tag_level_offsets.bin";
                 if (FILE* of = fopen(offPath.c_str(), "wb")) {
-                    int32_t nLevels = numBaseCols;
+                    int32_t nLevels = static_cast<int32_t>(levelMin.size());
                     fwrite(&nLevels, sizeof(int32_t), 1, of);
                     fwrite(levelMin.data(), sizeof(uint32_t), levelMin.size(), of);
                     fclose(of);
                 }
-            }
-
-            // Pivot estimator (tags-only) drives per-bundle tag routing.
-            const std::uint32_t* routingTags =
-                p_tagsPtr;
-            int routingTagCount =
-                p_numTagsPerVec;
-            std::vector<std::uint32_t>
-                categoricalTags;
-            if (!limitedTagEnabled &&
-                staticACLTagCols <
-                p_numTagsPerVec) {
-                categoricalTags.resize(
-                    static_cast<size_t>(
-                        p_numVectors) *
-                    static_cast<size_t>(
-                        staticACLTagCols));
-                for (int vid = 0;
-                     vid < p_numVectors; ++vid) {
-                    std::memcpy(
-                        categoricalTags.data() +
-                            static_cast<size_t>(vid) *
-                                staticACLTagCols,
-                        p_tagsPtr +
-                            static_cast<size_t>(vid) *
-                                p_numTagsPerVec,
-                        static_cast<size_t>(
-                            staticACLTagCols) *
-                            sizeof(std::uint32_t));
-                }
-                routingTags =
-                    categoricalTags.data();
-                routingTagCount =
-                    staticACLTagCols;
-            }
-            PivotEstimatorComputation pivotComputation;
-            const PivotEstimatorCandidate* pivotCandidate = nullptr;
-            if (!hybridDistanceEnabled &&
-                !limitedTagEnabled &&
-                BuildPivotEstimatorComputation(
-                    routingTags, p_numVectors,
-                    routingTagCount,
-                                               0, 0.99, 10.0, 1.0, std::string(), pivotComputation)) {
-                pivotCandidate = FindBestPivotEstimatorCandidate(pivotComputation.candidates);
-            }
-            if (pivotCandidate != nullptr) {
-                m_tenantPivotLevels[p_tenantId] = pivotCandidate->pivotLevel;
-                m_tenantPivotNodeCounts[p_tenantId] = pivotCandidate->nodeCount;
-                m_tenantNodePivotTags[p_tenantId] = pivotCandidate->nodePivotTags;
-                BuildTagToNodeIndexForCandidate(*pivotCandidate, pivotComputation.levelData,
-                                                m_tenantTagToNodes[p_tenantId]);
             }
 
             memoryIndex->InitializeHeadNodeMeta(
@@ -7687,7 +5395,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                                                       &quantParams,
                                                       &postingPureNumericMasks,
                                                       &postingTailNumericMasks,
-                                                      signatureGenerationFingerprint)) {
+                                                      signatureGenerationFingerprint, &tagSchema)) {
                         return false;
                     }
                     fprintf(stderr, "[INFO] Tenant %d: built posting hier masks for %zu STM1 postings.\n",
@@ -7764,9 +5472,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                 rawTags.reserve(
                     static_cast<size_t>(
                         staticACLTagCols));
-                for (int column = 0;
-                     column < staticACLTagCols;
-                     ++column) {
+                for (int column : tagSchema.categorical) {
                     const std::uint32_t tag =
                         p_tagsPtr[
                             static_cast<size_t>(vid) *
@@ -7916,7 +5622,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                 ++resolved;
                 SPTAG::Cache::HierarchicalOwnTags ownMask;
                 ownMask.Clear();
-                for (int t = 0; t < staticACLTagCols; ++t) {
+                for (int t = 0; t < p_numTagsPerVec; ++t) {
                     uint32_t tag = p_tagsPtr[(size_t)globalVID * p_numTagsPerVec + t];
                     ownMask.Insert(t, tag);
                 }
@@ -7932,72 +5638,6 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                 return false;
             }
 
-            if (pivotCandidate != nullptr) {
-                std::vector<int> headNodeToNode;
-                BuildHeadNodeToNodeIndexForCandidate(*pivotCandidate, routingTags, p_numVectors,
-                                                     routingTagCount, memoryIndex, spannInternalIdx,
-                                                     headNodeToNode);
-                m_tenantHeadNodeToNode[p_tenantId] = headNodeToNode;
-                for (SizeType hid = 0; hid < numHeadSamples; ++hid) {
-                    int16_t nid = (hid < (SizeType)headNodeToNode.size() && headNodeToNode[hid] >= 0)
-                                  ? (int16_t)headNodeToNode[hid] : (int16_t)-1;
-                    memoryIndex->SetHeadNodeBundleNodeId(hid, nid);
-                }
-                SaveHeadNodeRoutingIndexFile(workDir, pivotCandidate->pivotLevel,
-                                             pivotCandidate->nodePivotTags,
-                                             m_tenantTagToNodes[p_tenantId], headNodeToNode);
-            } else if (hybridDistanceEnabled ||
-                       limitedTagEnabled) {
-                std::vector<int> headNodeToNode(
-                    static_cast<size_t>(
-                        numHeadSamples),
-                    0);
-                auto& tagToNodes =
-                    m_tenantTagToNodes[p_tenantId];
-                if (hybridDistanceEnabled) {
-                    m_tenantPivotLevels[
-                        p_tenantId] = -1;
-                    m_tenantPivotNodeCounts[
-                        p_tenantId] = 1;
-                    m_tenantNodePivotTags[
-                        p_tenantId] = {
-                            std::vector<
-                                std::uint32_t>()};
-                    tagToNodes.clear();
-                    for (int vid = 0;
-                         vid < p_numVectors;
-                         ++vid) {
-                        for (int column = 0;
-                             column <
-                                 staticACLTagCols;
-                             ++column) {
-                            tagToNodes[
-                                p_tagsPtr[
-                                    static_cast<
-                                        size_t>(
-                                        vid) *
-                                        p_numTagsPerVec +
-                                    column]] = {0};
-                        }
-                    }
-                }
-                m_tenantHeadNodeToNode[
-                    p_tenantId] =
-                    headNodeToNode;
-                for (SizeType hid = 0;
-                     hid < numHeadSamples;
-                     ++hid) {
-                    memoryIndex->
-                        SetHeadNodeBundleNodeId(
-                            hid, 0);
-                }
-                SaveHeadNodeRoutingIndexFile(
-                    workDir, -1,
-                    m_tenantNodePivotTags[
-                        p_tenantId],
-                    tagToNodes,
-                    headNodeToNode);
-            }
             memoryIndex
                 ->SetHeadNodeNumericDomainFingerprint(
                     numericContentFingerprint);
@@ -8039,69 +5679,6 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                     std::move(quantParams);
                 m_tenantNumericMeta[p_tenantId] =
                     std::move(metadata);
-            }
-            const std::string extremeSparsePath =
-                workDir + "/" +
-                extremeSparseTagFile;
-            if (extremeSparseTagEnabled) {
-                auto store = std::make_shared<
-                    SPTAG::Cache::ExtremeSparseTagStore>();
-                std::string error;
-                if (!store->Build(
-                        extremeSparsePath,
-                        p_tagsPtr,
-                        static_cast<std::uint64_t>(
-                            p_numVectors),
-                        static_cast<std::uint32_t>(
-                            p_numTagsPerVec),
-                        static_cast<std::uint32_t>(
-                            limitedTagColumn),
-                        p_vectors.Data(),
-                        p_vectors.Length(),
-                        static_cast<std::uint32_t>(
-                            m_inputVectorSize),
-                        m_valueType,
-                        static_cast<std::uint32_t>(
-                            m_dimension),
-                        static_cast<std::uint64_t>(
-                            extremeSparseTagMinCount),
-                        static_cast<std::uint64_t>(
-                            numHeads),
-                        static_cast<std::uint32_t>(
-                            limitedTagSlotsPerHead),
-                        static_cast<std::uint32_t>(
-                            extremeSparseTagStorageCoverageTarget),
-                        limitedTagGenerationFingerprint,
-                        &error)) {
-                    fprintf(
-                        stderr,
-                        "[ERROR] Tenant %d: cannot build %s: %s\n",
-                        p_tenantId,
-                        extremeSparsePath.c_str(),
-                        error.c_str());
-                    return false;
-                }
-                fprintf(
-                    stderr,
-                    "[INFO] Tenant %d: built extreme-sparse tag store "
-                    "(column=%d records=%llu count_range=<%llu or <=%llu "
-                    "heads=%llu slots=%u storage_coverage_target=%u)\n",
-                    p_tenantId, limitedTagColumn,
-                    static_cast<unsigned long long>(
-                        store->StoredRecordCount()),
-                    static_cast<unsigned long long>(
-                        store->MinTagCount()),
-                    static_cast<unsigned long long>(
-                        store->MaxTagCount()),
-                    static_cast<unsigned long long>(
-                        store->HeadCount()),
-                    store->SlotsPerHead(),
-                    store->CoverageTarget());
-                m_tenantExtremeSparseTagStores[
-                    p_tenantId] = std::move(store);
-            } else {
-                m_tenantExtremeSparseTagStores.erase(
-                    p_tenantId);
             }
             fprintf(stderr, "[INFO] Tenant %d: head_node_meta generated for %d heads "
                     "(%d resolved) [non-FILEIO].\n",
@@ -8221,7 +5798,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
     };
 
     // ── Numeric attribute setup (quantized signature) ──────────────────────
-    // The last `numNumericCols` tag columns are numeric attributes: the RAW value
+    // Schema-selected numeric columns contain raw attributes: the value
     // is stored inline per vector (read by the exact filter) and a quantized
     // bucket is OR-ed into the per-posting numeric signature for range pruning.
     // numNumericCols=0 => pure categorical (layout/behavior unchanged).
@@ -8299,8 +5876,8 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
             // The constrained suffix is a complete original posting and may
             // overlap the pure prefix across this boundary.
             if (j < nPure) {
-                // Categorical tags (cols 0..numBaseCols-1) -> Bloom + hier mask.
-                for (int t = 0; t < numBaseCols; t++) {
+                // Categorical tags retain original column indices.
+                for (int t : tagSchema.categorical) {
                     uint32_t tag = p_tagsPtr[vid * p_numTagsPerVec + t];
                     posting_tags[pid].push_back(tag);
                     postingRoutingKeys.push_back(
@@ -8316,9 +5893,9 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                     posting_hier_masks[pid].Insert(
                         t, tag, hierWidths);
                 }
-                // Numeric attributes (cols numBaseCols..) -> quantized signature.
+                // Dense numeric signature lanes map back to original columns.
                 for (int c = 0; c < numNumericCols; c++) {
-                    uint32_t v = p_tagsPtr[vid * p_numTagsPerVec + numBaseCols + c];
+                    uint32_t v = p_tagsPtr[vid * p_numTagsPerVec + tagSchema.numeric[c]];
                     int b = SPTAG::Cache::NumQuantBucket(quantParams[c], v);
                     SPTAG::Cache::NumQuantInsert(
                         posting_num_quant.data() + (size_t)pid * numNumericCols * SPTAG::Cache::NUM_QUANT_WORDS,
@@ -8326,7 +5903,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                 }
                 totalAssignments++;
             } else if (hasSelfContainedGlobalTail) {
-                for (int t = 0; t < numBaseCols; ++t) {
+                for (int t : tagSchema.categorical) {
                     tail_posting_tags[pid].push_back(
                         p_tagsPtr[
                             vid * p_numTagsPerVec +
@@ -8337,7 +5914,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                     const uint32_t value =
                         p_tagsPtr[
                             vid * p_numTagsPerVec +
-                            numBaseCols + c];
+                            tagSchema.numeric[c]];
                     const int bucket =
                         SPTAG::Cache::
                             NumQuantBucket(
@@ -8404,9 +5981,9 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
     // Tag value ranges are disjoint per level, so the per-column minimum is a
     // valid level boundary. Persist these so query processes can load them.
     {
-        std::vector<uint32_t> levelMin(numBaseCols, std::numeric_limits<uint32_t>::max());
+        std::vector<uint32_t> levelMin(p_numTagsPerVec, std::numeric_limits<uint32_t>::max());
         for (int vid = 0; vid < p_numVectors; ++vid) {
-            for (int t = 0; t < numBaseCols; ++t) {
+            for (int t : tagSchema.categorical) {
                 uint32_t tag = p_tagsPtr[vid * p_numTagsPerVec + t];
                 if (tag < levelMin[t]) levelMin[t] = tag;
             }
@@ -8414,7 +5991,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
         m_tenantTagLevelOffsets[p_tenantId] = levelMin;
         const std::string offPath = workDir + "/tag_level_offsets.bin";
         if (FILE* of = fopen(offPath.c_str(), "wb")) {
-            int32_t nLevels = numBaseCols;
+            int32_t nLevels = static_cast<int32_t>(levelMin.size());
             fwrite(&nLevels, sizeof(int32_t), 1, of);
             fwrite(levelMin.data(), sizeof(uint32_t), levelMin.size(), of);
             fclose(of);
@@ -8435,7 +6012,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
         rawTags.reserve(
             static_cast<size_t>(
                 numBaseCols));
-        for (int t = 0; t < numBaseCols; ++t) {
+        for (int t : tagSchema.categorical) {
             uint32_t tag = p_tagsPtr[vid * p_numTagsPerVec + t];
             ++tagVectorCounts[
                 MakeTagRoutingKey(
@@ -8519,126 +6096,6 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
     // (Tag-pure postings are built after the head-iteration loop below, once
     // both posting-side and head-side vector data have been captured into
     // vidVecData / vidSeen.)
-
-    constexpr int kPivotEstimatorDefaultMaxNodes = 0;
-    constexpr double kPivotEstimatorDefaultRecallTarget = 0.99;
-    constexpr double kPivotEstimatorDefaultLambdaRecall = 10.0;
-    constexpr double kPivotEstimatorDefaultEstimatedRecall = 1.0;
-
-    const std::uint32_t* routingTags = p_tagsPtr;
-    int routingTagCount = p_numTagsPerVec;
-    std::vector<std::uint32_t> categoricalRoutingTags;
-    if (!limitedTagEnabled) {
-        std::vector<int> routingCols;
-        if (const char* configured =
-                std::getenv("SPTAG_ACL_COLS")) {
-            const char* cursor = configured;
-            while (*cursor != '\0') {
-                const int column = std::atoi(cursor);
-                if (column >= 0 && column < numBaseCols &&
-                    std::find(
-                        routingCols.begin(),
-                        routingCols.end(),
-                        column) == routingCols.end()) {
-                    routingCols.push_back(column);
-                }
-                const char* comma =
-                    std::strchr(cursor, ',');
-                if (comma == nullptr) break;
-                cursor = comma + 1;
-            }
-        }
-        if (routingCols.empty()) {
-            int leadingColumns = numBaseCols;
-            if (const char* configured =
-                    std::getenv("SPTAG_ROUTING_COLS")) {
-                const int requested =
-                    std::atoi(configured);
-                if (requested > 0) {
-                    leadingColumns =
-                        (std::min)(
-                            requested, numBaseCols);
-                }
-            }
-            for (int column = 0;
-                 column < leadingColumns;
-                 ++column) {
-                routingCols.push_back(column);
-            }
-        }
-
-        routingTagCount =
-            static_cast<int>(routingCols.size());
-        bool identityProjection =
-            routingTagCount == p_numTagsPerVec;
-        if (identityProjection) {
-            for (int column = 0;
-                 column < routingTagCount;
-                 ++column) {
-                if (routingCols[
-                        static_cast<size_t>(column)] !=
-                    column) {
-                    identityProjection = false;
-                    break;
-                }
-            }
-        }
-        if (routingTagCount > 0 &&
-            !identityProjection) {
-            categoricalRoutingTags.resize(
-                static_cast<size_t>(p_numVectors) *
-                static_cast<size_t>(routingTagCount));
-            for (int vector = 0;
-                 vector < p_numVectors; ++vector) {
-                for (int column = 0;
-                     column < routingTagCount;
-                     ++column) {
-                    categoricalRoutingTags[
-                        static_cast<size_t>(vector) *
-                            static_cast<size_t>(
-                                routingTagCount) +
-                        static_cast<size_t>(column)] =
-                        p_tagsPtr[
-                            static_cast<size_t>(vector) *
-                                static_cast<size_t>(
-                                    p_numTagsPerVec) +
-                            static_cast<size_t>(
-                                routingCols[
-                                    static_cast<size_t>(
-                                        column)])];
-                }
-            }
-            routingTags =
-                categoricalRoutingTags.data();
-        } else if (routingTagCount == 0) {
-            routingTags = nullptr;
-        }
-    }
-
-    PivotEstimatorComputation pivotComputation;
-    const PivotEstimatorCandidate* pivotCandidate = nullptr;
-    if (!limitedTagEnabled &&
-        routingTagCount > 0 &&
-        BuildPivotEstimatorComputation(routingTags,
-                                       p_numVectors,
-                                       routingTagCount,
-                                       kPivotEstimatorDefaultMaxNodes,
-                                       kPivotEstimatorDefaultRecallTarget,
-                                       kPivotEstimatorDefaultLambdaRecall,
-                                       kPivotEstimatorDefaultEstimatedRecall,
-                                       std::string(),
-                                       pivotComputation)) {
-        pivotCandidate = FindBestPivotEstimatorCandidate(pivotComputation.candidates);
-    }
-
-    if (pivotCandidate != nullptr) {
-        m_tenantPivotLevels[p_tenantId] = pivotCandidate->pivotLevel;
-        m_tenantPivotNodeCounts[p_tenantId] = pivotCandidate->nodeCount;
-        m_tenantNodePivotTags[p_tenantId] = pivotCandidate->nodePivotTags;
-        BuildTagToNodeIndexForCandidate(*pivotCandidate,
-                                        pivotComputation.levelData,
-                                        m_tenantTagToNodes[p_tenantId]);
-    }
 
     // Build head tag table: VIDs NOT found in any posting are head vectors.
     // They need tag metadata for filtered search since inline tag filter
@@ -8798,52 +6255,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
                 headTagCount++;
             }
 
-            if (pivotCandidate != nullptr) {
-                std::vector<int> headNodeToNode;
-                BuildHeadNodeToNodeIndexForCandidate(*pivotCandidate,
-                                                     routingTags,
-                                                     p_numVectors,
-                                                     routingTagCount,
-                                                     memoryIndex,
-                                                     spannInternalIdx,
-                                                     headNodeToNode);
-                m_tenantHeadNodeToNode[p_tenantId] = headNodeToNode;
-
-                // Populate bundleNodeId for each head
-                for (SizeType hid = 0; hid < numHeadSamples; ++hid) {
-                    int16_t nid = (hid < (SizeType)headNodeToNode.size() && headNodeToNode[hid] >= 0)
-                                  ? (int16_t)headNodeToNode[hid] : (int16_t)-1;
-                    memoryIndex->SetHeadNodeBundleNodeId(hid, nid);
-                }
-
-                SaveHeadNodeRoutingIndexFile(workDir,
-                                             pivotCandidate->pivotLevel,
-                                             pivotCandidate->nodePivotTags,
-                                             m_tenantTagToNodes[p_tenantId],
-                                             headNodeToNode);
-            } else if (limitedTagEnabled) {
-                std::vector<int> headNodeToNode(
-                    static_cast<size_t>(
-                        numHeadSamples),
-                    0);
-                m_tenantHeadNodeToNode[
-                    p_tenantId] =
-                    headNodeToNode;
-                for (SizeType hid = 0;
-                     hid < numHeadSamples;
-                     ++hid) {
-                    memoryIndex
-                        ->SetHeadNodeBundleNodeId(
-                            hid, 0);
-                }
-                SaveHeadNodeRoutingIndexFile(
-                    workDir, -1,
-                    m_tenantNodePivotTags[
-                        p_tenantId],
-                    m_tenantTagToNodes[
-                        p_tenantId],
-                    headNodeToNode);
-            }
+            if (!spannInternalIdx->PopulateHeadNodeGlobalVIDsFromBundles()) return false;
             // Save meta file AFTER bundleNodeId is populated
             memoryIndex
                 ->SetHeadNodeNumericDomainFingerprint(
@@ -8894,13 +6306,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
             std::move(metadata);
     }
 
-    if (pivotCandidate != nullptr) {
-        fprintf(stderr,
-                "[INFO] Tenant %d: pivot estimator selected level=%d nodes=%d\n",
-                p_tenantId,
-                pivotCandidate->pivotLevel,
-                pivotCandidate->nodeCount);
-    }
+
 
     // ── Tag-pure postings (chunked, KV-backed) ───────────────────────────
     // For tags with selectivity strictly below SPTAG_TAG_PURE_THRESHOLD
@@ -8973,7 +6379,7 @@ bool TenantIndexManager::BuildSignaturesWithVectors(
             for (int vid = 0; vid < p_numVectors; ++vid) {
                 std::unordered_set<uint32_t> seenLocal;
                 bool anyHit = false;
-                for (int t = 0; t < p_numTagsPerVec; ++t) {
+                for (int t : tagSchema.categorical) {
                     uint32_t tag = p_tagsPtr[vid * p_numTagsPerVec + t];
                     if (!seenLocal.insert(tag).second) continue;
                     if (eligibleTags.count(tag) == 0) continue;
@@ -9202,7 +6608,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
 
     // Unfiltered requests do not need ACL context, tag routing, selectivity
     // estimation, or posting metadata. AnnIndex::Search already executes the
-    // PerTagBKT cross-edge unfilter path, so bypass the wrapper-only setup.
+    // physical-bundle cross-edge unfilter path, so bypass the wrapper-only setup.
     if (p_numTags == 0) {
         return indexPtr->Search(p_queryVector, p_resultNum);
     }
@@ -9216,11 +6622,12 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
     bool forceDenseTagSearch = false;
     bool adaptiveFilteredNprobeEnabled = false;
     bool hybridDistanceEnabled = false;
-    bool secondLevelRoutingEnabled = false;
+    bool hierarchyEnabled = false;
     bool limitedTagLayout = false;
     const SPTAG::SPANN::Options*
         spannSearchOptions = nullptr;
     int categoricalColumns = 0;
+    SPTAG::TagSchema querySchema;
     float filteredSearchNprobeSafety = 1.0f;
     if (internalIdx != nullptr) {
         const std::string forceDenseParam = internalIdx->GetParameter("ForceDenseTagSearch", "BuildSSDIndex");
@@ -9245,14 +6652,12 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
             spannIndex->HasLimitedTagLayout();
         if (searchOptions != nullptr)
         {
-            categoricalColumns =
-                searchOptions->m_staticACLTagCols > 0
-                ? searchOptions->m_staticACLTagCols
-                : searchOptions->m_numTagsPerVec;
+            querySchema = searchOptions->Schema();
+            categoricalColumns = static_cast<int>(querySchema.categorical.size());
         }
         adaptiveFilteredNprobeEnabled =
             searchOptions != nullptr && searchOptions->m_enableAdaptiveFilteredNprobe;
-        secondLevelRoutingEnabled =
+        hierarchyEnabled =
             searchOptions != nullptr &&
             searchOptions->m_selectSecondLevel;
         const std::string hybridDistanceParam =
@@ -9269,9 +6674,9 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
             // eligible here.
             forceDenseTagSearch = true;
         }
-        if (secondLevelRoutingEnabled) {
-            // Selectivity decides H2 versus H1 inside SPANN. Wrapper-local
-            // tag-pure/sparse returns would bypass that policy entirely.
+        if (hierarchyEnabled) {
+            // Hierarchy navigation belongs to SPANN; wrapper-local
+            // tag-pure/sparse returns must not bypass the highest graph.
             forceDenseTagSearch = true;
         }
     }
@@ -9282,7 +6687,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
             !ValidateDNFColumns(
                 dnf, dnfEncoding,
                 spannSearchOptions->m_numTagsPerVec,
-                categoricalColumns,
+                querySchema,
                 dnfError))
         {
             fprintf(
@@ -9368,295 +6773,15 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
 
     const auto tagStatsIt = m_tenantTagRoutingStats.find(p_tenantId);
     const auto* tagStats = (tagStatsIt != m_tenantTagRoutingStats.end()) ? &tagStatsIt->second : nullptr;
-    if ((hybridDistanceEnabled ||
-         secondLevelRoutingEnabled) &&
+    if (hybridDistanceEnabled &&
         (tagStats == nullptr || tagStats->empty())) {
         fprintf(
             stderr,
-            "[ERROR] Tenant %d: hybrid/second-level filtered search requires "
+            "[ERROR] Tenant %d: hybrid filtered search requires "
             "tag_routing_stats.bin; run BuildSignatures with the native "
             "INI before serving filtered queries\n",
             p_tenantId);
         return nullptr;
-    }
-
-    std::shared_ptr<QueryResult>
-        extremeSparseResult;
-    constexpr bool kEnableExtremeSparseTagRoute = false;
-    if (kEnableExtremeSparseTagRoute &&
-        spannSearchOptions != nullptr &&
-        spannSearchOptions->m_enableExtremeSparseTag)
-    {
-        const auto storeEntry =
-            m_tenantExtremeSparseTagStores.find(
-                p_tenantId);
-        if (storeEntry ==
-                m_tenantExtremeSparseTagStores.end() ||
-            storeEntry->second == nullptr)
-        {
-            fprintf(
-                stderr,
-                "[ERROR] Tenant %d: extreme-sparse tag routing is enabled "
-                "but its validated sidecar is not loaded\n",
-                p_tenantId);
-            return nullptr;
-        }
-        const auto& store = *storeEntry->second;
-        std::string storeError;
-        SPTAG::Cache::DNFPredicate denseFallbackDNF;
-        const auto tenantVectorCountEntry =
-            m_tenantVectorCounts.find(p_tenantId);
-        const auto tenantHeadCountEntry =
-            m_tenantHeadCounts.find(p_tenantId);
-        if (tenantVectorCountEntry ==
-                m_tenantVectorCounts.end() ||
-            tenantVectorCountEntry->second <= 0 ||
-            tenantHeadCountEntry ==
-                m_tenantHeadCounts.end() ||
-            tenantHeadCountEntry->second <= 0)
-        {
-            return nullptr;
-        }
-        const int tenantVectorCount =
-            tenantVectorCountEntry->second;
-        const int tenantHeadCount =
-            tenantHeadCountEntry->second;
-        if (!store.ValidateExpected(
-                m_valueType,
-                static_cast<std::uint32_t>(
-                    m_dimension),
-                static_cast<std::uint32_t>(
-                    spannSearchOptions
-                        ->m_numTagsPerVec),
-                static_cast<std::uint32_t>(
-                    spannSearchOptions
-                        ->m_limitedTagColumn),
-                static_cast<std::uint64_t>(
-                    tenantVectorCount),
-                store.GenerationFingerprint(),
-                static_cast<std::uint64_t>(
-                    spannSearchOptions
-                        ->m_extremeSparseTagMinCount),
-                static_cast<std::uint64_t>(
-                    tenantHeadCount),
-                static_cast<std::uint32_t>(
-                    spannSearchOptions
-                        ->m_limitedTagSlotsPerHead),
-                &storeError))
-        {
-            fprintf(
-                stderr,
-                "[ERROR] Tenant %d: %s\n",
-                p_tenantId, storeError.c_str());
-            return nullptr;
-        }
-
-        std::vector<std::uint32_t> sparseTags;
-        bool allClausesCovered = true;
-        if (spannSearchOptions
-                ->m_searchInternalResultNum <= 0)
-        {
-            fprintf(
-                stderr,
-                "[ERROR] Tenant %d: extreme-sparse routing requires "
-                "positive SearchInternalResultNum\n",
-                p_tenantId);
-            return nullptr;
-        }
-        const std::uint32_t runtimeCoverageTarget =
-            static_cast<std::uint32_t>(
-                spannSearchOptions
-                    ->m_searchInternalResultNum);
-        if (runtimeCoverageTarget > store.CoverageTarget())
-        {
-            fprintf(
-                stderr,
-                "[ERROR] Tenant %d: SearchInternalResultNum=%u exceeds "
-                "the EST4 storage coverage target %u; rebuild signatures "
-                "with at least this MaxCheck\n",
-                p_tenantId, runtimeCoverageTarget,
-                store.CoverageTarget());
-            return nullptr;
-        }
-        const auto eligibleEntry =
-            [&store, runtimeCoverageTarget](
-                std::uint32_t p_tag) {
-                const auto* entry = store.Find(p_tag);
-                return entry != nullptr &&
-                    store.IsEligibleCount(
-                        entry->m_count,
-                        runtimeCoverageTarget)
-                    ? entry
-                    : nullptr;
-            };
-        if (dnfMode && !dnf.Empty())
-        {
-            for (const auto& clause : dnf.clauses)
-            {
-                bool found = false;
-                bool conflicting = false;
-                std::uint32_t value = 0;
-                for (const auto& literal :
-                     clause.lits)
-                {
-                    if (literal.kind != 0 ||
-                        literal.op !=
-                            SPTAG::Cache::DNF_EQ ||
-                        literal.col !=
-                            static_cast<std::uint32_t>(
-                                spannSearchOptions
-                                    ->m_limitedTagColumn))
-                    {
-                        continue;
-                    }
-                    if (!found)
-                    {
-                        found = true;
-                        value = literal.val;
-                    }
-                    else if (value != literal.val)
-                    {
-                        conflicting = true;
-                    }
-                }
-                if (conflicting)
-                {
-                    continue;
-                }
-                if (!found || eligibleEntry(value) == nullptr)
-                {
-                    allClausesCovered = false;
-                    denseFallbackDNF.clauses.push_back(
-                        clause);
-                    continue;
-                }
-                sparseTags.push_back(value);
-            }
-        }
-        else if (p_numTags > 0 &&
-                 queryTagsPtr != nullptr &&
-                 categoricalColumns == 1 &&
-                 spannSearchOptions
-                         ->m_limitedTagColumn == 0)
-        {
-            for (int query = 0;
-                 query < p_numTags; ++query)
-            {
-                if (eligibleEntry(queryTagsPtr[query]) ==
-                    nullptr)
-                {
-                    allClausesCovered = false;
-                    denseFlatTags.push_back(
-                        queryTagsPtr[query]);
-                    continue;
-                }
-                sparseTags.push_back(
-                    queryTagsPtr[query]);
-            }
-        }
-        else
-        {
-            allClausesCovered = false;
-        }
-        std::sort(
-            sparseTags.begin(), sparseTags.end());
-        sparseTags.erase(
-            std::unique(
-                sparseTags.begin(), sparseTags.end()),
-            sparseTags.end());
-
-        std::uint64_t sparseCandidateCount = 0;
-        for (std::uint32_t tag : sparseTags)
-        {
-            const auto* directory =
-                store.Find(tag);
-            if (directory != nullptr)
-            {
-                sparseCandidateCount +=
-                    directory->m_count;
-            }
-        }
-        if (sparseCandidateCount > 0)
-        {
-            if (spannSearchOptions
-                    ->m_logExtremeSparseTagRoute)
-            {
-                std::uint64_t runtimeMaxTagCount = 0;
-                SPTAG::Cache::ExtremeSparseTagStore::
-                    TryComputeMaxTagCount(
-                        static_cast<std::uint64_t>(
-                            tenantVectorCount),
-                        static_cast<std::uint64_t>(
-                            tenantHeadCount),
-                        spannSearchOptions
-                            ->m_limitedTagSlotsPerHead,
-                        runtimeCoverageTarget,
-                        runtimeMaxTagCount);
-                fprintf(
-                    stdout,
-                    "ExtremeSparseRoute: tags=%zu candidates=%llu "
-                    "minCount=%llu runtimeMaxCount=%llu "
-                    "coverageTarget=%u allClauses=%d route=%s\n",
-                    sparseTags.size(),
-                    static_cast<unsigned long long>(
-                        sparseCandidateCount),
-                    static_cast<unsigned long long>(
-                        store.MinTagCount()),
-                    static_cast<unsigned long long>(
-                        runtimeMaxTagCount),
-                    runtimeCoverageTarget,
-                    allClausesCovered ? 1 : 0,
-                    allClausesCovered
-                        ? "sparse-only"
-                        : "sparse+dense");
-            }
-            if (!SearchExtremeSparseTagStore(
-                    store, internalIdx,
-                    p_queryVector, p_resultNum,
-                    sparseTags,
-                    dnfMode ? nullptr
-                            : queryTagsPtr,
-                    dnfMode ? 0 : p_numTags,
-                    categoricalColumns,
-                    dnfMode ? &dnf : nullptr,
-                    extremeSparseResult,
-                    storeError))
-            {
-                fprintf(
-                    stderr,
-                    "[ERROR] Tenant %d: extreme-sparse tag search failed: %s\n",
-                    p_tenantId,
-                    storeError.c_str());
-                return nullptr;
-            }
-            if (allClausesCovered)
-            {
-                return extremeSparseResult;
-            }
-            // EST has evaluated every clause/tag it owns exactly. Retain
-            // only the uncovered predicate for dense routing so an
-            // extreme tag excluded from H2 signatures cannot force the
-            // remaining medium tag back to H1.
-            if (dnfMode)
-            {
-                dnf = std::move(denseFallbackDNF);
-            }
-            else
-            {
-                std::sort(
-                    denseFlatTags.begin(),
-                    denseFlatTags.end());
-                denseFlatTags.erase(
-                    std::unique(
-                        denseFlatTags.begin(),
-                        denseFlatTags.end()),
-                    denseFlatTags.end());
-                queryTagsPtr = denseFlatTags.data();
-                p_numTags = static_cast<int>(
-                    denseFlatTags.size());
-            }
-            forceDenseTagSearch = true;
-        }
     }
 
     // Effective categorical view used by dense signatures, selectivity, and
@@ -9694,7 +6819,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
         else if (p_numTags > 0 &&
                  queryTagsPtr != nullptr &&
                  categoricalColumns == 1 &&
-                 keyColumn == 0)
+                 querySchema.IsCategorical(keyColumn))
         {
             limitedTagRouteEligible = true;
             limitedTagQueryValues.assign(
@@ -9714,61 +6839,6 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
     auto _ck_routingStart = s_wrapperTime ? std::chrono::high_resolution_clock::now()
                                           : std::chrono::high_resolution_clock::time_point{};
 
-    const auto tagToNodesIt = m_tenantTagToNodes.find(p_tenantId);
-    const auto headNodeToNodeIt = m_tenantHeadNodeToNode.find(p_tenantId);
-    const std::vector<int>* headNodeToNode = (headNodeToNodeIt != m_tenantHeadNodeToNode.end())
-        ? &headNodeToNodeIt->second
-        : nullptr;
-    std::vector<int> routedNodes;
-    std::vector<uint8_t> allowedNodeMask;
-    bool hasRoutingNodeFilter = false;
-    // Flat queries union the nodes containing each requested value. DNF can
-    // narrow safely only when every clause has categorical equality literals:
-    // intersect within each AND clause, then union across OR clauses. Numeric
-    // or non-equality-only clauses conservatively retain every bundle.
-    bool routingCollected = false;
-    if (tagToNodesIt != m_tenantTagToNodes.end() &&
-        headNodeToNode != nullptr &&
-        !headNodeToNode->empty()) {
-        if (dnfMode && !dnf.Empty()) {
-            routingCollected =
-                TryCollectRoutingNodesForDNF(
-                    tagToNodesIt->second, dnf,
-                    routedNodes);
-        } else if (p_numTags > 0) {
-            routingCollected = TryCollectRoutingNodesForQuery(tagToNodesIt->second, queryTagsPtr, p_numTags, routedNodes);
-            static const bool s_routeDbg2 = (std::getenv("SPTAG_ROUTE_DEBUG") != nullptr);
-            if (s_routeDbg2) {
-                static std::atomic<int> g_rc2{0};
-                if (g_rc2++ < 8)
-                    fprintf(stderr, "[OR-ROUTE] numTags=%d routedNodes=%zu collected=%d\n",
-                            (int)p_numTags, routedNodes.size(), (int)routingCollected);
-            }
-        }
-    }
-    if (routingCollected) {
-        int nodeCount = 0;
-        auto nodeCountIt = m_tenantPivotNodeCounts.find(p_tenantId);
-        if (nodeCountIt != m_tenantPivotNodeCounts.end()) {
-            nodeCount = nodeCountIt->second;
-        }
-        if (nodeCount <= 0) {
-            for (int nodeId : routedNodes) {
-                nodeCount = std::max(nodeCount, nodeId + 1);
-            }
-        }
-
-        if (nodeCount > 0) {
-            allowedNodeMask.assign(static_cast<size_t>(nodeCount), 0);
-            for (int nodeId : routedNodes) {
-                if (nodeId >= 0 && nodeId < nodeCount) {
-                    allowedNodeMask[static_cast<size_t>(nodeId)] = 1;
-                    hasRoutingNodeFilter = true;
-                }
-            }
-        }
-    }
-
     // Check if ALL query tags are sparse → use brute-force path
     auto _ck_routing = s_wrapperTime ? std::chrono::high_resolution_clock::now()
                                      : std::chrono::high_resolution_clock::time_point{};
@@ -9779,7 +6849,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
         fprintf(stdout,
             "[1] WrapperRouting: tag0=%u rn=%zu  idxParam=%.3f tagStats=%.3f routeNodes=%.3f\n",
             (p_numTags > 0 && queryTagsPtr) ? queryTagsPtr[0] : 0u,
-            (size_t)routedNodes.size(), t_idxParam, t_tagStats, t_routeNodes);
+            size_t{1}, t_idxParam, t_tagStats, t_routeNodes);
         fflush(stdout);
     }
     static const bool s_disableSparsePath = []() {
@@ -9813,9 +6883,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
                     auto result = std::make_shared<SPTAG::COMMON::QueryResultSet<float>>(
                         reinterpret_cast<const float*>(p_queryVector.Data()), p_resultNum);
                     if (disk->OPQTagPureSearch(*result, queryTagsPtr[0])) {
-                        return MergeQueryResults(
-                            p_queryVector, p_resultNum,
-                            extremeSparseResult, result);
+                        return result;
                     }
                 }
             }
@@ -9923,19 +6991,12 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
                                     : std::chrono::high_resolution_clock::time_point{};
     SPTAG::Cache::PostingBitmask queryMask;
     queryMask.Clear();
-    SPTAG::Cache::HierarchicalPostingMask queryHierMask;
-    queryHierMask.Clear();
     auto memoryIndex =
         GetMemoryIndexForInternal(internalIdx);
     const SPTAG::Cache::HierWidthTable queryHierWidths =
         memoryIndex != nullptr
             ? memoryIndex->GetHeadNodeHierWidths()
             : SPTAG::Cache::HierWidthTable();
-    // Map a raw tag value to its hierarchical level using the per-level offsets
-    // persisted at build time (tag_level_offsets.bin). Tag value ranges are
-    // disjoint and ascending per level, so the level is the largest index i
-    // with qtag >= offsets[i]. Falls back to the legacy fixed thresholds only
-    // when offsets are unavailable (pre-fix indexes).
     const std::vector<uint32_t>* levelOffsets = nullptr;
     {
         auto offIt = m_tenantTagLevelOffsets.find(p_tenantId);
@@ -9944,23 +7005,6 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
     }
     for (int i = 0; i < effNumTags; i++) {
         queryMask.Insert(effTagsPtr[i]);
-        // Hierarchical mask uses 0-indexed levels (0=org,1=dept,2=team,3=project)
-        // matching the convention used at build time in
-        // LoadPostingSignaturesIntoHeadIndex (Insert(t, tag) for t = 0..numTagsPerVec-1).
-        uint32_t qtag = effTagsPtr[i];
-        int level;
-        if (levelOffsets != nullptr) {
-            level = 0;
-            for (int l = 0; l < (int)levelOffsets->size(); ++l) {
-                if (qtag >= (*levelOffsets)[l]) level = l;
-                else break;
-            }
-        } else {
-            level = (qtag < 2000) ? 0 : (qtag < 3000) ? 1 : (qtag < 4000) ? 2 : 3;
-        }
-        queryHierMask.Insert(
-            level, qtag,
-            queryHierWidths);
     }
     auto _ck_qmask = s_wrapperTime ? std::chrono::high_resolution_clock::now()
                                    : std::chrono::high_resolution_clock::time_point{};
@@ -9978,9 +7022,8 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
         limitedTagRouteEligible;
     searchContext.m_limitedTagQueryValues =
         limitedTagQueryValues;
-    // Plumb the data-driven tag-level offsets so the SPANN search path maps tag
-    // values to hierarchical levels identically to build (column index = level),
-    // instead of the stale legacy thresholds in TagLevelFromId.
+    // Retain offsets for downstream routing/selectivity, not for inferring
+    // categorical columns in flat ACL posting masks.
     if (levelOffsets != nullptr) {
         searchContext.m_tagLevelOffsets = *levelOffsets;
     }
@@ -9988,17 +7031,15 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
             // Dense path posting pre-filter.
             //
             // The previous implementation routed each posting by its head centroid's
-            // OWN pivot-level tag (single-value `headNodeToNode`). That was a type
+            // Own attribute instead of posting support. That was a type
             // error: SPANN places each vector in its K vector-space-nearest heads
             // regardless of tag, so a posting's content has an arbitrary tag
             // distribution that is NOT determined by the centroid's tag. Filtering
             // on the centroid's tag dropped valid postings (whose member vectors
             // matched the query) and capped ACL recall at ~0.91 regardless of nprobe.
             //
-            // Fix: use the per-posting HierarchicalPostingMask built in
-            // LoadPostingSignaturesIntoHeadIndex by OR-ing ALL member vectors' tags
-            // at every level. MayIntersect is a no-false-negative test, so it is
-            // safe as a pre-filter (false positives only let extra postings through).
+            // Use complete member signatures: column-agnostic masks for flat
+            // ACL and per-column masks for explicitly column-qualified DNF.
             const bool dnfHasNum = !dnf.Empty() && dnf.HasNumericLiteral();
             TenantIndexManager::NumericMeta numMeta;
             bool loadedNumericMeta = false;
@@ -10116,14 +7157,13 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
                         ? numMeta.numBaseCols
                         : categoricalColumns;
                 if (searchOptions != nullptr &&
-                    searchOptions->m_enableHierPostingFilter &&
                     (spannInternalIdx == nullptr ||
                      !spannInternalIdx
                           ->HasLimitedTagLayout())) {
                 searchContext.m_postingFilter =
-                    [memIdx = memoryIndex.get(), queryHierMask, queryHierWidths,
+                    [memIdx = memoryIndex.get(), queryMask, queryHierWidths,
                      dnf, dnfHasNum, quantCols, quantParams, qp,
-                     numQuantParams, numBase](int localHid) {
+                     numQuantParams, numBase, querySchema](int localHid) {
                         // Use the per-posting multi-membership mask (union of all
                         // member-vector tags). MayIntersect / MayMatchHier are
                         // no-false-negative so they are safe as a pre-filter; the
@@ -10131,31 +7171,30 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
                         // exact filtering (DNF eval when present). Numeric range
                         // literals additionally prune on the quantized numeric
                         // signature (MayMatchHierQuant) when present.
+                        if (dnf.Empty()) {
+                            // Flat ACL matches a value in any categorical column.
+                            // Per-column minima do not prove disjoint ordered ranges.
+                            const auto* mask = memIdx->GetHeadNodePS(localHid);
+                            return mask == nullptr || mask->MayIntersect(queryMask);
+                        }
                         const auto* hierMask = memIdx->GetHeadNodePostingHierMask(localHid);
                         if (hierMask == nullptr) return true;  // fail open
-                        if (!dnf.Empty()) {
-                            if (dnfHasNum && quantCols > 0 && qp != nullptr) {
-                                const std::uint64_t* quant = memIdx->GetHeadNodeNumQuant(localHid);
-                                if (quant != nullptr)
-                                    return dnf.MayMatchHierQuant(
-                                        *hierMask, quant,
-                                        quantCols, qp,
-                                        numQuantParams,
-                                        numBase,
-                                        queryHierWidths);
-                            }
-                            return dnf.MayMatchHier(
-                                *hierMask,
-                                queryHierWidths);
+                        if (dnfHasNum && quantCols > 0 && qp != nullptr) {
+                            const std::uint64_t* quant = memIdx->GetHeadNodeNumQuant(localHid);
+                            if (quant != nullptr)
+                                return dnf.MayMatchHierQuant(
+                                    *hierMask, quant,
+                                    quantCols, qp,
+                                    numQuantParams,
+                                    numBase,
+                                    queryHierWidths, &querySchema.numericLanes);
                         }
-                        return hierMask->MayIntersect(
-                            queryHierMask,
+                        return dnf.MayMatchHier(
+                            *hierMask,
                             queryHierWidths);
                     };
                 }
                 if (searchOptions != nullptr &&
-                    searchOptions
-                        ->m_enableHierPostingFilter &&
                     (effNumTags > 0 ||
                      dnfHasNum) &&
                     memoryIndex
@@ -10166,7 +7205,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
                          queryMask, dnf,
                          quantCols, quantParams, qp,
                          numQuantParams,
-                         numBase](int localHid) {
+                         numBase, querySchema](int localHid) {
                             const auto* tailMask =
                                 memIdx
                                     ->GetHeadNodeTailPS(
@@ -10183,7 +7222,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
                                                 localHid),
                                         quantCols, qp,
                                         numQuantParams,
-                                        numBase);
+                                        numBase, &querySchema.numericLanes);
                             }
                             return tailMask
                                 ->MayIntersect(
@@ -10191,17 +7230,9 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
                         };
                 }
             }
-            // Bundle-node routing (multi-bundle graph search) is separate from the
-            // posting pre-filter above and still useful when manifest has >1 node.
-            if (hasRoutingNodeFilter && headNodeToNode != nullptr) {
-                searchContext.m_searchHeadBundleNodes = routedNodes;
-            }
-            (void)allowedNodeMask;
-            (void)headNodeToNode;
-
         if (adaptiveFilteredNprobeEnabled ||
             hybridDistanceEnabled ||
-            secondLevelRoutingEnabled) {
+            (spannSearchOptions != nullptr && spannSearchOptions->m_logPhaseTime)) {
             auto vcIt2 = m_tenantVectorCounts.find(p_tenantId);
             int tenantSize2 = (vcIt2 != m_tenantVectorCounts.end()) ? vcIt2->second : 1;
             float vectorSel = EstimateQueryVectorSelectivity(
@@ -10220,7 +7251,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
                     : nullptr,
                 hasNumericMeta
                     ? numMeta.params.size()
-                    : 0);
+                    : 0, &querySchema);
             searchContext.m_routeSelectivity = vectorSel;
             searchContext.m_filterSelectivity = std::clamp(
                 vectorSel / std::max(1.0f, filteredSearchNprobeSafety),
@@ -10274,7 +7305,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
         fprintf(stdout,
             "[1] WrapperPre: tag0=%u rn=%zu  routing=%.3f sparse=%.3f qmask=%.3f denseSetup=%.3f\n",
             (p_numTags > 0 && queryTagsPtr) ? queryTagsPtr[0] : 0u,
-            (size_t)routedNodes.size(), t_routing, t_sparse, t_qmask, t_dense);
+            size_t{1}, t_routing, t_sparse, t_qmask, t_dense);
         fflush(stdout);
     }
     auto _wrT0 = s_wrapperTime ? std::chrono::high_resolution_clock::now()
@@ -10288,13 +7319,11 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
         fprintf(stdout,
             "[1] WrapperCall: tag0=%u nTags=%d routedNodes=%zu preMs=%.3f searchMs=%.3f totalMs=%.3f\n",
             (p_numTags > 0 && queryTagsPtr) ? queryTagsPtr[0] : 0u,
-            p_numTags, (size_t)routedNodes.size(), preMs, searchMs, totalMs);
+            p_numTags, size_t{1}, preMs, searchMs, totalMs);
         fflush(stdout);
     }
 
-    return MergeQueryResults(
-        p_queryVector, p_resultNum,
-        extremeSparseResult, result);
+    return result;
 }
 
 std::shared_ptr<QueryResult> TenantIndexManager::SearchWithACL(

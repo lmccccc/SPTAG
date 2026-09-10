@@ -34,6 +34,32 @@ namespace SPTAG
 namespace SPANN
 {
 
+inline Cache::PostingBitmask BuildHierarchyQuerySignature(
+    const std::vector<std::uint32_t>& p_anchors,
+    const LimitedTagSupport& p_support,
+    const std::vector<SecondLevelHeadPostings>& p_postings)
+{
+    Cache::PostingBitmask signature;
+    signature.Clear();
+    for (std::uint32_t tag : p_anchors)
+    {
+        for (const auto& layer : p_postings)
+        {
+            // Legacy CSR domains are authenticated metadata, not routing
+            // thresholds. One unrepresented OR anchor disables all signature
+            // pruning, while exact H1/posting admission and navigation remain.
+            if (!p_support.TagSelectivityInRange(
+                    tag, layer.SignatureMinSelectivity(), layer.SignatureMaxSelectivity()))
+            {
+                signature.Clear();
+                return signature;
+            }
+        }
+        signature.Insert(tag);
+    }
+    return signature;
+}
+
 struct SecondLevelHierarchyLayerTimes
 {
     double m_graphMs = 0.0;
@@ -503,7 +529,6 @@ ErrorCode SearchSecondLevelHierarchy(
     const std::function<bool(SizeType, const float*)>& p_headPointCandidate = nullptr,
     SecondLevelHierarchyDetail::SearchWorkspace* p_workspace = nullptr,
     bool p_batchVectorPrefetch = false,
-    const std::function<bool()>& p_stopBeforeWidening = nullptr,
     bool p_graphSignaturePruning = false)
 {
     const int levels = static_cast<int>(p_postings.size());
@@ -598,14 +623,15 @@ ErrorCode SearchSecondLevelHierarchy(
             topState.Push(distance, id);
     };
 
-    // Search once at the common ceiling. Later widening consumes this saved
-    // frontier, even when the native graph has already spent its check budget.
+    // Matching top results, not an unfiltered top-k, consume the routing ceiling.
+    // Native result admission continues the same graph/tree frontier when
+    // underfilled; later CSR widening never restarts that search.
     COMMON::QueryResultSet<T> topResults(p_results.GetTarget(), fullTopProbe);
     p_stats.m_topProbe = fullTopProbe;
     p_stats.m_maxCheck = p_maxCheck;
     const auto graphStart = now();
     ErrorCode graphStatus;
-    if (p_graphSignaturePruning && hasSignature)
+    if (hasSignature)
     {
         const std::function<bool(SizeType)> graphAdmission = [&](SizeType id) {
             ++p_stats.m_graphSignatureChecks;
@@ -618,8 +644,11 @@ ErrorCode SearchSecondLevelHierarchy(
             if (!admitted) ++p_stats.m_graphSignatureRejects;
             return admitted;
         };
-        graphStatus = p_indexes.back()->SearchIndexWithTraversalFilter(
-            topResults, graphAdmission, p_maxCheck);
+        graphStatus = p_graphSignaturePruning
+            ? p_indexes.back()->SearchIndexWithTraversalFilter(
+                  topResults, graphAdmission, p_maxCheck)
+            : p_indexes.back()->SearchIndexWithResultFilter(
+                  topResults, graphAdmission, p_maxCheck);
     }
     else
     {
@@ -862,7 +891,6 @@ ErrorCode SearchSecondLevelHierarchy(
         if (p_stats.m_layerRetained.front() >= static_cast<std::uint64_t>(p_resultBudget) ||
             routingBudget >= p_resultBudget)
             break;
-        if (p_stopBeforeWidening && p_stopBeforeWidening()) break;
         routingBudget = p_resultBudget;
     }
 
@@ -906,7 +934,10 @@ ErrorCode SearchSecondLevelHierarchy(
                 *p_workLog += ",graph_checked=" +
                     std::to_string(p_stats.m_graphScanned) +
                     ",graph_sig_checks=" + std::to_string(p_stats.m_graphSignatureChecks) +
-                    ",graph_sig_rejects=" + std::to_string(p_stats.m_graphSignatureRejects);
+                    ",graph_sig_rejects=" + std::to_string(p_stats.m_graphSignatureRejects) +
+                    ",graph_result_filter=" + std::to_string(hasSignature) +
+                    ",graph_traversal_filter=" +
+                    std::to_string(hasSignature && p_graphSignaturePruning);
             if (p_profile)
             {
                 const auto& times = p_stats.m_layerTimes[static_cast<size_t>(level)];

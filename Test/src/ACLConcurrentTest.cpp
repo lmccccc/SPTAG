@@ -179,6 +179,27 @@ void FillNormalizedVectors(std::vector<float>& vectors, int numVectors, int dime
 
 BOOST_AUTO_TEST_SUITE(ACLConcurrentTest)
 
+BOOST_AUTO_TEST_CASE(RemovedAttributeOrganizationRejectedBeforeBuild)
+{
+    const float vector[2] = {1.0f, 2.0f};
+    ByteArray vectors(reinterpret_cast<std::uint8_t*>(const_cast<float*>(vector)),
+                      sizeof(vector), false);
+    for (const char* name : {"ACLCols", "HierLevelWidths", "PivotForceNodeCount",
+                             "DisablePivotEstimator", "RoutingCols", "PerVectorTagsFile",
+                             "LimitedTagVoteHeadCount", "TagOffset", "BKTSeed", "TPTSeed",
+                             "HierarchySignatureMinSelectivity", "HierarchySignatureMaxSelectivity"}) {
+        TenantIndexManager builder(2, "SPANN", "Float");
+        builder.SetBuildParam(name, "0", "MultiTenant");
+        BOOST_CHECK(!builder.BuildFromData(vectors, ByteArray(), 1, false, true));
+        TenantIndexManager ssdBuilder(2, "SPANN", "Float");
+        ssdBuilder.SetSSDBuildParam(name, "0");
+        BOOST_CHECK(!ssdBuilder.BuildFromData(vectors, ByteArray(), 1, false, true));
+    }
+    TenantIndexManager builder(2, "SPANN", "Float");
+    builder.SetBuildParam("SelectHeadType", "PerTagBKT", "SelectHead");
+    BOOST_CHECK(!builder.BuildFromData(vectors, ByteArray(), 1, false, true));
+}
+
 BOOST_AUTO_TEST_CASE(SearchWithACLSameTenantThreadLocalState)
 {
     constexpr int kDim = 16;
@@ -322,6 +343,198 @@ BOOST_AUTO_TEST_CASE(SearchWithACLSameTenantThreadLocalState)
     BOOST_CHECK(failures.empty());
 }
 
+BOOST_AUTO_TEST_CASE(FlatACLSignaturesDoNotInferCategoricalColumns)
+{
+    constexpr int dimension = 8;
+    constexpr int count = 256;
+    constexpr int resultCount = 10;
+    std::vector<float> vectors(count * dimension);
+    FillNormalizedVectors(vectors, count, dimension);
+    std::string metadata;
+    for (int row = 0; row < count; ++row) metadata += "tenant0\n";
+    ByteArray vectorBytes(reinterpret_cast<std::uint8_t*>(vectors.data()),
+        vectors.size() * sizeof(float), false);
+    ByteArray metadataBytes(reinterpret_cast<std::uint8_t*>(metadata.data()),
+        metadata.size(), false);
+    ByteArray query(vectorBytes.Data(), dimension * sizeof(float), false);
+
+    for (const auto& scenario : {
+             std::pair<bool, bool>{false, false}, {false, true},
+             {true, false}, {true, true}}) {
+        const bool limitedTag = scenario.first;
+        const bool overlapping = scenario.second;
+        BOOST_TEST_CONTEXT("limited-tag=" << limitedTag << ", overlapping=" << overlapping) {
+            std::vector<std::uint32_t> tags(count * 2);
+            for (int row = 0; row < count; ++row) {
+                tags[row * 2] = overlapping ? 10U + row % 2 : 10U;
+                tags[row * 2 + 1] = overlapping && row % 3 != 0 ? 10U : 0U;
+            }
+            ByteArray tagBytes(reinterpret_cast<std::uint8_t*>(tags.data()),
+                tags.size() * sizeof(std::uint32_t), false);
+            TenantIndexManager builder(dimension, "SPANN", "Float");
+            builder.SetStorageBackend("STATIC");
+            builder.SetBuildParam("DistCalcMethod", "L2", "Base");
+            builder.SetBuildParam("IndexAlgoType", "BKT", "Base");
+            builder.SetBuildParam("SelectHeadType", "BKT", "SelectHead");
+            builder.SetBuildParam("Ratio", "0.25", "SelectHead");
+            builder.SetBuildParam("NumberOfThreads", "1", "SelectHead");
+            builder.SetBuildParam("NumberOfThreads", "1", "BuildHead");
+            builder.SetSSDBuildParam("NumberOfThreads", "1");
+            builder.SetSSDBuildParam("InternalResultNum", "64");
+            builder.SetSSDBuildParam("SearchInternalResultNum", "256");
+            builder.SetSSDBuildParam("MaxCheck", "4096");
+            builder.SetSSDBuildParam("ReplicaCount", "2");
+            builder.SetSSDBuildParam("PostingPageLimit", "2");
+            builder.SetSSDBuildParam("StaticACLTagCols", "2");
+            builder.SetSSDBuildParam("EnableLimitedTagPosting", limitedTag ? "true" : "false");
+            if (limitedTag)
+                builder.SetSSDBuildParam("LimitedTagSlotsPerHead", overlapping ? "2" : "1");
+            builder.SetSSDBuildParam("LimitedTagMinHeadCount", "1");
+            builder.SetSSDBuildParam("EnableHybridDistance", "false");
+            builder.SetSSDBuildParam("ForceDenseTagSearch", "true");
+            builder.SetSSDBuildParam("ExcludeHead", "true");
+            builder.SetSSDBuildParam("EnableUnfilterTail", "true");
+            builder.SetSSDBuildParam("TailReplicaCount", "0");
+            builder.SetSSDBuildParam("UnfilterTailBufferLength", "0");
+            BOOST_REQUIRE(builder.BuildFromDataWithTags(vectorBytes, metadataBytes,
+                count, tagBytes, 2, false, true));
+            BOOST_REQUIRE(builder.BuildSignatures(0, tagBytes, count, 2));
+            ScopedTempDir saved(MakeTempDir());
+            BOOST_REQUIRE(builder.SaveAll(saved.path.c_str()));
+            if (limitedTag) {
+                // Two categorical columns make flat ACL ineligible for key-only H:
+                // these searches must retain the complete original/O route.
+                std::shared_ptr<SPTAG::VectorIndex> native;
+                const std::string tenantDirectory = saved.path + "/tenant_0";
+                BOOST_REQUIRE(SPTAG::VectorIndex::LoadIndex(tenantDirectory, native) ==
+                    SPTAG::ErrorCode::Success);
+                auto* spann = dynamic_cast<SPTAG::SPANN::Index<float>*>(native.get());
+                BOOST_REQUIRE(spann != nullptr);
+                BOOST_REQUIRE(LoadHeadNodeMetaFile(tenantDirectory, native));
+                BOOST_REQUIRE(spann->GetDiskIndex()->LimitedTagPostingRegionsReady());
+                BOOST_REQUIRE(spann->GetMemoryIndex()->HasHeadNodeTailPS());
+            }
+            TenantIndexManager loaded(dimension, "SPANN", "Float");
+            BOOST_REQUIRE(loaded.LoadAll(saved.path.c_str()));
+            for (int pass = 0; pass < 2; ++pass) {
+                for (std::uint32_t value : {10U, 0U, overlapping ? 11U : 10U}) {
+                    auto result = loaded.SearchWithACL(query, 0, resultCount,
+                        ByteArray(reinterpret_cast<std::uint8_t*>(&value), sizeof(value), false), 1);
+                    const auto ids = ExtractValidIds(result);
+                    BOOST_CHECK_EQUAL(ids.size(), resultCount);
+                    for (const int id : ids) {
+                        BOOST_REQUIRE_LT(id, count);
+                        BOOST_CHECK(tags[id * 2] == value || tags[id * 2 + 1] == value);
+                    }
+                }
+                for (std::uint32_t column : {0U, 1U}) {
+                    const std::uint32_t value = column == 0 || overlapping ? 10U : 0U;
+                    std::vector<std::uint32_t> words{0x444E4633U, 1U, 1U, 0U, column, 0U, value};
+                    auto result = loaded.SearchWithPredicate(query, 0, resultCount,
+                        ByteArray(reinterpret_cast<std::uint8_t*>(words.data()),
+                            words.size() * sizeof(std::uint32_t), false), -1);
+                    const auto ids = ExtractValidIds(result);
+                    BOOST_CHECK_EQUAL(ids.size(), resultCount);
+                    for (const int id : ids) {
+                        BOOST_REQUIRE_LT(id, count);
+                        BOOST_CHECK_EQUAL(tags[id * 2 + column], value);
+                    }
+                }
+                std::uint32_t absent = 9999U;
+                BOOST_CHECK(ExtractValidIds(loaded.SearchWithACL(query, 0, resultCount,
+                    ByteArray(reinterpret_cast<std::uint8_t*>(&absent), sizeof(absent), false), 1)).empty());
+                BOOST_REQUIRE(loaded.UnloadTenant(0));
+            }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(BuildSignaturesRejectsMismatchedSchemaWidth)
+{
+    constexpr int dimension = 8;
+    constexpr int count = 256;
+    std::vector<float> vectors(count * dimension);
+    FillNormalizedVectors(vectors, count, dimension);
+    std::string metadata;
+    for (int row = 0; row < count; ++row) metadata += "tenant0\n";
+    ByteArray vectorBytes(reinterpret_cast<std::uint8_t*>(vectors.data()),
+        vectors.size() * sizeof(float), false);
+    ByteArray metadataBytes(reinterpret_cast<std::uint8_t*>(metadata.data()),
+        metadata.size(), false);
+
+    for (const char* types : {
+             "numeric,categorical", "numeric,categorical,numeric,categorical"}) {
+        BOOST_TEST_CONTEXT("ColumnTypes=" << types) {
+            const auto schema = SPTAG::TagSchema::Parse(types);
+            const int width = schema.Width();
+            std::vector<std::uint32_t> tags(count * width);
+            for (int row = 0; row < count; ++row) {
+                for (int column = 0; column < width; ++column) {
+                    tags[row * width + column] = schema.IsCategorical(column)
+                        ? 10U + row % 2 : 1000U * (column + 1) + row;
+                }
+            }
+            ByteArray tagBytes(reinterpret_cast<std::uint8_t*>(tags.data()),
+                tags.size() * sizeof(std::uint32_t), false);
+            ScopedTempDir saved(MakeTempDir());
+            ScopedEnvironmentVariable inPlace("SPTAG_SPANN_INPLACE_DIR", saved.path.c_str());
+            TenantIndexManager builder(dimension, "SPANN", "Float");
+            builder.SetStorageBackend("STATIC");
+            builder.SetBuildParam("DistCalcMethod", "L2", "Base");
+            builder.SetBuildParam("IndexAlgoType", "BKT", "Base");
+            builder.SetBuildParam("SelectHeadType", "BKT", "SelectHead");
+            builder.SetBuildParam("Ratio", "0.25", "SelectHead");
+            builder.SetBuildParam("BKTLambdaFactor", "1", "SelectHead");
+            builder.SetBuildParam("NumberOfThreads", "1", "SelectHead");
+            builder.SetBuildParam("NumberOfThreads", "1", "BuildHead");
+            builder.SetBuildParam("RefineIterations", "1", "BuildHead");
+            builder.SetSSDBuildParam("NumberOfThreads", "1");
+            builder.SetSSDBuildParam("InternalResultNum", "64");
+            builder.SetSSDBuildParam("ReplicaCount", "2");
+            builder.SetSSDBuildParam("PostingPageLimit", "2");
+            builder.SetSSDBuildParam("ColumnTypes", types);
+            builder.SetSSDBuildParam("LimitedTagColumn", std::to_string(width - 1).c_str());
+            builder.SetSSDBuildParam("EnableLimitedTagPosting", "true");
+            builder.SetSSDBuildParam("LimitedTagSlotsPerHead", "2");
+            builder.SetSSDBuildParam("LimitedTagMinHeadCount", "1");
+            builder.SetSSDBuildParam("EnableHybridDistance", "false");
+            builder.SetSSDBuildParam("ExcludeHead", "true");
+            builder.SetSSDBuildParam("EnableUnfilterTail", "true");
+            builder.SetSSDBuildParam("TailReplicaCount", "0");
+            builder.SetSSDBuildParam("UnfilterTailBufferLength", "0");
+            builder.SetSSDBuildParam("CrossEdges", "0");
+            BOOST_REQUIRE(builder.BuildFromDataWithTags(vectorBytes, metadataBytes,
+                count, tagBytes, width, false, true));
+
+            const auto checkRejectedWidths = [&](TenantIndexManager& manager) {
+                const auto before = SnapshotFiles(saved.path);
+                BOOST_REQUIRE(!before.empty());
+                for (int callerWidth : {width + 1, width - 1}) {
+                    BOOST_TEST_CONTEXT("caller width=" << callerWidth) {
+                        // Each buffer matches the caller's dimensions, not the saved schema.
+                        std::vector<std::uint32_t> mismatched(count * callerWidth, 10U);
+                        ByteArray bytes(reinterpret_cast<std::uint8_t*>(mismatched.data()),
+                            mismatched.size() * sizeof(std::uint32_t), false);
+                        BOOST_CHECK(!manager.BuildSignatures(0, bytes, count, callerWidth));
+                        CheckSavedFiles(before, SnapshotFiles(saved.path));
+                    }
+                }
+            };
+            checkRejectedWidths(builder);
+            BOOST_REQUIRE(builder.BuildSignatures(0, tagBytes, count, width));
+            BOOST_REQUIRE(builder.SaveAll(saved.path.c_str()));
+            BOOST_REQUIRE(PathExists(saved.path + "/tenant_0/HeadIndex/head_node_meta.bin"));
+            checkRejectedWidths(builder);
+            BOOST_REQUIRE(builder.BuildSignatures(0, tagBytes, count, width));
+
+            TenantIndexManager loaded(dimension, "SPANN", "Float");
+            BOOST_REQUIRE(loaded.LoadAll(saved.path.c_str()));
+            checkRejectedWidths(loaded);
+            BOOST_REQUIRE(loaded.BuildSignatures(0, tagBytes, count, width));
+        }
+    }
+}
+
 BOOST_AUTO_TEST_CASE(HeadMetadataV8WithoutTailRoundTrips)
 {
     constexpr int kDim = 8;
@@ -374,7 +587,6 @@ BOOST_AUTO_TEST_CASE(HeadMetadataV8WithoutTailRoundTrips)
     builder.SetSSDBuildParam("ReplicaCount", "2");
     builder.SetSSDBuildParam("ExcludeHead", "true");
     builder.SetSSDBuildParam("StaticACLTagCols", "4");
-    builder.SetSSDBuildParam("EnableHierPostingFilter", "true");
 
     ByteArray vectorBytes(
         reinterpret_cast<std::uint8_t*>(vectors.data()),
@@ -388,9 +600,8 @@ BOOST_AUTO_TEST_CASE(HeadMetadataV8WithoutTailRoundTrips)
     BOOST_REQUIRE(builder.BuildFromDataWithTags(
         vectorBytes, metadataBytes, kNumVectors,
         tagBytes, kNumTagsPerVec, false, true));
-    BOOST_REQUIRE(builder.BuildSignaturesWithVectors(
-        0, tagBytes, kNumVectors, kNumTagsPerVec,
-        vectorBytes));
+    BOOST_REQUIRE(builder.BuildSignatures(
+        0, tagBytes, kNumVectors, kNumTagsPerVec));
 
     ScopedTempDir saveDir(MakeTempDir());
     BOOST_REQUIRE(builder.SaveAll(saveDir.path.c_str()));
@@ -422,6 +633,119 @@ BOOST_AUTO_TEST_CASE(HeadMetadataV8WithoutTailRoundTrips)
     BOOST_REQUIRE(loaded.LoadAll(saveDir.path.c_str()));
     BOOST_REQUIRE_EQUAL(
         loaded.GetInternalTenantId("tenant0"), 0);
+}
+
+BOOST_AUTO_TEST_CASE(LimitedTagRescueSignaturesRepairAndExport)
+{
+    constexpr int dimension = 128, count = 512, width = 4;
+    constexpr int stride = sizeof(SPTAG::SizeType) + width * sizeof(uint32_t) + dimension * sizeof(float);
+    std::vector<float> vectors(count * dimension);
+    FillNormalizedVectors(vectors, count, dimension);
+    std::vector<uint32_t> tags(count * width);
+    std::string metadata;
+    for (int vid = 0; vid < count; ++vid) {
+        tags[vid * width] = vid;
+        tags[vid * width + 1] = 7;
+        tags[vid * width + 2] = count - vid;
+        tags[vid * width + 3] = 1000 + vid;
+        metadata += "tenant0\n";
+    }
+    TenantIndexManager builder(dimension, "SPANN", "Float");
+    builder.SetStorageBackend("STATIC");
+    builder.SetBuildParam("DistCalcMethod", "L2", "Base");
+    builder.SetBuildParam("IndexAlgoType", "BKT", "Base");
+    builder.SetBuildParam("SelectHeadType", "Random", "SelectHead");
+    builder.SetBuildParam("Ratio", "0.015625", "SelectHead");
+    builder.SetBuildParam("NumberOfThreads", "1", "SelectHead");
+    builder.SetBuildParam("NumberOfThreads", "1", "BuildHead");
+    builder.SetBuildParam("BKTLambdaFactor", "1", "BuildHead");
+    builder.SetBuildParam("RefineIterations", "1", "BuildHead");
+    builder.SetSSDBuildParam("NumberOfThreads", "1");
+    builder.SetSSDBuildParam("InternalResultNum", "16");
+    builder.SetSSDBuildParam("ReplicaCount", "8");
+    builder.SetSSDBuildParam("RNGFactor", "100");
+    builder.SetSSDBuildParam("PostingPageLimit", "1");
+    builder.SetSSDBuildParam("PostingVectorLimit", "0");
+    builder.SetSSDBuildParam("SearchPostingPageLimit", "12");
+    builder.SetSSDBuildParam("ExcludeHead", "true");
+    builder.SetSSDBuildParam("ColumnTypes", "numeric,categorical,numeric,categorical");
+    builder.SetSSDBuildParam("StaticACLTagCols", "2");
+    builder.SetSSDBuildParam("EnableLimitedTagPosting", "true");
+    builder.SetSSDBuildParam("EnableLimitedTagSupportExpansion", "true");
+    builder.SetSSDBuildParam("LimitedTagColumn", "1");
+    builder.SetSSDBuildParam("LimitedTagSlotsPerHead", "1");
+    builder.SetSSDBuildParam("LimitedTagMinHeadCount", "1");
+    ByteArray vectorBytes(reinterpret_cast<uint8_t*>(vectors.data()), vectors.size() * sizeof(float), false);
+    ByteArray tagBytes(reinterpret_cast<uint8_t*>(tags.data()), tags.size() * sizeof(uint32_t), false);
+    ByteArray metadataBytes(reinterpret_cast<uint8_t*>(metadata.data()), metadata.size(), false);
+    BOOST_REQUIRE(builder.BuildFromDataWithTags(
+        vectorBytes, metadataBytes, count, tagBytes, width, false, true));
+    BOOST_REQUIRE(builder.BuildSignatures(0, tagBytes, count, width));
+    ScopedTempDir directory(MakeTempDir());
+    BOOST_REQUIRE(builder.SaveAll(directory.path.c_str()));
+    const auto tenant = directory.path + "/tenant_0";
+    std::shared_ptr<SPTAG::VectorIndex> index;
+    BOOST_REQUIRE(SPTAG::VectorIndex::LoadIndex(tenant, index) == SPTAG::ErrorCode::Success);
+    BOOST_REQUIRE(LoadHeadNodeMetaFile(tenant, index));
+    auto* spann = dynamic_cast<SPTAG::SPANN::Index<float>*>(index.get());
+    BOOST_REQUIRE(spann != nullptr);
+    const auto headIndex = spann->GetMemoryIndex();
+    const auto disk = spann->GetDiskIndex();
+    BOOST_REQUIRE_EQUAL(headIndex->GetNumSamples(), 8);
+    BOOST_CHECK_EQUAL(spann->GetOptions()->Schema().text, "numeric,categorical,numeric,categorical");
+    BOOST_CHECK_EQUAL(spann->GetOptions()->m_searchPostingPageLimit, 12);
+    unsigned beyondCut = 0;
+    std::vector<unsigned> copies(count, 0);
+    for (SPTAG::SizeType head = 0; head < headIndex->GetNumSamples(); ++head) {
+        const auto own = spann->GetGlobalVID(head);
+        BOOST_CHECK_EQUAL(own, headIndex->GetHeadNodeGlobalVID(head));
+        BOOST_CHECK_EQUAL(headIndex->GetHeadNodeHierMask(head)->tag[1], 7U);
+        BOOST_CHECK_EQUAL(headIndex->GetHeadNodeHierMask(head)->tag[3], 1000U + own);
+        const int pure = disk->GetPostingVectorCount(head, true);
+        const int full = disk->GetPostingVectorCount(head, false);
+        beyondCut += (std::max)(0, pure - 7);
+        BOOST_CHECK_LE(full - pure, 7);
+        std::string records;
+        BOOST_REQUIRE(disk->GetWritePosting(nullptr, head, records, false) == SPTAG::ErrorCode::Success);
+        BOOST_REQUIRE_EQUAL(records.size(), static_cast<size_t>(full) * stride);
+        SPTAG::Cache::PostingBitmask expectedH, expectedO;
+        for (int row = 0; row < full; ++row) {
+            SPTAG::SizeType vid;
+            const char* record = records.data() + static_cast<size_t>(row) * stride;
+            std::memcpy(&vid, record, sizeof(vid));
+            BOOST_REQUIRE_GE(vid, 0);
+            BOOST_REQUIRE_LT(vid, count);
+            BOOST_CHECK_EQUAL(std::memcmp(record + sizeof(vid), tags.data() + vid * width,
+                width * sizeof(uint32_t)), 0);
+            BOOST_CHECK_EQUAL(std::memcmp(record + sizeof(vid) + width * sizeof(uint32_t),
+                vectors.data() + vid * dimension, dimension * sizeof(float)), 0);
+            auto& signature = row < pure ? expectedH : expectedO;
+            signature.Insert(7);
+            signature.Insert(1000 + vid);
+            if (row < pure) ++copies[vid];
+        }
+        BOOST_REQUIRE(headIndex->GetHeadNodePS(head) != nullptr);
+        BOOST_REQUIRE(headIndex->GetHeadNodeTailPS(head) != nullptr);
+        for (int word = 0; word < SPTAG::Cache::PS_BITMASK_WORDS; ++word) {
+            BOOST_CHECK_EQUAL(headIndex->GetHeadNodePS(head)->bits[word], expectedH.bits[word]);
+            BOOST_CHECK_EQUAL(headIndex->GetHeadNodeTailPS(head)->bits[word], expectedO.bits[word]);
+        }
+    }
+    BOOST_CHECK_GT(beyondCut, 0U);
+    for (SPTAG::SizeType head = 0; head < headIndex->GetNumSamples(); ++head)
+        copies[spann->GetGlobalVID(head)] = 1;
+    BOOST_CHECK(std::all_of(copies.begin(), copies.end(), [](unsigned n) { return n > 0; }));
+    const auto snapshot = SnapshotFiles(tenant);
+    BOOST_REQUIRE(std::filesystem::remove(tenant + "/numeric_meta.bin"));
+    TenantIndexManager repaired(dimension, "SPANN", "Float");
+    BOOST_REQUIRE(repaired.LoadAll(directory.path.c_str()));
+    BOOST_REQUIRE(repaired.BuildSignatures(0, tagBytes, count, width));
+    CheckSavedFiles(snapshot, SnapshotFiles(tenant));
+    ScopedTempDir exported(MakeTempDir());
+    BOOST_REQUIRE(repaired.SaveAll(exported.path.c_str()));
+    CheckSavedFiles(snapshot, SnapshotFiles(exported.path + "/tenant_0"), false);
+    TenantIndexManager loaded(dimension, "SPANN", "Float");
+    BOOST_REQUIRE(loaded.LoadAll(exported.path.c_str()));
 }
 
 BOOST_AUTO_TEST_CASE(GraphlessHeadMetadataUsesCanonicalVIDs)
@@ -462,10 +786,9 @@ BOOST_AUTO_TEST_CASE(GraphlessHeadMetadataUsesCanonicalVIDs)
         builder.SetBuildParam("SplitThreshold", "8", "SelectHead");
         builder.SetBuildParam("BKTLambdaFactor", "-1", "SelectHead");
         builder.SetBuildParam("NumberOfThreads", "1", "SelectHead");
-        builder.SetBuildParam("SelectSecondLevel", "true", "SelectHead");
-        builder.SetBuildParam("SecondLevelHierarchyLevels", "3", "SelectHead");
-        builder.SetBuildParam("SecondLevelRatio", "0.5", "SelectHead");
-        builder.SetBuildParam("SecondLevelReplicaCount", "2", "SelectHead");
+        builder.SetBuildParam("HierarchyEnabled", "true", "SelectHead");
+        builder.SetBuildParam("HierarchyLevels", "3", "SelectHead");
+        builder.SetBuildParam("HierarchyReplicaCount", "2", "SelectHead");
         builder.SetBuildParam("BuildH1Graph", graphless ? "false" : "true", "SelectHead");
         builder.SetBuildParam("CompactHierarchyVectors", "false", "SelectHead");
         builder.SetBuildParam("NumberOfThreads", "1", "BuildHead");
@@ -485,20 +808,18 @@ BOOST_AUTO_TEST_CASE(GraphlessHeadMetadataUsesCanonicalVIDs)
         builder.SetSSDBuildParam("StaticACLTagCols", "1");
         builder.SetSSDBuildParam("EnableLimitedTagPosting", "true");
         builder.SetSSDBuildParam("LimitedTagSlotsPerHead", "2");
-        builder.SetSSDBuildParam("LimitedTagVoteHeadCount", "2");
         builder.SetSSDBuildParam("LimitedTagMinHeadCount", "1");
-        builder.SetSSDBuildParam("EnableExtremeSparseTag", "false");
-        BOOST_REQUIRE(builder.BuildFromDataWithTags(
+            BOOST_REQUIRE(builder.BuildFromDataWithTags(
             vectorBytes, metadataBytes, kNumVectors, tagBytes, 1, false, true));
-        BOOST_REQUIRE(builder.BuildSignaturesWithVectors(
-            0, tagBytes, kNumVectors, 1, vectorBytes));
+        BOOST_REQUIRE(builder.BuildSignatures(
+            0, tagBytes, kNumVectors, 1));
 
         const std::string tenantDirectory = saved.path + "/tenant_0";
         const std::string routingStatsPath = tenantDirectory + "/tag_routing_stats.bin";
         BOOST_REQUIRE(PathExists(routingStatsPath));
         BOOST_REQUIRE(std::filesystem::remove(routingStatsPath));
-        BOOST_REQUIRE(builder.BuildSignaturesWithVectors(
-            0, tagBytes, kNumVectors, 1, vectorBytes));
+        BOOST_REQUIRE(builder.BuildSignatures(
+            0, tagBytes, kNumVectors, 1));
         BOOST_REQUIRE(PathExists(routingStatsPath));
         std::shared_ptr<SPTAG::VectorIndex> index;
         BOOST_REQUIRE(SPTAG::VectorIndex::LoadIndex(tenantDirectory, index) ==
@@ -544,7 +865,7 @@ BOOST_AUTO_TEST_CASE(GraphlessHeadMetadataUsesCanonicalVIDs)
             BOOST_CHECK_EQUAL(config.GetParameter("SelectHead", "BuildH1Graph", graphless),
                               !graphless);
             BOOST_CHECK(!config.GetParameter("SelectHead", "CompactHierarchyVectors", true));
-            BOOST_CHECK_EQUAL(config.GetParameter("SelectHead", "SecondLevelHierarchyLevels", 0), 3);
+            BOOST_CHECK_EQUAL(config.GetParameter("SelectHead", "HierarchyLevels", 0), 3);
             BOOST_CHECK_EQUAL(config.GetParameter("BuildSSDIndex", "ReplicaCount", 0), 2);
             BOOST_CHECK(config.GetParameter("BuildSSDIndex", "EnableLimitedTagPosting", false));
             BOOST_CHECK_EQUAL(config.GetParameter("BuildSSDIndex", "UnfilterTailBufferLength", -1), 0);
@@ -796,10 +1117,7 @@ BOOST_AUTO_TEST_CASE(HybridTagRoutingStatsPersistRepairAndReload)
         "HybridCategoricalWeights", "8,16,32,64");
     builder.SetSSDBuildParam("HybridNumericCols", "4");
     builder.SetSSDBuildParam("HybridNumericWeights", "0.01");
-    builder.SetSSDBuildParam("HybridGraphDegree", "16");
     builder.SetSSDBuildParam("HybridCandidateCount", "32");
-    builder.SetSSDBuildParam(
-        "EnableHierPostingFilter", "true");
 
     ByteArray vectorBytes(
         reinterpret_cast<std::uint8_t*>(vectors.data()),
@@ -1326,706 +1644,7 @@ BOOST_AUTO_TEST_CASE(HybridTagRoutingStatsPersistRepairAndReload)
         filteredSearch(repaired) != nullptr);
 }
 
-BOOST_AUTO_TEST_CASE(ExtremeSparseTagRouteMergeAndReload)
-{
-    constexpr int kDim = 8;
-    constexpr int kNumVectors = 256;
-    constexpr int kNumAttributes = 2;
-    constexpr int kResultNum = 5;
-    constexpr int kSparseCount = 8;
-    constexpr std::uint32_t kCommonTag = 10U;
-    constexpr std::uint32_t kSparseTag = 99U;
-
-    std::vector<float> vectors(
-        static_cast<size_t>(kNumVectors) * kDim);
-    FillNormalizedVectors(
-        vectors, kNumVectors, kDim);
-    std::vector<std::uint32_t> attributes(
-        static_cast<size_t>(kNumVectors) *
-        kNumAttributes);
-    for (int vector = 0;
-         vector < kNumVectors; ++vector)
-    {
-        attributes[
-            static_cast<size_t>(vector) *
-                kNumAttributes] =
-            vector >= kNumVectors - kSparseCount
-            ? kSparseTag
-            : kCommonTag +
-                static_cast<std::uint32_t>(
-                    vector % 4);
-        attributes[
-            static_cast<size_t>(vector) *
-                kNumAttributes +
-            1] = static_cast<std::uint32_t>(vector);
-    }
-    attributes[
-        static_cast<size_t>(7) *
-            kNumAttributes] = kCommonTag;
-    std::string metadata;
-    for (int vector = 0;
-         vector < kNumVectors; ++vector)
-    {
-        metadata += "tenant0\n";
-    }
-
-    TenantIndexManager builder(
-        kDim, "SPANN", "Float");
-    builder.SetStorageBackend("STATIC");
-    builder.SetBuildParam(
-        "DistCalcMethod", "L2", "Base");
-    builder.SetBuildParam(
-        "IndexAlgoType", "BKT", "Base");
-    builder.SetBuildParam(
-        "SSDIndex", "custom_static_postings.bin",
-        "Base");
-    builder.SetBuildParam(
-        "SelectHeadType", "BKT", "SelectHead");
-    builder.SetBuildParam(
-        "Ratio", "0.25", "SelectHead");
-    builder.SetBuildParam(
-        "BKTLambdaFactor", "-1", "SelectHead");
-    builder.SetBuildParam(
-        "NumberOfThreads", "1", "SelectHead");
-    builder.SetBuildParam(
-        "NumberOfThreads", "1", "BuildHead");
-    builder.SetBuildParam(
-        "NeighborhoodSize", "32", "BuildHead");
-    builder.SetBuildParam(
-        "RefineIterations", "3", "BuildHead");
-    builder.SetBuildParam(
-        "BKTLambdaFactor", "-1", "BuildHead");
-    builder.SetSSDBuildParam(
-        "InternalResultNum", "32");
-    builder.SetSSDBuildParam(
-        "SearchInternalResultNum", "16");
-    builder.SetSSDBuildParam(
-        "NumberOfThreads", "2");
-    builder.SetSSDBuildParam(
-        "PostingPageLimit", "4");
-    builder.SetSSDBuildParam(
-        "SearchPostingPageLimit", "4");
-    builder.SetSSDBuildParam(
-        "ReplicaCount", "3");
-    builder.SetSSDBuildParam(
-        "TailReplicaCount", "0");
-    builder.SetSSDBuildParam(
-        "EnableUnfilterTail", "true");
-    builder.SetSSDBuildParam(
-        "UnfilterTailBufferLength", "0");
-    builder.SetSSDBuildParam("CrossEdges", "0");
-    builder.SetSSDBuildParam(
-        "ExcludeHead", "true");
-    builder.SetSSDBuildParam(
-        "StaticACLTagCols", "1");
-    builder.SetSSDBuildParam(
-        "EnableLimitedTagPosting", "true");
-    builder.SetSSDBuildParam(
-        "LimitedTagColumn", "0");
-    builder.SetSSDBuildParam(
-        "LimitedTagSlotsPerHead", "2");
-    builder.SetSSDBuildParam(
-        "LimitedTagVoteHeadCount", "2");
-    builder.SetSSDBuildParam(
-        "LimitedTagMinHeadCount", "1");
-    builder.SetSSDBuildParam(
-        "EnableExtremeSparseTag", "true");
-    builder.SetSSDBuildParam(
-        "ExtremeSparseTagMinCount", "10");
-    builder.SetSSDBuildParam(
-        "ExtremeSparseTagFile",
-        "extreme_sparse_tags.bin");
-    builder.SetSSDBuildParam(
-        "LogExtremeSparseTagRoute", "true");
-    builder.SetSSDBuildParam(
-        "EnableHierPostingFilter", "false");
-
-    ByteArray vectorBytes(
-        reinterpret_cast<std::uint8_t*>(
-            vectors.data()),
-        vectors.size() * sizeof(float), false);
-    ByteArray metadataBytes(
-        reinterpret_cast<std::uint8_t*>(
-            metadata.data()),
-        metadata.size(), false);
-    ByteArray attributeBytes(
-        reinterpret_cast<std::uint8_t*>(
-            attributes.data()),
-        attributes.size() *
-            sizeof(std::uint32_t),
-        false);
-    BOOST_REQUIRE(builder.BuildFromDataWithTags(
-        vectorBytes, metadataBytes, kNumVectors,
-        attributeBytes, kNumAttributes,
-        false, true));
-    BOOST_REQUIRE(builder.BuildSignaturesWithVectors(
-        0, attributeBytes, kNumVectors,
-        kNumAttributes, vectorBytes));
-    auto staleAttributes = attributes;
-    staleAttributes.back() = 10000U;
-    ByteArray staleAttributeBytes(
-        reinterpret_cast<std::uint8_t*>(
-            staleAttributes.data()),
-        staleAttributes.size() *
-            sizeof(std::uint32_t),
-        false);
-    BOOST_REQUIRE(
-        builder.BuildSignaturesWithVectors(
-            0, staleAttributeBytes, kNumVectors,
-            kNumAttributes, vectorBytes));
-    BOOST_REQUIRE(
-        builder.BuildSignaturesWithVectors(
-            0, attributeBytes, kNumVectors,
-            kNumAttributes, vectorBytes));
-
-    ScopedTempDir saveDir(MakeTempDir());
-    BOOST_REQUIRE(
-        builder.SaveAll(saveDir.path.c_str()));
-    BOOST_CHECK(
-        std::filesystem::exists(
-            saveDir.path +
-            "/tenant_0/custom_static_postings.bin"));
-    BOOST_CHECK(
-        !std::filesystem::exists(
-            saveDir.path +
-            "/tenant_0/SPTAGFullList.bin"));
-    const std::string headMetadataPath =
-        saveDir.path +
-        "/tenant_0/HeadIndex/head_node_meta.bin";
-    {
-        std::ifstream headMetadata(
-            headMetadataPath,
-            std::ios::binary);
-        BOOST_REQUIRE(headMetadata.good());
-        std::array<std::int32_t, 4> header{};
-        headMetadata.read(
-            reinterpret_cast<char*>(header.data()),
-            static_cast<std::streamsize>(
-                sizeof(header)));
-        BOOST_REQUIRE(headMetadata.good());
-        BOOST_CHECK_EQUAL(header[0], 8);
-        BOOST_CHECK_GT(header[1], 0);
-        BOOST_CHECK_EQUAL(header[2], 1);
-    }
-    const std::string sparsePath =
-        saveDir.path +
-        "/tenant_0/extreme_sparse_tags.bin";
-    BOOST_REQUIRE(PathExists(sparsePath));
-    SPTAG::Cache::ExtremeSparseTagStore::Header
-        sparseHeader;
-    {
-        std::ifstream sparseInput(
-            sparsePath, std::ios::binary);
-        BOOST_REQUIRE(sparseInput.good());
-        sparseInput.read(
-            reinterpret_cast<char*>(&sparseHeader),
-            sizeof(sparseHeader));
-        BOOST_REQUIRE(sparseInput.good());
-        BOOST_CHECK_EQUAL(sparseHeader.m_version, 4U);
-        BOOST_CHECK_EQUAL(
-            sparseHeader.m_headerBytes,
-            sizeof(sparseHeader));
-        BOOST_CHECK_EQUAL(
-            sparseHeader.m_minTagCount, 10U);
-        BOOST_CHECK_EQUAL(
-            sparseHeader.m_slotsPerHead, 2U);
-        BOOST_CHECK_GE(
-            sparseHeader.m_coverageTarget, 16U);
-    }
-    const std::string numericMetadataPath =
-        saveDir.path +
-        "/tenant_0/numeric_meta.bin";
-    std::vector<std::uint8_t>
-        validNumericMetadata;
-    {
-        std::ifstream input(
-            numericMetadataPath,
-            std::ios::binary);
-        BOOST_REQUIRE(input.good());
-        input.seekg(0, std::ios::end);
-        const std::streamoff bytes = input.tellg();
-        BOOST_REQUIRE_GE(bytes, 48);
-        validNumericMetadata.resize(
-            static_cast<size_t>(bytes));
-        input.seekg(0, std::ios::beg);
-        input.read(
-            reinterpret_cast<char*>(
-                validNumericMetadata.data()),
-            bytes);
-        BOOST_REQUIRE(input.good());
-        std::uint32_t magic = 0;
-        std::uint32_t version = 0;
-        std::int32_t base = 0;
-        std::int32_t count = 0;
-        std::int32_t vectorsInMetadata = 0;
-        std::int32_t attributesInMetadata = 0;
-        std::uint64_t generation = 0;
-        std::uint32_t domainHigh = 0;
-        std::memcpy(
-            &magic,
-            validNumericMetadata.data(),
-            sizeof(magic));
-        std::memcpy(
-            &version,
-            validNumericMetadata.data() + 4,
-            sizeof(version));
-        std::memcpy(
-            &base,
-            validNumericMetadata.data() + 8,
-            sizeof(base));
-        std::memcpy(
-            &count,
-            validNumericMetadata.data() + 12,
-            sizeof(count));
-        std::memcpy(
-            &vectorsInMetadata,
-            validNumericMetadata.data() + 16,
-            sizeof(vectorsInMetadata));
-        std::memcpy(
-            &attributesInMetadata,
-            validNumericMetadata.data() + 20,
-            sizeof(attributesInMetadata));
-        std::memcpy(
-            &generation,
-            validNumericMetadata.data() + 24,
-            sizeof(generation));
-        std::memcpy(
-            &domainHigh,
-            validNumericMetadata.data() + 44,
-            sizeof(domainHigh));
-        BOOST_CHECK_EQUAL(magic, 0x324D554EU);
-        BOOST_CHECK_EQUAL(version, 2U);
-        BOOST_CHECK_EQUAL(base, 1);
-        BOOST_CHECK_EQUAL(count, 1);
-        BOOST_CHECK_EQUAL(
-            vectorsInMetadata, kNumVectors);
-        BOOST_CHECK_EQUAL(
-            attributesInMetadata,
-            kNumAttributes);
-        BOOST_CHECK_NE(generation, 0U);
-        BOOST_CHECK_EQUAL(
-            domainHigh,
-            static_cast<std::uint32_t>(
-                kNumVectors - 1));
-    }
-
-    TenantIndexManager loaded(
-        kDim, "SPANN", "Float");
-    BOOST_REQUIRE(
-        loaded.LoadAll(saveDir.path.c_str()));
-    const auto query =
-        [&](int vector) {
-            return ByteArray(
-                reinterpret_cast<std::uint8_t*>(
-                    vectors.data() +
-                    static_cast<size_t>(vector) *
-                        kDim),
-                kDim * sizeof(float), false);
-        };
-    std::uint64_t commonCount = 0;
-    for (int vector = 0;
-         vector < kNumVectors; ++vector) {
-        if (attributes[
-                static_cast<size_t>(vector) *
-                kNumAttributes] == kCommonTag) {
-            ++commonCount;
-        }
-    }
-    const std::uint32_t commonCoverageTarget =
-        static_cast<std::uint32_t>(
-            commonCount *
-                sparseHeader.m_headCount *
-                sparseHeader.m_slotsPerHead /
-                kNumVectors +
-            1);
-    BOOST_REQUIRE_LE(
-        commonCoverageTarget,
-        sparseHeader.m_coverageTarget);
-    loaded.SetSearchParam(
-        "InternalResultNum",
-        std::to_string(commonCoverageTarget).c_str(),
-        "SearchSSDIndex");
-    std::uint32_t commonTag = kCommonTag;
-    auto coverageQualified = loaded.SearchWithACL(
-        query(7), 0, kResultNum,
-        ByteArray(
-            reinterpret_cast<std::uint8_t*>(
-                &commonTag),
-            sizeof(commonTag), false),
-        1);
-    BOOST_REQUIRE(coverageQualified != nullptr);
-    BOOST_CHECK_EQUAL(
-        coverageQualified->GetScanned(),
-        commonCount);
-    loaded.SetSearchParam(
-        "InternalResultNum", "16",
-        "SearchSSDIndex");
-
-    loaded.SetSearchParam(
-        "InternalResultNum",
-        std::to_string(
-            sparseHeader.m_coverageTarget + 1)
-            .c_str(),
-        "SearchSSDIndex");
-    BOOST_CHECK(
-        loaded.SearchWithACL(
-            query(7), 0, kResultNum,
-            ByteArray(
-                reinterpret_cast<std::uint8_t*>(
-                           &commonTag),
-                sizeof(commonTag), false),
-            1) == nullptr);
-    loaded.SetSearchParam(
-        "InternalResultNum", "16",
-        "SearchSSDIndex");
-
-    std::uint32_t sparseTag = kSparseTag;
-    auto sparseOnly = loaded.SearchWithACL(
-        query(kNumVectors - 1), 0, kResultNum,
-        ByteArray(
-            reinterpret_cast<std::uint8_t*>(
-                &sparseTag),
-            sizeof(sparseTag), false),
-        1);
-    BOOST_REQUIRE(sparseOnly != nullptr);
-    const auto sparseOnlyIDs =
-        ExtractValidIds(sparseOnly);
-    BOOST_REQUIRE_EQUAL(
-        sparseOnlyIDs.size(), kResultNum);
-    BOOST_CHECK(
-        std::find(
-            sparseOnlyIDs.begin(),
-            sparseOnlyIDs.end(),
-            kNumVectors - 1) !=
-        sparseOnlyIDs.end());
-    for (int vector : sparseOnlyIDs)
-    {
-        BOOST_CHECK_GE(
-            vector, kNumVectors - kSparseCount);
-    }
-    BOOST_CHECK_EQUAL(
-        sparseOnly->GetScanned(), kSparseCount);
-
-    const std::vector<std::uint32_t> mixedDNF = {
-        0x444E4633U, 2,
-        1, 0, 0, SPTAG::Cache::DNF_EQ,
-        kSparseTag,
-        2,
-        0, 0, SPTAG::Cache::DNF_EQ,
-        kCommonTag,
-        1, 1, SPTAG::Cache::DNF_EQ, 7U};
-    auto mixed = loaded.SearchWithACL(
-        query(7), 0, kResultNum,
-        ByteArray(
-            reinterpret_cast<std::uint8_t*>(
-                const_cast<std::uint32_t*>(
-                    mixedDNF.data())),
-            mixedDNF.size() *
-                sizeof(std::uint32_t),
-            false),
-        -1);
-    BOOST_REQUIRE(mixed != nullptr);
-    const auto mixedIDs = ExtractValidIds(mixed);
-    BOOST_CHECK(
-        std::find(
-            mixedIDs.begin(), mixedIDs.end(), 7) !=
-        mixedIDs.end());
-    bool foundSparse = false;
-    for (int vector : mixedIDs)
-    {
-        foundSparse =
-            foundSparse ||
-            vector >=
-                kNumVectors - kSparseCount;
-        BOOST_CHECK(
-            vector >=
-                kNumVectors - kSparseCount ||
-            vector == 7);
-    }
-    BOOST_CHECK(foundSparse);
-
-    const std::vector<std::uint32_t> numericOnlyDNF = {
-        0x444E4633U, 1,
-        1, 1, 1, SPTAG::Cache::DNF_EQ, 42U};
-    auto numericOnly = loaded.SearchWithACL(
-        query(42), 0, kResultNum,
-        ByteArray(
-            reinterpret_cast<std::uint8_t*>(
-                const_cast<std::uint32_t*>(
-                    numericOnlyDNF.data())),
-            numericOnlyDNF.size() *
-                sizeof(std::uint32_t),
-            false),
-        -1);
-    BOOST_REQUIRE(numericOnly != nullptr);
-    const auto numericIDs =
-        ExtractValidIds(numericOnly);
-    BOOST_REQUIRE(
-        std::find(
-            numericIDs.begin(), numericIDs.end(),
-            42) != numericIDs.end());
-    for (int vector : numericIDs)
-    {
-        BOOST_CHECK_EQUAL(vector, 42);
-    }
-
-    const auto writeNumericMetadata =
-        [&](const std::vector<std::uint8_t>& bytes) {
-            std::ofstream output(
-                numericMetadataPath,
-                std::ios::binary |
-                    std::ios::trunc);
-            BOOST_REQUIRE(output.good());
-            if (!bytes.empty()) {
-                output.write(
-                    reinterpret_cast<const char*>(
-                        bytes.data()),
-                    static_cast<std::streamsize>(
-                        bytes.size()));
-            }
-            BOOST_REQUIRE(output.good());
-        };
-    const auto checkNumericFailOpen = [&]() {
-        TenantIndexManager fallback(
-            kDim, "SPANN", "Float");
-        BOOST_REQUIRE(
-            fallback.LoadAll(
-                saveDir.path.c_str()));
-        auto result = fallback.SearchWithACL(
-            query(42), 0, kResultNum,
-            ByteArray(
-                reinterpret_cast<std::uint8_t*>(
-                    const_cast<std::uint32_t*>(
-                        numericOnlyDNF.data())),
-                numericOnlyDNF.size() *
-                    sizeof(std::uint32_t),
-                false),
-            -1);
-        BOOST_REQUIRE(result != nullptr);
-        const auto ids = ExtractValidIds(result);
-        BOOST_REQUIRE(
-            std::find(
-                ids.begin(), ids.end(), 42) !=
-            ids.end());
-        for (int vector : ids) {
-            BOOST_CHECK_EQUAL(vector, 42);
-        }
-    };
-    const auto refreshNumericFingerprint =
-        [](std::vector<std::uint8_t>& bytes) {
-            constexpr std::uint64_t kOffset =
-                1469598103934665603ULL;
-            constexpr std::uint64_t kPrime =
-                1099511628211ULL;
-            std::uint64_t fingerprint = kOffset;
-            const auto append =
-                [&](size_t offset, size_t count) {
-                    for (size_t i = 0; i < count;
-                         ++i) {
-                        fingerprint ^=
-                            bytes[offset + i];
-                        fingerprint *= kPrime;
-                    }
-                };
-            append(8, 4);
-            append(12, 4);
-            append(16, 4);
-            append(20, 4);
-            append(24, 8);
-            append(40, 8);
-            std::memcpy(
-                bytes.data() + 32,
-                &fingerprint,
-                sizeof(fingerprint));
-        };
-
-    std::filesystem::remove(
-        numericMetadataPath);
-    checkNumericFailOpen();
-    writeNumericMetadata(validNumericMetadata);
-
-    auto truncatedNumericMetadata =
-        validNumericMetadata;
-    truncatedNumericMetadata.pop_back();
-    writeNumericMetadata(
-        truncatedNumericMetadata);
-    checkNumericFailOpen();
-
-    auto wrongBaseNumericMetadata =
-        validNumericMetadata;
-    wrongBaseNumericMetadata[8] ^= 1U;
-    refreshNumericFingerprint(
-        wrongBaseNumericMetadata);
-    writeNumericMetadata(
-        wrongBaseNumericMetadata);
-    checkNumericFailOpen();
-
-    auto wrongCountNumericMetadata =
-        validNumericMetadata;
-    wrongCountNumericMetadata[12] ^= 1U;
-    writeNumericMetadata(
-        wrongCountNumericMetadata);
-    checkNumericFailOpen();
-
-    auto wrongDomainNumericMetadata =
-        validNumericMetadata;
-    wrongDomainNumericMetadata[44] ^= 1U;
-    refreshNumericFingerprint(
-        wrongDomainNumericMetadata);
-    writeNumericMetadata(
-        wrongDomainNumericMetadata);
-    checkNumericFailOpen();
-
-    auto wrongGenerationNumericMetadata =
-        validNumericMetadata;
-    wrongGenerationNumericMetadata[24] ^= 1U;
-    refreshNumericFingerprint(
-        wrongGenerationNumericMetadata);
-    writeNumericMetadata(
-        wrongGenerationNumericMetadata);
-    checkNumericFailOpen();
-    writeNumericMetadata(validNumericMetadata);
-
-    const std::string loaderPath =
-        saveDir.path +
-        "/tenant_0/indexloader.ini";
-    {
-        std::ifstream input(loaderPath);
-        BOOST_REQUIRE(input.good());
-        std::string migratedConfig;
-        std::string line;
-        while (std::getline(input, line)) {
-            if (line.rfind(
-                    "ExtremeSparseTagMinCount=",
-                    0) == 0) {
-                continue;
-            }
-            migratedConfig += line + "\n";
-        }
-        BOOST_REQUIRE(input.eof());
-        BOOST_CHECK(
-            migratedConfig.find(
-                "ExtremeSparseTagMinCount=") ==
-            std::string::npos);
-        std::ofstream output(
-            loaderPath, std::ios::trunc);
-        BOOST_REQUIRE(output.good());
-        output << migratedConfig;
-        BOOST_REQUIRE(output.good());
-    }
-    {
-        std::fstream output(
-            sparsePath,
-            std::ios::binary |
-                std::ios::in |
-                std::ios::out);
-        BOOST_REQUIRE(output.good());
-        output.seekp(
-            static_cast<std::streamoff>(
-                offsetof(
-                    SPTAG::Cache::
-                        ExtremeSparseTagStore::Header,
-                    m_version)),
-            std::ios::beg);
-        const std::uint32_t oldVersion = 3;
-        output.write(
-            reinterpret_cast<const char*>(
-                &oldVersion),
-            sizeof(oldVersion));
-        BOOST_REQUIRE(output.good());
-    }
-    TenantIndexManager corrupted(
-        kDim, "SPANN", "Float");
-    BOOST_CHECK(
-        !corrupted.LoadAll(saveDir.path.c_str()));
-    TenantIndexManager repair(
-        kDim, "SPANN", "Float");
-    repair.SetSSDBuildParam(
-        "ExtremeSparseTagMinCount", "11");
-    BOOST_REQUIRE(
-        repair.LoadAllForSignatureRepair(
-            saveDir.path.c_str()));
-    {
-        std::ifstream input(loaderPath);
-        BOOST_REQUIRE(input.good());
-        const std::string migratedConfig(
-            (std::istreambuf_iterator<char>(
-                 input)),
-            std::istreambuf_iterator<char>());
-        BOOST_CHECK(
-            migratedConfig.find(
-                "ExtremeSparseTagMinCount=11") !=
-            std::string::npos);
-    }
-    BOOST_REQUIRE(
-        repair.BuildSignaturesWithVectors(
-            0, attributeBytes, kNumVectors,
-            kNumAttributes, vectorBytes));
-    TenantIndexManager repaired(
-        kDim, "SPANN", "Float");
-    BOOST_REQUIRE(
-        repaired.LoadAll(saveDir.path.c_str()));
-    {
-        SPTAG::Cache::ExtremeSparseTagStore::Header
-            repairedHeader;
-        std::ifstream input(
-            sparsePath, std::ios::binary);
-        BOOST_REQUIRE(input.good());
-        input.read(
-            reinterpret_cast<char*>(
-                &repairedHeader),
-            sizeof(repairedHeader));
-        BOOST_REQUIRE(input.good());
-        BOOST_CHECK_EQUAL(
-            repairedHeader.m_version, 4U);
-        BOOST_CHECK_EQUAL(
-            repairedHeader.m_minTagCount, 11U);
-    }
-    auto repairedSparse = repaired.SearchWithACL(
-        query(kNumVectors - 1), 0, kResultNum,
-        ByteArray(
-            reinterpret_cast<std::uint8_t*>(
-                &sparseTag),
-            sizeof(sparseTag), false),
-        1);
-    BOOST_REQUIRE(repairedSparse != nullptr);
-    const auto repairedIDs =
-        ExtractValidIds(repairedSparse);
-    BOOST_REQUIRE_EQUAL(
-        repairedIDs.size(), kResultNum);
-    BOOST_CHECK(
-        std::find(
-            repairedIDs.begin(), repairedIDs.end(),
-            kNumVectors - 1) !=
-        repairedIDs.end());
-
-    TenantIndexManager saveFailure(
-        kDim, "SPANN", "Float");
-    BOOST_REQUIRE(
-        saveFailure.LoadAll(
-            saveDir.path.c_str()));
-    const std::uintmax_t publishedHeadBytes =
-        std::filesystem::file_size(
-            headMetadataPath);
-    const std::string blockedTemporary =
-        headMetadataPath + ".tmp";
-    BOOST_REQUIRE(
-        std::filesystem::create_directory(
-            blockedTemporary));
-    BOOST_CHECK(
-        !saveFailure.BuildSignaturesWithVectors(
-            0, staleAttributeBytes, kNumVectors,
-            kNumAttributes, vectorBytes));
-    BOOST_CHECK_EQUAL(
-        std::filesystem::file_size(
-            headMetadataPath),
-        publishedHeadBytes);
-    BOOST_REQUIRE(
-        std::filesystem::remove(
-            blockedTemporary));
-}
-
-BOOST_AUTO_TEST_CASE(ExtremeSparseIntegerCosineMergeUsesNativeScale)
+BOOST_AUTO_TEST_CASE(SingleLabelIntegerCosineUsesNativeScale)
 {
     constexpr int kDim = 128;
     constexpr int kNumVectors = 256;
@@ -2069,6 +1688,7 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseIntegerCosineMergeUsesNativeScale)
         tags[static_cast<size_t>(kSparseVector)] =
             kSparseTag;
     }
+    const auto originalVectors = vectors;
     TenantIndexManager builder(
         kDim, "SPANN", "UInt8");
     builder.SetStorageBackend("STATIC");
@@ -2122,15 +1742,7 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseIntegerCosineMergeUsesNativeScale)
     builder.SetSSDBuildParam(
         "LimitedTagSlotsPerHead", "2");
     builder.SetSSDBuildParam(
-        "LimitedTagVoteHeadCount", "2");
-    builder.SetSSDBuildParam(
         "LimitedTagMinHeadCount", "1");
-    builder.SetSSDBuildParam(
-        "EnableExtremeSparseTag", "true");
-    builder.SetSSDBuildParam(
-        "ExtremeSparseTagMinCount", "10");
-    builder.SetSSDBuildParam(
-        "EnableHierPostingFilter", "false");
 
     ByteArray vectorBytes(
         vectors.data(), vectors.size(), false);
@@ -2143,10 +1755,12 @@ BOOST_AUTO_TEST_CASE(ExtremeSparseIntegerCosineMergeUsesNativeScale)
         builder.BuildFromDataWithTagsSingleTenant(
             vectorBytes, 0, kNumVectors, tagBytes, 1,
             false, false));
+    BOOST_CHECK_EQUAL_COLLECTIONS(
+        vectors.begin(), vectors.end(),
+        originalVectors.begin(), originalVectors.end());
     BOOST_REQUIRE(
-        builder.BuildSignaturesWithVectors(
-            0, tagBytes, kNumVectors, 1,
-            vectorBytes));
+        builder.BuildSignatures(
+            0, tagBytes, kNumVectors, 1));
 
     std::array<std::uint8_t, kDim> query = {
         255, 0, 0, 0, 0, 0, 0, 0};

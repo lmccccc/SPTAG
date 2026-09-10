@@ -60,7 +60,6 @@ artifacts are byte-exact with the in-posting convention:
 | Output (under `$OUT`) | Built by | Meaning |
 | --- | --- | --- |
 | `spacev1b_tags5.u32` `(N,5)` uint32 | `--merge-tags5` | `[org,dept,team,project \| price]` — interleaves `tags.npy` + `num_attr.npy` |
-| `spacev1b_group_tags.txt` | `--merge-tags5` | ACL col 0 (org), one int/line — the PerTagBKT routing key |
 | `opq_codes_m25.bin` `(N,25)` uint8 | `--gen-opq-codes` | raw OPQ codes (raw-widen, ADC=false, header-less) — **not** the normalizing `Release/quantizer` |
 | `opq_quantizer.bin` | copied | the OPQ codebook (search-time ADC) |
 
@@ -118,12 +117,13 @@ Tools/benchmarks/run_spann_attr_build.sh Tools/benchmarks/build_spann_attr_space
 #             + Release/augmentheadgraph -d $IDX/tenant_0/HeadIndex -k 15 -m N -t T -w true
 ```
 
-Build phases in the log: `PerTagBKT` head selection → `DualPoolAugment` (U_extra)
+Build phases in the log: global spatial `BKT` head selection → optional `DualPoolAugment` (U_extra)
 → `Begin Build Head` (BKT + RNG graph over the heads) → `BuildSSDIndex` (slim
 in-posting postings) → in-place `SaveAll`. For the three **unfilter-enhancement
-layers** (cross-graph / U_extra / unfilter-tail) — which must be enabled together
-or unfilter degrades to a per-node fan-out — see **AGENTS.md → "Unfilter
-Enhancement Pipeline"**. Billion-scale knobs (resume checkpoint, pinned BKT
+layers** (cross-graph / U_extra / unfilter-tail), see **AGENTS.md → "Unfilter
+Enhancement Pipeline"**. They are not requirements of the current single global
+H/O hierarchy; attribute partitioning and its grouping files are removed.
+Billion-scale knobs (resume checkpoint, pinned BKT
 balance factor, in-place build, slim SSD block-pool sizing) are documented in
 **AGENTS.md → "Billion-scale build options"**.
 
@@ -134,8 +134,8 @@ The 3M-scale sibling config is `Script_AE/iniFile/build_spann_attr_spacev_opq25.
 ## (5) Query / benchmark  —  native persisted search config
 
 Build and search parameters are persisted in the same native `.ini`:
-`[SearchSSDIndex] InternalResultNum`, `MaxCheck`, `EnableUnfilterTail`,
-and `EnableHierPostingFilter`. Do **not** override build or search parameters
+`[SearchSSDIndex] InternalResultNum`, `MaxCheck`, and `EnableUnfilterTail`.
+Validated head/posting signatures are used automatically for filtering. Do **not** override build or search parameters
 through environment variables.
 
 For the committed Float STM1 SIFT-1M fixture, build the native benchmark target

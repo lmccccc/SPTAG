@@ -18,6 +18,16 @@ namespace BKT
 
 template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader)
 {
+    for (const char* name : {"BKTSeed", "TPTSeed"}) {
+        if (!p_reader.DoesParameterExist("Index", name)) continue;
+        int legacySeed;
+        if (!Helper::Convert::ConvertStringTo<int>(
+                p_reader.GetParameter("Index", name, std::string()).c_str(), legacySeed) || legacySeed < -1)
+            return ErrorCode::FailedParseValue;
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Warning,
+            "Loading legacy %s=%d as artifact provenance only; saved geometry is unchanged, rebuilds use upstream RNG behavior.\n",
+            name, legacySeed);
+    }
 #define DefineBKTParameter(VarName, VarType, DefaultValue, RepresentStr)                                               \
     SetParameter(RepresentStr, p_reader.GetParameter("Index", RepresentStr, std::string(#DefaultValue)).c_str());
 
@@ -334,7 +344,9 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
     }
     m_pTrees.InitSearchTrees(m_pSamples, m_fComputeDistance, p_query, p_space, p_traversalFilter);
     m_pTrees.SearchTrees(m_pSamples, m_fComputeDistance, p_query, p_space,
-        m_iNumberOfInitialDynamicPivots, p_traversalFilter);
+        p_resultFilter ? (std::min)(p_space.m_iMaxCheck, m_iNumberOfInitialDynamicPivots)
+                       : m_iNumberOfInitialDynamicPivots,
+        p_traversalFilter);
     std::chrono::high_resolution_clock::time_point graphStart;
 
     if constexpr (EnableCrossEdges)
@@ -704,8 +716,22 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
         p_query.SortResult();
     };
 
-    while (!p_space.m_NGQueue.empty())
+    while (true)
     {
+        if (p_space.m_NGQueue.empty())
+        {
+            if (!p_resultFilter || p_query.worstDist() < MaxDist ||
+                p_space.m_iNumberOfCheckedLeaves >= p_space.m_iMaxCheck ||
+                p_space.m_SPTQueue.empty())
+                break;
+            // Underfilled admission resumes the existing tree frontier, with
+            // no new workspace, reseeding, or second MaxCheck allowance.
+            m_pTrees.SearchTrees(m_pSamples, m_fComputeDistance, p_query, p_space,
+                p_space.m_iNumberOfCheckedLeaves + (std::min)(
+                    p_space.m_iMaxCheck - p_space.m_iNumberOfCheckedLeaves,
+                    (std::max)(1, m_iNumberOfOtherDynamicPivots)), p_traversalFilter);
+            if (p_space.m_NGQueue.empty()) continue;
+        }
         NodeDistPair gnode = p_space.m_NGQueue.pop();
         SizeType currentLocal = gnode.node;
         int currentNode = 0;
@@ -1428,7 +1454,7 @@ ErrorCode Index<T>::SearchIndexWithResultFilter(
     if (!m_bReady)
         return ErrorCode::EmptyIndex;
     if (!p_resultFilter)
-        return SearchIndex(p_query, p_searchDeleted);
+        return SearchIndexWithMaxCheck(p_query, p_maxCheck, p_searchDeleted);
 
     auto workSpace = RentWorkSpace(
         p_query.GetResultNum(), nullptr,
@@ -1467,7 +1493,7 @@ ErrorCode Index<T>::SearchIndexWithTraversalFilter(
     workSpace->PrepareResultCheckStatus();
     SearchIndex(
         *((COMMON::QueryResultSet<T>*)&p_query), *workSpace,
-        p_searchDeleted, true, nullptr, nullptr, p_filter);
+        p_searchDeleted, true, nullptr, p_filter, p_filter);
     m_workSpaceFactory->ReturnWorkSpace(std::move(workSpace));
     if (p_query.WithMeta() && m_pMetadata != nullptr)
     {
@@ -2088,6 +2114,11 @@ template <typename T> ErrorCode Index<T>::SetParameter(const char *p_param, cons
 {
     if (nullptr == p_param || nullptr == p_value)
         return ErrorCode::Fail;
+    if (Helper::StrUtils::StrEqualIgnoreCase(p_param, "BKTSeed") ||
+        Helper::StrUtils::StrEqualIgnoreCase(p_param, "TPTSeed")) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "%s was removed; construction uses upstream RNG behavior.\n", p_param);
+        return ErrorCode::FailedParseValue;
+    }
 
 #define DefineBKTParameter(VarName, VarType, DefaultValue, RepresentStr)                                               \
     else if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_param, RepresentStr))                                       \

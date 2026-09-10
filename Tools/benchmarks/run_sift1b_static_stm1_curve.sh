@@ -127,7 +127,6 @@ make_overlay() {
     set_ini_value "$tenant/indexloader.ini" SearchSSDIndex PostingPageLimit 3
     set_ini_value "$tenant/indexloader.ini" SearchSSDIndex IOThreadsPerHandler 1
     set_ini_value "$tenant/indexloader.ini" SearchSSDIndex ForceDenseTagSearch true
-    set_ini_value "$tenant/indexloader.ini" SearchSSDIndex EnableHierPostingFilter true
 
     grep -Fqx "IndexDirectory=$tenant" "$tenant/indexloader.ini"
     grep -Fqx 'NumberOfThreads=1' "$tenant/indexloader.ini"
@@ -136,7 +135,7 @@ make_overlay() {
     grep -Fqx "MaxCheck=$maxcheck" "$tenant/indexloader.ini"
     grep -Fqx 'IOThreadsPerHandler=1' "$tenant/indexloader.ini"
     grep -Fqx 'ForceDenseTagSearch=true' "$tenant/indexloader.ini"
-    grep -Fqx 'EnableHierPostingFilter=true' "$tenant/indexloader.ini"
+    [ -s "$tenant/HeadIndex/head_node_meta.bin" ]
     ! grep -Eiq '^[[:space:]]*(FixedNprobe|PinnedPostingTarget|TagAwareHeadExpansion)[[:space:]]*=' \
         "$tenant/indexloader.ini"
     printf '%s\n' "$overlay"
@@ -166,7 +165,6 @@ for nprobe in "${NPROBES[@]}"; do
 
     grep -F "Setting SearchInternalResultNum with value $nprobe" "$point_log" >/dev/null
     grep -F "Setting MaxCheck with value $maxcheck" "$point_log" >/dev/null
-    grep -F 'Setting EnableHierPostingFilter with value true' "$point_log" >/dev/null
     grep -E 'AsyncFileIO::InitializeFileIo: file .* threads=1 maxNumBlocks=' "$point_log" >/dev/null
     ! grep -F 'Cannot setup aio:' "$point_log"
     python3 - "$point_log" "$CURVE" "$nprobe" "$maxcheck" <<'PY'

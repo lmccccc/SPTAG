@@ -162,7 +162,7 @@ def parse_args() -> argparse.Namespace:
         "--config",
         type=Path,
         default=DEFAULT_CONFIG,
-        help="Native SPANN INI that defines the EST coverage policy.",
+        help="Native SPANN INI supplying head/support/search budgets for the rare-label recipe.",
     )
     parser.add_argument("--seed", type=int, default=20260817)
     parser.add_argument("--numeric-seed", type=int, default=20260821)
@@ -204,7 +204,7 @@ def main() -> None:
         policy.vector_count != vector_count
     ):
         raise ValueError(
-            f"{config_path}: VectorCount={policy.vector_count} "
+            f"{config_path}: native vector count={policy.vector_count} "
             f"does not match base count {vector_count}"
         )
     if args.attribute_cardinality <= 0:
@@ -253,12 +253,12 @@ def main() -> None:
     if configured_prefix != expected_prefix:
         raise ValueError(
             f"{config_path}: TagFile encodes {configured_prefix}, "
-            f"but its EST policy derives {expected_prefix}"
+            f"but its label-coverage recipe derives {expected_prefix}"
         )
     prefix = args.output_prefix or configured_prefix
     if prefix != expected_prefix:
         raise ValueError(
-            f"output prefix {prefix} does not match native EST policy "
+            f"output prefix {prefix} does not match the label-coverage recipe "
             f"({expected_prefix})"
         )
     output_dir = (
@@ -409,9 +409,8 @@ def main() -> None:
             ),
             "extreme_tag_policy": {
                 "formula": (
-                    "max(min_tag_count - 1, "
                     "ceil(coverage_target / "
-                    "(expected_head_ratio * slots_per_head)) - 1)"
+                    "(expected_head_ratio * slots_per_head)) - 1"
                 ),
                 "expected_head_ratio": str(
                     policy.head_ratio
@@ -421,7 +420,6 @@ def main() -> None:
                 ),
                 "slots_per_head": policy.slots_per_head,
                 "coverage_target": policy.coverage_target,
-                "min_tag_count": policy.min_tag_count,
                 "derived_max_tag_count": extreme_tag_count,
             },
             "numeric_generation": {

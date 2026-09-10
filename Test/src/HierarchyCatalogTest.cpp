@@ -251,7 +251,7 @@ SupportRequirements NativeSupportRequirements()
 LimitedTagSupport NativeSupportExpansionBase()
 {
     LimitedTagSupport support;
-    BOOST_REQUIRE(support.Initialize(5, 2, 3, 3, 1, 3, 9123));
+    BOOST_REQUIRE(support.Initialize(5, 2, 3, 1, 3, 9123));
     const std::vector<std::vector<std::uint32_t>> tags{
         {10, 20}, {10, 20}, {20, 30}, {40}};
     for (SizeType head = 0; head < 4; ++head)
@@ -267,12 +267,12 @@ LimitedTagSupport NativeSupportExpansionBase()
     return support;
 }
 
-LimitedTagSupport NativeExpandedSupport(std::uint64_t budget = 3)
+LimitedTagSupport NativeExpandedSupport()
 {
     auto support = NativeSupportExpansionBase();
     std::string error;
     BOOST_REQUIRE_MESSAGE(support.ConfigureExpansion(
-        {0, 2, 2, 3, 3, 3}, {30, 50, 10}, NativeSupportRequirements(), budget, &error), error);
+        {0, 2, 2, 3, 3, 3}, {30, 50, 10}, NativeSupportRequirements(), &error), error);
     BOOST_REQUIRE_MESSAGE(support.Finalize(&error), error);
     return support;
 }
@@ -341,10 +341,21 @@ std::uint64_t NativeSupportFingerprint(const std::vector<std::uint8_t>& bytes)
     const std::size_t countsBytes = header.m_tagCount * sizeof(LimitedTagSupport::TagCountRecord);
     BOOST_REQUIRE(countsOffset <= bytes.size());
     BOOST_REQUIRE(countsBytes <= bytes.size() - countsOffset);
-    auto hash = NativeSupportHash(bytes.data() + header.m_headerBytes, rowsBytes);
+    std::uint64_t hash = 1469598103934665603ULL;
+    if (header.m_version == 5)
+    {
+        const std::uint64_t semantics = 0x5245515549524544ULL;
+        hash = NativeSupportHash(&semantics, sizeof(semantics), hash);
+    }
+    if (header.m_legacyVoteHeadCount == 0)
+    {
+        const std::uint64_t source = 0x52455441494e4544ULL;
+        hash = NativeSupportHash(&source, sizeof(source), hash);
+    }
+    hash = NativeSupportHash(bytes.data() + header.m_headerBytes, rowsBytes, hash);
     hash = NativeSupportHash(&header.m_vectorCount, sizeof(header.m_vectorCount), hash);
     hash = NativeSupportHash(bytes.data() + countsOffset, countsBytes, hash);
-    if (header.m_version == 4)
+    if (header.m_version == 4 || header.m_version == 5)
     {
         const auto expanded = NativeSupportValue<LimitedTagSupport::HeaderV4>(bytes, 0);
         hash = NativeSupportHash(&expanded.m_extraTagCount, sizeof(expanded.m_extraTagCount), hash);
@@ -905,7 +916,7 @@ BOOST_AUTO_TEST_CASE(H1SignaturesCoverPureAndOwnKeyWithoutTail)
     LimitedTagSupport support;
     for (int keyColumn : {0, Cache::HIER_LEVELS})
     {
-        BOOST_REQUIRE(support.Initialize(2, 2, 1, 1, keyColumn, keyColumn + 1, 9123));
+        BOOST_REQUIRE(support.Initialize(2, 2, 1, keyColumn, keyColumn + 1, 9123));
         for (SizeType row = 0; row < 2; ++row)
         {
             head->SetHeadNodeGlobalVID(row, row + 20);
@@ -963,7 +974,7 @@ BOOST_AUTO_TEST_CASE(H1SignaturesCoverPureAndOwnKeyWithoutTail)
     BOOST_CHECK(head->GetHeadNodeMetaBlob() == blob);
 }
 
-BOOST_AUTO_TEST_CASE(LimitedSupportV3StorageAndLegacyReadersRemainUnchanged)
+BOOST_AUTO_TEST_CASE(LimitedSupportRetainedSourceAndLegacyProvenanceRoundTrip)
 {
     using Header = LimitedTagSupport::Header;
     using Record = LimitedTagSupport::TagCountRecord;
@@ -973,7 +984,7 @@ BOOST_AUTO_TEST_CASE(LimitedSupportV3StorageAndLegacyReadersRemainUnchanged)
     BOOST_CHECK_EQUAL(LimitedTagSupport::HeaderV4().m_base.m_version, 4U);
 
     LimitedTagSupport support;
-    BOOST_REQUIRE(support.Initialize(3, 2, 2, 3, 0, 1, 9123));
+    BOOST_REQUIRE(support.Initialize(3, 2, 3, 0, 1, 9123));
     const std::uint32_t tags[] = {10, 20, 20, 10, 10, 20};
     const std::uint32_t attributes[] = {10, 20, 10};
     for (SizeType head = 0; head < 3; ++head)
@@ -986,7 +997,7 @@ BOOST_AUTO_TEST_CASE(LimitedSupportV3StorageAndLegacyReadersRemainUnchanged)
     BOOST_REQUIRE(support.Save(file.path));
     BOOST_CHECK(!support.HasExpansion());
     BOOST_CHECK_EQUAL(support.ExtraSupportCount(), 0U);
-    BOOST_CHECK_EQUAL(support.MaxExtraSupports(), 0U);
+    BOOST_CHECK_EQUAL(support.LegacyExtraSupportCap(), 0U);
     BOOST_CHECK_EQUAL(support.ExtraTagCount(0), 0U);
     BOOST_CHECK(support.ExtraTagData(0) == nullptr);
     BOOST_CHECK_EQUAL(support.RequiredHeadCount(20), 3U);
@@ -994,7 +1005,7 @@ BOOST_AUTO_TEST_CASE(LimitedSupportV3StorageAndLegacyReadersRemainUnchanged)
     Header header;
     header.m_headCount = 3;
     header.m_slotsPerHead = 2;
-    header.m_voteHeadCount = 2;
+    header.m_legacyVoteHeadCount = 0;
     header.m_minHeadCount = 3;
     header.m_tagCount = 2;
     header.m_attributeCount = 1;
@@ -1012,9 +1023,10 @@ BOOST_AUTO_TEST_CASE(LimitedSupportV3StorageAndLegacyReadersRemainUnchanged)
     BOOST_CHECK_EQUAL(support.ContentFingerprint(), NativeSupportFingerprint(expected));
 
     LimitedTagSupport loaded;
-    BOOST_REQUIRE(loaded.Load(file.path, 3, 2, 2, 3, 0, 1, 9123));
+    BOOST_REQUIRE(loaded.Load(file.path, 3, 2, 3, 0, 1, 9123));
+    BOOST_CHECK(loaded.UsesRetainedOriginalCandidates());
     BOOST_CHECK(!loaded.HasExpansion());
-    BOOST_CHECK_EQUAL(loaded.MaxExtraSupports(), 0U);
+    BOOST_CHECK_EQUAL(loaded.LegacyExtraSupportCap(), 0U);
     BOOST_CHECK(loaded.HasTagVectorCounts());
     BOOST_CHECK_EQUAL(loaded.TagVectorCount(20), 1U);
     BOOST_REQUIRE(loaded.SetHeadTags(0, {10}));
@@ -1041,26 +1053,38 @@ BOOST_AUTO_TEST_CASE(LimitedSupportV3StorageAndLegacyReadersRemainUnchanged)
             SetNativeSupportValue(legacy, 0, old);
         }
         WriteNativeSupportBytes(file.path, legacy);
-        BOOST_REQUIRE(loaded.Load(file.path, 3, 2, 2, 3, 0, 1, 9123));
+        BOOST_REQUIRE(loaded.Load(file.path, 3, 2, 3, 0, 1, 9123));
+        BOOST_CHECK(!loaded.UsesRetainedOriginalCandidates());
         BOOST_REQUIRE(loaded.Validate());
         BOOST_CHECK(!loaded.HasExpansion());
-        BOOST_CHECK_EQUAL(loaded.MaxExtraSupports(), 0U);
+        BOOST_CHECK_EQUAL(loaded.LegacyExtraSupportCap(), 0U);
         BOOST_CHECK(!loaded.HasTagVectorCounts());
         BOOST_CHECK_EQUAL(loaded.ContentFingerprint(), hash);
         BOOST_CHECK_EQUAL(loaded.RequiredHeadCount(10), 3U);
         BOOST_CHECK_EQUAL(loaded.CoverageCount(20), 3);
         BOOST_CHECK_EQUAL(loaded.HeadAttributes(1)[0], 20U);
+        auto invalidLegacySource = legacy;
+        SetNativeSupportValue(invalidLegacySource, std::size_t{20}, std::uint32_t{0});
+        WriteNativeSupportBytes(file.path, invalidLegacySource);
+        BOOST_CHECK(!loaded.Load(file.path, 3, 2, 3, 0, 1, 9123));
+        WriteNativeSupportBytes(file.path, legacy);
+        BOOST_REQUIRE(loaded.Load(file.path, 3, 2, 3, 0, 1, 9123));
         BOOST_CHECK(!loaded.Save(file.path));
         BOOST_REQUIRE(loaded.SetTagVectorCounts(3, {{10, 2}, {20, 1}}));
         BOOST_REQUIRE(loaded.Save(file.path));
-        BOOST_CHECK(NativeSupportBytes(file.path) == expected);
+        auto legacyExpected = expected;
+        SetNativeSupportValue(legacyExpected, offsetof(Header, m_legacyVoteHeadCount), std::uint32_t{2});
+        UpdateNativeSupportFingerprint(legacyExpected);
+        BOOST_CHECK(NativeSupportBytes(file.path) == legacyExpected);
+        BOOST_REQUIRE(loaded.Load(file.path, 3, 2, 3, 0, 1, 9123));
+        BOOST_CHECK(!loaded.UsesRetainedOriginalCandidates());
     }
 
     auto invalidReserved = expected;
     SetNativeSupportValue(invalidReserved, countsOffset + offsetof(Record, m_reserved), std::uint32_t{1});
     UpdateNativeSupportFingerprint(invalidReserved);
     WriteNativeSupportBytes(file.path, invalidReserved);
-    BOOST_CHECK(!loaded.Load(file.path, 3, 2, 2, 3, 0, 1, 9123));
+    BOOST_CHECK(!loaded.Load(file.path, 3, 2, 3, 0, 1, 9123));
 }
 
 BOOST_AUTO_TEST_CASE(LimitedSupportExpansionIndexesBaseAndOverflow)
@@ -1072,7 +1096,7 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionIndexesBaseAndOverflow)
     const auto* extraStorage = extras.data();
     std::string error = "old diagnostic";
     BOOST_REQUIRE_MESSAGE(support.ConfigureExpansion(
-        std::move(offsets), std::move(extras), NativeSupportRequirements(), 3, &error), error);
+        std::move(offsets), std::move(extras), NativeSupportRequirements(), &error), error);
     BOOST_CHECK(error.empty());
     BOOST_CHECK(extras.empty());
     BOOST_CHECK(support.ExtraTagData(0) == extraStorage);
@@ -1126,20 +1150,19 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionIndexesBaseAndOverflow)
 BOOST_AUTO_TEST_CASE(LimitedSupportExpansionAllowsHeadOnlySingletonWithoutExtras)
 {
     LimitedTagSupport support;
-    BOOST_REQUIRE(support.Initialize(1, 2, 1, 3, 0, 1, 9123));
+    BOOST_REQUIRE(support.Initialize(1, 2, 3, 0, 1, 9123));
     const std::uint32_t attribute = 40;
     BOOST_REQUIRE(support.SetHeadTags(0, {40}));
     BOOST_REQUIRE(support.SetHeadAttributes(0, &attribute, 1));
     BOOST_REQUIRE(support.SetTagVectorCounts(1, {{40, 1}}));
     BOOST_CHECK(!support.Finalize());
-    BOOST_CHECK(!support.ConfigureExpansion({0, 0}, {}, {{40, 1}}, 0));
-    BOOST_CHECK(!support.ConfigureExpansion({0, 0}, {}, {{40, 2}}, 1));
+    BOOST_CHECK(!support.ConfigureExpansion({0, 0}, {}, {{40, 2}}));
     BOOST_CHECK(!support.HasExpansion());
-    BOOST_REQUIRE(support.ConfigureExpansion({0, 0}, {}, {{40, 1}}, 1));
+    BOOST_REQUIRE(support.ConfigureExpansion({0, 0}, {}, {{40, 1}}));
     BOOST_REQUIRE(support.Finalize());
     BOOST_CHECK(support.HasExpansion());
     BOOST_CHECK_EQUAL(support.ExtraSupportCount(), 0U);
-    BOOST_CHECK_EQUAL(support.MaxExtraSupports(), 1U);
+    BOOST_CHECK_EQUAL(support.LegacyExtraSupportCap(), 0U);
     BOOST_CHECK(support.ExtraTagData(0) == nullptr);
     BOOST_CHECK_EQUAL(support.MinHeadCount(), 3);
     BOOST_CHECK_EQUAL(support.RequiredHeadCount(40), 1U);
@@ -1152,17 +1175,28 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionAllowsHeadOnlySingletonWithoutExtras
     const auto bytes = NativeSupportBytes(file.path);
     const auto header = NativeSupportValue<LimitedTagSupport::HeaderV4>(bytes, 0);
     BOOST_CHECK_EQUAL(header.m_extraTagCount, 0U);
-    BOOST_CHECK_EQUAL(header.m_maxExtraSupports, 1U);
+    BOOST_CHECK_EQUAL(header.m_maxExtraSupports, 0U);
     BOOST_CHECK_EQUAL(bytes.size(), 80U + 2U * 4U + 4U + 16U + 2U * 8U);
     LimitedTagSupport loaded;
-    BOOST_REQUIRE(loaded.Load(file.path, 1, 2, 1, 3, 0, 1, 9123));
+    BOOST_REQUIRE(loaded.Load(file.path, 1, 2, 3, 0, 1, 9123));
     BOOST_CHECK(loaded.HasExpansion());
-    BOOST_CHECK_EQUAL(loaded.MaxExtraSupports(), 1U);
+    BOOST_CHECK_EQUAL(loaded.LegacyExtraSupportCap(), 0U);
     BOOST_CHECK_EQUAL(loaded.ContentFingerprint(), support.ContentFingerprint());
     BOOST_CHECK_EQUAL(loaded.RequiredHeadCount(40), 1U);
     BOOST_CHECK_EQUAL(loaded.TagVectorCount(40), 1U);
     BOOST_CHECK(!loaded.TombstoneHead(0));
     BOOST_CHECK(!loaded.AppendRuntimeTombstoneHead());
+    auto legacy = bytes;
+    SetNativeSupportValue(legacy, offsetof(LimitedTagSupport::Header, m_version), std::uint32_t{4});
+    SetNativeSupportValue(legacy, offsetof(LimitedTagSupport::HeaderV4, m_maxExtraSupports),
+                          std::uint64_t{262144});
+    UpdateNativeSupportFingerprint(legacy);
+    WriteNativeSupportBytes(file.path, legacy);
+    BOOST_REQUIRE(loaded.Load(file.path, 1, 2, 3, 0, 1, 9123));
+    BOOST_CHECK_EQUAL(loaded.LegacyExtraSupportCap(), 262144U);
+    BOOST_CHECK_EQUAL(loaded.ExtraSupportCount(), 0U);
+    BOOST_REQUIRE(loaded.Save(file.path));
+    BOOST_CHECK(NativeSupportBytes(file.path) == legacy);
 }
 
 BOOST_AUTO_TEST_CASE(LimitedSupportExpansionRoundTripsExactMetadataAndFingerprints)
@@ -1177,11 +1211,11 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionRoundTripsExactMetadataAndFingerprin
     const auto header = NativeSupportValue<HeaderV4>(original, 0);
     BOOST_CHECK_EQUAL(original.size(), 320U);
     BOOST_CHECK_EQUAL(header.m_base.m_magic, 0x3153544cU);
-    BOOST_CHECK_EQUAL(header.m_base.m_version, 4U);
+    BOOST_CHECK_EQUAL(header.m_base.m_version, 5U);
     BOOST_CHECK_EQUAL(header.m_base.m_headerBytes, 80U);
     BOOST_CHECK_EQUAL(header.m_base.m_headCount, 5U);
     BOOST_CHECK_EQUAL(header.m_base.m_slotsPerHead, 2U);
-    BOOST_CHECK_EQUAL(header.m_base.m_voteHeadCount, 3U);
+    BOOST_CHECK_EQUAL(header.m_base.m_legacyVoteHeadCount, 0U);
     BOOST_CHECK_EQUAL(header.m_base.m_minHeadCount, 3U);
     BOOST_CHECK_EQUAL(header.m_base.m_keyColumn, 1U);
     BOOST_CHECK_EQUAL(header.m_base.m_attributeCount, 3U);
@@ -1190,7 +1224,7 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionRoundTripsExactMetadataAndFingerprin
     BOOST_CHECK_EQUAL(header.m_base.m_generationFingerprint, 9123U);
     BOOST_CHECK_EQUAL(header.m_extraTagCount, 3U);
     BOOST_CHECK_EQUAL(header.m_maxExtraSupports, 3U);
-    BOOST_CHECK_EQUAL(support.MaxExtraSupports(), header.m_maxExtraSupports);
+    BOOST_CHECK_EQUAL(support.LegacyExtraSupportCap(), 0U);
     BOOST_CHECK_EQUAL(header.m_base.m_bodyFingerprint, support.ContentFingerprint());
     BOOST_CHECK_EQUAL(header.m_base.m_bodyFingerprint, NativeSupportFingerprint(original));
     const std::size_t countsOffset = 80 + (10 + 15) * sizeof(std::uint32_t);
@@ -1212,6 +1246,10 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionRoundTripsExactMetadataAndFingerprin
         BOOST_CHECK_EQUAL(NativeSupportValue<std::uint32_t>(original, extrasOffset + i * 4), extras[i]);
 
     std::vector<std::vector<std::uint8_t>> variants(5, original);
+    // These historical V4 files authenticate their opaque configured cap,
+    // including requirements less than already materialized coverage.
+    SetNativeSupportValue(variants[1], offsetof(Header, m_version), std::uint32_t{4});
+    SetNativeSupportValue(variants[2], offsetof(Header, m_version), std::uint32_t{4});
     SetNativeSupportValue(variants[1], offsetof(HeaderV4, m_maxExtraSupports), std::uint64_t{4});
     SetNativeSupportValue(variants[2], countsOffset + 2 * sizeof(Record) + offsetof(Record, m_reserved),
                           std::uint32_t{1});
@@ -1227,12 +1265,13 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionRoundTripsExactMetadataAndFingerprin
             BOOST_CHECK_NE(saved.m_base.m_bodyFingerprint, header.m_base.m_bodyFingerprint);
         WriteNativeSupportBytes(file.path, bytes);
         LimitedTagSupport loaded;
-        BOOST_REQUIRE(loaded.Load(file.path, 5, 2, 3, 3, 1, 3, 9123));
+        BOOST_REQUIRE(loaded.Load(file.path, 5, 2, 3, 1, 3, 9123));
         BOOST_REQUIRE(loaded.Validate());
         BOOST_CHECK(loaded.HasExpansion());
         BOOST_CHECK(loaded.HasTagVectorCounts());
         BOOST_CHECK_EQUAL(loaded.VectorCount(), saved.m_base.m_vectorCount);
-        BOOST_CHECK_EQUAL(loaded.MaxExtraSupports(), saved.m_maxExtraSupports);
+        BOOST_CHECK_EQUAL(loaded.LegacyExtraSupportCap(),
+                          saved.m_base.m_version == 4 ? saved.m_maxExtraSupports : 0U);
         BOOST_CHECK_EQUAL(loaded.ContentFingerprint(), saved.m_base.m_bodyFingerprint);
         for (std::size_t i = 0; i < 5; ++i)
         {
@@ -1275,16 +1314,15 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionRejectsInvalidInputsAtomically)
     const std::vector<std::uint32_t> extras{30, 50, 10};
     const auto reject = [&](std::vector<std::uint64_t> badOffsets,
                             std::vector<std::uint32_t> badExtras,
-                            SupportRequirements requirements = NativeSupportRequirements(),
-                            std::uint64_t budget = 3)
+                            SupportRequirements requirements = NativeSupportRequirements())
     {
         std::string error;
         BOOST_CHECK(!support.ConfigureExpansion(
-            std::move(badOffsets), std::move(badExtras), requirements, budget, &error));
+            std::move(badOffsets), std::move(badExtras), requirements, &error));
         BOOST_CHECK(!error.empty());
         BOOST_CHECK(!support.HasExpansion());
         BOOST_CHECK_EQUAL(support.ExtraSupportCount(), 0U);
-        BOOST_CHECK_EQUAL(support.MaxExtraSupports(), 0U);
+        BOOST_CHECK_EQUAL(support.LegacyExtraSupportCap(), 0U);
         BOOST_CHECK_EQUAL(support.HeadCount(), original.HeadCount());
         BOOST_CHECK_EQUAL(support.ContentFingerprint(), original.ContentFingerprint());
         BOOST_CHECK_EQUAL(support.VectorCount(), original.VectorCount());
@@ -1316,8 +1354,6 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionRejectsInvalidInputsAtomically)
     reject(offsets, {30, 99, 10});
     reject(offsets, {30, 50});
     reject({0, 1, 1, 2, 2, 3}, {30, 10, 50});
-    reject(offsets, extras, NativeSupportRequirements(), 0);
-    reject(offsets, extras, NativeSupportRequirements(), 2);
     auto requirements = NativeSupportRequirements();
     requirements.erase(50);
     reject(offsets, extras, requirements);
@@ -1338,25 +1374,56 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionRejectsInvalidInputsAtomically)
     const std::uint32_t wrongAttributes[] = {100, 99, 1000};
     BOOST_REQUIRE(mismatchedOwnTag.SetHeadAttributes(0, wrongAttributes, 3));
     BOOST_CHECK(!mismatchedOwnTag.ConfigureExpansion(
-        offsets, extras, NativeSupportRequirements(), 3));
+        offsets, extras, NativeSupportRequirements()));
     BOOST_CHECK(!mismatchedOwnTag.HasExpansion());
     LimitedTagSupport missingCounts;
-    BOOST_REQUIRE(missingCounts.Initialize(1, 2, 1, 1, 0, 1, 9123));
+    BOOST_REQUIRE(missingCounts.Initialize(1, 2, 1, 0, 1, 9123));
     const std::uint32_t ownTag = 40;
     BOOST_REQUIRE(missingCounts.SetHeadTags(0, {40}));
     BOOST_REQUIRE(missingCounts.SetHeadAttributes(0, &ownTag, 1));
-    BOOST_CHECK(!missingCounts.ConfigureExpansion({0, 0}, {}, {{40, 1}}, 1));
+    BOOST_CHECK(!missingCounts.ConfigureExpansion({0, 0}, {}, {{40, 1}}));
     BOOST_REQUIRE(missingCounts.SetTagVectorCounts(1, {{40, 1}}));
     CatalogFile file;
     BOOST_REQUIRE(missingCounts.Save(file.path));
     const auto stable = NativeSupportBytes(file.path);
-    BOOST_CHECK(!missingCounts.ConfigureExpansion({0, 1}, {40}, {{40, 1}}, 1));
+    BOOST_CHECK(!missingCounts.ConfigureExpansion({0, 1}, {40}, {{40, 1}}));
     BOOST_REQUIRE(missingCounts.Save(file.path));
     BOOST_CHECK(NativeSupportBytes(file.path) == stable);
 
-    BOOST_REQUIRE(support.ConfigureExpansion(offsets, extras, NativeSupportRequirements(), 3));
+    BOOST_REQUIRE(support.ConfigureExpansion(offsets, extras, NativeSupportRequirements()));
     BOOST_REQUIRE(support.Finalize());
     BOOST_CHECK_EQUAL(support.CoverageCount(10), 3);
+}
+
+BOOST_AUTO_TEST_CASE(LimitedSupportLegacyExpandedReadExportKeepsCandidateProvenance)
+{
+    using Header = LimitedTagSupport::Header;
+    auto support = NativeExpandedSupport();
+    CatalogFile file;
+    BOOST_REQUIRE(support.Save(file.path));
+    const auto retained = NativeSupportBytes(file.path);
+    auto legacy = retained;
+    SetNativeSupportValue(legacy, offsetof(Header, m_version), std::uint32_t{4});
+    SetNativeSupportValue(legacy, offsetof(LimitedTagSupport::HeaderV4, m_maxExtraSupports),
+                          std::uint64_t{1} << 40);
+    SetNativeSupportValue(legacy, offsetof(Header, m_legacyVoteHeadCount), std::uint32_t{7});
+    UpdateNativeSupportFingerprint(legacy);
+    WriteNativeSupportBytes(file.path, legacy);
+    LimitedTagSupport loaded;
+    BOOST_REQUIRE(loaded.Load(file.path, 5, 2, 3, 1, 3, 9123));
+    BOOST_CHECK(loaded.HasExpansion());
+    BOOST_CHECK(!loaded.UsesRetainedOriginalCandidates());
+    BOOST_CHECK_EQUAL(loaded.LegacyExtraSupportCap(), std::uint64_t{1} << 40);
+    BOOST_CHECK(loaded.TagHeads() == support.TagHeads());
+    BOOST_REQUIRE(loaded.Save(file.path));
+    BOOST_CHECK(NativeSupportBytes(file.path) == legacy);
+    // Changing provenance without recomputing its source-bound hash is corruption.
+    SetNativeSupportValue(legacy, offsetof(Header, m_legacyVoteHeadCount), std::uint32_t{0});
+    WriteNativeSupportBytes(file.path, legacy);
+    BOOST_CHECK(!loaded.Load(file.path, 5, 2, 3, 1, 3, 9123));
+    WriteNativeSupportBytes(file.path, retained);
+    BOOST_REQUIRE(loaded.Load(file.path, 5, 2, 3, 1, 3, 9123));
+    BOOST_CHECK(loaded.UsesRetainedOriginalCandidates());
 }
 
 BOOST_AUTO_TEST_CASE(LimitedSupportExpansionRejectsCorruptStorage)
@@ -1378,13 +1445,13 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionRejectsCorruptStorage)
         if (rehash) UpdateNativeSupportFingerprint(bytes);
         WriteNativeSupportBytes(file.path, bytes);
         std::string error;
-        BOOST_CHECK(!loaded.Load(file.path, 5, 2, 3, 3, 1, 3, 9123, &error));
+        BOOST_CHECK(!loaded.Load(file.path, 5, 2, 3, 1, 3, 9123, &error));
         BOOST_CHECK(!error.empty());
         if (fingerprintError) BOOST_CHECK(error.find("fingerprint") != std::string::npos);
         BOOST_CHECK(!loaded.HasExpansion());
         BOOST_CHECK_EQUAL(loaded.HeadCount(), 0);
         BOOST_CHECK_EQUAL(loaded.ExtraSupportCount(), 0U);
-        BOOST_CHECK_EQUAL(loaded.MaxExtraSupports(), 0U);
+        BOOST_CHECK_EQUAL(loaded.LegacyExtraSupportCap(), 0U);
         BOOST_CHECK(loaded.ExtraTagData(0) == nullptr);
         BOOST_CHECK(loaded.TagHeads().empty());
         BOOST_CHECK_EQUAL(loaded.ContentFingerprint(), 0U);
@@ -1404,24 +1471,24 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionRejectsCorruptStorage)
         reject(std::move(bytes), rehash, fingerprintError);
     };
 
-    reject32(80 + 4, 19, false, true);
+    reject32(80 + 4, 19, false);
     reject32(80 + 10 * 4, 101, false, true);
-    reject64(offsetof(Header, m_vectorCount), 12, false, true);
-    reject64(countsOffset + offsetof(Record, m_count), 5, false, true);
-    reject32(countsOffset + offsetof(Record, m_reserved), 2, false, true);
-    reject64(offsetof(HeaderV4, m_maxExtraSupports), 4, false, true);
+    reject64(offsetof(Header, m_vectorCount), 12, false);
+    reject64(countsOffset + offsetof(Record, m_count), 5, false);
+    reject32(countsOffset + offsetof(Record, m_reserved), 2, false);
+    reject64(offsetof(HeaderV4, m_maxExtraSupports), 4, false);
     reject64(offsetsOffset + 8, 1, false, true);
     reject32(extrasOffset + 4, 40, false, true);
     reject64(offsetof(Header, m_bodyFingerprint), support.ContentFingerprint() ^ 1U, false, true);
 
     for (const auto& field : std::vector<std::pair<std::size_t, std::uint32_t>>{
         {offsetof(Header, m_magic), 0},
-        {offsetof(Header, m_version), 5},
+        {offsetof(Header, m_version), 6},
         {offsetof(Header, m_version), 3},
         {offsetof(Header, m_headerBytes), 64},
         {offsetof(Header, m_headCount), 6},
         {offsetof(Header, m_slotsPerHead), 3},
-        {offsetof(Header, m_voteHeadCount), 4},
+        {offsetof(Header, m_legacyVoteHeadCount), 4},
         {offsetof(Header, m_minHeadCount), 4},
         {offsetof(Header, m_keyColumn), 2},
         {offsetof(Header, m_attributeCount), 4},
@@ -1444,7 +1511,7 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionRejectsCorruptStorage)
     SetNativeSupportValue(impossibleRows, offsetof(Header, m_slotsPerHead), static_cast<std::uint32_t>(maxInt));
     SetNativeSupportValue(impossibleRows, offsetof(Header, m_attributeCount), static_cast<std::uint32_t>(maxInt));
     WriteNativeSupportBytes(file.path, impossibleRows);
-    BOOST_CHECK(!loaded.Load(file.path, MaxSize, maxInt, 3, 3, 1, maxInt, 9123));
+    BOOST_CHECK(!loaded.Load(file.path, MaxSize, maxInt, 3, 1, maxInt, 9123));
     BOOST_CHECK_EQUAL(loaded.HeadCount(), 0);
 
     reject32(80 + 4, 10);
@@ -1471,6 +1538,13 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionRejectsCorruptStorage)
     reject32(countsOffset + offsetof(Record, m_reserved), 0);
     reject32(countsOffset + offsetof(Record, m_reserved), 4);
     reject32(countsOffset + 3 * sizeof(Record) + offsetof(Record, m_reserved), 2);
+    auto shiftedRequirement = original;
+    SetNativeSupportValue(shiftedRequirement, countsOffset + offsetof(Record, m_reserved),
+                          std::uint32_t{2});
+    SetNativeSupportValue(shiftedRequirement,
+                          countsOffset + 2 * sizeof(Record) + offsetof(Record, m_reserved),
+                          std::uint32_t{3});
+    reject(std::move(shiftedRequirement), true);
     reject32(countsOffset + sizeof(Record) + offsetof(Record, m_tag), 10);
     reject32(countsOffset + 4 * sizeof(Record) + offsetof(Record, m_tag), 99);
     reject32(countsOffset + 4 * sizeof(Record) + offsetof(Record, m_tag), LimitedTagSupport::EmptyTag);
@@ -1496,7 +1570,7 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionRejectsCorruptStorage)
     trailing.push_back(0);
     reject(std::move(trailing));
     WriteNativeSupportBytes(file.path, original);
-    BOOST_REQUIRE(loaded.Load(file.path, 5, 2, 3, 3, 1, 3, 9123));
+    BOOST_REQUIRE(loaded.Load(file.path, 5, 2, 3, 1, 3, 9123));
     BOOST_CHECK(loaded.TagHeads() == support.TagHeads());
 }
 
@@ -1505,14 +1579,14 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionFreezesAllMutationAPIs)
     auto support = NativeSupportExpansionBase();
     BOOST_REQUIRE(support.PrepareRuntimeTombstoneHead());
     BOOST_REQUIRE(support.ConfigureExpansion(
-        {0, 2, 2, 3, 3, 3}, {30, 50, 10}, NativeSupportRequirements(), 3));
+        {0, 2, 2, 3, 3, 3}, {30, 50, 10}, NativeSupportRequirements()));
     BOOST_REQUIRE(support.Finalize());
     CatalogFile file;
     BOOST_REQUIRE(support.Save(file.path));
     const auto originalBytes = NativeSupportBytes(file.path);
     for (bool reload : {false, true})
     {
-        if (reload) BOOST_REQUIRE(support.Load(file.path, 5, 2, 3, 3, 1, 3, 9123));
+        if (reload) BOOST_REQUIRE(support.Load(file.path, 5, 2, 3, 1, 3, 9123));
         const auto original = support;
         const auto* baseStorage = support.HeadTagData(0);
         const auto* attributeStorage = support.HeadAttributes(0);
@@ -1525,7 +1599,7 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionFreezesAllMutationAPIs)
             BOOST_CHECK_EQUAL(support.ContentFingerprint(), original.ContentFingerprint());
             BOOST_CHECK_EQUAL(support.VectorCount(), original.VectorCount());
             BOOST_CHECK_EQUAL(support.ExtraSupportCount(), original.ExtraSupportCount());
-            BOOST_CHECK_EQUAL(support.MaxExtraSupports(), original.MaxExtraSupports());
+            BOOST_CHECK_EQUAL(support.LegacyExtraSupportCap(), original.LegacyExtraSupportCap());
             BOOST_CHECK(support.TagHeads() == original.TagHeads());
             BOOST_CHECK(support.HeadTagData(0) == baseStorage);
             BOOST_CHECK(support.HeadAttributes(0) == attributeStorage);
@@ -1564,7 +1638,7 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionFreezesAllMutationAPIs)
         reject(support.ReplaceAndTombstoneRuntime(0, tags, attributes, 3, 1));
         reject(support.ApplyPreparedRuntimeReplaceAndTombstone(0, tags, attributes, 3, 1));
         reject(support.ConfigureExpansion(
-            {0, 2, 2, 3, 3, 3}, {30, 50, 10}, NativeSupportRequirements(), 3));
+            {0, 2, 2, 3, 3, 3}, {30, 50, 10}, NativeSupportRequirements()));
         BOOST_REQUIRE(support.Validate());
         BOOST_REQUIRE(support.Finalize());
         BOOST_REQUIRE(support.Save(file.path));
@@ -1575,11 +1649,11 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionFreezesAllMutationAPIs)
     BOOST_CHECK(!support.HasExpansion());
     BOOST_CHECK_EQUAL(support.HeadCount(), 0);
     BOOST_CHECK_EQUAL(support.ExtraSupportCount(), 0U);
-    BOOST_CHECK_EQUAL(support.MaxExtraSupports(), 0U);
+    BOOST_CHECK_EQUAL(support.LegacyExtraSupportCap(), 0U);
     BOOST_CHECK(support.ExtraTagData(0) == nullptr);
     BOOST_CHECK_EQUAL(support.RequiredHeadCount(10), 0U);
     BOOST_CHECK(support.TagHeads().empty());
-    BOOST_REQUIRE(support.Initialize(2, 2, 1, 1, 0, 1, 9123));
+    BOOST_REQUIRE(support.Initialize(2, 2, 1, 0, 1, 9123));
     const std::uint32_t attributes[] = {7, 0};
     for (SizeType head = 0; head < 2; ++head)
     {
@@ -1590,10 +1664,10 @@ BOOST_AUTO_TEST_CASE(LimitedSupportExpansionFreezesAllMutationAPIs)
     BOOST_REQUIRE(support.Save(file.path));
     BOOST_CHECK_EQUAL(NativeSupportValue<LimitedTagSupport::Header>(
         NativeSupportBytes(file.path), 0).m_headerBytes, 64U);
-    BOOST_REQUIRE(support.ConfigureExpansion({0, 1, 1}, {0}, {{7, 1}, {0, 1}}, 1));
+    BOOST_REQUIRE(support.ConfigureExpansion({0, 0, 0}, {}, {{7, 1}, {0, 1}}));
     BOOST_REQUIRE(support.Finalize());
-    BOOST_CHECK(support.Supports(0, 0));
-    BOOST_CHECK_EQUAL(support.CoverageCount(0), 2);
+    BOOST_CHECK(support.Supports(1, 0));
+    BOOST_CHECK_EQUAL(support.CoverageCount(0), 1);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

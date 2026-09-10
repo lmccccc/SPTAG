@@ -76,7 +76,7 @@ if (Python_FOUND)
     include_directories(${PYTHON_INCLUDE_PATH} ${PROJECT_SOURCE_DIR}/AnnService ${PROJECT_SOURCE_DIR}/Wrappers)
 
     file(GLOB CORE_HDR_FILES ${PROJECT_SOURCE_DIR}/Wrappers/inc/CoreInterface.h)
-    file(GLOB CORE_SRC_FILES ${PROJECT_SOURCE_DIR}/Wrappers/src/CoreInterface.cpp ${PROJECT_SOURCE_DIR}/Wrappers/inc/CoreInterface_pwrap.cpp)
+    set(CORE_SRC_FILES ${PROJECT_SOURCE_DIR}/Wrappers/src/CoreInterface.cpp ${CORE_PY_WRAP})
     add_library (_SPTAG SHARED ${CORE_SRC_FILES} ${CORE_HDR_FILES})
     add_dependencies(_SPTAG swig_python_wrappers)
     set_target_properties(_SPTAG PROPERTIES PREFIX "" SUFFIX ${PY_SUFFIX})
@@ -221,4 +221,3 @@ if (DOTNET_FOUND)
 else()
     message (STATUS "Could not find C#.")
 endif()
-

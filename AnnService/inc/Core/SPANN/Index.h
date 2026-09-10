@@ -456,7 +456,7 @@ namespace SPTAG
             ErrorCode SaveHeadBundleManifest(const std::string& p_baseDir) const;
             ErrorCode LoadHeadBundleManifest(const std::string& p_baseDir);
 
-            // SelectHead resume checkpoint: persist / reload the PerTagBKT-derived
+            // SelectHead resume checkpoint: persist / reload the spatial head-selection
             // build state so a failed BuildHead/BuildSSDIndex can restart without
             // re-running the head-selection BKT. Gated by SPTAG_PERSIST_SELECTHEAD
             // (+ SPTAG_RESUME_BUILD to actually resume).
@@ -500,8 +500,7 @@ namespace SPTAG
                 const LimitedTagSupport* p_headSupport,
                 int& p_scannedOut,
                 ExtraWorkSpace* p_workspace = nullptr,
-                const std::function<bool(SizeType, const float*)>& p_headPointCandidate = nullptr,
-                const std::function<bool()>& p_stopBeforeWidening = nullptr) const;
+                const std::function<bool(SizeType, const float*)>& p_headPointCandidate = nullptr) const;
             ErrorCode LoadHeadCrossEdges() const;
             ErrorCode EnsureHeadHybridGraph();
             ErrorCode EnsureStaticTailCrossEdges();
@@ -629,6 +628,14 @@ namespace SPTAG
                         m_index->SetHeadNodeGlobalVID(
                             localHeadId,
                             static_cast<SizeType>(*(m_vectorTranslateMap[localHeadId])));
+                        m_index->SetHeadNodeBundleNodeId(localHeadId, 0);
+                    }
+                    for (size_t slot = 0; slot < m_headBundleNodes.size() &&
+                                          slot < m_headBundleLocalToGlobalHIDs.size(); ++slot) {
+                        for (SizeType head : m_headBundleLocalToGlobalHIDs[slot]) {
+                            if (head >= 0 && head < metaCount)
+                                m_index->SetHeadNodeBundleNodeId(head, m_headBundleNodes[slot].nodeId);
+                        }
                     }
                     return true;
                 }
@@ -651,12 +658,15 @@ namespace SPTAG
                     SizeType globalVID = kv.first;
                     int nodeId = kv.second.first;
                     SizeType local = kv.second.second;
-                    if (nodeId < 0 || nodeId >= (int)m_headBundleLocalToGlobalHIDs.size()) continue;
+                    if (nodeId < 0 || nodeId >= (int)m_headBundleLocalToGlobalHIDs.size() ||
+                        nodeId >= (int)m_headBundleNodes.size()) continue;
                     const auto& l2g = m_headBundleLocalToGlobalHIDs[(size_t)nodeId];
                     if (local < 0 || (size_t)local >= l2g.size()) continue;
                     SizeType globalHeadId = l2g[(size_t)local];
                     if (globalHeadId < 0 || globalHeadId >= metaCount) continue;
                     m_index->SetHeadNodeGlobalVID(globalHeadId, globalVID);
+                    m_index->SetHeadNodeBundleNodeId(
+                        globalHeadId, m_headBundleNodes[static_cast<size_t>(nodeId)].nodeId);
                 }
                 if (requireResolvedVIDs) {
                     for (SizeType head = 0; head < metaCount; ++head) {
@@ -787,7 +797,6 @@ namespace SPTAG
             template <typename InternalDataType>
             bool SelectHeadsFromData(COMMON::Dataset<InternalDataType>& p_data,
                                      Options& p_options,
-                                     const std::vector<int>* p_perVectorTags,
                                      std::vector<SizeType>& p_selected,
                                      const char* p_stage,
                                      bool p_fallbackToFirst,

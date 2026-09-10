@@ -256,6 +256,38 @@ public:
             p_secondLevelToFirst,
         std::string* p_error = nullptr)
     {
+        return LoadInternal(p_path, p_expectedFirstLevelHeadCount, p_expectedSecondLevelHeadCount,
+            p_expectedReplicaCount, p_expectedFirstLevelIDFingerprint, p_expectedLimitedTagSupportFingerprint,
+            p_expectedSignatureMinSelectivity, p_expectedSignatureMaxSelectivity,
+            p_expectedGeneration, p_secondLevelToFirst, true, p_error);
+    }
+
+    // Domains are authenticated persisted metadata, not runtime tuning. This
+    // also retains restricted-domain V3 and full-domain V2 compatibility.
+    bool LoadPersisted(
+        const std::string& path, SizeType firstCount, SizeType secondCount, int replicas,
+        std::uint64_t firstIDs, std::uint64_t support, std::uint64_t generation,
+        const std::vector<std::uint64_t>& secondToFirst, std::string* error = nullptr)
+    {
+        return LoadInternal(path, firstCount, secondCount, replicas, firstIDs, support,
+            0.0, 1.0, generation, secondToFirst, false, error);
+    }
+
+private:
+    bool LoadInternal(
+        const std::string& p_path,
+        SizeType p_expectedFirstLevelHeadCount,
+        SizeType p_expectedSecondLevelHeadCount,
+        int p_expectedReplicaCount,
+        std::uint64_t p_expectedFirstLevelIDFingerprint,
+        std::uint64_t p_expectedLimitedTagSupportFingerprint,
+        double p_expectedSignatureMinSelectivity,
+        double p_expectedSignatureMaxSelectivity,
+        std::uint64_t p_expectedGeneration,
+        const std::vector<std::uint64_t>& p_secondLevelToFirst,
+        bool p_validateSignatureDomain,
+        std::string* p_error)
+    {
         Reset();
         std::ifstream input(
             p_path,
@@ -364,7 +396,7 @@ public:
                 p_expectedFirstLevelIDFingerprint ||
             m_header.m_limitedTagSupportFingerprint !=
                 p_expectedLimitedTagSupportFingerprint ||
-            (!legacyV2 &&
+            (!legacyV2 && p_validateSignatureDomain &&
              (m_header.m_signatureMinSelectivity !=
                   p_expectedSignatureMinSelectivity ||
               m_header.m_signatureMaxSelectivity !=
@@ -524,6 +556,7 @@ public:
         return true;
     }
 
+public:
     bool Loaded() const
     {
         return

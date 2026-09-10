@@ -1,3 +1,5 @@
+> Historical experiment record: attribute pivot partitioning and PerTagBKT are now removed. The old grouping commands below require the historical revision; do not run them with the current builder. Current builds use global spatial selection and exact attribute filtering.
+
 # Multi-Tenant SIFT-1M — Huffman Partition Size Ablation (post bug-fix)
 
 Dataset: SIFT-1M, tenant_0 (404 819 vectors), 4-level ACL tree

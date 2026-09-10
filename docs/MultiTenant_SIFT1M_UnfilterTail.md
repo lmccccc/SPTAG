@@ -1,3 +1,5 @@
+> Historical experiment record: attribute pivot partitioning and PerTagBKT are now removed. The old grouping commands below require the historical revision; do not run them with the current builder. Current builds use global spatial selection and exact attribute filtering.
+
 # UnfilterTail: vector-similar tail records for unfiltered SPANN search
 
 ## Motivation

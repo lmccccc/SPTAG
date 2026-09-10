@@ -5,6 +5,7 @@
 #define _SPTAG_SPANN_LIMITEDTAGSUPPORTEXPANSION_H_
 
 #include "LimitedTagSupport.h"
+#include "RetainedOriginalPostings.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -26,8 +27,7 @@ public:
         const LimitedTagSupport& p_base,
         const std::vector<std::uint32_t>& p_observedTags,
         int p_floor,
-        std::uint64_t p_maxExtraSupports,
-        std::string* p_error = nullptr)
+        std::string* p_error = nullptr) try
     {
         m_base = nullptr;
         m_plans.clear();
@@ -38,7 +38,7 @@ public:
         m_originalAssignments = 0;
         m_lastHead = -1;
         if (p_base.HeadCount() <= 0 || p_base.HasExpansion() ||
-            p_floor <= 0 || p_maxExtraSupports == 0 || p_observedTags.empty())
+            p_floor <= 0 || p_observedTags.empty())
             return Fail(p_error, "invalid O-based support expansion configuration");
         std::uint32_t previous = 0;
         for (std::size_t i = 0; i < p_observedTags.size(); ++i)
@@ -77,19 +77,22 @@ public:
                 entry.second = m_floor;
             }
         }
-        m_maxExtraSupports = p_maxExtraSupports;
         m_base = &p_base;
         return true;
     }
+    catch (const std::bad_alloc&) { return Fail(p_error, "cannot allocate O-based expansion plans"); }
+    catch (const std::length_error&) { return Fail(p_error, "O-based expansion plans are too large"); }
 
     bool ObserveOriginalAssignment(
-        SizeType p_head, std::uint32_t p_tag, std::string* p_error = nullptr)
+        SizeType p_head, std::uint32_t p_tag, std::string* p_error = nullptr) try
     {
         if (m_base == nullptr || p_head < 0 || p_head >= m_base->HeadCount() ||
             p_head < m_lastHead || p_tag == LimitedTagSupport::EmptyTag ||
             m_required.find(p_tag) == m_required.end())
             return Fail(p_error, "invalid or unsorted retained O assignment");
         m_lastHead = p_head;
+        if (m_originalAssignments == (std::numeric_limits<std::uint64_t>::max)())
+            return Fail(p_error, "retained O assignment count overflow");
         ++m_originalAssignments;
         const auto found = m_plans.find(p_tag);
         if (found == m_plans.end()) return true;
@@ -101,8 +104,8 @@ public:
         const RankedHead candidate{Rank(p_tag, p_head), p_head};
         if (plan.candidates.size() < plan.needed)
         {
-            if (m_selectedCount >= m_maxExtraSupports)
-                return Fail(p_error, "O-based support expansion exceeds LimitedTagMaxExtraSupports");
+            if (m_selectedCount == (std::numeric_limits<std::uint64_t>::max)())
+                return Fail(p_error, "O-based support expansion size overflow");
             plan.candidates.push_back(candidate);
             std::push_heap(plan.candidates.begin(), plan.candidates.end());
             ++m_selectedCount;
@@ -115,8 +118,10 @@ public:
         }
         return true;
     }
+    catch (const std::bad_alloc&) { return Fail(p_error, "cannot allocate O-based expansion candidates"); }
+    catch (const std::length_error&) { return Fail(p_error, "O-based expansion candidates are too large"); }
 
-    bool Apply(LimitedTagSupport& p_support, std::string* p_error = nullptr)
+    bool Apply(LimitedTagSupport& p_support, std::string* p_error = nullptr) try
     {
         if (m_base != &p_support)
             return Fail(p_error, "O-based expansion must apply to its original base support");
@@ -155,14 +160,15 @@ public:
         for (std::size_t head = 1; head < offsets.size(); ++head)
             offsets[head] += offsets[head - 1];
         if (!p_support.ConfigureExpansion(
-                std::move(offsets), std::move(tags), m_required,
-                m_maxExtraSupports, p_error))
+                std::move(offsets), std::move(tags), m_required, p_error))
             return false;
         m_required.clear();
         m_required.rehash(0);
         m_base = nullptr;
         return true;
     }
+    catch (const std::bad_alloc&) { return Fail(p_error, "cannot allocate O-based expansion metadata"); }
+    catch (const std::length_error&) { return Fail(p_error, "O-based expansion metadata is too large"); }
 
     template <typename TEdge, typename TTagAt>
     bool ObserveRetainedOriginalPostings(
@@ -175,27 +181,13 @@ public:
         if (m_base == nullptr || m_originalAssignments != 0 || p_vectorCount <= 0 ||
             p_retainedCounts.size() != static_cast<std::size_t>(m_base->HeadCount()))
             return Fail(p_error, "invalid retained O posting dimensions");
-        std::size_t read = 0;
-        for (SizeType head = 0; head < m_base->HeadCount(); ++head)
-        {
-            const std::size_t begin = read;
-            while (read < p_edges.size() && p_edges[read].node == head) ++read;
-            const int retained = p_retainedCounts[static_cast<std::size_t>(head)];
-            if (retained < 0 || static_cast<std::size_t>(retained) > read - begin)
-                return Fail(p_error, "retained O prefix exceeds its sorted head group");
-            // Posting cuts change counts, not the discarded suffix in the scratch edge array.
-            for (int row = 0; row < retained; ++row)
-            {
-                const auto vid = p_edges[begin + static_cast<std::size_t>(row)].tonode;
-                if (vid < 0 || vid >= p_vectorCount)
-                    return Fail(p_error, "invalid retained O vector ID");
-                if (!ObserveOriginalAssignment(head, p_tagAt(vid), p_error)) return false;
-            }
-        }
-        for (; read < p_edges.size(); ++read)
-            if (p_edges[read].node != MaxSize)
-                return Fail(p_error, "retained O scratch edges are not sorted by head");
-        return true;
+        return VisitRetainedOriginalPostings(p_edges, p_retainedCounts, p_vectorCount,
+            [&](SizeType head, std::size_t begin, std::size_t end) {
+                for (std::size_t row = begin; row < end; ++row)
+                    if (!ObserveOriginalAssignment(
+                            head, p_tagAt(p_edges[row].tonode), p_error)) return false;
+                return true;
+            }, p_error);
     }
 
     std::uint64_t AddedSupports() const { return m_selectedCount; }
@@ -235,7 +227,6 @@ private:
     std::unordered_map<std::uint32_t, Plan> m_plans;
     std::unordered_map<std::uint32_t, std::uint32_t> m_required;
     std::uint32_t m_floor = 0;
-    std::uint64_t m_maxExtraSupports = 0;
     std::uint64_t m_selectedCount = 0;
     std::uint64_t m_expandedTags = 0;
     std::uint64_t m_cappedTags = 0;

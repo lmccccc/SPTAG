@@ -35,13 +35,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--extreme-tag-coverage",
         action="store_true",
-        help="Append the EST boundary tag derived from coverage parameters.",
+        help="Append a rare label derived from head/support/search coverage budgets.",
     )
     parser.add_argument(
         "--config",
         type=Path,
         default=DEFAULT_CONFIG,
-        help="Native SPANN INI that defines the EST coverage policy.",
+        help="Native SPANN INI supplying budgets for the rare-label coverage recipe.",
     )
     parser.add_argument(
         "--numeric-column",
@@ -113,7 +113,7 @@ def main() -> None:
         policy = read_extreme_tag_policy(config_path)
         if policy.vector_count != vector_count:
             raise ValueError(
-                f"{config_path}: VectorCount={policy.vector_count} "
+                f"{config_path}: native vector count={policy.vector_count} "
                 f"does not match base count {vector_count}"
             )
         if not args.numeric_column:
@@ -145,7 +145,7 @@ def main() -> None:
         if prefix != expected_prefix:
             raise ValueError(
                 f"{config_path}: TagFile encodes {prefix}, "
-                f"but its EST policy derives {expected_prefix}"
+                f"but its label-coverage recipe derives {expected_prefix}"
             )
     else:
         prefix = f"sift1m_zipf{args.attribute_cardinality}"
@@ -155,7 +155,7 @@ def main() -> None:
             prefix += "_numeric"
     if policy is not None and prefix != expected_prefix:
         raise ValueError(
-            f"output prefix {prefix} does not match native EST policy "
+            f"output prefix {prefix} does not match the label-coverage recipe "
             f"({expected_prefix})"
         )
     payload_name = "attrs" if args.numeric_column else "tags"
@@ -163,14 +163,12 @@ def main() -> None:
     npy_tags_path = output_dir / f"{prefix}_{payload_name}.npy"
     key_tags_path = output_dir / f"{prefix}_key_tags.npy"
     numeric_path = output_dir / f"{prefix}_numeric.npy"
-    group_tags_path = output_dir / f"{prefix}_group_tags.txt"
     counts_path = output_dir / f"{prefix}_counts.tsv"
     manifest_path = output_dir / "manifest.json"
     outputs = [
         raw_tags_path,
         npy_tags_path,
         key_tags_path,
-        group_tags_path,
         counts_path,
         manifest_path,
     ]
@@ -235,7 +233,6 @@ def main() -> None:
         np.save(numeric_path, numeric_values.reshape(vector_count, 1))
     attributes.tofile(raw_tags_path)
     np.save(npy_tags_path, attributes)
-    np.savetxt(group_tags_path, little_endian_tags, fmt="%u")
 
     with counts_path.open("w", encoding="utf-8") as stream:
         stream.write(
@@ -299,9 +296,8 @@ def main() -> None:
         "extreme_tag_policy": (
             {
                 "formula": (
-                    "max(min_tag_count - 1, "
                     "ceil(coverage_target / "
-                    "(expected_head_ratio * slots_per_head)) - 1)"
+                    "(expected_head_ratio * slots_per_head)) - 1"
                 ),
                 "expected_head_ratio": str(
                     policy.head_ratio
@@ -311,7 +307,6 @@ def main() -> None:
                 ),
                 "slots_per_head": policy.slots_per_head,
                 "coverage_target": policy.coverage_target,
-                "min_tag_count": policy.min_tag_count,
                 "derived_max_tag_count": extreme_tag_count,
             }
             if extreme_tag_count
@@ -358,12 +353,6 @@ def main() -> None:
                 "dtype": "uint32",
                 "sha256": sha256(key_tags_path),
             },
-            "per_tag_bkt_tags": {
-                "path": str(group_tags_path),
-                "format": "one decimal attribute id per line",
-                "bytes": group_tags_path.stat().st_size,
-                "sha256": sha256(group_tags_path),
-            },
             "counts": {
                 "path": str(counts_path),
                 "sha256": sha256(counts_path),
@@ -400,7 +389,6 @@ def main() -> None:
             f"{int(numeric_values.max())}]"
         )
     print(f"SPTAG TagFile       : {raw_tags_path}")
-    print(f"PerVectorTagsFile   : {group_tags_path}")
     print(f"distribution        : {counts_path}")
     print(f"manifest            : {manifest_path}")
 

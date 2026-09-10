@@ -550,7 +550,7 @@ static inline bool NumQuantAnyInRange(const uint64_t* mask, int col, int blo, in
 //     tag is one logical ACL attribute physically split across these columns.
 //     These drive the categorical (hier/flat) signatures.
 //   - kind==1: `col` ALSO indexes the per-vector tag columns -- numeric attributes
-//     are stored inline as additional tag columns (col >= numBaseCols) holding the
+//     are stored at their schema-selected original columns holding the
 //     RAW order-preserving value. The exact post-filter reads vecTags[col] for both
 //     kinds; the only difference is `op` (range vs equality). For signature pruning
 //     a numeric literal is matched against the QUANTIZED numeric signature, not the
@@ -741,8 +741,8 @@ struct DNFPredicate {
     // passes iff EVERY one of its literals may match: categorical literals against
     // the hierarchical mask `h`, numeric literals against the posting's quantized
     // numeric mask `quant` (M*NUM_QUANT_WORDS uint64). `qp` holds the per-column
-    // [lo,hi] domains; `numBaseCols` is the first numeric tag-column index (so a
-    // numeric literal at absolute column `col` maps to quant lane col-numBaseCols).
+    // [lo,hi] domains. Explicit schemas supply original-column numericLanes;
+    // legacy callers use the numeric suffix beginning at numBaseCols.
     // Conservative: a numeric literal "may match" iff some bucket overlapping its
     // range is set. When `quant` is null (no numeric signature present) numeric
     // literals are treated as always-may-match (fail open).
@@ -750,7 +750,8 @@ struct DNFPredicate {
                            const uint64_t* quant, int numQuantCols,
                            const NumQuantParam* qp, int numQuantParams,
                            int numBaseCols,
-                           const HierWidthTable& widths) const {
+                           const HierWidthTable& widths,
+                           const std::vector<int>* numericLanes = nullptr) const {
         for (const auto& c : clauses) {
             if (c.lits.empty()) continue;
             bool all = true;
@@ -762,7 +763,9 @@ struct DNFPredicate {
                         break;
                     }
                 } else if (quant != nullptr && qp != nullptr) {
-                    int lane = (int)l.col - numBaseCols;
+                    int lane = numericLanes != nullptr
+                        ? (l.col < numericLanes->size() ? (*numericLanes)[l.col] : -1)
+                        : (int)l.col - numBaseCols;
                     if (lane < 0 || lane >= numQuantCols ||
                         lane >= numQuantParams) {
                         continue;  // unknown col: fail open
@@ -794,7 +797,7 @@ struct DNFPredicate {
         const PostingBitmask& categorical,
         const uint64_t* quant, int numQuantCols,
         const NumQuantParam* qp, int numQuantParams,
-        int numBaseCols) const {
+        int numBaseCols, const std::vector<int>* numericLanes = nullptr) const {
         for (const auto& c : clauses) {
             if (c.lits.empty()) continue;
             bool all = true;
@@ -806,9 +809,9 @@ struct DNFPredicate {
                     }
                 } else if (quant != nullptr &&
                            qp != nullptr) {
-                    const int lane =
-                        static_cast<int>(l.col) -
-                        numBaseCols;
+                    const int lane = numericLanes != nullptr
+                        ? (l.col < numericLanes->size() ? (*numericLanes)[l.col] : -1)
+                        : static_cast<int>(l.col) - numBaseCols;
                     if (lane < 0 ||
                         lane >= numQuantCols ||
                         lane >= numQuantParams) {

@@ -8,6 +8,12 @@
 #include <fstream>
 #include <string.h>
 #include <memory>
+#ifndef _MSC_VER
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include "inc/Core/Common.h"
 
 #ifdef SPDK
@@ -157,6 +163,11 @@ namespace SPTAG
 
             virtual std::uint64_t TellP() = 0;
 
+            virtual bool GetFileSize(std::uint64_t& size) { return false; }
+
+            // Optional immutable local-file view. The returned owner keeps the mapping alive.
+            virtual std::shared_ptr<std::uint8_t> MapReadOnly(std::uint64_t size) { return {}; }
+
             virtual void ShutDown() = 0; 
 
             virtual bool ShutDownAndCheck()
@@ -189,7 +200,44 @@ namespace SPTAG
                 std::uint64_t maxFileSize = (300ULL << 30))
             {
                 m_handle.reset(new std::fstream(filePath, (std::ios::openmode)openMode));
+                m_path = filePath;
                 return m_handle->is_open();
+            }
+
+            bool GetFileSize(std::uint64_t& size) override
+            {
+                const auto position = m_handle->tellg();
+                if (position < 0) return false;
+                m_handle->seekg(0, std::ios::end);
+                const auto end = m_handle->tellg();
+                m_handle->seekg(position);
+                if (end < 0 || !*m_handle) return false;
+                size = static_cast<std::uint64_t>(end);
+                return true;
+            }
+
+            std::shared_ptr<std::uint8_t> MapReadOnly(std::uint64_t size) override
+            {
+#ifndef _MSC_VER
+                if (size == 0 || size > SIZE_MAX) return {};
+                const int fd = ::open(m_path.c_str(), O_RDONLY);
+                if (fd < 0) return {};
+                struct stat st;
+                if (::fstat(fd, &st) != 0 || st.st_size < 0 ||
+                    static_cast<std::uint64_t>(st.st_size) != size) {
+                    ::close(fd);
+                    return {};
+                }
+                void* data = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+                ::close(fd);
+                if (data == MAP_FAILED) return {};
+                // Shuffled BKT/posting access should not trigger sequential readahead/page dropping.
+                ::madvise(data, size, MADV_RANDOM);
+                return std::shared_ptr<std::uint8_t>(static_cast<std::uint8_t*>(data),
+                    [size](std::uint8_t* p) { ::munmap(p, size); });
+#else
+                return {};
+#endif
             }
 
             virtual std::uint64_t ReadBinary(std::uint64_t readSize, char* buffer, std::uint64_t offset = UINT64_MAX)
@@ -269,6 +317,7 @@ namespace SPTAG
 
         private:
             std::unique_ptr<std::fstream> m_handle;
+            std::string m_path;
         };
 
         class SimpleBufferIO : public DiskIO

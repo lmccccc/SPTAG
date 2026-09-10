@@ -35,8 +35,8 @@ write_overlay() {
         'ResultNum=10' \
         'NumberOfThreads=1' \
         'MaxCheck=8192' \
-        'SecondLevelInitialProbeRatio=0.666666' \
-        'SecondLevelMaxCheck=512' \
+        'HierarchyInitialProbeRatio=0.666666' \
+        'HierarchyMaxCheck=512' \
         'SearchPostingPageLimit=12' \
         > "$path"
     printf '%s\n' "$path"

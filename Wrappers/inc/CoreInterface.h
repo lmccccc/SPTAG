@@ -12,7 +12,6 @@
 #include "inc/Helper/KeyValueIO.h"
 #include "inc/Core/Cache/HeadIndexCache.h"
 #include "inc/Core/Cache/PostingSignature.h"
-#include "inc/Core/Cache/ExtremeSparseTagStore.h"
 #include <map>
 #include <string>
 #include <vector>
@@ -229,9 +228,6 @@ public:
 
     // Load all tenant indices from a base directory (unified storage)
     bool LoadAll(const char* p_baseDir);
-    // Maintenance-only loader used by spannbuilder to regenerate a stale EST.
-    bool LoadAllForSignatureRepair(
-        const char* p_baseDir);
 
     // Get vector count for a specific tenant
     int GetTenantVectorCount(int p_tenantId) const;
@@ -248,19 +244,6 @@ public:
     // Each entry uses the layout: uint32_t column, uint32_t tag,
     // int32_t vectorCount, int32_t postingCount.
     ByteArray GetColumnAwareTagRoutingStatsBlob(int p_tenantId) const;
-
-    // Build-time pivot planner cost estimator.
-    // Returns a UTF-8 JSON payload with all candidates and the selected best plan.
-    // p_tags layout: [p_numVectors * p_numTagsPerVec] uint32_t.
-    // p_levelWeightsCsv: comma-separated weights for each tag level, empty = uniform.
-    ByteArray EstimatePivotBuildPlan(ByteArray p_tags,
-                                     int p_numVectors,
-                                     int p_numTagsPerVec,
-                                     int p_maxNodes,
-                                     float p_recallTarget,
-                                     float p_lambdaRecall,
-                                     float p_estimatedRecall,
-                                     ByteArray p_levelWeightsCsv) const;
 
     // Set build/search parameters for all tenant indices. Build parameters are
     // retained so values supplied before tenant indexes are created are applied
@@ -307,10 +290,6 @@ public:
     // Each vector can have multiple tags (e.g. org, dept, team, project).
     bool BuildSignatures(int p_tenantId, ByteArray p_tags, int p_numVectors,
                          int p_numTagsPerVec);
-    bool BuildSignaturesWithVectors(
-        int p_tenantId, ByteArray p_tags,
-        int p_numVectors, int p_numTagsPerVec,
-        ByteArray p_vectors);
 
     // Recompute each vector's nearest persisted head and write primary_head_csr.bin
     // without touching the posting store. Intended for an existing SPANN index.
@@ -380,13 +359,6 @@ private:
     // Per-tenant sparse tag index: tag → [posting_ids] for low-selectivity tags
     std::map<int, std::shared_ptr<SPTAG::Cache::SparseTagIndex>> m_tenantSparseIdx;
 
-    // Versioned tag-keyed sidecar whose records are contiguous by extreme
-    // sparse tag. It duplicates only the selected records; ordinary SPANN
-    // postings remain authoritative for unfiltered and fallback searches.
-    std::map<int, std::shared_ptr<SPTAG::Cache::ExtremeSparseTagStore>>
-        m_tenantExtremeSparseTagStores;
-    bool m_allowExtremeSparseTagRepairLoad = false;
-
     // Per-tenant tag-pure postings (chunked, stored inside the same KV/FileIO
     // backend that holds the regular SPANN postings — reuses its cache).
     // Each metadata entry carries the chunk-key list + per-chunk entry counts;
@@ -428,10 +400,9 @@ private:
     // path cannot know which level a single ACL tag belongs to.
     std::map<int, std::vector<uint32_t>> m_tenantTagLevelOffsets;
 
-    // Numeric attribute metadata per tenant: the first numeric tag-column index
-    // (numBaseCols) and the per-column quantization domain [lo,hi]. Used by the
-    // query path to build the quantized numeric pre-filter. Loaded from
-    // numeric_meta.bin; absent => no numeric columns.
+    // numBaseCols is the persisted categorical count (also the numeric start
+    // for legacy prefix layouts). Explicit TagSchema maps original indices to
+    // these dense numeric domains; raw attribute rows are never reordered.
     struct NumericMeta {
         int numBaseCols = 0;
         int vectorCount = 0;
@@ -444,21 +415,6 @@ private:
     std::map<int, NumericMeta> m_tenantNumericMeta;
     std::unordered_set<int>
         m_warnedInvalidNumericMetaTenants;
-
-    // Build-time pivot plan selected by the estimator.
-    std::map<int, int> m_tenantPivotLevels;
-    std::map<int, int> m_tenantPivotNodeCounts;
-    std::map<int, std::vector<std::vector<uint32_t>>> m_tenantNodePivotTags;
-    std::map<int, std::vector<std::vector<int>>> m_tenantPlannedNodeVectors;
-    std::map<int, std::vector<std::vector<int>>> m_tenantPlannedPrimaryNodeVectors;
-
-    // Tag -> node routing index derived from the pivot plan.
-    // For levels above the pivot, one tag can map to multiple nodes.
-    // For pivot and deeper levels, one tag maps to a unique node.
-    std::map<int, std::unordered_map<uint32_t, std::vector<int>>> m_tenantTagToNodes;
-
-    // Head sample -> node assignment for the selected pivot partitioning.
-    std::map<int, std::vector<int>> m_tenantHeadNodeToNode;
 
     // Unified storage path (base directory for all tenants)
     std::string m_baseStoragePath;
@@ -559,7 +515,6 @@ private:
     // Load optional extreme_sparse_tags.bin sidecars. The file header is
     // self-describing and is validated again against the loaded SPANN options
     // before a query can use it.
-    bool LoadTenantExtremeSparseTagStores();
 
     // Load per-tenant tagpure_meta.bin sidecars into m_tenantTagPurePostings.
     // Also resolves and caches the KV store handle + page budget needed by
@@ -575,7 +530,6 @@ private:
     void TouchLRU(int p_tenantId);
     void EvictIfNeeded();
     uint64_t EstimateTenantHeadIndexBytes(int p_tenantId) const;
-    bool EnsureTenantPivotIndexLoaded(int p_tenantId);
 
     bool EnsureTenantLoaded(int p_tenantId);
 

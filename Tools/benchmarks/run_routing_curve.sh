@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Full recall/QPS curve across all 5 filter levels after the routing sidecar
-# (tag_node_index.bin) was regenerated. One process per nprobe (env override);
+# (head/posting signatures) was regenerated. One process per nprobe (env override);
 # each process benchmarks every level at that fixed nprobe. Warm page cache =>
 # reload is ~free. Emits one JSONL row per (nprobe, level).
 set -u

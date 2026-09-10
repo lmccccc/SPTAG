@@ -33,7 +33,6 @@
 
 %include "PythonCommon.i"
 
-%ignore TenantIndexManager::LoadAllForSignatureRepair;
 %ignore TenantIndexManager::BuildFromDataSingleTenant;
 %ignore TenantIndexManager::BuildFromDataWithTagsSingleTenant;
 %ignore AnnIndex::SetVectorTagsView;
@@ -96,54 +95,6 @@ def _tenant_get_head_index_cache_state(self):
     }
 
 
-def _tenant_estimate_pivot_build_plan(
-    self,
-    tags,
-    num_vectors,
-    num_tags_per_vec,
-    max_nodes=5,
-    recall_target=0.99,
-    lambda_recall=10.0,
-    estimated_recall=1.0,
-    level_weights=None,
-):
-    """Estimate best pivot layer and node count before index build."""
-    import json as _json
-    import numpy as _np
-
-    tag_arr = _np.ascontiguousarray(tags, dtype=_np.uint32)
-    if tag_arr.ndim == 2:
-        if int(tag_arr.shape[0]) != int(num_vectors) or int(tag_arr.shape[1]) != int(num_tags_per_vec):
-            raise ValueError("tags shape does not match num_vectors/num_tags_per_vec")
-    elif tag_arr.ndim == 1:
-        expected = int(num_vectors) * int(num_tags_per_vec)
-        if int(tag_arr.size) != expected:
-            raise ValueError("flat tags length does not match num_vectors * num_tags_per_vec")
-    else:
-        raise ValueError("tags must be a 1D or 2D uint32 array")
-
-    if level_weights is None:
-        weights_csv = b""
-    else:
-        if len(level_weights) != int(num_tags_per_vec):
-            raise ValueError("level_weights length must equal num_tags_per_vec")
-        weights_csv = ",".join(str(float(v)) for v in level_weights).encode("utf-8")
-
-    payload = self.EstimatePivotBuildPlan(
-        tag_arr,
-        int(num_vectors),
-        int(num_tags_per_vec),
-        int(max_nodes),
-        float(recall_target),
-        float(lambda_recall),
-        float(estimated_recall),
-        weights_csv,
-    )
-    if not payload:
-        raise RuntimeError("EstimatePivotBuildPlan returned empty payload")
-    return _json.loads(payload.decode("utf-8"))
-
-
 def _tenant_build_from_numpy(self, vectors, tenant_ids, with_meta_index=True, normalized=False):
     """
     Build per-tenant independent indices from numpy vectors and tenant id array.
@@ -182,7 +133,6 @@ TenantIndexManager.BuildFromNumpy = _tenant_build_from_numpy
 TenantIndexManager.GetTagRoutingStats = _tenant_get_tag_routing_stats
 TenantIndexManager.GetColumnAwareTagRoutingStats = _tenant_get_column_aware_tag_routing_stats
 TenantIndexManager.GetHeadIndexCacheState = _tenant_get_head_index_cache_state
-TenantIndexManager.EstimatePivotPlan = _tenant_estimate_pivot_build_plan
 CreateTenantIndexManager = _create_tenant_index_manager
 %}
 

@@ -72,7 +72,7 @@ public:
     struct TagCountRecord
     {
         std::uint32_t m_tag = EmptyTag;
-        std::uint32_t m_reserved = 0; // v4: required support heads; v3: zero.
+        std::uint32_t m_reserved = 0; // v4/v5: required support heads; v3: zero.
         std::uint64_t m_count = 0;
     };
 
@@ -83,7 +83,9 @@ public:
         std::uint32_t m_headerBytes = 64;
         std::uint32_t m_headCount = 0;
         std::uint32_t m_slotsPerHead = 0;
-        std::uint32_t m_voteHeadCount = 0;
+        // Zero identifies retained-O candidates; positive values preserve the
+        // legacy pre-RNG vote provenance on read/export. Not a build setting.
+        std::uint32_t m_legacyVoteHeadCount = 0;
         std::uint32_t m_minHeadCount = 0;
         std::uint32_t m_tagCount = 0;
         std::uint32_t m_keyColumn = 0;
@@ -97,6 +99,8 @@ public:
     {
         Header m_base;
         std::uint64_t m_extraTagCount = 0;
+        // V4: immutable legacy configured cap. V5 (same 80-byte layout):
+        // exact sum of source-capped per-tag deficits, never a tuning limit.
         std::uint64_t m_maxExtraSupports = 0;
 
         HeaderV4()
@@ -135,7 +139,6 @@ public:
     bool Initialize(
         SizeType p_headCount,
         int p_slotsPerHead,
-        int p_voteHeadCount,
         int p_minHeadCount,
         int p_keyColumn,
         int p_attributeCount,
@@ -144,7 +147,7 @@ public:
         Reset();
         if (p_headCount <= 0 ||
             !IsSupportedSlotCount(p_slotsPerHead) ||
-            p_voteHeadCount <= 0 || p_minHeadCount <= 0 ||
+            p_minHeadCount <= 0 ||
             p_keyColumn < 0 || p_attributeCount <= 0 ||
             p_keyColumn >= p_attributeCount ||
             p_generationFingerprint == 0)
@@ -162,8 +165,6 @@ public:
             static_cast<std::uint32_t>(p_headCount);
         m_header.m_slotsPerHead =
             static_cast<std::uint32_t>(p_slotsPerHead);
-        m_header.m_voteHeadCount =
-            static_cast<std::uint32_t>(p_voteHeadCount);
         m_header.m_minHeadCount =
             static_cast<std::uint32_t>(p_minHeadCount);
         m_header.m_keyColumn =
@@ -242,7 +243,6 @@ public:
         std::vector<std::uint32_t> p_extraTags,
         const std::unordered_map<
             std::uint32_t, std::uint32_t>& p_requiredCounts,
-        std::uint64_t p_maxExtraSupports,
         std::string* p_error = nullptr)
     {
         if (p_error != nullptr) p_error->clear();
@@ -252,12 +252,10 @@ public:
         };
         if (HasExpansion())
             return fail("expanded limited-tag support is immutable");
-        if (p_maxExtraSupports == 0 ||
-            p_extraTags.size() > p_maxExtraSupports ||
-            static_cast<std::uint64_t>(p_offsets.size()) !=
+        if (static_cast<std::uint64_t>(p_offsets.size()) !=
                 static_cast<std::uint64_t>(m_header.m_headCount) + 1)
         {
-            return fail("invalid limited-tag expansion shape or budget");
+            return fail("invalid limited-tag expansion shape");
         }
         if (m_tagVectorCounts.empty() ||
             p_requiredCounts.size() != m_tagVectorCounts.size())
@@ -275,13 +273,15 @@ public:
                 entry.m_reserved = required->second;
             }
             Header expanded = m_header;
-            expanded.m_version = 4;
+            expanded.m_version = 5;
             expanded.m_headerBytes = sizeof(HeaderV4);
             expanded.m_tagCount = static_cast<std::uint32_t>(counts.size());
             expanded.m_bodyFingerprint = 0;
-            if (!ValidateStorage(
+            std::uint64_t requirementBound = 0;
+            if (!ExpansionRequirementBound(expanded, counts, false, requirementBound, p_error) ||
+                !ValidateStorage(
                     expanded, counts, p_offsets, p_extraTags,
-                    p_maxExtraSupports, p_error))
+                    requirementBound, p_error))
             {
                 return false;
             }
@@ -295,7 +295,7 @@ public:
             m_extraTags = std::move(p_extraTags);
             m_headsWithExtraTags = std::move(headsWithExtras);
             InlineFirstExtraTags();
-            m_maxExtraSupports = p_maxExtraSupports;
+            m_maxExtraSupports = requirementBound;
             m_legacyWithoutTagVectorCounts = false;
             m_headsByTag.clear();
             return true;
@@ -1010,7 +1010,7 @@ public:
 
     bool HasExpansion() const
     {
-        return m_header.m_version == 4;
+        return m_header.m_version == 4 || m_header.m_version == 5;
     }
 
     std::uint64_t ExtraSupportCount() const
@@ -1018,9 +1018,10 @@ public:
         return static_cast<std::uint64_t>(m_extraTags.size());
     }
 
-    std::uint64_t MaxExtraSupports() const
+    // Read-only provenance; zero for new requirement-derived V5 supports.
+    std::uint64_t LegacyExtraSupportCap() const
     {
-        return HasExpansion() ? m_maxExtraSupports : 0;
+        return m_header.m_version == 4 ? m_maxExtraSupports : 0;
     }
 
     bool HasInlineExtraTags() const
@@ -1078,7 +1079,7 @@ public:
 
     std::uint32_t RequiredHeadCount(std::uint32_t p_tag) const
     {
-        // Legacy tables use the global floor; unknown v4 tags have no requirement.
+        // Non-expanded tables use the global floor; unknown expanded tags have no requirement.
         if (!HasExpansion()) return m_header.m_minHeadCount;
         const auto found = std::lower_bound(
             m_tagVectorCounts.begin(), m_tagVectorCounts.end(), p_tag,
@@ -1238,7 +1239,6 @@ public:
         const std::string& p_path,
         SizeType p_expectedHeadCount,
         int p_expectedSlotsPerHead,
-        int p_expectedVoteHeadCount,
         int p_expectedMinHeadCount,
         int p_expectedKeyColumn,
         int p_expectedAttributeCount,
@@ -1272,18 +1272,18 @@ public:
             input.read(
                 reinterpret_cast<char*>(&legacy),
                 sizeof(legacy));
-            if (!input)
+            if (!input || legacy.m_voteHeadCount == 0)
             {
                 if (p_error != nullptr)
                     *p_error =
-                        "cannot read limited-tag v1 header";
+                        "invalid limited-tag v1 header or legacy provenance";
                 Reset();
                 return false;
             }
             m_header.m_headCount = legacy.m_headCount;
             m_header.m_slotsPerHead =
                 legacy.m_slotsPerHead;
-            m_header.m_voteHeadCount =
+            m_header.m_legacyVoteHeadCount =
                 legacy.m_voteHeadCount;
             m_header.m_minHeadCount =
                 legacy.m_minHeadCount;
@@ -1305,18 +1305,18 @@ public:
             input.read(
                 reinterpret_cast<char*>(&legacy),
                 sizeof(legacy));
-            if (!input)
+            if (!input || legacy.m_voteHeadCount == 0)
             {
                 if (p_error != nullptr)
                     *p_error =
-                        "cannot read limited-tag v2 header";
+                        "invalid limited-tag v2 header or legacy provenance";
                 Reset();
                 return false;
             }
             m_header.m_headCount = legacy.m_headCount;
             m_header.m_slotsPerHead =
                 legacy.m_slotsPerHead;
-            m_header.m_voteHeadCount =
+            m_header.m_legacyVoteHeadCount =
                 legacy.m_voteHeadCount;
             m_header.m_minHeadCount =
                 legacy.m_minHeadCount;
@@ -1332,7 +1332,7 @@ public:
             legacyV2 = true;
         }
         else if (input && prefix[0] == 0x3153544cU &&
-                 prefix[1] == 4 &&
+                 (prefix[1] == 4 || prefix[1] == 5) &&
                  prefix[2] == sizeof(HeaderV4))
         {
             HeaderV4 expanded;
@@ -1356,7 +1356,6 @@ public:
             (!HasExpansion() && m_header.m_version != 3) ||
             m_header.m_headerBytes != (HasExpansion() ? sizeof(HeaderV4) : sizeof(Header)) ||
             p_expectedHeadCount <= 0 ||
-            p_expectedVoteHeadCount <= 0 ||
             p_expectedMinHeadCount <= 0 ||
             p_expectedKeyColumn < 0 ||
             p_expectedAttributeCount <= p_expectedKeyColumn ||
@@ -1367,8 +1366,6 @@ public:
                 p_expectedSlotsPerHead) ||
             m_header.m_slotsPerHead !=
                 static_cast<std::uint32_t>(p_expectedSlotsPerHead) ||
-            m_header.m_voteHeadCount !=
-                static_cast<std::uint32_t>(p_expectedVoteHeadCount) ||
             m_header.m_minHeadCount !=
                 static_cast<std::uint32_t>(p_expectedMinHeadCount) ||
             m_header.m_keyColumn !=
@@ -1416,8 +1413,12 @@ public:
             extraTagCount > m_extraTags.max_size() ||
             (m_header.m_tagCount > tagCount &&
              m_header.m_tagCount - tagCount > extraTagCount) ||
-            (HasExpansion() &&
+            (m_header.m_version == 4 &&
              (m_maxExtraSupports == 0 || extraTagCount > m_maxExtraSupports)) ||
+            (m_header.m_version == 5 &&
+             (extraTagCount != m_maxExtraSupports ||
+              extraTagCount > static_cast<std::uint64_t>(m_header.m_tagCount) *
+                  (std::min)(m_header.m_minHeadCount, m_header.m_headCount))) ||
             !addBytes(tagCount, sizeof(std::uint32_t)) ||
             !addBytes(legacyV1 ? 0 : attributeCount, sizeof(std::uint32_t)) ||
             !addBytes(legacyV1 || legacyV2 ? 0 : m_header.m_tagCount, sizeof(TagCountRecord)) ||
@@ -1468,6 +1469,21 @@ public:
                 input.read(
                     reinterpret_cast<char*>(m_extraTagOffsets.data()),
                     static_cast<std::streamsize>(offsetCount * sizeof(std::uint64_t)));
+                bool validOffsets = input && m_extraTagOffsets.front() == 0 &&
+                    m_extraTagOffsets.back() == extraTagCount;
+                for (size_t i = 1; validOffsets && i < m_extraTagOffsets.size(); ++i)
+                    validOffsets = m_extraTagOffsets[i - 1] <= m_extraTagOffsets[i] &&
+                        m_extraTagOffsets[i] <= extraTagCount;
+                std::uint64_t requirementBound = 0;
+                if (!validOffsets ||
+                    !ExpansionRequirementBound(m_header, m_tagVectorCounts, false,
+                                               requirementBound, p_error) ||
+                    (m_header.m_version == 5 && requirementBound != extraTagCount))
+                {
+                    if (p_error != nullptr) *p_error = "invalid limited-tag expansion offsets or requirements";
+                    Reset();
+                    return false;
+                }
                 m_extraTags.resize(static_cast<size_t>(extraTagCount));
                 if (extraTagCount != 0)
                 {
@@ -1520,6 +1536,11 @@ public:
     int SlotsPerHead() const
     {
         return static_cast<int>(m_header.m_slotsPerHead);
+    }
+
+    bool UsesRetainedOriginalCandidates() const
+    {
+        return m_header.m_legacyVoteHeadCount == 0;
     }
 
     int MinHeadCount() const
@@ -1654,7 +1675,7 @@ private:
             if (p_error != nullptr) *p_error = p_message;
             return false;
         };
-        const bool expanded = p_header.m_version == 4;
+        const bool expanded = p_header.m_version == 4 || p_header.m_version == 5;
         const size_t inlineStride = static_cast<size_t>(p_header.m_slotsPerHead) +
             p_header.m_attributeCount + 2;
         const auto offsetAt = [&](size_t index) {
@@ -1668,7 +1689,6 @@ private:
             p_header.m_slotsPerHead == 0 ||
             p_header.m_slotsPerHead >
                 static_cast<std::uint32_t>((std::numeric_limits<int>::max)()) ||
-            p_header.m_voteHeadCount == 0 ||
             p_header.m_minHeadCount == 0 ||
             p_header.m_tagCount == 0 ||
             p_header.m_attributeCount == 0 ||
@@ -1701,12 +1721,14 @@ private:
         }
         if (expanded)
         {
-            if (p_maxExtraSupports == 0 || p_extraTags.size() > p_maxExtraSupports ||
+            if ((p_header.m_version == 4 &&
+                 (p_maxExtraSupports == 0 || p_extraTags.size() > p_maxExtraSupports)) ||
+                (p_header.m_version == 5 && p_extraTags.size() != p_maxExtraSupports) ||
                 (p_inlineExtraTag ? !p_offsets.empty()
                     : p_offsets.size() != static_cast<std::uint64_t>(p_header.m_headCount) + 1) ||
                 offsetAt(0) != 0 || offsetAt(p_header.m_headCount) != p_extraTags.size())
             {
-                return fail("invalid limited-tag expansion shape or budget");
+                return fail("invalid limited-tag expansion shape or provenance");
             }
             for (size_t i = 1; i <= p_header.m_headCount; ++i)
             {
@@ -1723,7 +1745,14 @@ private:
             return fail("legacy limited-tag support cannot contain expansion metadata");
         }
 
+        std::uint64_t requirementBound = 0;
+        if (p_header.m_version == 5 &&
+            (!ExpansionRequirementBound(p_header, p_counts, p_inlineExtraTag,
+                                        requirementBound, p_error) ||
+             requirementBound != p_maxExtraSupports))
+            return fail("limited-tag expansion requirement bound mismatch");
         std::unordered_map<std::uint32_t, std::uint32_t> coverage;
+        std::unordered_map<std::uint32_t, std::uint32_t> extraCoverage;
         for (std::uint32_t head = 0; head < p_header.m_headCount; ++head)
         {
             std::unordered_set<std::uint32_t> unique;
@@ -1759,6 +1788,7 @@ private:
                         return fail("invalid, duplicate or overlapping limited-tag extra support");
                     }
                     ++coverage[tag];
+                    if (p_header.m_version == 5) ++extraCoverage[tag];
                 }
             }
             if (!active) continue;
@@ -1801,6 +1831,9 @@ private:
                 }
                 if (expanded && found->second < entry.m_reserved)
                     return fail("limited-tag support coverage below effective minimum");
+                if (p_header.m_version == 5 && extraCoverage[entry.m_tag] != 0 &&
+                    found->second != entry.m_reserved)
+                    return fail("limited-tag extra supports exceed per-tag requirement");
                 previous = entry.m_tag;
                 total += entry.m_count;
             }
@@ -1808,6 +1841,46 @@ private:
                 return fail("limited-tag vector counts do not cover the dataset");
         }
         return true;
+    }
+
+    bool ExpansionRequirementBound(
+        const Header& p_header, const std::vector<TagCountRecord>& p_counts,
+        bool p_inline, std::uint64_t& p_bound, std::string* p_error) const
+    {
+        auto fail = [&]() {
+            if (p_error != nullptr) *p_error = "invalid limited-tag expansion requirements";
+            return false;
+        };
+        p_bound = 0;
+        if (p_counts.empty() || p_counts.size() != p_header.m_tagCount ||
+            p_header.m_vectorCount == 0) return fail();
+        std::unordered_map<std::uint32_t, std::uint32_t> baseCoverage;
+        const size_t stride = p_inline
+            ? static_cast<size_t>(p_header.m_slotsPerHead) + p_header.m_attributeCount + 2
+            : p_header.m_slotsPerHead;
+        for (size_t head = 0; head < p_header.m_headCount; ++head)
+            for (size_t slot = 0; slot < p_header.m_slotsPerHead; ++slot)
+            {
+                const auto tag = m_tags[head * stride + (p_inline ? 2 : 0) + slot];
+                if (tag != EmptyTag) ++baseCoverage[tag];
+            }
+        std::uint64_t total = 0;
+        for (size_t i = 0; i < p_counts.size(); ++i)
+        {
+            const auto& entry = p_counts[i];
+            if (entry.m_tag == EmptyTag || (i && entry.m_tag <= p_counts[i - 1].m_tag) ||
+                entry.m_reserved == 0 || entry.m_reserved > p_header.m_minHeadCount ||
+                entry.m_reserved > p_header.m_headCount || entry.m_count == 0 ||
+                total > p_header.m_vectorCount || entry.m_count > p_header.m_vectorCount - total)
+                return fail();
+            total += entry.m_count;
+            const auto found = baseCoverage.find(entry.m_tag);
+            const auto base = found == baseCoverage.end() ? 0U : found->second;
+            const std::uint64_t deficit = entry.m_reserved > base ? entry.m_reserved - base : 0;
+            if (p_bound > (std::numeric_limits<std::uint64_t>::max)() - deficit) return fail();
+            p_bound += deficit;
+        }
+        return total == p_header.m_vectorCount || fail();
     }
 
     bool ValidActiveRow(
@@ -1943,6 +2016,16 @@ private:
     std::uint64_t CurrentBodyFingerprint() const
     {
         std::uint64_t hash = 1469598103934665603ULL;
+        if (m_header.m_version == 5)
+        {
+            const std::uint64_t semantics = 0x5245515549524544ULL; // REQUIRED
+            FingerprintAppend(hash, &semantics, sizeof(semantics));
+        }
+        if (UsesRetainedOriginalCandidates())
+        {
+            const std::uint64_t source = 0x52455441494e4544ULL; // RETAINED
+            FingerprintAppend(hash, &source, sizeof(source));
+        }
         ForEachBaseTagChunk([&](const std::uint32_t* tags, size_t count) {
             FingerprintAppend(hash, tags, count * sizeof(std::uint32_t));
         });

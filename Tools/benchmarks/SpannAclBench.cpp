@@ -536,19 +536,20 @@ int main(int argc, char** argv)
                     return manager.SearchWithPredicate(
                         queryBytes, options.tenant, options.topk, dnfBytes, -1);
                 }
-                std::uint32_t tag = scenario.tagColumn >= 0
-                    ? queryTags[p_queryIndex * tagCols + static_cast<std::size_t>(scenario.tagColumn)]
-                    : 0;
+                std::uint32_t predicate[] = {
+                    0x444E4633U, 1, 1, 0,
+                    static_cast<std::uint32_t>(scenario.tagColumn), SPTAG::Cache::DNF_EQ,
+                    scenario.tagColumn >= 0 ? queryTags[
+                        p_queryIndex * tagCols + static_cast<std::size_t>(scenario.tagColumn)] : 0};
                 const ByteArray tagBytes(
-                    reinterpret_cast<std::uint8_t*>(&tag),
-                    scenario.tagColumn >= 0 ? sizeof(tag) : 0,
-                    false);
+                    reinterpret_cast<std::uint8_t*>(predicate),
+                    scenario.tagColumn >= 0 ? sizeof(predicate) : 0, false);
                 return manager.SearchWithPredicate(
                     queryBytes,
                     options.tenant,
                     options.topk,
                     tagBytes,
-                    scenario.tagColumn >= 0 ? 1 : 0);
+                    scenario.tagColumn >= 0 ? -1 : 0);
             };
             for (std::size_t i = 0; i < warmup; ++i) {
                 search(i);

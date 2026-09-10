@@ -5,11 +5,13 @@
 #define _SPTAG_SPANN_OPTIONS_H_
 
 #include "inc/Core/Common.h"
+#include "inc/Core/TagSchema.h"
 #include "inc/Helper/StringConvert.h"
 #include "inc/Helper/CommonHelper.h"
 #include "inc/Helper/KeyValueIO.h"
 #include <memory>
 #include <string>
+#include <cmath>
 
 namespace SPTAG {
     namespace SPANN {
@@ -68,12 +70,10 @@ namespace SPTAG {
             int m_splitThreshold;
             int m_maxRandomTryCount;
             double m_ratio;
-            bool m_ratioExplicitlySet;
             int m_headVectorCount;
             bool m_recursiveCheckSmallCluster;
             bool m_printSizeCount;
             std::string m_selectType;
-            std::string m_perVectorTagsFile;
             int m_minHeadsPerTag;
             bool m_dualPoolAugment;
             double m_dualPoolExtraRatio;
@@ -81,22 +81,18 @@ namespace SPTAG {
             bool m_parallelBKTBuild;
             bool m_selectSecondLevel;
             int m_secondLevelHierarchyLevels;
-            double m_secondLevelRatio;
+            // Read-only legacy constraint, never used for selection or serialized.
+            std::string m_legacyHierarchyRatio;
             std::string m_secondLevelHeadVectorFile;
             std::string m_secondLevelHeadIDFile;
             int m_secondLevelReplicaCount;
             std::string m_secondLevelHeadIndexFolder;
             std::string m_secondLevelPostingFile;
             std::string m_secondLevelGenerationFingerprint;
-            float m_secondLevelRouteSelectivityThreshold;
             double m_secondLevelInitialProbeRatio;
-            double m_secondLevelSignatureMinSelectivity;
-            double m_secondLevelSignatureMaxSelectivity;
             int m_secondLevelMaxCheck;
             bool m_secondLevelGraphSignaturePruning;
             std::string m_secondLevelPrefetchMode;
-            int m_sparseFallbackMaxHeads;
-            int m_sparseFallbackMaxPostingPages;
             std::string m_headNavigationMode;
 
             // Section 3: for build head
@@ -119,21 +115,13 @@ namespace SPTAG {
             std::string m_limitedTagSupportFile;
             int m_limitedTagColumn;
             int m_limitedTagSlotsPerHead;
-            int m_limitedTagVoteHeadCount;
             int m_limitedTagMinHeadCount;
             bool m_enableLimitedTagSupportExpansion;
-            std::uint64_t m_limitedTagMaxExtraSupports;
-            int m_limitedTagMaxExpandedPostingPages;
-            bool m_enableExtremeSparseTag;
-            int m_extremeSparseTagMinCount;
-            std::string m_extremeSparseTagFile;
-            bool m_logExtremeSparseTagRoute;
             float m_hybridVectorWeight;
             std::string m_hybridCategoricalCols;
             std::string m_hybridCategoricalWeights;
             std::string m_hybridNumericCols;
             std::string m_hybridNumericWeights;
-            int m_hybridGraphDegree;
             int m_hybridCandidateCount;
             int m_hybridRouteSampleCount;
             float m_hybridRouteSelectivityThreshold;
@@ -173,6 +161,46 @@ namespace SPTAG {
 
             // Per-vector tags embedded in posting metadata
             int m_numTagsPerVec;
+            std::string m_columnTypes;
+            int m_tagSchemaVersion;
+            std::string m_tagSchemaFingerprint;
+            const TagSchema& Schema() const {
+                if (m_cachedSchemaText != m_columnTypes || m_cachedSchemaWidth != m_numTagsPerVec ||
+                    m_cachedLegacyColumns != m_staticACLTagCols) {
+                    m_cachedSchema = TagSchema::Parse(m_columnTypes, m_numTagsPerVec, m_staticACLTagCols);
+                    m_cachedSchemaText = m_columnTypes;
+                    m_cachedSchemaWidth = m_numTagsPerVec;
+                    m_cachedLegacyColumns = m_staticACLTagCols;
+                }
+                return m_cachedSchema;
+            }
+            mutable TagSchema m_cachedSchema;
+            mutable std::string m_cachedSchemaText;
+            mutable int m_cachedSchemaWidth = -1;
+            mutable int m_cachedLegacyColumns = -1;
+            bool ValidateTagSchema(bool loading = false) {
+                try {
+                    const auto schema = Schema();
+                    if (!m_columnTypes.empty()) {
+                        if (loading && m_tagSchemaVersion != 1)
+                            throw std::invalid_argument("Unsupported or missing stored tag schema version");
+                        if (loading && m_tagSchemaFingerprint != schema.Fingerprint())
+                            throw std::invalid_argument("Stored tag schema fingerprint mismatch");
+                        m_tagSchemaVersion = 1;
+                        m_columnTypes = schema.text;
+                        m_tagSchemaFingerprint = schema.Fingerprint();
+                    } else if (!m_tagSchemaFingerprint.empty() || m_tagSchemaVersion != 0) {
+                        throw std::invalid_argument("Stored tag schema is missing ColumnTypes");
+                    }
+                    if (m_enableLimitedTagPosting && !schema.IsCategorical(m_limitedTagColumn))
+                        throw std::invalid_argument("LimitedTagColumn must identify a categorical original column");
+                    (void)Schema();
+                    return true;
+                } catch (const std::exception& error) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid tag schema: %s\n", error.what());
+                    return false;
+                }
+            }
             // Number of leading tag columns used by static ACL filtering.
             // Zero preserves the legacy behavior of using every tag column.
             int m_staticACLTagCols;
@@ -208,12 +236,7 @@ namespace SPTAG {
             bool m_enableAdaptiveFilteredNprobe;
             bool m_logAdaptiveNprobe;
             bool m_logPhaseTime;
-            bool m_unifiedNprobeBudget;
-            double m_multiNodeBudgetKeepRatio;
             bool m_disableCrossEdges;
-            bool m_filterKeepCross;
-            bool m_disableCrossSubgraph;
-            bool m_logUExtra;
             bool m_logCrossStats;
             bool m_logPathStats;
             int m_dumpHeads;
@@ -224,7 +247,6 @@ namespace SPTAG {
             bool m_unfilterPurePages;
             int m_unfilterExtraTailPages;
             int m_unfilterPureDistanceScanPercent;
-            bool m_enableHierPostingFilter;
             int m_rerank;
             bool m_recall_analysis;
             int m_debugBuildInternalResultNum;
@@ -315,7 +337,6 @@ namespace SPTAG {
 
             // In-posting quantization (unified config interface). See ParameterDefinitionList.h.
             std::string m_postingQuantizer;   // None|RaBitQ|OPQ|PipePQ
-            int m_postingQuantBits;           // RaBitQ bits per dim
             int m_postingQuantM;              // OPQ/PipePQ code bytes per vector
             bool m_requantizeFromPipePQ;      // one-time same-stride PipePQ->OPQ posting rewrite
             bool m_quantizeHead;              // quantize the head index too
@@ -349,14 +370,139 @@ namespace SPTAG {
 
 #include "inc/Core/SPANN/ParameterDefinitionList.h"
 #undef DefineSSDParameter
-                m_ratioExplicitlySet = false;
             }
 
             ~Options() {}
 
+            static const char* CanonicalParameter(const char* section, const char* name)
+            {
+                if (section == nullptr || name == nullptr) return name;
+                if (Helper::StrUtils::StrEqualIgnoreCase(section, "SearchSSDIndex") &&
+                    Helper::StrUtils::StrEqualIgnoreCase(name, "PostingPageLimit"))
+                    return "SearchPostingPageLimit";
+                const bool select = Helper::StrUtils::StrEqualIgnoreCase(section, "SelectHead");
+                const bool ssd = Helper::StrUtils::StrEqualIgnoreCase(section, "BuildSSDIndex") ||
+                    Helper::StrUtils::StrEqualIgnoreCase(section, "SearchSSDIndex");
+                struct Alias { const char* oldName; const char* name; bool select; };
+                static const Alias aliases[] = {
+                    {"SelectSecondLevel", "HierarchyEnabled", true},
+                    {"SecondLevelHierarchyLevels", "HierarchyLevels", true},
+                    {"SecondLevelHeadVectors", "HierarchyHeadVectors", true},
+                    {"SecondLevelHeadVectorIDs", "HierarchyHeadVectorIDs", true},
+                    {"SecondLevelReplicaCount", "HierarchyReplicaCount", true},
+                    {"SecondLevelHeadIndexFolder", "HierarchyHeadIndexFolder", true},
+                    {"SecondLevelPostingFile", "HierarchyPostingFile", true},
+                    {"SecondLevelGenerationFingerprint", "HierarchyGenerationFingerprint", true},
+                    {"SecondLevelInitialProbeRatio", "HierarchyInitialProbeRatio", false},
+                    {"SecondLevelMaxCheck", "HierarchyMaxCheck", false},
+                    {"SecondLevelGraphSignaturePruning", "HierarchyGraphSignaturePruning", false},
+                    {"SecondLevelPrefetchMode", "HierarchyPrefetchMode", false},
+                };
+                for (const auto& alias : aliases)
+                    if ((alias.select ? select : ssd) &&
+                        Helper::StrUtils::StrEqualIgnoreCase(name, alias.oldName))
+                        return alias.name;
+                return name;
+            }
+
+            bool ValidateHierarchyRatio() const
+            {
+                if (!m_selectSecondLevel) return true;
+                double legacy = 0.0;
+                if (!m_legacyHierarchyRatio.empty() &&
+                    (!Helper::Convert::ConvertStringTo<double>(m_legacyHierarchyRatio.c_str(), legacy) ||
+                     !std::isfinite(legacy) || std::abs(legacy - m_ratio) > 1e-12))
+                {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                        "Conflicting legacy SecondLevelRatio: hierarchy selection now uses Ratio at every level. "
+                        "An index built with unequal ratios requires the legacy reader; do not rewrite its config. "
+                        "For a new build remove SecondLevelRatio and set Ratio explicitly.\n");
+                    return false;
+                }
+                if (!std::isfinite(m_ratio) || m_ratio <= 0.0 || m_ratio >= 1.0)
+                {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Hierarchy selection requires 0 < Ratio < 1.\n");
+                    return false;
+                }
+                return true;
+            }
+
+            static bool IsRemovedParameter(const char* name)
+            {
+                for (const char* removed : {"HierarchyRouteSelectivityThreshold", "SecondLevelRouteSelectivityThreshold",
+                                            "ACLCols", "HierLevelWidths", "PivotForceNodeCount",
+                                            "DisablePivotEstimator", "RoutingCols", "PerVectorTagsFile",
+                                            "NumericCols", "EnableExtremeSparseTag", "ExtremeSparseTagMinCount",
+                                            "ExtremeSparseTagFile", "LogExtremeSparseTagRoute", "FilterKeepCross",
+                                            "DisableCrossSubgraph", "UnifiedNprobeBudget", "MultiNodeBudgetKeepRatio",
+                                            "LogUExtra", "PostingQuantBits", "HybridGraphDegree",
+                                            "EnableHierPostingFilter", "LimitedTagVoteHeadCount",
+                                            "LimitedTagMaxExpandedPostingPages", "LimitedTagMaxExtraSupports",
+                                            "TagOffset", "BKTSeed", "TPTSeed",
+                                            "SparseFallbackMaxHeads", "SparseFallbackMaxPostingPages",
+                                            "HierarchySignatureMinSelectivity", "HierarchySignatureMaxSelectivity",
+                                            "SecondLevelSignatureMinSelectivity", "SecondLevelSignatureMaxSelectivity"}) {
+                    if (Helper::StrUtils::StrEqualIgnoreCase(name, removed)) return true;
+                }
+                return false;
+            }
+
+            static bool IsRemovedSectionAlias(const char* section, const char* name)
+            {
+                if (!Helper::StrUtils::StrEqualIgnoreCase(section, "MultiTenant")) return false;
+                for (const char* native : {"CrossEdges", "CrossExtraEdges", "DualPoolAugment",
+                                          "DualPoolExtraRatio", "UExtraIDFile"}) {
+                    if (Helper::StrUtils::StrEqualIgnoreCase(name, native)) return true;
+                }
+                return false;
+            }
+
+            static bool ValidateNativeEnvironment()
+            {
+                for (const char* removed : {"SPTAG_ACL_COLS", "SPTAG_HIER_LEVEL_WIDTHS",
+                                            "SPTAG_PIVOT_FORCE_NODE_COUNT", "SPTAG_DISABLE_PIVOT_ESTIMATOR",
+                                            "SPTAG_ROUTING_COLS", "SPTAG_ROUTING_ONLY",
+                                            "SPTAG_PER_VECTOR_TAGS_FILE", "SPTAG_PERTAG_HEAD_RATIO",
+                                            "SPTAG_SELECT_TYPE_OVERRIDE", "SPTAG_NUMERIC_COLS",
+                                            "SPTAG_TAG_OFFSET", "SPTAG_TAGS_OFFSET"}) {
+                    if (std::getenv(removed) != nullptr) {
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                            "%s was removed: use the native record schema and spatial configuration.\n", removed);
+                        return false;
+                    }
+                }
+                return true;
+            }
+
             ErrorCode SetParameter(const char* p_section, const char* p_param, const char* p_value)
             {
                 if (nullptr == p_section || nullptr == p_param || nullptr == p_value) return ErrorCode::Fail;
+                if (IsRemovedParameter(p_param) || IsRemovedSectionAlias(p_section, p_param) ||
+                    ((Helper::StrUtils::StrEqualIgnoreCase(p_param, "SelectHeadType") ||
+                      Helper::StrUtils::StrEqualIgnoreCase(p_param, "SelectType")) &&
+                     Helper::StrUtils::StrEqualIgnoreCase(p_value, "PerTagBKT"))) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                        "[%s] %s=%s was removed: use the canonical native configuration.\n",
+                        p_section, p_param, p_value);
+                    return ErrorCode::FailedParseValue;
+                }
+                p_param = CanonicalParameter(p_section, p_param);
+                if (Helper::StrUtils::StrEqualIgnoreCase(p_param, "ColumnTypes") &&
+                    Helper::StrUtils::StrEqualIgnoreCase(p_section, "BuildSSDIndex")) {
+                    try {
+                        m_columnTypes = *p_value ? TagSchema::Parse(p_value).text : "";
+                        return ErrorCode::Success;
+                    } catch (const std::exception& error) {
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid tag schema: %s\n", error.what());
+                        return ErrorCode::FailedParseValue;
+                    }
+                }
+                if (Helper::StrUtils::StrEqualIgnoreCase(p_section, "SelectHead") &&
+                    Helper::StrUtils::StrEqualIgnoreCase(p_param, "SecondLevelRatio"))
+                {
+                    m_legacyHierarchyRatio = p_value;
+                    return ErrorCode::Success;
+                }
 
                 if (Helper::StrUtils::StrEqualIgnoreCase(p_section, "Base")) {
 #define DefineBasicParameter(VarName, VarType, DefaultValue, RepresentStr) \
@@ -385,6 +531,7 @@ namespace SPTAG {
         { \
             VarName = tmp; \
         } \
+        else return ErrorCode::FailedParseValue; \
     } else \
 
 #include "inc/Core/SPANN/ParameterDefinitionList.h"
@@ -432,6 +579,7 @@ namespace SPTAG {
             std::string GetParameter(const char* p_section, const char* p_param) const
             {
                 if (nullptr == p_section || nullptr == p_param) return std::string();
+                p_param = CanonicalParameter(p_section, p_param);
 
                 if (Helper::StrUtils::StrEqualIgnoreCase(p_section, "Base")) {
 #define DefineBasicParameter(VarName, VarType, DefaultValue, RepresentStr) \

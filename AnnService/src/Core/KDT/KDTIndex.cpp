@@ -17,6 +17,16 @@ namespace KDT
 
 template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader)
 {
+    for (const char* name : {"BKTSeed", "TPTSeed"}) {
+        if (!p_reader.DoesParameterExist("Index", name)) continue;
+        int legacySeed;
+        if (!Helper::Convert::ConvertStringTo<int>(
+                p_reader.GetParameter("Index", name, std::string()).c_str(), legacySeed) || legacySeed < -1)
+            return ErrorCode::FailedParseValue;
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Warning,
+            "Loading legacy %s=%d as artifact provenance only; saved geometry is unchanged, rebuilds use upstream RNG behavior.\n",
+            name, legacySeed);
+    }
 #define DefineKDTParameter(VarName, VarType, DefaultValue, RepresentStr)                                               \
     SetParameter(RepresentStr, p_reader.GetParameter("Index", RepresentStr, std::string(#DefaultValue)).c_str());
 
@@ -206,13 +216,29 @@ p_query.SortResult(); \
 */
 template <typename T>
 template <typename Q, bool (*notDeleted)(const COMMON::LabelSet &, SizeType)>
-void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_space) const
+void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_space,
+    const std::function<bool(SizeType)>& p_resultFilter) const
 {
     std::shared_lock<std::shared_timed_mutex> lock(*(m_pTrees.m_lock));
-    m_pTrees.InitSearchTrees<T, Q>(m_pSamples, m_fComputeDistance, p_query, p_space);
-    m_pTrees.SearchTrees<T, Q>(m_pSamples, m_fComputeDistance, p_query, p_space, m_iNumberOfInitialDynamicPivots);
-    while (!p_space.m_NGQueue.empty())
+    m_pTrees.InitSearchTrees<T, Q>(m_pSamples, m_fComputeDistance, p_query, p_space,
+        static_cast<bool>(p_resultFilter));
+    m_pTrees.SearchTrees<T, Q>(m_pSamples, m_fComputeDistance, p_query, p_space,
+        p_resultFilter ? (std::min)(p_space.m_iMaxCheck, m_iNumberOfInitialDynamicPivots)
+                       : m_iNumberOfInitialDynamicPivots);
+    while (true)
     {
+        if (p_space.m_NGQueue.empty())
+        {
+            if (!p_resultFilter || p_query.worstDist() < MaxDist ||
+                p_space.m_iNumberOfCheckedLeaves >= p_space.m_iMaxCheck ||
+                p_space.m_SPTQueue.empty())
+                break;
+            m_pTrees.SearchTrees<T, Q>(m_pSamples, m_fComputeDistance, p_query, p_space,
+                p_space.m_iNumberOfCheckedLeaves + (std::min)(
+                    p_space.m_iMaxCheck - p_space.m_iNumberOfCheckedLeaves,
+                    (std::max)(1, m_iNumberOfOtherDynamicPivots)));
+            if (p_space.m_NGQueue.empty()) continue;
+        }
         NodeDistPair gnode = p_space.m_NGQueue.pop();
         const SizeType *node = m_pGraph[gnode.node];
         _mm_prefetch((const char *)node, _MM_HINT_T0);
@@ -224,7 +250,8 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
             _mm_prefetch((const char *)(m_pSamples)[futureNode], _MM_HINT_T0);
         }
 
-        if (notDeleted(m_deletedID, gnode.node))
+        if (notDeleted(m_deletedID, gnode.node) &&
+            (!p_resultFilter || p_resultFilter(gnode.node)))
         {
             if (!p_query.AddPoint(gnode.node, gnode.distance) && p_space.m_iNumberOfCheckedLeaves > p_space.m_iMaxCheck)
             {
@@ -237,6 +264,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
         bool bLocalOpt = true;
         for (DimensionType i = 0; i < m_pGraph.m_iNeighborhoodSize; i++)
         {
+            if (p_resultFilter && p_space.m_iNumberOfCheckedLeaves >= p_space.m_iMaxCheck) break;
             SizeType nn_index = node[i];
             if (nn_index < 0)
                 break;
@@ -259,7 +287,10 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
             if (p_space.m_iNumberOfTreeCheckedLeaves <= p_space.m_iNumberOfCheckedLeaves / 10)
             {
                 m_pTrees.SearchTrees<T, Q>(m_pSamples, m_fComputeDistance, p_query, p_space,
-                                           m_iNumberOfOtherDynamicPivots + p_space.m_iNumberOfCheckedLeaves);
+                    p_resultFilter ? p_space.m_iNumberOfCheckedLeaves + (std::min)(
+                        p_space.m_iMaxCheck - p_space.m_iNumberOfCheckedLeaves,
+                        (std::max)(1, m_iNumberOfOtherDynamicPivots))
+                    : m_iNumberOfOtherDynamicPivots + p_space.m_iNumberOfCheckedLeaves);
             }
             else if (gnode.distance > p_query.worstDist())
             {
@@ -285,15 +316,16 @@ bool CheckIfNotDeleted(const COMMON::LabelSet &deletedIDs, SizeType node)
 
 template <typename T>
 template <typename Q>
-void Index<T>::SearchIndex(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_space, bool p_searchDeleted) const
+void Index<T>::SearchIndex(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_space, bool p_searchDeleted,
+    const std::function<bool(SizeType)>& p_resultFilter) const
 {
     if (m_deletedID.Count() == 0 || p_searchDeleted)
     {
-        Search<Q, StaticDispatch::AlwaysTrue>(p_query, p_space);
+        Search<Q, StaticDispatch::AlwaysTrue>(p_query, p_space, p_resultFilter);
     }
     else
     {
-        Search<Q, StaticDispatch::CheckIfNotDeleted>(p_query, p_space);
+        Search<Q, StaticDispatch::CheckIfNotDeleted>(p_query, p_space, p_resultFilter);
     }
     p_query.SetScanned(p_space.m_iNumberOfCheckedLeaves);
 }
@@ -350,6 +382,13 @@ template <typename T>
 ErrorCode Index<T>::SearchIndexWithMaxCheck(QueryResult& p_query, int maxCheck,
                                              bool p_searchDeleted) const
 {
+    return SearchIndexWithResultFilter(p_query, nullptr, maxCheck, p_searchDeleted);
+}
+
+template <typename T>
+ErrorCode Index<T>::SearchIndexWithResultFilter(QueryResult& p_query,
+    std::function<bool(SizeType)> p_resultFilter, int maxCheck, bool p_searchDeleted) const
+{
     if (!m_bReady)
         return ErrorCode::EmptyIndex;
 
@@ -366,7 +405,7 @@ ErrorCode Index<T>::SearchIndexWithMaxCheck(QueryResult& p_query, int maxCheck,
         {
 #define DefineVectorValueType(Name, Type)                                                                              \
     case VectorValueType::Name:                                                                                        \
-        SearchIndex<Type>(*p_results, *workSpace, p_searchDeleted);                                                    \
+        SearchIndex<Type>(*p_results, *workSpace, p_searchDeleted, p_resultFilter);                                    \
         break;
 
 #include "inc/Core/DefinitionList.h"
@@ -378,7 +417,7 @@ ErrorCode Index<T>::SearchIndexWithMaxCheck(QueryResult& p_query, int maxCheck,
     }
     else
     {
-        SearchIndex<T>(*p_results, *workSpace, p_searchDeleted);
+        SearchIndex<T>(*p_results, *workSpace, p_searchDeleted, p_resultFilter);
     }
 
     m_workSpaceFactory->ReturnWorkSpace(std::move(workSpace));
@@ -945,6 +984,11 @@ template <typename T> ErrorCode Index<T>::SetParameter(const char *p_param, cons
 {
     if (nullptr == p_param || nullptr == p_value)
         return ErrorCode::Fail;
+    if (Helper::StrUtils::StrEqualIgnoreCase(p_param, "BKTSeed") ||
+        Helper::StrUtils::StrEqualIgnoreCase(p_param, "TPTSeed")) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "%s was removed; construction uses upstream RNG behavior.\n", p_param);
+        return ErrorCode::FailedParseValue;
+    }
 
 #define DefineKDTParameter(VarName, VarType, DefaultValue, RepresentStr)                                               \
     else if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_param, RepresentStr))                                       \

@@ -1,7 +1,158 @@
 # Benchmark Scripts
 
+## Native vector input migration
+
+`spannbuilder` now uses the original `VectorSetReader` dispatch and core DiskIO:
+
+```ini
+[Base]
+ValueType=UInt8
+VectorType=DEFAULT
+VectorPath=/path/to/headered_base.u8bin
+; Dim is optional for DEFAULT; when present it must match the header.
+Dim=128
+; Optional bounded prefix, min(header rows, VectorSize); omit for the full input.
+VectorSize=2000000
+```
+
+`DEFAULT` is `[int32 rows][int32 dimensions][row-major elements]`, not a filename
+extension heuristic. Negative/invalid dimensions, short headers, size overflow,
+truncated payloads, trailing bytes, and conflicting `Dim`/`ValueType` are rejected
+before payload allocation. The file itself must remain immutable during a build.
+`ValueType` specifies `UInt8`, `Int8`, `Int16`, or `Float`; it is **not**
+`VectorType`. `TXT` (native metadata-tab-vector syntax) and `XVEC` (per-record
+dimension header) still use their native converters, require `Dim`, and validate
+dimensions before exposing their converted DEFAULT vector set.
+
+`VectorOffset`, `VectorCount`, `--vec-offset`, `--vector-offset`,
+`--vector-count`, and vector `--n` are removed and fail explicitly.
+Use `--vector-type`, `--value-type`, and optional `--vector-size` instead.
+`VectorSize=-1`/omission means all; zero and values outside native signed
+`SizeType` are rejected. This applies to normal build, signatures-only,
+primary-head backfill, and OPQ/PipePQ prep. `--merge-tags5 --n` remains an
+explicit prefix for the separate NPY-to-native-attributes preparation command.
+
+`TagFile` is **headerless row-major native uint32 `[N, NumTagsPerVec]`**.
+Its first row always begins at byte zero, implicitly. `TagOffset`,
+`--tags-offset`, `--tag-offset`, `SPTAG_TAG_OFFSET` and `SPTAG_TAGS_OFFSET`
+are removed and rejected even when explicitly zero (including CLI `=0` forms).
+No format or replacement offset knob is introduced. Native DiskIO owns the
+read-only attribute mapping, with a checked native read fallback when unavailable.
+For all-row builds the file must be exactly `N * NumTagsPerVec * 4` bytes.
+For `VectorSize` prefixes it must have exactly the selected number of rows
+**or** the full validated vector-source count; only the selected rows are used.
+Arbitrary extra rows, truncated/misaligned data and normally sized NPY/headered
+files fail rather than being skipped or guessed. The production 1B/2-column
+sidecar remains the same 8,000,000,000-byte file, unchanged.
+
+Raw bytes have no embedded dtype/shape/endian marker: uint32 is the contract,
+not a detectable property of same-size bytes. Same-size float/int32 data or a
+header substituted for payload cannot be identified reliably and must not be
+passed as TagFile. Declare **every column in original order** with
+`[Tags] ColumnTypes=categorical,numeric` (CLI `--column-types`).
+`cate,num` aliases are accepted; saved configs use full canonical names.
+Width is derived; optional `NumTagsPerVec` must equal it. Single-label means
+one value per categorical column, not one categorical column per record.
+For example `numeric,categorical,numeric,categorical` uses numeric lanes
+for original columns 0 and 2 and independent category values at 1 and 3.
+`[BuildSSDIndex] LimitedTagColumn=3` selects the original key column; it must
+be in range and categorical. Inputs and posting records are never reordered.
+`spannaclbench --tag-column N` reads column N of the supplied query-tag matrix
+and emits categorical equality on that same original column, rather than
+matching the value across all columns. `--or-tag-count` retains flat tag-value
+OR semantics; numeric predicates use `--query-dnf`.
+
+Native APIs use `SetSSDBuildParam("ColumnTypes", ...)` (or the SPANN
+`BuildSSDIndex` setter). Saved `TagSchemaVersion=1`, `ColumnTypes` and
+`TagSchemaFingerprint` check the canonical original-order schema on load.
+The existing posting/support formats remain unchanged and contain full raw rows.
+Explicit-schema snapshots require a schema-aware reader; do not open interleaved
+snapshots with older binaries that only understand categorical prefixes.
+Numeric metadata retains its category-count field and densely packed domains;
+the schema maps absolute query indices to numeric lanes everywhere.
+Old authentic prefix layouts without explicit types remain readable through
+private legacy count metadata; they are never reinterpreted as one-category
+inputs. Signature regeneration requires a matching explicit input schema.
+The legacy packed PrimaryHeadCSR utility still requires its exact four-category,
+one-numeric order and rejects incompatible schemas.
+
+Repository recipes with known four-category or four-category-plus-numeric
+inputs now declare their actual schema. Unsupported headerless `VectorType=RAW`
+markers still require deliberate native-vector migration. No existing datasets,
+historical inputs or historical run configurations are rewritten.
+
+Only `--merge-tags5 --tags-npy ... --num-npy ...` accepts NPY: v1.0,
+C-order little-endian uint32 `[N,acl-cols]` plus nonnegative int32 `[N]`,
+with matching source row counts, checked shape/type/header/size and bounded
+`--n`. Unsupported versions/order/dtypes and mismatches fail explicitly.
+It writes a new native raw sidecar; never point TagFile at those NPY inputs or
+rewrite historical datasets to make a config appear compatible.
+
+On POSIX, the native DEFAULT reader optionally maps a validated file read-only.
+The vector set owns the mapping through build/save, and the single-tenant bulk
+path borrows it without a wrapper/core corpus copy for L2 or normalized Cosine.
+Non-mapping DiskIO backends fall back to one native allocation/read.
+Unnormalized Cosine automatically needs one mutable copy, which the core borrows
+through normalization, build and save; the mapped source is never mutated.
+Signatures-only reads header/stat and maps without scanning the
+corpus, validates against saved metadata, and uses tags plus persisted support.
+TXT/XVEC conversion may materialize a native intermediate on disk; it does not
+silently treat those formats as DEFAULT.
+
+Legacy `tenant0_base*.f32` profiles are deliberately marked `VectorType=RAW`,
+an **unsupported migration marker**, not a new reader. Their files have no native
+header; changing only the container to DEFAULT would corrupt interpretation.
+Before rerunning those examples, explicitly create a **new** native headered file
+with the known shape and unchanged row ordering/normalization (or select a
+matching existing XVEC/TXT source), then update `VectorPath`/`VectorType` in a new
+run configuration. Do not rewrite historical files or substitute a full SIFT
+corpus for a tenant-local 404819-row source: tags and local VIDs must still match.
+Headered UInt8/Int8 profiles are migrated directly, and intentional SPACEV
+prefixes retain `VectorSize`. Production H5 uses `ValueType=UInt8`,
+`VectorType=DEFAULT`, no offset/count/full-size override; all hierarchy,
+thread-count, support, numeric, and H/O page settings are unchanged.
+
+### Other redundant bulk input settings
+
+The bulk command also removes `[Tags] Tenant`, `[Build] WithMetaIndex`,
+`[Build] ShareBuildOwnership`, `--tenant`, `--with-meta-index`,
+`--share-build-ownership`, and the `SPTAG_BUILD_SHARE_OWNERSHIP` environment
+override. Explicit values fail even if they used to be `0`/`false`. Tenant 0
+and no line-metadata index are invariants of this bulk model, not choices.
+Ownership now follows the native metric and reader's `Normalized` state:
+L2/normalized Cosine borrows; unnormalized Cosine copies once before native
+normalization. The library's real tenant, metadata-index and ownership APIs
+remain intact. `--tenant` still selects a real tenant for hierarchy maintenance
+and existing-index posting transforms; it is removed only from bulk input.
+
+`[BuildSSDIndex]`/`[SearchSSDIndex] NumTagsPerVec` is a redundant **bulk-input** setting: it is
+derived from `[Tags] ColumnTypes` and still persisted
+as the native runtime option. Keep only the schema setting in builder INIs.
+Schema width remains required. The bulk categorical prefix and target column
+are fixed to one and zero respectively; a tag byte offset is not a setting.
+
+Retained deliberately:
+- `Normalized` is the native reader assertion that Cosine input is already
+  normalized; it cannot safely be inferred from a file header. It uses native
+  boolean parsing, including `--normalized true|false` (native `-norm` alias);
+  a bare checkbox-style `--normalized` is no longer accepted.
+  Omitted means false (the redundant L2 production declaration
+  was removed).
+- `Dim` is the native consistency constraint (and required TXT/XVEC dimension),
+  not a second format-specific offset/count. DEFAULT can derive it.
+- `BuildSignatures` schedules real work: the launcher defers it to a fresh process
+  to control peak memory, and no-tag/unfiltered builds need not generate filtering
+  sidecars. `false` is also useful for a build followed by signatures-only.
+  It does not promise filtered serving before required sidecars exist.
+- `MinHeadsPerTag` has an active native representative-head promotion algorithm.
+  Support expansion requires it to be zero, but non-expansion experiments can
+  use it meaningfully; a mode constraint is not grounds to remove the native knob.
+- Native head selection, storage, compression, H/O and search budgets remain
+  native options. No meaningful budgets were replaced with wrapper constants.
+
 ## STM1 Static Metadata Demo
 
+First migrate this legacy headerless Float input as described above.
 The native INI is the source of truth for build and search settings. The
 committed Float SIFT-1M fixture demonstrates node-pure STM1 postings, unbounded
 unfilter tails, and the exact member-OR posting prefilter:
@@ -25,8 +176,8 @@ Release/spannaclbench \
 ```
 
 `[SearchSSDIndex]` in the INI controls the persisted search behavior:
-`InternalResultNum`, `MaxCheck`, `EnableUnfilterTail`, and
-`EnableHierPostingFilter`. Do not override these with `SPTAG_*` environment
+`InternalResultNum`, `MaxCheck`, and `EnableUnfilterTail`. Posting-signature
+prefiltering is automatic when validated metadata is available. Do not override these with `SPTAG_*` environment
 variables. The JSON output includes recall/QPS and loaded-posting contribution
 metrics when `CollectPostingContributionStats=true` is enabled in a diagnostic
 search overlay.
@@ -95,10 +246,71 @@ categorical/numeric limited-tag experiment. Its canonical H3 -> H2 -> H1
 pipeline keeps only the H3 graph; lower layers use ID-only CSR postings and
 logical vector catalogs. It does not create attribute subsets, hybrid edges,
 or cross edges.
-The record schema is driven by native `NumTagsPerVec`, `ACLCols`,
-`NumericCols`, and `LimitedTagColumn` values rather than a fixed attribute
-count. Limited-tag placement and H1/H2 routing use only categorical equality
-anchors on `LimitedTagColumn`; all categorical and numeric DNF3 literals are
+For local SIFT1B, use
+`build_spann_attr_sift1b_zipf200_limited_tag_h5.ini`: it keeps the
+[`GettingStart.md`](../../docs/GettingStart.md) SIFT1B baseline budgets and
+extends this routing-only model to five total levels. Its raw UInt8 records
+are 140 bytes, and it uses the existing two-column single-label/numeric
+attributes, O-derived floor-16 support, and new `_h5` output directories.
+Only H5 retains a graph; every level uses the same `.12` selection ratio,
+configured solely by native `[SelectHead] Ratio=.12`, `HierarchyEnabled=true`,
+and `HierarchyLevels=5`.
+The CSR replica count remains `8`. This profile does not overwrite the older H1/H2 index.
+
+The native hierarchy interface uses `[SelectHead] HierarchyEnabled`,
+`HierarchyLevels` (total levels, including H1), and **one** `Ratio` for all
+selection stages. `Count` must remain zero for hierarchy builds. Small layers
+round up to at least one head without changing the saved ratio. The remaining
+selection keys are `HierarchyReplicaCount`, `HierarchyHeadVectors`,
+`HierarchyHeadVectorIDs`, `HierarchyHeadIndexFolder`, `HierarchyPostingFile`,
+and the generated `HierarchyGenerationFingerprint`.
+SSD construction/search keys are `HierarchyInitialProbeRatio`, `HierarchyMaxCheck`,
+`HierarchyGraphSignaturePruning`, and `HierarchyPrefetchMode`. The initial
+probe ratio controls search breadth, not head selection. `BuildH1Graph=false`
+retains just the top graph and uses CSR descent below it. Existing
+`HeadNavigationMode=Auto` always uses that hierarchy when enabled, for sparse,
+dense, unfiltered and numeric-only queries; selectivity never switches to H1.
+Without a hierarchy Auto retains ordinary native H1 navigation.
+The legacy explicit `H1Only` mode requires an existing H1 graph;
+`H2Only` requires a loaded hierarchy and means the entire hierarchy route,
+not a two-level limit. Matching results at the actual highest graph are completed by native
+result admission within the same search and budget, before CSR descent.
+Hierarchy queries never enumerate the global tag-to-H1 support map.
+
+`HierarchyRouteSelectivityThreshold` and its `SecondLevelRouteSelectivityThreshold`
+alias are removed and rejected, including zero, empty and old-default values.
+There is no replacement dispatch knob. New signatures cover all categorical tags.
+Authenticated legacy partial CSR signature domains remain read-only: if any
+query equality anchor is outside any layer's domain, signature pruning is disabled
+conservatively for that query, not hierarchy navigation or exact H1/posting filtering.
+Numeric-only predicates use the full O region without categorical signature pruning.
+Hierarchy navigation no longer requires wrapper selectivity estimates or
+`tag_routing_stats.bin`. The sidecar is still produced/read for adaptive nprobe,
+hybrid routing, diagnostics and public stats consumers; it is not retired.
+
+Except for the removed route threshold and signature-domain pair, legacy `SelectSecondLevel` and `SecondLevel*` names remain explicit read/set
+aliases, with canonical keys taking precedence in INI files. Saving emits only
+canonical keys. Old artifact filenames and binary formats are unchanged.
+`SecondLevelRatio` is **not** a selection option: it is accepted only as a
+compatibility constraint and is omitted on save. An enabled legacy hierarchy
+whose ratio differs from `Ratio` fails build/load/save explicitly; use the
+legacy reader for that historical index, never edit its frozen config to
+pretend it was built with shared ratios. Disabled old hierarchies can ignore
+their unused legacy ratio. Repository templates now describe new shared-ratio
+builds; historical benchmark results and run INIs are not rewritten.
+New hierarchy SelectHead checkpoints also record the shared ratio and total
+levels. Resume rejects missing legacy provenance or a changed ratio/depth rather
+than silently reusing heads selected under a different model. Use
+`ResumeBuild=0` and fresh output paths for such migrations; non-hierarchy legacy
+checkpoints remain readable.
+The launcher validates these settings before any build, and checks canonical
+persisted settings afterwards (including STATIC graphless indexes). A read-only
+preflight is also available:
+`python3 Tools/benchmarks/validate_spann_hierarchy_config.py <build.ini> [indexloader.ini]`.
+
+The bulk schema lists every original column in `ColumnTypes`; categorical and
+numeric columns may be interleaved. Limited-tag placement and H1/H2
+routing use only categorical equality anchors on the target column; all categorical and numeric DNF3 literals are
 still evaluated exactly on posting records. Native
 `[BuildSSDIndex] LimitedTagSlotsPerHead` accepts any positive integer (`2` is
 the default).
@@ -118,6 +330,23 @@ The canonical INI sets `LimitedTagSlotsPerHead=2` explicitly. Use
 `build_spann_attr_sift1m_zipf200_limited_tag4.ini` for the isolated four-slot
 experiment.
 
+The current SIFT1M `build_spann_attr_sift1m_zipf200_limited_tag.ini` uses the
+**retained-O expansion model**: shared `Ratio=.16`, H3, `MinHeadsPerTag=0` and
+`LimitedTagMinHeadCount=16`. It declares native DEFAULT Float input and original
+`categorical,numeric` columns, with expansion enabled and no global cap. Fresh output
+uses `index_limited_tag_h3_current`, never the historical
+`index_limited_tag_h3_placement_fixed`. Derive unique run directories for repeat
+experiments. Its 24-thread native build, beam 64, build MaxCheck 8192,
+construction page limit 16 and search page limit 12 remain unchanged.
+The old eight-head non-expanded control remains historical provenance, not the
+current build recipe.
+The launcher completes both the primary build and the separate signature phase
+when `BuildSignatures=true`; a primary-only build is not an equivalent benchmark.
+Comparisons against historical results measure the broader accumulated cleanup,
+not cap removal alone. A causal cap-only comparison also needs frozen compatible
+executables/configuration and identical retained assignments; upstream RNG does
+not guarantee identical independent rebuilds.
+
 ### O-derived low-coverage support expansion
 
 The opt-in expansion mode keeps the geometrically selected real H1 heads fixed.
@@ -131,15 +360,21 @@ MinHeadsPerTag=0
 [BuildSSDIndex]
 EnableLimitedTagSupportExpansion=true
 LimitedTagSlotsPerHead=2
-LimitedTagVoteHeadCount=2
 LimitedTagMinHeadCount=16
-LimitedTagMaxExtraSupports=262144
-LimitedTagMaxExpandedPostingPages=32
+PostingPageLimit=3
+PostingVectorLimit=118
+
+[SearchSSDIndex]
+SearchPostingPageLimit=3
 ```
 
-The base row keeps the own tag and up to the configured number of nearest
-external O-search-vote tags. Unlike legacy mode, it may remain underfilled;
-centroid-neighbor filling and per-tag global coverage repair are skipped.
+The base row protects the own tag and takes the nearest distinct external tags
+from actual **post-RNG, post-cut retained O records**, up to
+`LimitedTagSlotsPerHead - 1`. A tag's distance is its closest retained member's
+distance to that head (ties use tag ID). Rows may remain underfilled.
+There is no separate candidate-count option, centroid-neighbor filling, or
+base-row coverage repair. With expansion disabled, an unmet support floor
+fails validation rather than replacing nearer tags or inventing candidates.
 Original vector counts include real H1 representatives and count each VID
 once. A single pass over the **retained O prefixes after posting cuts** finds
 distinct candidate `(tag, head)` relationships for tags below the support floor.
@@ -151,22 +386,90 @@ not consume additional slots.
 The required support count is the smaller of the floor and the number of
 feasible base-plus-O heads. Thus a head-only singleton needs its one own head,
 not sixteen invented postings. A tag with neither a support head nor a retained
-O source fails construction. `LimitedTagMaxExtraSupports` bounds the total
-additional relationships; exceeding it fails explicitly rather than silently
-reducing targets. The planner does not scan the entire head catalog once per
-tag.
+O source fails construction. There is no independent global extra-support cap:
+candidate state grows incrementally only for distinct actual retained-O heads,
+up to each tag's floor deficit. Total state is bounded by the sum of those
+deficits, not a configured maximum or an eager floor-sized allocation.
+Overflow and allocation failures remain explicit; targets are never truncated
+to fit memory. The planner does not scan the entire head catalog once per tag.
 
 All non-head records still use support-filtered placement and the same RNG
 replica rule. Empty-result recovery ranks supported heads and applies that
 same RNG rule; it does not impose a special one-replica policy on sparse tags.
-The O assignments remain unchanged. For heads receiving extra support,
-`LimitedTagMaxExpandedPostingPages` bounds the complete H-prefix **payload**
-in native pages; page-aligned physical reads may include one additional
-boundary page. Exceeding this limit fails without trimming H replicas.
+The O assignments remain unchanged. Both H and O use the native construction
+cut: if `PostingPageLimit>0`, the effective page count is
+`max(PostingPageLimit, ceil(PostingVectorLimit*recordBytes/4096))`, and each
+region initially retains at most `floor(effectivePages*4096/recordBytes)` nearest records.
+This applies to every H head, not only heads with extra supports. For 140-byte
+records, `PostingPageLimit=3` and `PostingVectorLimit=118` mean **5 pages /
+146 records per region**, not 3 pages. Nonpositive build page limits disable
+the cut. Whole records and their attributes are preserved; RNG copies beyond
+the cut are intentionally dropped. If a non-head vector loses every H copy,
+a lightweight pre-write rescue appends **one** of its already-computed H RNG
+edges: the nearest originally assigned support-legal head, using the original
+distance (head ID breaks distance ties). Vectors retaining any H copy receive
+no supplement. This is not SPFresh dynamic insertion/refill: there is no second
+BKT search, global support-head scan, new support, or restoration of all replicas.
+Rescues are distance/VID ordered within each head's H tail, **before O**; the
+normal H prefix and all O bytes/order/counts are unchanged. The H tail is not
+recut and may exceed the normal build bound, subject to the existing native
+uint16 page-count capacity. Full row attributes, VID and vector are serialized,
+and pure counts, signatures and fingerprints include the rescued H records.
+Build logs distinguish zero-H before/after, rescued vectors/records/postings,
+and added H payload pages. A missing original source edge after successful
+pre-cut placement remains an explicit internal inconsistency, not permission
+to invent an edge. This lightweight policy is not a coverage/floor acceptance
+gate or a guarantee of query recall.
+Support-row membership is permission to receive records, not a guarantee that
+every support has a nonempty H posting or that the realized floor is reached.
 
-Expanded support uses generation-bound V4 storage: the original base rows,
+`SearchPostingPageLimit` independently bounds physical pages read from the
+selected H prefix or O suffix, starting at that region's first physical page.
+Only fully read records are scanned, including at an unaligned H|O boundary.
+The `PostingVectorLimit` uplift is construction-only. Nonpositive search
+limits mean an unrestricted region scan. `[SearchSSDIndex] PostingPageLimit`
+is the native runtime alias for `SearchPostingPageLimit`; it does not change
+the build cut. Numeric/flat/DNF fallback selects O but does not bypass this
+budget or exact predicate checks. Rescue does not raise this budget: for
+example a 12-page search can still stop before a rescued H tail.
+
+`LimitedTagMaxExpandedPostingPages` is removed and explicit uses are rejected.
+For an immutable older index, remove only that obsolete INI entry in a copy;
+support binary versions/fingerprints are unchanged. Loading does not retrofit
+the native H cut/rescue: rebuild to adopt it. The auditor strictly checks the
+O construction bound but reports beyond-cut H records, postings and payload
+pages without rejecting a legal H overflow. A saved index cannot prove that
+arbitrary excess H records came from this rescue; these are **not** inferred
+rescued counts. Zero-H non-heads and unobserved VIDs are diagnostic counts,
+not a global coverage acceptance gate. Support legality, duplicates, replica
+limits and retained-O support provenance remain validated.
+
+New expanded support uses generation-bound V5 storage: the original base rows,
 sparse `uint64` head offsets and sorted `uint32` extra tags, plus authenticated
-per-tag feasible targets and the global extra-support budget. The serialized
+per-tag feasible targets. V5 retains the 80-byte V4 header layout; the old
+`maxExtraSupports` word is now the exact sum of
+`max(RequiredHeadCount(tag) - baseCoverage(tag), 0)`, equal to the stored extra
+count (including zero). It is a validated content invariant, not a build
+parameter. Each tag's extras must exactly fill its source-capped deficit.
+A new fingerprint discriminator authenticates these V5 semantics; V4 hashes
+are not reinterpreted. File sizes/count arithmetic, requirements and CSR offsets
+are checked before allocating the extra payload.
+
+`LimitedTagMaxExtraSupports` and `--limited-tag-max-extra-supports` are removed;
+explicit INI keys (even zero/empty, including saved-index metadata) and the CLI
+flag are rejected. New saved INIs omit the key. `ConfigureExpansion` no longer
+accepts a budget; the old `MaxExtraSupports()` API is removed.
+`LegacyExtraSupportCap()` exposes **only** authenticated read-only V4 provenance,
+and returns zero for V5/non-expanded tables. Old immutable V4 support files
+retain their original positive cap, version, candidate-source provenance and
+fingerprints on read/export, byte-for-byte; they need not satisfy V5's exact
+deficit invariant. Migration means deleting only the retired INI entry in a
+separate writable clone, never rewriting historical datasets, support bytes,
+hierarchy/signature files or experiment manifests. A fresh rebuild creates V5.
+Expansion-mode, generation, schema and expected-content compatibility guards
+still apply; no runtime INI cap is needed to load either version.
+
+The serialized
 overflow costs `8*(H1+1) + 4*extraSupports` bytes, plus 16 header bytes; runtime
 lookup indexes have additional memory costs. The full-width offset path uses
 a derived one-bit-per-head presence map; zero-overflow tables skip that lookup
@@ -180,8 +483,8 @@ tag does not require another payload load. Empty
 rows cache the reserved empty tag rather than taking a per-head presence
 branch. Larger tables retain full-width offsets. This is a
 runtime representation only: validation, fingerprints, and saving decode the
-original base rows and uint64 CSR offsets in bounded chunks, so V4 files remain
-byte-compatible. Loading reserves the local rows before conversion and releases
+original base rows and uint64 CSR offsets in bounded chunks, so legacy V4 files
+remain byte-compatible and V5 remains V5. Loading reserves the local rows before conversion and releases
 the original attribute and offset buffers afterwards. Hierarchy admission prefetches the
 whole small lookup row directly; the full-width path additionally
 prefetches out-of-line tags in a bounded stack batch. Neither path duplicates
@@ -216,16 +519,27 @@ For a floor-only comparison, keep O-derived mode enabled on both sides and
 vary `LimitedTagMinHeadCount` (for example, 1 versus 16). A legacy-mode
 comparison also changes base-row filling and empty-search RNG recovery;
 even a run with zero added supports can change replication and I/O. Independently
-rebuilt BKT trees can vary even with one head-build thread: the legacy KDT/TPT
-builders reseed the process-global random generator from the clock, affecting
-subsequent BKT k-means initialization. For the controlled CPU head builds, use
-native `[BuildHead] BKTSeed=0`, `TPTSeed=0`, and `NumberOfThreads=1`.
-Nonnegative seeds select local generators (TPT streams are keyed by tree
-ordinal); negative/default `-1` retains legacy behavior. Seeded TPT construction
-does not need the legacy clock-separation sleeps. These parameters do not
-change saved-index query behavior. Require matching source-ID, tree/graph,
+rebuilt trees can vary even with one head-build thread because clock-based
+global reseeding affects BKT k-means. `BKTSeed`/`TPTSeed` were local additions
+(absent upstream), and remain rejected rather than exposed as tuning parameters.
+Current CPU construction matches upstream `5619bb1` RNG behavior: BKT centers
+use `Utils::rand` (global `std::rand`), with default `std::mt19937` shuffles.
+TPT uses one default `std::mt19937` shuffle engine per worker; each tree calls
+`Sleep(i * 100)` then `std::srand(clock())`, and projection weights use global
+`rand()`. The upstream sleep/reseed sequence is intentional, not a new seed
+control. There is no custom fixed seed or deterministic tree-ordinal stream.
+One thread does not guarantee reproducibility; parallel scheduling and
+floating-point reductions add variability. For paired build tests, reuse a
+single saved head/candidate realization rather than assume independent builds
+match. RNG alignment does not imply full upstream build bit-identity.
+Saved seed declarations are load-only provenance, logged explicitly; existing
+tree/graph bytes and query behavior are unchanged. Require matching source-ID, tree/graph,
 CSR-geometry, base-support, and O fingerprints before attributing differences
 solely to the support floor.
+
+Historical fixed-seed controls and recorded results below remain frozen
+provenance. They do not describe current nondeterministic reconstruction;
+do not rewrite their manifests or infer that a fresh build has the same results.
 
 #### Controlled SIFT1M / 8192-tag experiment
 
@@ -278,8 +592,12 @@ grid. This experiment therefore does **not** justify a universal floor of 16.
 Expansion remains opt-in; the canonical 201-tag INI and active index are
 unchanged.
 
-Reproduce from the repository root using the existing fixture and a fresh run
-label (the driver refuses to overwrite an existing run):
+Historical command sequence (not a current fixed-geometry reproduction recipe):
+it used the existing fixture and a fresh run label, refusing to overwrite an
+existing run. Current independent builds use upstream RNG and can fail the
+driver's required geometry/O identity audit; a matched comparison must reuse
+the same realized heads/candidates. Do not bypass that audit or relabel the
+historical results as current:
 
 ```bash
 cmake --build build --target spannbuilder spannaclbench spannsupportaudit -j2
@@ -381,12 +699,15 @@ Rscript Tools/benchmarks/plot_limited_tag_support_lookup.R \
 ### Shared H/O placement and metadata
 
 The normal BKT candidate search first builds the complete original SPANN
-placement `O`. Its raw top-`LimitedTagVoteHeadCount` candidates are reused as
-support votes before RNG pruning, so support construction does not run a second
-nearest-head search. With `BuildH1Graph=0`, spatial placement uses the hierarchy
+placement `O`. Base support reads only its retained posting prefixes after RNG
+and posting cuts; neither rejected search candidates nor discarded scratch
+suffixes contribute. A retained member beyond search rank two can contribute.
+Support construction runs no additional nearest-head search and needs only
+O(slots) aggregation scratch space, not an N-times-candidate-count buffer.
+Distance ordering of the O scratch records is not required or changed.
+With `BuildH1Graph=0`, spatial placement uses the hierarchy
 callback to reach H1; the graphless H1 catalog is not a standalone search graph.
-The vote count must not exceed `InternalResultNum`, keeping
-the vote window inside the unchanged original search. Non-head vectors are then
+The original search and RNG geometry are unchanged. Non-head vectors are then
 assigned only to heads supporting their attribute, using constrained BKT search
 and RNG pruning for up to eight `H` replicas. The single STM1 v3 posting is
 `H | O`: limited-tag queries scan `H`, while unfiltered and exact-filter fallback
@@ -394,7 +715,23 @@ queries use the same hierarchy and read only the complete `O` suffix.
 Cross-region overlap is intentional. Limited-tag builds require
 `TailReplicaCount=0`; `O` is already self-contained, so no supplemental
 unfilter-tail replicas are built.
-With `EnableHierPostingFilter=true`, V8 head metadata stores separate
+
+`LimitedTagVoteHeadCount` has been removed from every active interface:
+explicit INI/API values fail even when set to the old default. For immutable
+old indexes, make a copy and remove that obsolete INI entry before loading
+with this reader; do not change the support binary or its generation.
+The packed LTS v1/v2/v3/v4 layouts remain unchanged; new expansion uses V5's
+requirement-derived invariant as described above. The former vote-count
+word in v3/v4/v5 is legacy provenance: **positive** preserves an old pre-RNG
+candidate source; **zero** identifies retained-O construction. New support
+hashes include a retained-source discriminator, and new build generations
+also include that discriminator. Loading/exporting legacy v3/v4 preserves the
+positive word and original body hash; it never relabels old support as
+retained-O. The existing v1/v2 reader still requires authentic vector counts
+before export to v3, retaining legacy provenance. Older readers reject new
+zero-marker tables instead of interpreting them as vote-built indexes.
+Rebuilding is required to change an old index's candidate semantics.
+V8 head metadata automatically supplies separate
 categorical and quantized-numeric signatures for `H` and `O`; the selected
 route consults only its matching signature before I/O. Numeric signatures use
 256 uniform buckets per numeric column and remain conservative at bucket
@@ -422,7 +759,7 @@ filtered search budget scales from support coverage and retries up to a bounded
 `MaxCheck`; it does not directly enumerate a tag-to-H1 list. Empty physical
 postings do not count. This gives H1 and H2 the same nprobe and posting-I/O
 semantics without adding a predicate-specific H1 entry path.
-`HeadNavigationMode=H1Only`, and `Auto` with `SelectSecondLevel=false`, do not
+`HeadNavigationMode=H1Only`, and `Auto` with `HierarchyEnabled=false`, do not
 read hierarchy signatures or require upper-layer artifacts. Explicit `H2Only`
 without a loaded hierarchy returns an error rather than switching to H1.
 
@@ -437,13 +774,20 @@ use first-visited records, while `scanned_occurrence_to_unique_ratio` measures
 all scanned replicas. The legacy `FalsePositivePostings()` counter now includes
 postings containing only already-visited matches.
 
-`[SelectHead] SecondLevelHierarchyLevels` counts H1: `3` means H3 -> H2 -> H1,
+`[SelectHead] HierarchyLevels` counts H1: `3` means H3 -> H2 -> H1,
 with only H3 retaining a search graph. Every layer uses the same
 `[SearchSSDIndex] InternalResultNum` nprobe ceiling. One native top-graph search
-uses `SecondLevelMaxCheck` and saves its returned routing frontier. H3/H2 are
+uses `HierarchyMaxCheck` and saves its returned routing frontier. Anchored
+queries apply the highest CSR row's signature as **result admission**, not a
+post-filter over an unfiltered top-k. If matching top results remain underfilled,
+the same native search continues its graph/tree frontier; it does not restart
+the graph, enumerate top IDs, or grant another work allowance. The result
+ceiling is `min(highest-layer node count, InternalResultNum)`, independent of
+whether the highest layer is H2, H3 or H5. This completion precedes all descent.
+H3/H2 are
 routing-only indexes: their vectors and signatures do not carry real result
 attributes or enter the final top-k. Only native top-search returned nodes can
-become downward routing parents. `SecondLevelInitialProbeRatio`
+become downward routing parents. `HierarchyInitialProbeRatio`
 sets the initial downward routing beam, while H1 keeps the full posting target.
 An underfilled descent widens from saved candidates even after the graph budget
 is spent: it does not restart the graph or clear the H1 result heap. Previously
@@ -456,12 +800,23 @@ list; a cursor expands only its new suffix. There are no separate
 selected/expanded bitmaps or copied parent lists.
 Signature/support checks precede the bounded nearest-child selection; rejected
 children cannot consume the next layer's beam.
-After an underfilled initial descent, a complete bounded single-tag fallback is
-considered before widening. Only a support set fitting both head/nprobe and
-posting-page limits can stop that widening; otherwise the incremental descent
-continues. The fallback admits real support-head points even when they have no
-SSD posting, then selects its nonempty postings. It never becomes a separate
-pre-entry search route.
+An underfilled initial descent always uses normal saved-frontier widening up to
+the navigation budget. There is no direct H1 completion, including for a small
+single-tag support set. An out-of-reached support head stays unvisited; queries
+may return fewer than k matches or lower recall under the same limited budget.
+The global tag-to-H1 map remains for support construction, maintenance and audit,
+not hierarchy query navigation.
+
+`HierarchyMaxCheck` retains the native checked-work meaning. Filtered BKT
+initial dynamic pivots and subsequent graph/tree continuation share that one
+checked-leaf/graph-neighbor allowance; BKT internal tree-pivot distance work is
+not included in the native counter, so this is **not** an exact total-distance
+ceiling. KDT result-only admission also bounds initial tree seeds and graph/tree
+checks (its leaf/neighbor checks evaluate vectors). No unrelated unfiltered
+search semantics or native graph-construction RNG are changed. Existing saved
+top graph/tree settings, including pivot settings, still apply. Work logs expose
+`graph_result_filter` separately from `graph_traversal_filter` and report actual
+native `graph_checked`, not synthetic fallback counts.
 
 Each layer owns its local visited state. Native BKT navigation uses its original
 workspace without borrowed state or distance callbacks. CSR layers use separate
@@ -478,9 +833,9 @@ posting. After local visited, a safe own-key signature check discards impossible
 nonrouting points; potential matches then check VID/deletion/exact predicate
 before computing distance. The shared VID deduper still precedes exact predicate
 evaluation for both H1 points and SSD records.
-The compact H1 point heap is pooled with the query workspace. Bounded fallback
-reuses distances in the completed underfilled H1 routing results rather than a
-cross-layer cache. SSD retains `visited -> predicate -> decode/distance`.
+The compact H1 point heap is pooled with the query workspace. Only H1 children
+reached through CSR descent are offered to it, including reachable heads with
+empty postings. SSD retains `visited -> predicate -> decode/distance`.
 Legacy H1 conversion, repeated admission, and compaction are skipped when the
 H1 point heap is active. Empty/partial hierarchy results do not silently switch
 to H1 graph navigation.
@@ -492,15 +847,15 @@ own keys come from complete
 H1 attributes even when the key column exceeds the fixed hierarchical lanes.
 Only fully anchored pure-H queries use these signatures. Unfiltered/full-O or
 unanchored queries disable this pruning; their O data remains intact.
-H3/H2 head admission always checks the applicable signature, including dense
-tags. Selectivity thresholds do not disable this admission or H1 own-key pruning.
+Every hierarchy layer checks applicable signatures, including dense tags in new
+full-domain indexes. Authenticated legacy partial domains disable signature
+pruning conservatively if any query anchor was not represented; exact H1
+own-point and posting predicates still apply.
 
 An empty stored signature is a known nonmatch for a nonempty anchored query
-signature. The bounded single-tag fallback
-remains downstream of this shared hierarchy path and still requires both native
-head/page limits and the posting nprobe to fit.
+signature. Underfilled and all-filtered results do not trigger another search path.
 CSR expansion looks ahead four rows and prefetches their signatures. The native
-`SecondLevelPrefetchMode=Rolling16` default fetches complete vector rows,
+`HierarchyPrefetchMode=Rolling16` default fetches complete vector rows,
 including the final cache line of unaligned rows. `Batch64` retains the original
 64-vector/two-cache-line scheme for controlled comparisons. Both modes operate on
 layer-local vectors and have identical admission/budget semantics.
@@ -539,16 +894,19 @@ Build provenance, native content counts, paired results, and the report are in
 The refreshed `h1_h2_curve_h2_15pct_r8/h3_placement_fixed/` series contains the
 same 79 operating points and preserves the 110 historical H1/H2 rows.
 
-`[SearchSSDIndex] SecondLevelGraphSignaturePruning=false` independently controls
+`[SearchSSDIndex] HierarchyGraphSignaturePruning=false` independently controls
 the native top graph. With the default `false`, nonmatching graph bridges remain
-traversable; returned H3 heads are still signature-filtered before descent.
+traversable; top results use signature admission and underfilled native
+graph/tree continuation before descent.
 With `true`, the same signature filters graph seeds and neighbors after native
 visited checks, without reading upper attributes. BKT tree partitions themselves
 remain traversable. This can save graph work but can also lose routes through
 nonmatching graph bridges, so compare recall as well as QPS at unchanged
-`SecondLevelMaxCheck` and `InternalResultNum`. H2/H3 head admission, H1/SSD
+`HierarchyMaxCheck` and `InternalResultNum`. H2/H3 head admission, H1/SSD
 semantics, and cumulative layer budgets are identical in both modes. Empty query
-signatures bypass the graph filter in either mode.
+signatures bypass both result and traversal filtering. KDT supports the same
+result-only completion with default pruning disabled; its existing explicit
+traversal-filter mode remains unsupported, rather than silently ignoring it.
 
 The controlled SIFT1M Zipf200 comparison in
 `datasets/sift1m_zipf200_sparse193_numeric/hierarchy_audit_checks/graph_signature_ab/`
@@ -631,26 +989,26 @@ each named head layer, including eligible children, retained children, and
 distance computations. With `LogPhaseTime=true`, the same lines also report
 per-layer graph, merge, admission, vector-scoring, and sorting times in milliseconds.
 
-EST4 classifies a tag by absolute expected head coverage, not selectivity. A
-tag uses the exact contiguous `[VID | all attributes | vector]` route when
-`tagCount < ExtremeSparseTagMinCount` or
-`tagCount * actualHeadCount * LimitedTagSlotsPerHead <
-SearchInternalResultNum * vectorCount`. The strict inequality makes the largest
-coverage-qualified count `ceil(L*N/(H*S))-1`. The same vectors remain in
-ordinary postings for unfiltered, numeric-only, and other-attribute predicates.
-The sidecar stores every tag eligible up to the build-time
-`max(SearchInternalResultNum, MaxCheck)` ceiling, then each query re-evaluates
-eligibility with its current `InternalResultNum`.
-A partially covered DNF is split into an exact EST scan and a dense search of
-only its uncovered clauses, then deduplicated by VID. H2 posting signatures
-include only tags in
-`(SecondLevelSignatureMinSelectivity, SecondLevelSignatureMaxSelectivity]`.
+The retired EST4 sidecar and its split/merge serving route have been removed.
+Rare labels use regular H/O support and the ordinary exact-filter path. H2
+posting signatures now include the **complete categorical domain** `(0,1]`.
+`HierarchySignatureMinSelectivity`/`HierarchySignatureMaxSelectivity` and their
+`SecondLevel*` aliases are removed together. Collection already propagated
+complete own-key/H-prefix signatures; the old pair only restricted route
+eligibility and persisted a domain label. Full-domain equality-anchored
+queries can use hierarchy descent without an arbitrary min/max band.
+Legacy V3 domain endpoints remain authenticated fields in the unchanged
+binary format (V2 implies full coverage). Load/repair/save preserve their
+restricted domain and conservative legacy routing; old INI endpoints are
+read-only provenance, not overrides. New builds write `(0,1]`. An explicit
+fresh rebuild is required to change an old artifact's domain.
 H2 signatures are categorical only; numeric pruning applies to H1 posting
 selection and the self-contained `O` fallback route.
 Every dense DNF clause must have a signature-represented equality anchor before H2 is
 used; otherwise search falls back safely to H1 or complete ordinary postings.
-The generators read this policy directly from the canonical native INI. Before
-heads exist they use `expectedHeadCount = VectorCount * SelectHead.Ratio`; the
+The dataset generators derive their rare-label recipe from active native budgets;
+this is not a separate serving policy. Before
+heads exist they use `expectedHeadCount = native input count * SelectHead.Ratio`; the
 manifest records that assumption. SIFT1M therefore generates 193 extreme
 vectors from `Ratio=.16`, two slots, and `InternalResultNum=62`.
 
@@ -676,8 +1034,8 @@ value. It writes the final row-major `uint32 [N,2]` SPTAG input directly in
 bounded-memory chunks; no `tags5` merge or per-vector routing-key text file is
 used. The categorical assignment is an exact affine permutation of the Zipf
 counts. The generator reads the native INI and derives 399 extreme vectors from
-`Ratio=.12`, two support slots, `InternalResultNum=96`, and the strict EST
-coverage inequality. `spannbuilder` uses its tenant-0 bulk path for these inputs: mapped
+`Ratio=.12`, two support slots, `InternalResultNum=96`, and the rare-label
+dataset coverage formula. `spannbuilder` uses its tenant-0 bulk path for these inputs: mapped
 vectors and attributes are borrowed through the synchronous build instead of
 materializing one metadata string, pointer pair, and global ID per vector.
 Both original and constrained placement retain only emitted RNG edges rather
@@ -689,14 +1047,129 @@ CFG=Tools/benchmarks/build_spann_attr_sift1b_zipf200_limited_tag.ini
 Tools/benchmarks/run_spann_attr_build.sh "$CFG"
 ```
 
-The canonical build uses one global BKT graph, `ACLCols=0`, `NumericCols=1`,
-`LimitedTagColumn=0`, and `HierLevelWidths=201,64,64,64,64` for the 201
-active values plus minimum-width inactive lanes. EST4 binds the actual vector
-and head counts, slot width, coverage target, minimum count, and generation;
-H2 covers the configured intermediate range. The historical four-ACL SIFT1B
-INIs remain only as reproduction
-controls for archived `sift1b_tags5.u32` inputs and are not produced by the
-current generator.
+The canonical build uses one global spatial hierarchy,
+`[Tags] ColumnTypes=categorical,numeric`, and explicit `LimitedTagColumn=0`. Categorical mask layout is internal filter metadata, not
+an attribute hierarchy or a partition plan. Signed support and hierarchy
+artifacts retain generation checks; new upper-layer signatures cover all
+categorical labels. Historical four-category SIFT1B recipes explicitly retain the archived
+`sift1b_tags5.u32` schema; old `4node` filenames do not authorize schema reinterpretation.
+These inputs are not produced by the current generator.
+
+Attribute organization has been removed, not merely disabled. `ACLCols`,
+`HierLevelWidths`, `PivotForceNodeCount`, `DisablePivotEstimator`, `RoutingCols`,
+`PerVectorTagsFile`, `SelectHeadType=PerTagBKT`, their retired environment
+overrides, and `--routing-only` are rejected before a native build. Remove
+them from current configurations; use `SelectHeadType=BKT`. The planner API
+`EstimatePivotBuildPlan` / `EstimatePivotPlan`, grouping utilities, and
+`tag_node_index.bin` production/consumption are gone. `--merge-tags5` retains
+`--acl-cols` as an input **column count**, not a routing projection, and no
+longer writes a grouping file.
+
+`Hierarchy*` still configures the spatial H1..H5 hierarchy. Attribute records,
+exact categorical/numeric filtering, tag support, H/O placement, signed
+hierarchy CSR and head/posting signatures remain. Generic physical bundle
+APIs remain for geometry and upstream CRUD; tagged inserts into such bundles
+choose their owner by vector distance rather than an attribute pivot.
+
+### Reduced filtering configuration
+
+The current H5 recipe has **86 explicit entries, down from 138** after the
+attribute-partition cleanup. Most remaining entries are original SPANN
+construction/search settings or input/output configuration, not filtering
+tunables. The filtering/hierarchy-specific overrides are:
+
+```ini
+[Tags]
+ColumnTypes=categorical,numeric
+
+[SelectHead]
+HierarchyEnabled=true
+HierarchyLevels=5
+HierarchyReplicaCount=8
+BuildH1Graph=false
+
+[BuildSSDIndex]
+EnableLimitedTagPosting=true
+LimitedTagColumn=0
+LimitedTagMinHeadCount=16
+EnableLimitedTagSupportExpansion=true
+
+[SearchSSDIndex]
+HierarchyInitialProbeRatio=0.666666
+HierarchyMaxCheck=192
+```
+
+This is an excerpt, not a standalone build INI: shared native `Ratio=.12`,
+posting nprobe `InternalResultNum=96`, construction threads 45, search threads
+1, data paths and original graph/storage settings remain in the full recipe.
+
+| Removed interface | Replacement or reason |
+| --- | --- |
+| `LimitedTagMaxExtraSupports` | Per-tag source-capped deficits bound incremental candidate storage; no independent global cap. V4 caps remain read-only provenance. |
+| `NumericCols` / `SPTAG_NUMERIC_COLS`, old bulk prefix-count option | Use `[Tags] ColumnTypes` for every original column; width and numeric lane mapping are derived. Legacy stored prefix metadata remains readable. |
+| `HierarchySignatureMinSelectivity`, `HierarchySignatureMaxSelectivity` and `SecondLevel*` aliases | New signatures cover all labels; legacy domain metadata remains authenticated and read-only. |
+| `BKTSeed`, `TPTSeed` | Upstream global/clock RNG behavior; no custom fixed seed or external seed knob. Loaded historical geometry stays unchanged. |
+| `SparseFallbackMaxHeads`, `SparseFallbackMaxPostingPages` | Direct H1 completion and its early-widening stop callback are removed. Matching-top completion uses the existing native highest-graph configuration in one search, followed by budgeted CSR descent. |
+| `EnableExtremeSparseTag`, `ExtremeSparseTagMinCount`, `ExtremeSparseTagFile`, `LogExtremeSparseTagRoute` | Unreachable EST builder/reader/query/merge route and sidecar store removed. Rare labels use ordinary H/O support. |
+| `FilterKeepCross`, `LogUExtra`, `PostingQuantBits` / `--posting-quant-bits` | No effective consumer. Actual codec metadata determines its representation. |
+| `DisableCrossSubgraph` | Use the existing `DisableCrossEdges` gate. |
+| `UnifiedNprobeBudget`, `MultiNodeBudgetKeepRatio` | One aggregate native posting budget; no per-bundle budget multiplication. |
+| `HybridGraphDegree` | Existing fixed format degree 16, not an adjustable capacity. |
+| `EnableHierPostingFilter` | Validated posting/tail metadata is used automatically; missing or unusable metadata does not authorize dropping matches. |
+| `[MultiTenant] CrossEdges`, `CrossExtraEdges` | Canonical `[BuildSSDIndex]` settings only. |
+| `[MultiTenant] DualPoolAugment`, `DualPoolExtraRatio`, `UExtraIDFile` | Canonical `[SelectHead]` settings only. |
+
+These retired options and duplicate section aliases, in addition to the
+retired attribute-organization interfaces, are rejected
+even when supplied as `false` or `0`, including launcher/native preflight.
+`BuildSignaturesWithVectors` and `LoadAllForSignatureRepair` are removed;
+use `BuildSignatures` and ordinary `LoadAll`.
+
+The 42 removed H5 entries are **10 occurrences of retired options, four
+section-alias entries, 27 omitted defaults/inactive-mode settings, and one
+ineffective mis-sectioned storage default**. Recipe omissions do not remove
+their native interfaces. Automatic posting pruning uses column-agnostic member
+masks for flat ACL; only column-qualified DNF uses per-column masks. Neither
+sorted categorical ranges nor disjoint domains are required for flat ACL.
+
+Other omissions from the H5 recipe are defaults or controls for inactive
+alternative layouts, not deleted functionality. Support slot counts and
+support floor remain independent; the total expansion budget is removed.
+H/O construction uses native
+`PostingPageLimit`/`PostingVectorLimit`; selected-region runtime reads use
+`SearchPostingPageLimit`. Hierarchy beam ratio, hierarchy scoring work, native
+graph `MaxCheck` and posting nprobe measure different work and remain separate.
+Signature result admission and optional graph-signature traversal pruning remain distinct.
+`EnableUnfilterTail` remains enabled by default
+and **O/suffix reading is preserved**. Actual hybrid, cross-edge and upstream
+CRUD modes remain available through their canonical native settings.
+The ineffective `[BuildSSDIndex] SSDIndexFileNum=1` copy is also omitted;
+the original native `[Base] SSDIndexFileNum` storage option is not removed.
+
+Old saved INIs containing retired keys are intentionally rejected. Use their
+historical reader or rebuild from a canonical configuration; do not rewrite
+immutable historical build artifacts in place.
+
+For the retired route-selectivity threshold (including its SecondLevel alias)
+and direct-H1 completion pair, adopting the new query policy can
+instead use a separate writable clone with just those INI entries removed.
+Verify native reload/search and unchanged geometry/support/posting hashes.
+This intentionally changes query behavior, not an inert-default migration:
+Auto now uses the enabled hierarchy for every query regardless of selectivity;
+limited-budget recall or result count can decrease without global H1 completion.
+Highest-layer result-admission continuation can recover routes missed by the
+former unfiltered top-k crop, but is still approximate and budget-limited.
+
+An audited **inert serialized default**, such as `PerVectorTagsFile=` in an
+otherwise compatible BKT index, does not require rebuilding vector/posting data:
+create a separate writable clone, remove only the verified inert retired INI
+entries there, and require strict native load/export/reload validation before
+publication. Keep source artifacts unchanged and verify native artifact hashes,
+generation bindings, sampling IDs, CSR and VID mappings are unchanged. Do not
+blindly strip nondefault settings: active grouping or different query-budget/
+cross-edge semantics require a separate compatibility decision. New `SaveConfig`
+output no longer contains these removed parameter definitions. Empty defaults
+are not silently accepted by the new reader.
 
 ## Ordered ACL Page Starts for Static STM1
 

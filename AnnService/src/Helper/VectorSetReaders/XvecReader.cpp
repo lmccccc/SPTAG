@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "inc/Helper/VectorSetReaders/XvecReader.h"
+#include "inc/Helper/VectorSetReaders/DefaultReader.h"
 #include "inc/Core/VectorIndex.h"
 #include "inc/Helper/CommonHelper.h"
 #include <time.h>
@@ -30,6 +31,11 @@ XvecVectorReader::~XvecVectorReader()
 
 ErrorCode XvecVectorReader::LoadFile(const std::string &p_filePaths)
 {
+    if (m_options->m_dimension <= 0 ||
+        GetValueTypeSize(m_options->m_inputValueType) == 0 ||
+        static_cast<std::uint64_t>(m_options->m_dimension) *
+            GetValueTypeSize(m_options->m_inputValueType) > static_cast<std::uint64_t>(MaxSize))
+        return ErrorCode::DimensionSizeMismatch;
     const auto &files = Helper::StrUtils::SplitString(p_filePaths, ",");
     auto fp = f_createIO();
     if (fp == nullptr || !fp->Initialize(m_vectorOutput.c_str(), std::ios::binary | std::ios::out))
@@ -54,8 +60,11 @@ ErrorCode XvecVectorReader::LoadFile(const std::string &p_filePaths)
         while (true)
         {
             DimensionType dim;
-            if (ptr->ReadBinary(sizeof(DimensionType), (char *)&dim) == 0)
+            const auto bytes = ptr->ReadBinary(sizeof(DimensionType), (char *)&dim);
+            if (bytes == 0)
                 break;
+            if (bytes != sizeof(DimensionType) || vectorCount == MaxSize)
+                return ErrorCode::FailedParseValue;
 
             if (dim != m_options->m_dimension)
             {
@@ -76,46 +85,12 @@ ErrorCode XvecVectorReader::LoadFile(const std::string &p_filePaths)
 
 std::shared_ptr<VectorSet> XvecVectorReader::GetVectorSet(SizeType start, SizeType end) const
 {
-    auto ptr = f_createIO();
-    if (ptr == nullptr || !ptr->Initialize(m_vectorOutput.c_str(), std::ios::binary | std::ios::in))
-    {
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to read file %s.\n", m_vectorOutput.c_str());
-        throw std::runtime_error("Failed read file");
-    }
-
-    SizeType row;
-    DimensionType col;
-    if (ptr->ReadBinary(sizeof(SizeType), (char *)&row) != sizeof(SizeType))
-    {
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to read VectorSet!\n");
-        throw std::runtime_error("Failed read file");
-    }
-    if (ptr->ReadBinary(sizeof(DimensionType), (char *)&col) != sizeof(DimensionType))
-    {
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to read VectorSet!\n");
-        throw std::runtime_error("Failed read file");
-    }
-
-    if (start > row)
-        start = row;
-    if (end < 0 || end > row)
-        end = row;
-    std::uint64_t totalRecordVectorBytes =
-        ((std::uint64_t)GetValueTypeSize(m_options->m_inputValueType)) * (end - start) * col;
-    ByteArray vectorSet;
-    if (totalRecordVectorBytes > 0)
-    {
-        vectorSet = ByteArray::Alloc(totalRecordVectorBytes);
-        char *vecBuf = reinterpret_cast<char *>(vectorSet.Data());
-        std::uint64_t offset = ((std::uint64_t)GetValueTypeSize(m_options->m_inputValueType)) * start * col +
-                               +sizeof(SizeType) + sizeof(DimensionType);
-        if (ptr->ReadBinary(totalRecordVectorBytes, vecBuf, offset) != totalRecordVectorBytes)
-        {
-            SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to read VectorSet!\n");
-            throw std::runtime_error("Failed read file");
-        }
-    }
-    return std::shared_ptr<VectorSet>(new BasicVectorSet(vectorSet, m_options->m_inputValueType, col, end - start));
+    DefaultVectorReader reader(m_options);
+    if (reader.LoadFile(m_vectorOutput) != ErrorCode::Success)
+        throw std::runtime_error("Failed opening converted XVEC input");
+    auto vectors = reader.GetVectorSet(start, end);
+    m_sourceCount = reader.SourceCount();
+    return vectors;
 }
 
 std::shared_ptr<MetadataSet> XvecVectorReader::GetMetadataSet() const

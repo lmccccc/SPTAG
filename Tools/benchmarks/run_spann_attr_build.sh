@@ -17,6 +17,7 @@ ROOT=$(pwd)
 
 CFG="${1:-$ROOT/Script_AE/iniFile/build_spann_attr_spacev_opq25.ini}"
 [ -f "$CFG" ] || { echo "config not found: $CFG"; exit 2; }
+python3 "$ROOT/Tools/benchmarks/validate_spann_hierarchy_config.py" "$CFG"
 
 # --- process loader (NOT build params) ---
 # jemalloc reduces fragmentation/RSS at billion scale. Preload ONLY if present so
@@ -71,8 +72,8 @@ PIPEPQ_PIVOTS=$(ini PipePQPivotsFile)
 #                      supports older/non-STATIC builders.
 #   CrossExtraEdges  : -m, cross-subgraph edges kept per head (augmentheadgraph
 #                      clamps <=0 back to 10). Default 10.
-CROSS_EDGES=$(ini CrossEdges);            [ -z "$CROSS_EDGES" ] && CROSS_EDGES=1
-CROSS_EXTRA_EDGES=$(ini CrossExtraEdges); [ -z "$CROSS_EXTRA_EDGES" ] && CROSS_EXTRA_EDGES=10
+CROSS_EDGES=$(ini_section BuildSSDIndex CrossEdges);            [ -z "$CROSS_EDGES" ] && CROSS_EDGES=0
+CROSS_EXTRA_EDGES=$(ini_section BuildSSDIndex CrossExtraEdges); [ -z "$CROSS_EXTRA_EDGES" ] && CROSS_EXTRA_EDGES=10
 case "$CROSS_EXTRA_EDGES" in
   *[!0-9]*|'') CROSS_EXTRA_EDGES=10 ;;
 esac
@@ -140,6 +141,7 @@ fi
 validate_runtime_config() {
   local runtime_ini="$OUT/tenant_0/indexloader.ini"
   [ -f "$runtime_ini" ] || { echo "[launcher] missing runtime config: $runtime_ini"; exit 1; }
+  python3 "$ROOT/Tools/benchmarks/validate_spann_hierarchy_config.py" "$CFG" "$runtime_ini"
   if [ "${STORAGE^^}" = "STATIC" ]; then
     [ -s "$OUT/tenant_0/SPTAGFullList.bin" ] ||
       { echo "[launcher] missing static posting snapshot"; exit 1; }
@@ -345,7 +347,15 @@ if enabled != head_role_path.exists():
     )
 
 expected_ratio = config.get(("SelectHead", "Ratio"))
-vector_count = config.get(("Base", "VectorCount"))
+vector_count = None
+with (runtime_path.parent.parent / "manifest.txt").open() as manifest:
+    for line in manifest:
+        fields = line.split()
+        if len(fields) >= 3 and fields[:2] == ["tenant", "0"]:
+            vector_count = int(fields[2])
+            break
+if vector_count is None or vector_count <= 0:
+    raise SystemExit("[launcher] missing native built vector count in manifest")
 if expected_ratio is not None and vector_count is not None:
     import struct
     with (runtime_path.parent / "ssdinfo").open("rb") as f:
@@ -402,16 +412,6 @@ if is_true "$BUILD_SIGNATURES"; then
   fi
   [ -s "$OUT/tenant_0/HeadIndex/head_node_meta.bin" ] ||
     { echo "[launcher] missing head_node_meta.bin after BuildSignatures"; exit 1; }
-  # The full signature pass can lack the categorical-only routing projection
-  # when numeric attributes are present. Rebuild only that small sidecar rather
-  # than rescanning all SSD postings.
-  ROUTING_INDEX="$OUT/tenant_0/HeadIndex/tag_node_index.bin"
-  if [ ! -s "$ROUTING_INDEX" ]; then
-    echo "[launcher] missing tag_node_index.bin; rebuilding routing sidecar"
-    /usr/bin/time -v "$ROOT/Release/spannbuilder" -c "$CFG" --routing-only 2>&1
-  fi
-  [ -s "$ROUTING_INDEX" ] ||
-    { echo "[launcher] missing tag_node_index.bin after routing rebuild"; exit 1; }
 fi
 validate_runtime_config
 
@@ -430,7 +430,7 @@ if [ "$CROSS_EDGES" = "1" ] || [ "$CROSS_EDGES" = "true" ]; then
       -t "$CROSS_EDGE_BUILD_THREADS" -w true
   fi
 else
-  echo "[launcher] cross-graph DISABLED (CrossEdges=$CROSS_EDGES) -- skipping augmentheadgraph; unfilter will use per-node fan-out"
+  echo "[launcher] cross-graph DISABLED (CrossEdges=$CROSS_EDGES) -- skipping augmentheadgraph; using configured native routing without cross edges"
 fi
 
 if [ -n "$SID" ] && [ -f "$SID/opq_quantizer.bin" ]; then

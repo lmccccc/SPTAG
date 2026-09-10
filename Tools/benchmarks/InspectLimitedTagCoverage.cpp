@@ -14,6 +14,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -67,13 +68,14 @@ int main(int argc, char** argv)
     if (spann == nullptr || spann->GetDiskIndex() == nullptr)
         return Fail("Expected native SPANN postings.");
     const auto* options = spann->GetOptions();
+    const std::size_t valueBytes = GetValueTypeSize(index->GetVectorValueType());
     if (!options->m_enableLimitedTagPosting || options->m_storage != Storage::STATIC ||
         !options->m_excludehead || options->m_enableDataCompression ||
         options->m_enableDeltaEncoding || options->m_enablePostingListRearrange ||
-        index->GetVectorValueType() != VectorValueType::Float ||
+        valueBytes == 0 ||
         options->m_numTagsPerVec <= 0 || options->m_limitedTagColumn < 0 ||
         options->m_limitedTagColumn >= options->m_numTagsPerVec)
-        return Fail("Audit requires raw, immutable Float limited-tag H|O postings with ExcludeHead.");
+        return Fail("Audit requires raw, immutable limited-tag H|O postings with ExcludeHead and a supported value type.");
 
     const auto disk = spann->GetDiskIndex();
     const SizeType documents = index->GetNumSamples();
@@ -88,7 +90,7 @@ int main(int argc, char** argv)
     SPANN::LimitedTagSupport support;
     std::string error;
     if (!support.Load(supportPath.string(), heads, options->m_limitedTagSlotsPerHead,
-            options->m_limitedTagVoteHeadCount, options->m_limitedTagMinHeadCount,
+            options->m_limitedTagMinHeadCount,
             options->m_limitedTagColumn, options->m_numTagsPerVec, generation, &error))
         return Fail("Cannot load support metadata: " + error);
 
@@ -96,7 +98,7 @@ int main(int argc, char** argv)
     if (!prefix.parent_path().empty()) std::filesystem::create_directories(prefix.parent_path());
     std::ofstream postings(prefix.string() + ".postings.csv");
     if (!postings) return Fail("Cannot create posting coverage CSV.");
-    postings << "head,own_tag,base_supports,extra_supports,h_records,o_records,h_payload_pages\n";
+    postings << "head,own_tag,base_supports,extra_supports,h_records,o_records,h_payload_pages,h_beyond_cut_records,h_overflow_pages\n";
     std::map<std::uint32_t, TagCoverage> coverage;
     for (const auto& entry : support.TagHeads())
     {
@@ -120,10 +122,13 @@ int main(int argc, char** argv)
     }
     const std::size_t recordBytes = sizeof(SizeType) +
         static_cast<size_t>(options->m_numTagsPerVec) * sizeof(std::uint32_t) +
-        static_cast<size_t>(index->GetFeatureDim()) * sizeof(float);
+        static_cast<size_t>(index->GetFeatureDim()) * valueBytes;
     std::uint64_t records = 0, pureRecords = 0, headRecords = 0;
     std::uint64_t maxExpandedPurePages = 0, extraHPostings = 0;
+    std::uint64_t beyondCutHRecords = 0, beyondCutHPostings = 0, hOverflowPages = 0;
     std::uint64_t originalFingerprint = 14695981039346656037ULL;
+    std::uint64_t originalBytesFingerprint = 14695981039346656037ULL;
+    std::uint64_t originalDistanceFingerprint = 14695981039346656037ULL;
     std::string posting;
     for (SizeType head = 0; head < heads; ++head)
     {
@@ -152,6 +157,7 @@ int main(int argc, char** argv)
         const auto* extras = support.ExtraTagData(head);
         for (size_t slot = 0; slot < extraCount; ++slot) ++coverage[extras[slot]].extraHeads;
         std::unordered_set<std::uint32_t> hTags, oTags;
+        std::unordered_map<std::uint32_t, float> closestOriginalTags;
         std::unordered_set<SizeType> hVIDs, oVIDs;
         for (int row = 0; row < full; ++row)
         {
@@ -184,12 +190,31 @@ int main(int argc, char** argv)
                 if (!oVIDs.insert(vid).second) return Fail("Duplicate O assignment.");
                 ++coverage[tag].oRecords;
                 oTags.insert(tag);
+                const auto memory = spann->GetMemoryIndex();
+                const char* vector = record + sizeof(SizeType) +
+                    static_cast<size_t>(options->m_numTagsPerVec) * sizeof(std::uint32_t);
+                const float distance = memory->ComputeDistance(memory->GetSample(head), vector);
+                if (support.UsesRetainedOriginalCandidates() && tag != own)
+                {
+                    const auto found = closestOriginalTags.emplace(tag, distance);
+                    found.first->second = (std::min)(found.first->second, distance);
+                }
                 auto& copies = oSeen[static_cast<size_t>(vid)];
                 if (copies == (std::numeric_limits<std::uint8_t>::max)() ||
                     ++copies > options->m_replicaCount)
                     return Fail("O replication exceeds the native replica limit.");
                 HashU32(originalFingerprint, static_cast<std::uint32_t>(head));
                 HashU32(originalFingerprint, static_cast<std::uint32_t>(vid));
+                HashU32(originalBytesFingerprint, static_cast<std::uint32_t>(head));
+                for (size_t byte = 0; byte < recordBytes; ++byte) {
+                    originalBytesFingerprint ^= static_cast<unsigned char>(record[byte]);
+                    originalBytesFingerprint *= 1099511628211ULL;
+                }
+                std::uint32_t distanceBits;
+                std::memcpy(&distanceBits, &distance, sizeof(distanceBits));
+                HashU32(originalDistanceFingerprint, static_cast<std::uint32_t>(head));
+                HashU32(originalDistanceFingerprint, static_cast<std::uint32_t>(vid));
+                HashU32(originalDistanceFingerprint, distanceBits);
             }
         }
         for (const auto tag : hTags)
@@ -204,30 +229,61 @@ int main(int argc, char** argv)
             }
         }
         for (const auto tag : oTags) ++coverage[tag].oPostings;
+        if (support.UsesRetainedOriginalCandidates())
+        {
+            std::vector<std::pair<float, std::uint32_t>> ranked;
+            for (const auto& candidate : closestOriginalTags)
+                ranked.emplace_back(candidate.second, candidate.first);
+            std::sort(ranked.begin(), ranked.end());
+            for (int slot = 1; slot < support.SlotsPerHead(); ++slot)
+            {
+                const auto expected = static_cast<size_t>(slot) <= ranked.size()
+                    ? ranked[slot - 1].second : SPANN::LimitedTagSupport::EmptyTag;
+                if (support.TagAt(head, slot) != expected)
+                    return Fail("Base support differs from nearest distinct retained O tags.");
+            }
+        }
         for (size_t slot = 0; slot < extraCount; ++slot)
             if (oTags.count(extras[slot]) == 0)
                 return Fail("Expanded support has no retained O source.");
         const std::uint64_t purePages =
             (static_cast<std::uint64_t>(pure) * recordBytes + PageSize - 1) / PageSize;
+        std::uint64_t beyondCut = 0, overflow = 0;
+        if (options->m_postingPageLimit > 0)
+        {
+            const auto buildPages = (std::max)(
+                static_cast<std::uint64_t>(options->m_postingPageLimit),
+                (static_cast<std::uint64_t>((std::max)(0, options->m_postingVectorLimit)) *
+                    recordBytes + PageSize - 1) / PageSize);
+            const auto recordLimit = buildPages * PageSize / recordBytes;
+            if (static_cast<std::uint64_t>(full - pure) > recordLimit)
+                return Fail("O exceeds the native effective PostingPageLimit/PostingVectorLimit.");
+            if (static_cast<std::uint64_t>(pure) > recordLimit) {
+                beyondCut = static_cast<std::uint64_t>(pure) - recordLimit;
+                overflow = purePages - (recordLimit * recordBytes + PageSize - 1) / PageSize;
+                beyondCutHRecords += beyondCut;
+                ++beyondCutHPostings;
+                hOverflowPages += overflow;
+            }
+        }
         if (extraCount != 0)
         {
             maxExpandedPurePages = (std::max)(maxExpandedPurePages, purePages);
-            if (purePages > static_cast<std::uint64_t>(options->m_limitedTagMaxExpandedPostingPages))
-                return Fail("Expanded H-prefix exceeds its configured payload-page budget.");
         }
         postings << head << ',' << own << ',' << baseSupports << ',' << extraCount << ','
-                 << pure << ',' << full - pure << ',' << purePages << '\n';
+                 << pure << ',' << full - pure << ',' << purePages << ','
+                 << beyondCut << ',' << overflow << '\n';
         records += static_cast<std::uint64_t>(full);
         pureRecords += static_cast<std::uint64_t>(pure);
     }
-    std::uint64_t uniquePure = 0, uniqueOriginal = 0;
+    std::uint64_t uniquePure = 0, uniqueOriginal = 0, zeroHNonHeads = 0, unobservedVectors = 0;
     for (SizeType vid = 0; vid < documents; ++vid)
     {
         const auto offset = static_cast<size_t>(vid);
-        if (isHead[offset] == 0 && hSeen[offset] == 0) return Fail("A non-head VID is missing from H.");
+        zeroHNonHeads += isHead[offset] == 0 && hSeen[offset] == 0;
         const auto found = coverage.find(vectorTags[offset]);
-        if (found == coverage.end()) return Fail("An original vector has no routing tag.");
-        ++found->second.observedVectors;
+        if (found == coverage.end()) ++unobservedVectors;
+        else ++found->second.observedVectors;
         uniquePure += hSeen[offset] != 0;
         uniqueOriginal += oSeen[offset] != 0;
     }
@@ -240,7 +296,9 @@ int main(int argc, char** argv)
     for (const auto& entry : coverage)
     {
         const auto& row = entry.second;
-        if (row.observedVectors != row.vectors || row.supportHeads != row.baseHeads + row.extraHeads ||
+        if (row.observedVectors > row.vectors ||
+            (unobservedVectors == 0 && row.observedVectors != row.vectors) ||
+            row.supportHeads != row.baseHeads + row.extraHeads ||
             row.effectiveHeads == 0 || row.effectiveHeads > row.supportHeads)
             return Fail("Persisted tag counts or effective coverage disagree with actual records.");
         belowRequired += row.effectiveHeads < row.requiredHeads;
@@ -263,13 +321,27 @@ int main(int argc, char** argv)
          << ",\"pure_records\":" << pureRecords << ",\"original_records\":" << records - pureRecords
          << ",\"payload_bytes\":" << records * recordBytes << ",\"record_bytes\":" << recordBytes
          << ",\"unique_pure_vids\":" << uniquePure << ",\"unique_original_vids\":" << uniqueOriginal
+         << ",\"zero_h_nonhead_vids\":" << zeroHNonHeads
+         << ",\"unobserved_vids\":" << unobservedVectors
+         << ",\"beyond_cut_h_records\":" << beyondCutHRecords
+         << ",\"beyond_cut_h_postings\":" << beyondCutHPostings
+         << ",\"h_overflow_payload_pages\":" << hOverflowPages
+         << ",\"h_overflow_provenance\":\"not_inferable_from_saved_index\""
          << ",\"head_records\":" << headRecords << ",\"extra_supports\":" << support.ExtraSupportCount()
          << ",\"support_file_bytes\":" << std::filesystem::file_size(supportPath)
+         << ",\"legacy_extra_support_cap\":" << support.LegacyExtraSupportCap()
+         << ",\"expansion_storage_policy\":\""
+         << (!support.HasExpansion() ? "none" :
+             support.LegacyExtraSupportCap() ? "legacy_v4_cap" : "v5_required_deficits") << "\""
          << ",\"below_required_tags\":" << belowRequired << ",\"below_floor_tags\":" << belowFloor
          << ",\"source_capped_tags\":" << sourceCapped << ",\"extra_h_postings\":" << extraHPostings
          << ",\"unused_extra_supports\":" << support.ExtraSupportCount() - extraHPostings
          << ",\"max_expanded_pure_pages\":" << maxExpandedPurePages
-         << ",\"original_membership_fingerprint\":\"" << fingerprint.str() << "\"}\n";
+         << ",\"base_candidate_source\":\""
+         << (support.UsesRetainedOriginalCandidates() ? "retained_o" : "legacy_votes") << "\""
+         << ",\"original_membership_fingerprint\":\"" << fingerprint.str() << "\""
+         << ",\"original_bytes_fingerprint\":\"" << std::hex << originalBytesFingerprint << "\""
+         << ",\"original_distance_fingerprint\":\"" << originalDistanceFingerprint << "\"}\n";
     std::ofstream summary(prefix.string() + ".summary.json");
     summary << json.str();
     summary.close();

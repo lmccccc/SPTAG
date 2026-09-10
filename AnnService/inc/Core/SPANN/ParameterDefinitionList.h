@@ -63,20 +63,18 @@ DefineSelectHeadParameter(m_headVectorCount, int, 0, "Count")
 DefineSelectHeadParameter(m_recursiveCheckSmallCluster, bool, true, "RecursiveCheckSmallCluster")
 DefineSelectHeadParameter(m_printSizeCount, bool, true, "PrintSizeCount")
 DefineSelectHeadParameter(m_selectType, std::string, "BKT", "SelectHeadType")
-DefineSelectHeadParameter(m_perVectorTagsFile, std::string, std::string(), "PerVectorTagsFile")
 DefineSelectHeadParameter(m_minHeadsPerTag, int, 0, "MinHeadsPerTag")
 DefineSelectHeadParameter(m_dualPoolAugment, bool, false, "DualPoolAugment")
 DefineSelectHeadParameter(m_dualPoolExtraRatio, double, 0.1, "DualPoolExtraRatio")
 DefineSelectHeadParameter(m_uExtraIDFile, std::string, std::string(), "UExtraIDFile")
-DefineSelectHeadParameter(m_selectSecondLevel, bool, false, "SelectSecondLevel")
-DefineSelectHeadParameter(m_secondLevelHierarchyLevels, int, 2, "SecondLevelHierarchyLevels")
-DefineSelectHeadParameter(m_secondLevelRatio, double, 0.05, "SecondLevelRatio")
-DefineSelectHeadParameter(m_secondLevelHeadVectorFile, std::string, std::string("SPTAGSecondLevelHeadVectors.bin"), "SecondLevelHeadVectors")
-DefineSelectHeadParameter(m_secondLevelHeadIDFile, std::string, std::string("SPTAGSecondLevelHeadVectorIDs.bin"), "SecondLevelHeadVectorIDs")
-DefineSelectHeadParameter(m_secondLevelReplicaCount, int, 4, "SecondLevelReplicaCount")
-DefineSelectHeadParameter(m_secondLevelHeadIndexFolder, std::string, std::string("SecondLevelHeadIndex"), "SecondLevelHeadIndexFolder")
-DefineSelectHeadParameter(m_secondLevelPostingFile, std::string, std::string("second_level_head_postings.bin"), "SecondLevelPostingFile")
-DefineSelectHeadParameter(m_secondLevelGenerationFingerprint, std::string, std::string(), "SecondLevelGenerationFingerprint")
+DefineSelectHeadParameter(m_selectSecondLevel, bool, false, "HierarchyEnabled")
+DefineSelectHeadParameter(m_secondLevelHierarchyLevels, int, 2, "HierarchyLevels")
+DefineSelectHeadParameter(m_secondLevelHeadVectorFile, std::string, std::string("SPTAGSecondLevelHeadVectors.bin"), "HierarchyHeadVectors")
+DefineSelectHeadParameter(m_secondLevelHeadIDFile, std::string, std::string("SPTAGSecondLevelHeadVectorIDs.bin"), "HierarchyHeadVectorIDs")
+DefineSelectHeadParameter(m_secondLevelReplicaCount, int, 4, "HierarchyReplicaCount")
+DefineSelectHeadParameter(m_secondLevelHeadIndexFolder, std::string, std::string("SecondLevelHeadIndex"), "HierarchyHeadIndexFolder")
+DefineSelectHeadParameter(m_secondLevelPostingFile, std::string, std::string("second_level_head_postings.bin"), "HierarchyPostingFile")
+DefineSelectHeadParameter(m_secondLevelGenerationFingerprint, std::string, std::string(), "HierarchyGenerationFingerprint")
 DefineSelectHeadParameter(m_buildH1Graph, bool, true, "BuildH1Graph")
 // Retained for V2 indexloader.ini compatibility; new builds must leave this false.
 DefineSelectHeadParameter(m_compactHierarchyVectors, bool, false, "CompactHierarchyVectors")
@@ -103,31 +101,18 @@ DefineSSDParameter(m_limitedTagGenerationFingerprint, std::string, std::string("
 DefineSSDParameter(m_limitedTagSupportFile, std::string, std::string("limited_tag_support.bin"), "LimitedTagSupportFile")
 DefineSSDParameter(m_limitedTagColumn, int, 0, "LimitedTagColumn")
 DefineSSDParameter(m_limitedTagSlotsPerHead, int, 2, "LimitedTagSlotsPerHead")
-DefineSSDParameter(m_limitedTagVoteHeadCount, int, 2, "LimitedTagVoteHeadCount")
 DefineSSDParameter(m_limitedTagMinHeadCount, int, 8, "LimitedTagMinHeadCount")
 DefineSSDParameter(m_enableLimitedTagSupportExpansion, bool, false, "EnableLimitedTagSupportExpansion")
-DefineSSDParameter(m_limitedTagMaxExtraSupports, std::uint64_t, 0, "LimitedTagMaxExtraSupports")
-DefineSSDParameter(m_limitedTagMaxExpandedPostingPages, int, 32, "LimitedTagMaxExpandedPostingPages")
-DefineSSDParameter(m_enableExtremeSparseTag, bool, false, "EnableExtremeSparseTag")
-DefineSSDParameter(m_extremeSparseTagMinCount, int, 10, "ExtremeSparseTagMinCount")
-DefineSSDParameter(m_extremeSparseTagFile, std::string, std::string("extreme_sparse_tags.bin"), "ExtremeSparseTagFile")
-DefineSSDParameter(m_logExtremeSparseTagRoute, bool, false, "LogExtremeSparseTagRoute")
-DefineSSDParameter(m_secondLevelRouteSelectivityThreshold, float, 0.02f, "SecondLevelRouteSelectivityThreshold") // Mutable
-DefineSSDParameter(m_secondLevelInitialProbeRatio, double, 1.0, "SecondLevelInitialProbeRatio") // Mutable
-DefineSSDParameter(m_secondLevelSignatureMinSelectivity, double, 0.0, "SecondLevelSignatureMinSelectivity")
-DefineSSDParameter(m_secondLevelSignatureMaxSelectivity, double, 1.0, "SecondLevelSignatureMaxSelectivity")
-DefineSSDParameter(m_secondLevelMaxCheck, int, 112, "SecondLevelMaxCheck") // Mutable
-DefineSSDParameter(m_secondLevelGraphSignaturePruning, bool, false, "SecondLevelGraphSignaturePruning") // Mutable
-DefineSSDParameter(m_secondLevelPrefetchMode, std::string, std::string("Rolling16"), "SecondLevelPrefetchMode")
-DefineSSDParameter(m_sparseFallbackMaxHeads, int, 0, "SparseFallbackMaxHeads")
-DefineSSDParameter(m_sparseFallbackMaxPostingPages, int, 0, "SparseFallbackMaxPostingPages")
+DefineSSDParameter(m_secondLevelInitialProbeRatio, double, 1.0, "HierarchyInitialProbeRatio") // Mutable
+DefineSSDParameter(m_secondLevelMaxCheck, int, 112, "HierarchyMaxCheck") // Mutable
+DefineSSDParameter(m_secondLevelGraphSignaturePruning, bool, false, "HierarchyGraphSignaturePruning") // Mutable
+DefineSSDParameter(m_secondLevelPrefetchMode, std::string, std::string("Rolling16"), "HierarchyPrefetchMode")
 DefineSSDParameter(m_headNavigationMode, std::string, std::string("Auto"), "HeadNavigationMode") // Mutable
 DefineSSDParameter(m_hybridVectorWeight, float, 1.0f, "HybridVectorWeight")
 DefineSSDParameter(m_hybridCategoricalCols, std::string, std::string(""), "HybridCategoricalCols")
 DefineSSDParameter(m_hybridCategoricalWeights, std::string, std::string(""), "HybridCategoricalWeights")
 DefineSSDParameter(m_hybridNumericCols, std::string, std::string(""), "HybridNumericCols")
 DefineSSDParameter(m_hybridNumericWeights, std::string, std::string(""), "HybridNumericWeights")
-DefineSSDParameter(m_hybridGraphDegree, int, 16, "HybridGraphDegree")
 DefineSSDParameter(m_hybridCandidateCount, int, 128, "HybridCandidateCount")
 DefineSSDParameter(m_hybridRouteSampleCount, int, 64, "HybridRouteSampleCount")
 DefineSSDParameter(m_hybridRouteSelectivityThreshold, float, 0.02f, "HybridRouteSelectivityThreshold")
@@ -176,6 +161,9 @@ DefineSSDParameter(m_numTagsPerVec, int, 0, "NumTagsPerVec")
 // 0 scans every STM1 tag column; a positive value restricts flat ACL matching
 // to the categorical prefix, excluding trailing numeric attributes.
 DefineSSDParameter(m_staticACLTagCols, int, 0, "StaticACLTagCols")
+DefineSSDParameter(m_columnTypes, std::string, std::string(""), "ColumnTypes")
+DefineSSDParameter(m_tagSchemaVersion, int, 0, "TagSchemaVersion")
+DefineSSDParameter(m_tagSchemaFingerprint, std::string, std::string(""), "TagSchemaFingerprint")
 // Build the bundle cross-edge sidecar before STATIC tail construction. This is
 // separate from the mutable runtime DisableCrossEdges diagnostic switch below.
 DefineSSDParameter(m_buildCrossEdges, bool, false, "CrossEdges")
@@ -198,7 +186,7 @@ DefineSSDParameter(m_queryCountLimit, int, (std::numeric_limits<int>::max)(), "Q
 DefineSSDParameter(m_maxDistRatio, float, 10000, "MaxDistRatio")
 DefineSSDParameter(m_ioThreads, int, 4, "IOThreadsPerHandler") // Mutable
 DefineSSDParameter(m_searchInternalResultNum, int, 64, "SearchInternalResultNum") // Mutable; [SearchSSDIndex] InternalResultNum aliases here
-DefineSSDParameter(m_searchPostingPageLimit, int, 3, "SearchPostingPageLimit") // Mutable; STATIC reads are sized from posting metadata
+DefineSSDParameter(m_searchPostingPageLimit, int, 3, "SearchPostingPageLimit") // Mutable H/O read budget; STATIC buffers use posting metadata
 DefineSSDParameter(m_collectPostingContributionStats, bool, false, "CollectPostingContributionStats") // Mutable; diagnostic only
 DefineSSDParameter(m_forceDenseTagSearch, bool, false, "ForceDenseTagSearch") // Mutable
 DefineSSDParameter(m_directSparseMaxPostings, int, 320, "DirectSparseMaxPostings") // Sparse-tag sidecar threshold
@@ -208,12 +196,7 @@ DefineSSDParameter(m_filteredSearchCoverageExponent, float, 0.0f, "FilteredSearc
 DefineSSDParameter(m_enableAdaptiveFilteredNprobe, bool, false, "EnableAdaptiveFilteredNprobe") // Mutable; opt-in override of SearchInternalResultNum
 DefineSSDParameter(m_logAdaptiveNprobe, bool, false, "LogAdaptiveNprobe") // Mutable; per-query observability
 DefineSSDParameter(m_logPhaseTime, bool, false, "LogPhaseTime") // Mutable; diagnostic timing only
-DefineSSDParameter(m_unifiedNprobeBudget, bool, true, "UnifiedNprobeBudget") // Mutable
-DefineSSDParameter(m_multiNodeBudgetKeepRatio, double, 0.60, "MultiNodeBudgetKeepRatio") // Mutable
 DefineSSDParameter(m_disableCrossEdges, bool, false, "DisableCrossEdges") // Mutable
-DefineSSDParameter(m_filterKeepCross, bool, false, "FilterKeepCross") // Mutable
-DefineSSDParameter(m_disableCrossSubgraph, bool, false, "DisableCrossSubgraph") // Mutable
-DefineSSDParameter(m_logUExtra, bool, false, "LogUExtra") // Mutable
 DefineSSDParameter(m_logCrossStats, bool, false, "LogCrossStats") // Mutable
 DefineSSDParameter(m_logPathStats, bool, false, "LogPathStats") // Mutable
 DefineSSDParameter(m_dumpHeads, int, 0, "DumpHeads") // Mutable; number of queries to dump
@@ -226,7 +209,6 @@ DefineSSDParameter(m_unfilterExtraTailPages, int, 0, "UnfilterExtraTailPages") /
 // STATIC distance-order diagnostic: scan the nearest pure prefix while retaining
 // the complete tail suffix. 100 preserves normal full-posting behavior.
 DefineSSDParameter(m_unfilterPureDistanceScanPercent, int, 100, "UnfilterPureDistanceScanPercent") // Mutable
-DefineSSDParameter(m_enableHierPostingFilter, bool, false, "EnableHierPostingFilter") // Mutable
 DefineSSDParameter(m_rerank, int, 0, "Rerank")
 DefineSSDParameter(m_enableADC, bool, false, "EnableADC")
 DefineSSDParameter(m_recall_analysis, bool, false, "RecallAnalysis")
@@ -334,7 +316,6 @@ DefineSSDParameter(m_primaryHeadBypassRerankL, int, 0, "PrimaryHeadBypassRerankL
 // PostingQuantizer selects the in-posting codec; the head index is independently
 // kept full-precision unless QuantizeHead=true.
 DefineSSDParameter(m_postingQuantizer, std::string, std::string("None"), "PostingQuantizer") // None|RaBitQ|OPQ|PipePQ
-DefineSSDParameter(m_postingQuantBits, int, 2, "PostingQuantBits")          // RaBitQ bits per dim (1 or 2)
 DefineSSDParameter(m_postingQuantM, int, 0, "PostingQuantM")                // OPQ/PipePQ code bytes per vector (subvector/chunk count)
 DefineSSDParameter(m_requantizeFromPipePQ, bool, false, "RequantizeFromPipePQ") // one-time same-stride PipePQ->OPQ posting rewrite
 DefineSSDParameter(m_quantizeHead, bool, false, "QuantizeHead")             // build the head index on quantized vectors

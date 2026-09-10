@@ -375,6 +375,19 @@ namespace SPTAG {
                                 m_readStartPage);
                 }
 
+                void LimitContiguousPages(int p_pageLimit, int p_pageOffset, int p_recordBytes)
+                {
+                    if (p_pageLimit <= 0 || m_readPageCount <= p_pageLimit) return;
+                    m_readPageCount = p_pageLimit;
+                    const std::int64_t endBytes =
+                        (static_cast<std::int64_t>(m_readStartPage) + m_readPageCount) *
+                            PageSize - p_pageOffset;
+                    const int readableRecords = endBytes <= 0 || p_recordBytes <= 0
+                        ? 0 : static_cast<int>(endBytes / p_recordBytes);
+                    m_scanEnd = (std::max)(m_scanBegin, (std::min)(m_scanEnd, readableRecords));
+                    if (m_scanEnd == m_scanBegin) m_readPageCount = 0;
+                }
+
                 void SetPureDistancePrefix(int p_pureCount,
                                            int p_totalCount,
                                            int p_percent)

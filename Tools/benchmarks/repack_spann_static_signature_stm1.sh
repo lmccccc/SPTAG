@@ -39,11 +39,10 @@ is_true() {
 
 OUT=$(ini Base IndexDirectory)
 TAG_FILE=$(ini Tags TagFile)
-VECTOR_COUNT=$(ini Base VectorCount)
-DIM=$(ini Base Dim)
-VECTOR_TYPE=$(ini Base VectorType)
+read -r VECTOR_COUNT DIM < <(python3 Tools/benchmarks/native_vector_metadata.py "$CFG")
+VECTOR_TYPE=$(ini Base ValueType)
 TAG_COUNT=$(ini Tags NumTagsPerVec)
-TENANT=$(ini Tags Tenant)
+TENANT=0
 STORAGE=$(ini BuildSSDIndex Storage)
 BUILD_SIGNATURES=$(ini Build BuildSignatures)
 
@@ -55,7 +54,7 @@ is_true "$BUILD_SIGNATURES" ||
   [ -n "$VECTOR_TYPE" ] && [ -n "$TAG_COUNT" ] && [ -n "$TENANT" ] ||
   { echo "missing required Base/Tags values in $CFG" >&2; exit 2; }
 [ "$VECTOR_TYPE" = "UInt8" ] ||
-  { echo "this raw SIFT1B STM1 launcher requires VectorType=UInt8" >&2; exit 2; }
+  { echo "this SIFT1B STM1 launcher requires ValueType=UInt8" >&2; exit 2; }
 case "$OUT" in
   /mnt/nvme/baotonglu/mocheng/datasets/sift1b/sift1b_spann_static_signature_*) ;;
   *) echo "refusing unexpected output path: $OUT" >&2; exit 2 ;;

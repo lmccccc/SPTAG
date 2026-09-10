@@ -177,10 +177,10 @@ SearchPostingPageLimit=3
 
 #### **SIFT1B with categorical and numeric attributes**
 
-The current SIFT1B limited-tag input has exactly two row-major `uint32`
-columns: `[categorical tag, numeric]`. It replaces the historical four-level
-ACL hierarchy and does not use a `tags5` merge or a PerTagBKT routing-key file.
-Generate it in bounded-memory chunks with:
+The current SIFT1B recipe uses two row-major `uint32` columns:
+`[categorical tag, numeric]`. Column types are explicit schema, not navigation
+partitions; there is no attribute hierarchy or PerTagBKT routing-key file.
+If these inputs do not already exist, generate them in bounded-memory chunks with:
 
 ```bash
 Tools/benchmarks/prep_sift1b_inputs.sh
@@ -188,9 +188,9 @@ Tools/benchmarks/prep_sift1b_inputs.sh
 
 The categorical column contains 200 Zipf-distributed regular values and one
 extreme value. The generator reads the native INI and computes the largest
-strict EST count as
-`max(MinCount-1, ceil(L/(SelectHead.Ratio*Slots))-1)`. The canonical
-`.12` ratio, two slots, `L=96`, and minimum count 10 produce 399 vectors.
+rare-label dataset count as
+`ceil(L/(SelectHead.Ratio*Slots))-1`. The canonical
+`.12` ratio, two slots, and `L=96` produce 399 vectors; there is no EST serving route.
 The generator writes both the headerless SPTAG input
 `sift1b_zipf200_sparse399_numeric_attrs.u32` and a shape-preserving NumPy copy,
 plus exact counts, the policy inputs, and a hash-bound manifest.
@@ -203,70 +203,189 @@ mapped two-column attribute table before STATIC construction. Limited-tag
 STATIC placement also retains only emitted RNG edges for both `H` and `O`
 instead of allocating fixed `N * ReplicaCount` arrays.
 
-Use the native configuration
-`Tools/benchmarks/build_spann_attr_sift1b_zipf200_limited_tag.ini`:
+For the current five-level routing-only model, use
+`Tools/benchmarks/build_spann_attr_sift1b_zipf200_limited_tag_h5.ini`.
+It retains the SIFT1B baseline above: UInt8/L2, H1 ratio `.12`, SelectHead
+thresholds `10/25`, 45 build threads, build beam 64, MaxCheck 16324, replica
+cap 8, and posting page limit 3. As in the original native reader,
+`ValueType=UInt8` selects elements and `VectorType=DEFAULT` selects the
+row/column-headered container. The reader derives the count and dimension from
+the header and checks the entire file size. `Dim`, if specified, must match.
+`VectorOffset` and `VectorCount` are removed (explicit settings fail);
+`VectorSize` optionally selects a bounded prefix, with `-1`/omission meaning all.
+The bulk-only `Tenant`, `WithMetaIndex`, and `ShareBuildOwnership` settings are
+also removed: tenant 0/no metadata index are model invariants, and ownership is
+derived safely from the native metric/reader normalization state. `Normalized`
+remains meaningful for Cosine; L2 need not specify its default false value.
+`[Tags] ColumnTypes` declares the type of every original column and determines
+the native runtime width. Optional `[Tags] NumTagsPerVec` must agree with that
+width; do not duplicate it in the input `[BuildSSDIndex]` section. `TagFile` is
+headerless `uint32` data starting at byte zero, with validated row count and
+stride; `TagOffset` is removed.
 
 ```ini
+[SelectHead]
+Ratio=0.12
+HierarchyEnabled=true
+HierarchyLevels=5
+HierarchyReplicaCount=8
+BuildH1Graph=false
+CompactHierarchyVectors=false
+MinHeadsPerTag=0
+
 [Tags]
 TagFile=sift1b/sift1b_build/sift1b_zipf200_sparse399_numeric_attrs.u32
-NumTagsPerVec=2
+ColumnTypes=categorical,numeric
 
 [BuildSSDIndex]
 Storage=STATIC
-StaticACLTagCols=1
 EnableLimitedTagPosting=true
 LimitedTagColumn=0
+LimitedTagSlotsPerHead=2
+EnableLimitedTagSupportExpansion=true
+LimitedTagMinHeadCount=16
+PostingPageLimit=3
+PostingVectorLimit=118
 TailReplicaCount=0
 UnfilterTailBufferLength=0
-EnableExtremeSparseTag=true
-ExtremeSparseTagMinCount=10
 
-[MultiTenant]
-ACLCols=0
-HierLevelWidths=201,64,64,64,64
-NumericCols=1
-PivotForceNodeCount=1
+[SearchSSDIndex]
+SearchPostingPageLimit=3
+
 ```
 
-The complete INI keeps the documented SIFT1B BKT construction and search
-budgets while using one global BKT graph, constrained `H | O` postings, H2,
-numeric posting signatures, and EST4. At runtime EST uses the actual `N` and
-`H`: `tagCount < 10` or `tagCount*H*slots < InternalResultNum*N`; otherwise
-the tag follows normal limited-tag/H2 routing. The sidecar stores candidates
-through the build-time `max(SearchInternalResultNum, MaxCheck)` ceiling so
-native nprobe sweeps can re-evaluate the rule without rebuilding.
-Build it with:
+`Ratio` is the only selection ratio: every level uses `.12` relative to its input.
+Attribute partition settings (`ACLCols`, `HierLevelWidths`,
+`PivotForceNodeCount`, `PerVectorTagsFile`, and `PerTagBKT`) have been removed
+and are rejected. `NumericCols` and bulk `StaticACLTagCols` are also removed;
+use `ColumnTypes` instead. Multiple categorical columns and interleaved numeric
+columns are supported without reordering, for example
+`ColumnTypes=numeric,categorical,numeric,categorical` with `LimitedTagColumn=3`.
+The selected key must be categorical. Single-label means one value per vector
+in that key column, not that every input must have only one categorical column.
+Saved schema/version/fingerprint metadata binds the original column layout.
+New signed hierarchy records cover every categorical label; the signature
+min/max selectivity pair is removed. CPU BKT/TPT RNG follows upstream `5619bb1`:
+BKT centers and TPT projections use the global C RNG; TPT workers shuffle with
+default `std::mt19937` engines and call `Sleep(i * 100)` then `std::srand(clock())`
+per tree. There is no custom fixed seed or external seed parameter, and even
+single-threaded rebuilds need not match. Historical fixed-seed artifacts remain
+unchanged. `Hierarchy*` describes spatial layers; categorical and numeric
+columns remain exact-filter record fields, not partitions.
+`HierarchyLevels` counts H1, so `5` selects H1 through H5. Do not add a separate
+upper-level ratio. `HierarchyInitialProbeRatio` is a search beam fraction, not
+a head-selection ratio.
+The expected layer sizes are approximately 120M / 14.4M / 1.728M / 207.36K / 24.88K;
+BKT selection determines the actual counts. Only H5 retains a navigation
+graph. H4/H3/H2/H1 use CSR descent and independent vector catalogs; intermediate
+graphs are temporary construction aids. This SIFT1B recipe selects categorical
+column 0 as its key, with column 1 used for exact numeric filtering.
+Anchored queries use CSR signatures to admit results from one highest-layer
+graph/tree search. Nonmatching nodes remain traversable by default; an
+underfilled result continues the same frontier within `HierarchyMaxCheck`,
+rather than enumerating H1 supports or restarting the graph search.
+`SparseFallbackMaxHeads`, `SparseFallbackMaxPostingPages` and
+`HierarchyRouteSelectivityThreshold` are removed. Auto navigation uses the
+enabled hierarchy independently of selectivity. `HierarchyGraphSignaturePruning`
+is a separate, default-off traversal restriction. Both software prefetch modes
+remain available through `HierarchyPrefetchMode`: `Rolling16` (default) and
+`Batch64`.
+O-derived support expansion adds support relationships rather than real heads.
+H and O each independently apply the same native construction parameters
+(`PostingPageLimit`, raised by `PostingVectorLimit`), not a combined H+O limit:
+with 140-byte records, 3 pages plus 118 vectors means
+an effective 5 pages / 146 nearest records in each region. The independent
+runtime `SearchPostingPageLimit=3` reads at most 3 physical pages from the
+selected H or O region, scanning only complete records. A construction cut
+that removes every H copy of a non-head vector triggers a lightweight rescue
+of its nearest original H assignment. Exactly one full record is appended to
+that head's H tail before O, without new search or support expansion. H may
+exceed the normal cut; O is unchanged, and the search page limit still applies
+even when it excludes rescued tail records.
+The separate `LimitedTagMaxExpandedPostingPages` option has been removed.
+The existing 399-vector extreme tag remains part of the input, but there is no
+dedicated EST query route. The earlier INI without the `_h5` suffix is retained
+as a legacy profile, not the five-level launch configuration.
+
+The complete INI names `sift1b_spann_zipf200_limited_tag_h5` and
+`sift1b_spann_zipf200_limited_tag_h5_tmp`; these may already contain a stopped
+experiment. **Do not launch a fresh build against existing output paths:**
+the launcher clears `IndexDirectory` when `ResumeBuild=0`.
+For a restart after model changes, copy the current repository INI into a new
+run directory and set only `Base.IndexDirectory` and `BuildSSDIndex.TmpDir`
+to new, absent paths. Preserve previous run INIs, executables, logs and partial
+indexes. Freeze the new INI, builder, benchmark, auditor, launcher, validator
+and source commit/hashes before starting. The old stopped run's INI is
+historical evidence, not the current configuration.
+
+The recipe enables a SelectHead checkpoint, not arbitrary O/H-stage resume;
+do not resume an incompatible old checkpoint. On the local 96-core host,
+45 build threads can use socket-1 CPUs 48-95 with allocations interleaved over
+NUMA nodes 2 and 3. Check current load, memory and disk first, and adapt CPU
+placement on other hosts. Given the prepared run-local INI:
 
 ```bash
-Tools/benchmarks/run_spann_attr_build.sh \
-  Tools/benchmarks/build_spann_attr_sift1b_zipf200_limited_tag.ini
+CFG=/absolute/path/to/new-run/build.ini
+python3 Tools/benchmarks/validate_spann_hierarchy_config.py "$CFG"
+numactl --physcpubind=48-95 --interleave=2,3 \
+  bash Tools/benchmarks/run_spann_attr_build.sh "$CFG"
 ```
 
+Data, model and search settings come only from the INI; CPU/NUMA placement and
+process-loader settings are external execution controls. For an unattended run,
+use a detached supervisor that retains PID, start/end times, exit status and
+resource/log files. The launcher first builds with signatures deferred, then
+runs `spannbuilder -c <run.ini> --build-signatures-only` in a fresh process and
+validates the saved runtime configuration. Use the matching
+`spannsupportaudit <IndexDirectory>/tenant_0 <report-prefix>` after completion
+before interpreting filtered-query results. No build completion or performance
+claim follows merely from starting the supervisor.
+
 The raw STATIC profile stores the original 128-byte UInt8 vector, a 4-byte
-vector ID, and two inline `uint32` attributes per posting record. The original
-SPANN placement is built first, and its raw top-K head candidates are reused
-for limited-tag support votes before RNG pruning. This removes the separate
-nearest-head vote search; K must not exceed build-time `InternalResultNum`, so
-the original search itself is unchanged. `H` and `O` retain separate
+vector ID, and two inline `uint32` attributes: 140 bytes per posting record,
+not the Float128 profile's 524 bytes. Query and warm-up input are the local
+10K-query `query.u8bin`; unfiltered truth is the existing
+`raw/gnd/idx_1000M.ivecs` with `TruthType=XVEC`. No input regeneration,
+Float conversion, posting quantization, or dataset download is required.
+The native coverage auditor uses the persisted vector type to compute record
+width for both UInt8 and Float indexes. The original
+SPANN placement is built first. Only its actual post-RNG, post-cut retained O
+records supply base tag candidates: protect the own tag, then retain nearest
+distinct external tags by minimum member distance up to
+`LimitedTagSlotsPerHead - 1`. Underfilled rows are allowed; the existing
+O-derived rare-tag expansion still applies its source-capped floor. There is no
+global extra-support budget: state grows only for actual retained-O heads up
+to per-tag deficits. `LimitedTagMaxExtraSupports` is removed and rejected.
+New expansion uses V5 storage; V4 caps/hashes remain immutable provenance.
+There is no
+candidate vote-count setting, no pre-RNG vote buffer, and no additional O
+navigation search. Explicit `LimitedTagVoteHeadCount` settings are rejected.
+For immutable legacy read/export compatibility, see the support provenance
+policy in `Tools/benchmarks/README.md`; old support is not silently relabeled.
+`H` and `O` retain separate
 `(head distance, VID)` order. The persisted boundary lets filtered queries scan
 only `H`, while unfiltered and exact fallback routes read the self-contained
 original `O` suffix directly. Limited-tag mode sets `TailReplicaCount=0` because
 it does not append supplemental unfilter-tail replicas.
 
-`SearchPostingPageLimit` is retained for compatibility and explicit capped
-benchmarks. Normal STATIC filtered queries read the complete pure prefix
-reported by posting metadata. In constrained `H | O` snapshots, unfiltered and
-fallback queries start at the persisted pure boundary and read the complete
-self-contained `O` suffix. `UseDirectIO=false` selects buffered I/O. To match
+`SearchPostingPageLimit` actively caps physical reads in the selected region.
+In constrained `H | O` snapshots, anchored filtered queries read H, while
+unfiltered or predicates requiring the full-O path start at the persisted H/O
+boundary and read O. Neither path bypasses the positive page limit to read the
+complete region; only complete records in the readable prefix are scanned.
+Zero disables this read cap and must not be substituted in a capped benchmark.
+`UseDirectIO=false` selects buffered I/O. To match
 the SIFT1B paper protocol, warm the complete query set and then measure the same
 query set so its posting working set can reside in the Linux page cache.
 
-For a benchmark-only bounded-tail sweep, set `UnfilterPurePages=true` and
+The following legacy tail sweeps concern ordinary pure-plus-tail layouts,
+not the canonical limited-tag H/O recipe above. For a benchmark-only
+bounded-tail sweep, set `UnfilterPurePages=true` and
 `UnfilterExtraTailPages=N` in the native `[SearchSSDIndex]` section. `N=0`
 still scans tail records that share the final physical page of the pure prefix;
 positive values permit at most `N` additional tail pages. Keep the documented
 default (`UnfilterPurePages=false`, `UnfilterExtraTailPages=0`) for normal
-adaptive reads of the complete posting.
+adaptive reads, still subject to `SearchPostingPageLimit`.
 
 For a distance-prefix computation sweep, keep the complete tail and set
 `UnfilterPureDistanceScanPercent` to a value in `[1,100]`. The reader scans the
@@ -274,6 +393,60 @@ nearest percentage of the distance-ordered pure prefix plus every tail record;
 `100` is the normal full-posting path. This option is rejected for
 attribute-ordered snapshots and cannot be combined with `UnfilterPurePages` or
 `UnfilterExtraTailPages`.
+
+#### **Current SIFT1M limited-tag comparison**
+
+Use `Tools/benchmarks/build_spann_attr_sift1m_zipf200_limited_tag.ini` for the
+current three-level Float128 experiment, rather than the generic SSDServing
+example below. It uses native DEFAULT input, `ColumnTypes=categorical,numeric`,
+key column 0, shared `Ratio=0.16`, 24 build threads, retained-O support
+expansion with a source-capped floor of 16, and no global extra-support budget.
+Each H/O region has a normal build limit of 16 pages (125 full 524-byte
+records); zero-H rescue can append beyond the H cut. Search remains capped at
+12 pages. The lightweight rescue is not dynamic SPFresh insertion: it performs
+no new search, split, support expansion or replica-count refill.
+
+The 2026-09-09 full 1M run completed primary construction and signatures in
+180.38 seconds. Two zero-H vectors received two original-candidate records at
+one H tail, adding one payload page. The final index contained 160,091 / 25,607 /
+4,098 heads, 4,602,621 H records and 5,994,938 O records; all 839,909 non-heads
+were represented in each region. These are observations of this build, not a
+guarantee of query recall or deterministic cross-build equality.
+
+The matched comparison uses five workloads, nprobe 32/64/128/256, three serial
+old/current paired repetitions, one query thread, 100 warm-ups and 900 measured
+queries at offset 100. Both sides use native `MaxCheck=2048`,
+`HierarchyMaxCheck=512` (the old executable uses its legacy key),
+`HierarchyInitialProbeRatio=0.666666` and `SearchPostingPageLimit=12`.
+The old frozen executable loads its untouched historical index; current code
+loads the fresh index. This is an end-to-end comparison, not an isolated
+measurement of cap removal or the two rescue records.
+
+| Workload | Median QPS change over the four probes | Recall observation |
+| --- | --- | --- |
+| Unfiltered | +6.13% to +6.45% | -0.37 to -0.02 percentage points |
+| Broad tag | +0.05% to +3.77% | +0.01 to +0.30 percentage points |
+| Medium tag | -1.47% to +1.35% | -0.38 to +0.02 percentage points |
+| Mixed DNF | -1.43% to +0.17% | +0.62 to +2.00 percentage points |
+| Sparse tag | Budget-dependent trade-off | At nprobe32: QPS -24.86%, recall 79.57% to 93.42%; at nprobe256: QPS -8.89%, recall 100% to 99.97% |
+
+Historical direct-H1 completion is absent in current navigation; the older
+upper-layer ratio also differs. Do not attribute every difference to rescue
+or claim uniformly unchanged performance. The local run and raw measurements
+are preserved under
+`datasets/sift1m_zipf200_sparse193_numeric/build_runs/20260909T141212Z_lightweight_rescue`.
+The updated local `h1_h2_curve_h2_15pct_r8/sift1m_h1_h2_recall_qps.pdf` keeps
+historical H1/H2/H3 curves and adds both matched old/current H3 curves, with
+three-run QPS ranges and explicit budget labels. Reproduce that plot using R:
+
+```bash
+Rscript Tools/benchmarks/plot_sift1m_h1_h2_curve.R \
+  <results_h1_h2_h3_placement_fixed.jsonl> <output-prefix> \
+  <20260909T141212Z_results.summary.csv>
+```
+
+The JSONL/CSV, indexes and datasets are local experiment artifacts, not required
+repository downloads. Back up an existing figure before replacing it.
 
 For sift1m dataset, use the default configuration below (buildconfig.ini) and run .\SSDServing.exe buildconfig.ini:
 ```

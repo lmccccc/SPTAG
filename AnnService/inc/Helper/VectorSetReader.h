@@ -34,6 +34,9 @@ public:
     std::uint32_t m_threadNum;
 
     bool m_normalized;
+
+    // Opt in only when consumers will not normalize or otherwise mutate the data.
+    bool m_readOnlyMapped = false;
 };
 
 class VectorSetReader
@@ -51,10 +54,15 @@ public:
 
     virtual bool IsNormalized() const { return m_options->m_normalized; }
 
+    // Native file readers expose validated full rows after GetVectorSet, even for
+    // a prefix. Other reader implementations may leave this metadata unavailable.
+    SizeType SourceCount() const { return m_sourceCount; }
+
     static std::shared_ptr<VectorSetReader> CreateInstance(std::shared_ptr<ReaderOptions> p_options);
 
 protected:
     std::shared_ptr<ReaderOptions> m_options;
+    mutable SizeType m_sourceCount = -1;
 };
 
 

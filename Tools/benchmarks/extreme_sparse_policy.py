@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Read and apply the native INI policy for extreme-sparse tags."""
+"""Derive a rare-label dataset recipe from active head/support/search budgets."""
 
 import configparser
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
+from native_vector_metadata import default_vector_shape
 
 
 @dataclass(frozen=True)
@@ -13,7 +14,6 @@ class ExtremeSparsePolicy:
     head_ratio: Decimal
     slots_per_head: int
     coverage_target: int
-    min_tag_count: int
     tag_file: str
 
 
@@ -39,11 +39,8 @@ def coverage_boundary_count(
         raise ValueError(
             "LimitedTagSlotsPerHead must be positive"
         )
-    if policy.coverage_target <= 0 or policy.min_tag_count <= 0:
-        raise ValueError(
-            "InternalResultNum and ExtremeSparseTagMinCount "
-            "must be positive"
-        )
+    if policy.coverage_target <= 0:
+        raise ValueError("SearchSSDIndex InternalResultNum must be positive")
     coverage_max = int(
         (
             Decimal(policy.coverage_target)
@@ -53,7 +50,7 @@ def coverage_boundary_count(
             )
         ).to_integral_value(rounding=ROUND_CEILING)
     ) - 1
-    count = max(policy.min_tag_count - 1, coverage_max)
+    count = coverage_max
     if count <= 0:
         raise ValueError(
             "coverage policy has no positive extreme-tag boundary"
@@ -70,49 +67,42 @@ def read_extreme_tag_policy(path: Path) -> ExtremeSparsePolicy:
     config = configparser.ConfigParser(interpolation=None)
     with path.open("r", encoding="utf-8") as stream:
         config.read_file(stream)
+    for removed in ("TagOffset", "StaticACLTagCols"):
+        if any(removed in config[section] for section in config.sections()):
+            raise ValueError("Use native uint32 TagFile with explicit [Tags] ColumnTypes")
     try:
         policy = ExtremeSparsePolicy(
-            vector_count=config.getint("Base", "VectorCount"),
+            vector_count=default_vector_shape(config)[0],
             head_ratio=parse_ratio(
                 config.get("SelectHead", "Ratio")
             ),
             slots_per_head=config.getint(
-                "BuildSSDIndex", "LimitedTagSlotsPerHead"
+                "BuildSSDIndex", "LimitedTagSlotsPerHead", fallback=2
             ),
             coverage_target=config.getint(
                 "SearchSSDIndex", "InternalResultNum"
             ),
-            min_tag_count=config.getint(
-                "BuildSSDIndex", "ExtremeSparseTagMinCount"
-            ),
             tag_file=config.get("Tags", "TagFile"),
         )
-        num_attributes = config.getint(
-            "Tags", "NumTagsPerVec"
-        )
-        categorical_columns = config.getint(
-            "BuildSSDIndex", "StaticACLTagCols"
-        )
+        types = [t.strip().lower() for t in config.get("Tags", "ColumnTypes").split(",")]
+        types = [{"cate": "categorical", "num": "numeric"}.get(t, t) for t in types]
+        num_attributes = config.getint("Tags", "NumTagsPerVec", fallback=len(types))
         limited_tag_column = config.getint(
-            "BuildSSDIndex", "LimitedTagColumn"
+            "BuildSSDIndex", "LimitedTagColumn", fallback=0
         )
         limited_tag_enabled = config.getboolean(
             "BuildSSDIndex", "EnableLimitedTagPosting"
         )
-        extreme_tag_enabled = config.getboolean(
-            "BuildSSDIndex", "EnableExtremeSparseTag"
-        )
     except (configparser.Error, ValueError) as error:
         raise ValueError(
-            f"{path}: incomplete EST coverage configuration"
+            f"{path}: incomplete label-coverage configuration"
         ) from error
     if (
         policy.vector_count <= 0
         or num_attributes != 2
-        or categorical_columns != 1
+        or types != ["categorical", "numeric"]
         or limited_tag_column != 0
         or not limited_tag_enabled
-        or not extreme_tag_enabled
     ):
         raise ValueError(
             f"{path}: expected enabled one-tag plus one-numeric "

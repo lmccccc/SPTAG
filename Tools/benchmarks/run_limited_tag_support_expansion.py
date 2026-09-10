@@ -40,8 +40,6 @@ DEFAULT_MEASURED_QUERIES = 900
 DEFAULT_QUERY_BATCH = 64
 DEFAULT_SEARCH_GRID = (16, 32, 64, 128)
 DEFAULT_TRIALS = 3
-DEFAULT_EXTRA_SUPPORT_BUDGET = 262_144
-DEFAULT_EXPANDED_PAGE_BUDGET = 32
 MAIN_PROFILE = "zipf8192"
 CONTROL_PROFILE = "current201"
 
@@ -178,8 +176,7 @@ def render_ini_variant(
     template: OrderedDict[str, OrderedDict[str, str]],
     fixture_root: Path,
     attribute_cardinality: int,
-    attrs_path: Path,
-    group_tags_path: Path,
+    attrs_u32_path: Path,
     index_dir: Path,
     tmp_dir: Path,
     variant: "VariantSpec",
@@ -189,24 +186,24 @@ def render_ini_variant(
         (section, OrderedDict(values))
         for section, values in template.items()
     )
+    ensure(not any(key.lower() == "limitedtagmaxextrasupports"
+                   for values in template.values() for key in values),
+           "LimitedTagMaxExtraSupports was removed; migrate the INI in a writable clone")
     source_root = fixture_root / "source"
     set_ini_value(rendered, "Base", "VectorPath", source_root / "sift_base.bin")
     set_ini_value(rendered, "Base", "QueryPath", source_root / "sift_query.fvecs")
     set_ini_value(rendered, "Base", "WarmupPath", source_root / "sift_query.fvecs")
     set_ini_value(rendered, "Base", "TruthPath", source_root / "sift_groundtruth.ivecs")
     set_ini_value(rendered, "Base", "IndexDirectory", index_dir)
-    set_ini_value(rendered, "Tags", "TagFile", attrs_path)
+    set_ini_value(rendered, "Tags", "TagFile", attrs_u32_path)
     set_ini_value(rendered, "Tags", "NumTagsPerVec", 2)
     set_ini_value(rendered, "Build", "BuildSignatures", True)
     set_ini_value(rendered, "SelectHead", "MinHeadsPerTag", variant.min_heads_per_tag)
     if profile == MAIN_PROFILE:
         set_ini_value(rendered, "BuildHead", "NumberOfThreads", 1)
-        set_ini_value(rendered, "BuildHead", "BKTSeed", 0)
-        set_ini_value(rendered, "BuildHead", "TPTSeed", 0)
     set_ini_value(rendered, "BuildSSDIndex", "TmpDir", tmp_dir)
     set_ini_value(rendered, "BuildSSDIndex", "EnableLimitedTagPosting", True)
     set_ini_value(rendered, "BuildSSDIndex", "LimitedTagSlotsPerHead", 2)
-    set_ini_value(rendered, "BuildSSDIndex", "LimitedTagVoteHeadCount", 2)
     set_ini_value(rendered, "BuildSSDIndex", "LimitedTagMinHeadCount", variant.support_floor)
     set_ini_value(rendered, "BuildSSDIndex", "LimitedTagColumn", 0)
     set_ini_value(
@@ -215,31 +212,11 @@ def render_ini_variant(
         "EnableLimitedTagSupportExpansion",
         variant.enable_support_expansion,
     )
-    set_ini_value(
-        rendered,
-        "BuildSSDIndex",
-        "LimitedTagMaxExtraSupports",
-        variant.max_extra_supports,
-    )
-    set_ini_value(
-        rendered,
-        "BuildSSDIndex",
-        "LimitedTagMaxExpandedPostingPages",
-        variant.max_expanded_posting_pages,
-    )
-    set_ini_value(rendered, "BuildSSDIndex", "SparseFallbackMaxHeads", 64)
-    set_ini_value(rendered, "BuildSSDIndex", "SparseFallbackMaxPostingPages", 256)
-    set_ini_value(rendered, "BuildSSDIndex", "EnableExtremeSparseTag", False)
-    set_ini_value(rendered, "BuildSSDIndex", "LogExtremeSparseTagRoute", False)
     set_ini_value(rendered, "SearchSSDIndex", "InternalResultNum", 64)
     set_ini_value(rendered, "SearchSSDIndex", "MaxCheck", 2048)
-    set_ini_value(rendered, "SearchSSDIndex", "SecondLevelMaxCheck", 128)
-    set_ini_value(rendered, "SearchSSDIndex", "SecondLevelGraphSignaturePruning", False)
+    set_ini_value(rendered, "SearchSSDIndex", "HierarchyMaxCheck", 128)
+    set_ini_value(rendered, "SearchSSDIndex", "HierarchyGraphSignaturePruning", False)
     set_ini_value(rendered, "SearchSSDIndex", "NumberOfThreads", 1)
-    set_ini_value(rendered, "MultiTenant", "PerVectorTagsFile", group_tags_path)
-    set_ini_value(rendered, "MultiTenant", "NumericCols", 1)
-    set_ini_value(rendered, "MultiTenant", "ACLCols", 0)
-    set_ini_value(rendered, "MultiTenant", "HierLevelWidths", attribute_cardinality)
     set_ini_value(rendered, "MultiTenant", "InPlaceBuild", True)
     set_ini_value(rendered, "MultiTenant", "PersistSelectHead", 0)
     set_ini_value(rendered, "MultiTenant", "ResumeBuild", 0)
@@ -269,14 +246,14 @@ def render_search_ini(
     set_ini_value(
         rendered,
         "SearchSSDIndex",
-        "SecondLevelMaxCheck",
+        "HierarchyMaxCheck",
         max(128, 2 * nprobe),
     )
     set_ini_value(rendered, "SearchSSDIndex", "NumberOfThreads", 1)
     set_ini_value(
         rendered,
         "SearchSSDIndex",
-        "SecondLevelGraphSignaturePruning",
+        "HierarchyGraphSignaturePruning",
         False,
     )
     return rendered
@@ -503,8 +480,6 @@ class VariantSpec:
     enable_support_expansion: bool
     support_floor: int
     min_heads_per_tag: int = 0
-    max_extra_supports: int = 0
-    max_expanded_posting_pages: int = 0
     reference_index: bool = False
 
     def to_json(self) -> dict[str, Any]:
@@ -514,8 +489,6 @@ class VariantSpec:
             "enable_support_expansion": self.enable_support_expansion,
             "support_floor": self.support_floor,
             "min_heads_per_tag": self.min_heads_per_tag,
-            "max_extra_supports": self.max_extra_supports,
-            "max_expanded_posting_pages": self.max_expanded_posting_pages,
             "reference_index": self.reference_index,
         }
 
@@ -534,16 +507,12 @@ def profile_variants(profile: str) -> list[VariantSpec]:
                 label="o_source_f1",
                 enable_support_expansion=True,
                 support_floor=1,
-                max_extra_supports=DEFAULT_EXTRA_SUPPORT_BUDGET,
-                max_expanded_posting_pages=DEFAULT_EXPANDED_PAGE_BUDGET,
             ),
             VariantSpec(
                 name="o_source_f16",
                 label="o_source_f16",
                 enable_support_expansion=True,
                 support_floor=16,
-                max_extra_supports=DEFAULT_EXTRA_SUPPORT_BUDGET,
-                max_expanded_posting_pages=DEFAULT_EXPANDED_PAGE_BUDGET,
             ),
         ]
     if profile == CONTROL_PROFILE:
@@ -560,8 +529,6 @@ def profile_variants(profile: str) -> list[VariantSpec]:
                 label="o_source_f16",
                 enable_support_expansion=True,
                 support_floor=16,
-                max_extra_supports=DEFAULT_EXTRA_SUPPORT_BUDGET,
-                max_expanded_posting_pages=DEFAULT_EXPANDED_PAGE_BUDGET,
             ),
         ]
     raise RuntimeError(f"unsupported profile {profile}")
@@ -587,16 +554,16 @@ def build_default_workloads(profile: str) -> list[str]:
 def profile_notes(profile: str) -> list[str]:
     if profile == MAIN_PROFILE:
         return [
-            "Dedicated extreme-sparse route is compile-time disabled in current wrappers; copied INI EST flags do not imply an active separate EST route.",
-            "SparseFallbackMaxHeads and SparseFallbackMaxPostingPages remain the matched ordinary sparse fallback controls.",
-            "CPU head construction uses native BKTSeed=0 and TPTSeed=0 with one BuildHead thread, isolating tree initialization from legacy process-global clock reseeding; SelectHead and SSD assignment retain 24 threads.",
-            "Within the main 8192-tag fixture, O-source floor=1 vs floor=16 keeps the same unified fallback path and isolates the support-floor effect.",
+            "The dedicated EST route and its parameters are removed; rare labels use ordinary H/O support and exact filtering.",
+            "Hierarchy queries complete matching highest-layer results within one native graph/tree budget, then use CSR widening, with no global support-head scan.",
+            "CPU BKT/TPT construction follows upstream global/clock RNG, with no custom fixed seed or seed parameter. One BuildHead thread does not guarantee repeatable geometry; SelectHead and SSD assignment retain 24 threads.",
+            "O-source floor=1 vs floor=16 keeps the same hierarchy path, but isolates the support-floor effect only after the required geometry/O/base-support identity audit passes. Independent builds can fail that audit; historical fixed-seed results remain frozen provenance.",
         ]
     return [
-        "Dedicated extreme-sparse route is compile-time disabled in current wrappers; copied INI EST flags do not imply an active separate EST route.",
-        "SparseFallbackMaxHeads and SparseFallbackMaxPostingPages remain the matched ordinary sparse fallback controls.",
+        "The dedicated EST route and its parameters are removed; rare labels use ordinary H/O support and exact filtering.",
+        "Hierarchy queries complete matching highest-layer results within one native graph/tree budget, then use CSR widening, with no global support-head scan.",
         "Current201 is an independent-rebuild no-overflow control; do not claim exact O identity unless H-source hashes and original-membership fingerprints both match.",
-        "Current201 with E=0 is still not an algorithmic no-op: the unified fallback / RNG replica path can change scanned occurrences, dedup, page reads, recall, and QPS even without realized overflow expansion.",
+        "Current201 with E=0 is still not an algorithmic no-op: hierarchy navigation / RNG replica placement can change scanned occurrences, dedup, page reads, recall, and QPS even without realized overflow expansion.",
     ]
 
 
@@ -657,10 +624,8 @@ def prepare_fixture(args: argparse.Namespace) -> None:
 
     attrs_path = fixture_root / f"{prefix}_attrs.npy"
     attrs_u32_path = fixture_root / f"{prefix}_attrs.u32"
-    group_tags_path = fixture_root / f"{prefix}_group_tags.txt"
     ensure(attrs_path.is_file(), f"missing generated attrs: {attrs_path}")
     ensure(attrs_u32_path.is_file(), f"missing generated tag payload: {attrs_u32_path}")
-    ensure(group_tags_path.is_file(), f"missing generated group tags: {group_tags_path}")
 
     query_dir = fixture_root / "query"
     query_dir.mkdir(parents=True, exist_ok=True)
@@ -886,19 +851,16 @@ def prepare_fixture(args: argparse.Namespace) -> None:
         "default_search_grid": list(DEFAULT_SEARCH_GRID),
         "default_trials": DEFAULT_TRIALS,
         "default_workloads": build_default_workloads(MAIN_PROFILE),
-        "extreme_sparse_dedicated_route_compiled": False,
         "main8192_build_controls": {
             "BuildHead.NumberOfThreads": 1,
-            "BuildHead.BKTSeed": 0,
-            "BuildHead.TPTSeed": 0,
             "SelectHead.NumberOfThreads": 24,
             "BuildSSDIndex.NumberOfThreads": 24,
         },
         "notes": [
-            "Dedicated extreme-sparse routing is compile-time disabled in current wrappers; copied INI EST flags do not imply an active separate sparse route.",
-            "Ordinary sparse fallback remains governed by SparseFallbackMaxHeads=64 and SparseFallbackMaxPostingPages=256.",
-            "The explicit extra-support budget 262144 is safely above the structural 8192*16 upper bound 131072 for the main fixture.",
-            "Main 8192-tag runs use native BuildHead.BKTSeed=0, TPTSeed=0, and NumberOfThreads=1 for repeatable CPU head construction; SelectHead and BuildSSDIndex remain at 24 threads.",
+            "The dedicated EST route and its parameters are removed; rare labels use ordinary H/O support and exact filtering.",
+            "Hierarchy queries complete matching highest-layer results within one native graph/tree budget, then use CSR widening, with no global support-head scan.",
+            "Extra-support state grows only for actual retained-O candidates, bounded by per-tag floor deficits.",
+            "Main 8192-tag runs use NumberOfThreads=1 for CPU head construction, not deterministic seeding. Upstream global/clock RNG can change independent builds; SelectHead and BuildSSDIndex remain at 24 threads. Geometry/O identity must still be verified.",
         ],
         "variants": [variant.to_json() for variant in profile_variants(MAIN_PROFILE)],
         "source_fixture": str(reference_fixture),
@@ -908,9 +870,8 @@ def prepare_fixture(args: argparse.Namespace) -> None:
                 fixture_root / "source" / "sift_base.bin",
                 fixture_root / "source" / "sift_query.fvecs",
                 fixture_root / "source" / "sift_groundtruth.ivecs",
-                attrs_u32_path,
                 attrs_path,
-                group_tags_path,
+                attrs_u32_path,
                 query_dir / "workloads.json",
             ]
         ),
@@ -942,7 +903,6 @@ def create_run_manifest(
         "dataset_manifest": fixture_manifest["_path"],
         "nprobes": nprobes,
         "workloads": workloads,
-        "extreme_sparse_dedicated_route_compiled": False,
         "comparison_classification": (
             "same_fixture_strict_o_identity_required"
             if profile == MAIN_PROFILE
@@ -951,8 +911,6 @@ def create_run_manifest(
         "build_controls": (
             {
                 "BuildHead.NumberOfThreads": 1,
-                "BuildHead.BKTSeed": 0,
-                "BuildHead.TPTSeed": 0,
                 "SelectHead.NumberOfThreads": 24,
                 "BuildSSDIndex.NumberOfThreads": 24,
             }
@@ -1037,7 +995,6 @@ def build_variants(args: argparse.Namespace) -> None:
     template = parse_ini(CANONICAL_TEMPLATE)
     attribute_cardinality = int(fixture_manifest["attribute_cardinality"])
     attrs_u32_path = fixture_root / f"{fixture_root.name}_attrs.u32"
-    group_tags_path = fixture_root / f"{fixture_root.name}_group_tags.txt"
     canonical_index_dir = Path(template["Base"]["IndexDirectory"])
 
     run_manifest = read_json(run_dir / "run_manifest.json")
@@ -1060,7 +1017,6 @@ def build_variants(args: argparse.Namespace) -> None:
             fixture_root,
             attribute_cardinality,
             attrs_u32_path,
-            group_tags_path,
             index_dir,
             tmp_dir,
             variant,
@@ -1087,7 +1043,6 @@ def build_variants(args: argparse.Namespace) -> None:
                     primary_ini_path,
                     CANONICAL_TEMPLATE,
                     attrs_u32_path,
-                    group_tags_path,
                     fixture_root / "source" / "sift_base.bin",
                 ]
             ),
@@ -1150,7 +1105,6 @@ def build_variants(args: argparse.Namespace) -> None:
             tenant_dir / "SPTAGFullList.bin",
             tenant_dir / "limited_tag_support.bin",
             tenant_dir / "HeadIndex" / "head_node_meta.bin",
-            tenant_dir / "HeadIndex" / "tag_node_index.bin",
         ]
         for required in required_paths:
             ensure(required.is_file(), f"{variant.name}: missing build artifact {required}")
@@ -1216,7 +1170,14 @@ def require_matching_audits(run_dir: Path, manifest: dict[str, Any]) -> dict[str
         if metadata["enable_support_expansion"]:
             with (tenant_dir / "limited_tag_support.bin").open("rb") as stream:
                 header = struct.unpack("<5I", stream.read(20))
-                ensure(header[1:3] == (4, 80), f"{name}: expected expanded V4 support")
+                ensure(header[1:3] in ((4, 80), (5, 80)),
+                       f"{name}: expected expanded V4/V5 support")
+                variants[name]["support_storage_version"] = header[1]
+                if header[1] == 5:
+                    stream.seek(64)
+                    extra_count, requirement_bound = struct.unpack("<QQ", stream.read(16))
+                    ensure(extra_count == requirement_bound == int(summary["extra_supports"]),
+                           f"{name}: invalid V5 requirement-derived support bound")
                 stream.seek(header[2])
                 base_bytes = stream.read(header[3] * header[4] * 4)
                 ensure(len(base_bytes) == header[3] * header[4] * 4,
@@ -1297,9 +1258,10 @@ def parse_search_ini_metadata(path: Path) -> dict[str, Any]:
     return {
         "internal_result_num": int(section["InternalResultNum"]),
         "max_check": int(section["MaxCheck"]),
-        "second_level_max_check": int(section["SecondLevelMaxCheck"]),
+        "second_level_max_check": int(section.get("HierarchyMaxCheck", section.get("SecondLevelMaxCheck"))),
         "threads": int(section["NumberOfThreads"]),
-        "graph_signature_pruning": parse_native_bool(section["SecondLevelGraphSignaturePruning"]),
+        "graph_signature_pruning": parse_native_bool(section.get(
+            "HierarchyGraphSignaturePruning", section.get("SecondLevelGraphSignaturePruning"))),
     }
 
 
@@ -1565,7 +1527,6 @@ def finalize_run(args: argparse.Namespace) -> None:
     attribution = {
         "fixture": manifest["fixture_name"],
         "comparison_classification": manifest.get("comparison_classification", ""),
-        "extreme_sparse_dedicated_route_compiled": False,
         "variants": {},
         "h1_source_vid_sha256": {},
         "original_membership_fingerprint": {},
@@ -1647,9 +1608,6 @@ def finalize_run(args: argparse.Namespace) -> None:
                 "variant": variant_name,
                 "enable_support_expansion": manifest["variants"][variant_name]["enable_support_expansion"],
                 "support_floor": manifest["variants"][variant_name]["support_floor"],
-                "configured_extra_support_budget": int(
-                    manifest["variants"][variant_name]["max_extra_supports"]
-                ),
                 "documents": int(summary["documents"]),
                 "heads": int(summary["heads"]),
                 "tag_count": int(summary["tag_count"]),
@@ -1671,7 +1629,6 @@ def finalize_run(args: argparse.Namespace) -> None:
                 "max_expanded_pure_pages": int(summary["max_expanded_pure_pages"]),
                 "original_membership_fingerprint": summary["original_membership_fingerprint"],
                 "h1_source_vid_sha256": h1_hash,
-                "extreme_sparse_dedicated_route_compiled": False,
                 "low_count_tags": len(low_count_rows),
                 "low_count_mean_required_heads": avg("required_heads"),
                 "low_count_mean_own_heads": avg("own_heads"),
@@ -1731,7 +1688,7 @@ def finalize_run(args: argparse.Namespace) -> None:
             "Current201 remains an independent-rebuild no-overflow control unless both H-source hashes and original-membership fingerprints match exactly."
         )
         attribution["notes"].append(
-            "Current201 E=0 does not imply a no-op: unified fallback / RNG replica behavior can still change scan volume, dedup, pages, recall, and QPS."
+            "Current201 E=0 does not imply a no-op: hierarchy navigation / RNG replica placement can still change scan volume, dedup, pages, recall, and QPS."
         )
 
     if manifest["profile"] == MAIN_PROFILE:

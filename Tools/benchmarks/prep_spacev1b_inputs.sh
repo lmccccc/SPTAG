@@ -9,7 +9,6 @@
 #
 # Produces, under $OUT (default /datadisk/yfcc_fast/spacev1b_build):
 #   spacev1b_tags5.u32       [N,5] uint32 = [org,dept,team,project | price]   (--merge-tags5)
-#   spacev1b_group_tags.txt  org column, one int/line (PerTagBKT routing key)  (--merge-tags5)
 #   opq_codes_m25.bin        [N,25] uint8 raw OPQ codes                        (--gen-opq-codes)
 #   opq_quantizer.bin        the 3M-trained OPQ codebook (search-time ADC)     (copied)
 #
@@ -37,18 +36,19 @@ export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
 mkdir -p "$OUT"
 echo "[prep] OUT=$OUT  N=$N"
 
-# (1)+(2) tag sidecar + routing-key column (C++ .npy reader)
+# (1) Explicit NPY v1 C-order u32[N,4] + nonnegative i32[N], matching full rows.
+# Produces a headerless u32 TagFile; no configurable tag byte offset.
 "$SB" --merge-tags5 \
   --tags-npy "$TAGS" --num-npy "$NUM" \
-  --out-tags5 "$OUT/spacev1b_tags5.u32" --out-group "$OUT/spacev1b_group_tags.txt" \
-  --acl-cols 4 --group-col 0 --n "$N"
+  --out-tags5 "$OUT/spacev1b_tags5.u32" \
+  --acl-cols 4 --n "$N"
 
 # (3) in-posting OPQ codes (C++ encoder, raw widen + ADC=false, headerless N*M)
 "$SB" --gen-opq-codes \
-  --vectors "$BASE" --vec-offset 8 --dim 100 --value-type Int8 \
-  --quantizer "$CODEBOOK" --out "$OUT/opq_codes_m25.bin" --n "$N"
+  --vectors "$BASE" --vector-type DEFAULT --dim 100 --value-type Int8 \
+  --quantizer "$CODEBOOK" --out "$OUT/opq_codes_m25.bin" --vector-size "$N"
 
 # (4) codebook for search-time ADC
 cp "$CODEBOOK" "$OUT/opq_quantizer.bin"
 echo "[prep] copied opq_quantizer.bin"
-echo "[prep] done. Build with: Tools/benchmarks/run_spann_attr_build.sh Tools/benchmarks/build_spann_attr_spacev1b_opq25.ini"
+echo "[prep] done. Four-categorical tags5 is a legacy generic-library schema, not single-label spannbuilder input."

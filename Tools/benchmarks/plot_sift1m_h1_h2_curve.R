@@ -1,8 +1,11 @@
 #!/usr/bin/env Rscript
 
 args <- commandArgs(trailingOnly = TRUE)
-if (length(args) != 2) {
-  stop("usage: plot_sift1m_h1_h2_curve.R <results.jsonl> <output-prefix>")
+if (!length(args) %in% c(2, 3)) {
+  stop(paste(
+    "usage: plot_sift1m_h1_h2_curve.R <results.jsonl> <output-prefix>",
+    "[paired-results.summary.csv]"
+  ))
 }
 
 suppressPackageStartupMessages({
@@ -27,6 +30,45 @@ if (has_fixed_hierarchy) {
   rows$mode[rows$mode == "H3HierarchyFixed"] <- "H3Hierarchy"
 }
 
+has_paired <- length(args) == 3
+if (has_paired) {
+  paired <- read.csv(args[[3]], stringsAsFactors = FALSE)
+  metrics <- c("qps_median", "qps_min", "qps_max", "recall_median")
+  required <- c("workload", "nprobe", paste0("old_", metrics), paste0("new_", metrics))
+  if (!all(required %in% names(paired)) || nrow(paired) != 20 ||
+      anyDuplicated(paired[c("workload", "nprobe")]) ||
+      !setequal(paired$workload, c(
+        "unfilter", "broad_tag", "medium_tag", "sparse_tag", "mixed_dnf"
+      )) ||
+      any(table(paired$workload, paired$nprobe) != 1) ||
+      !setequal(paired$nprobe, c(32, 64, 128, 256))) {
+    stop("paired summary must contain five workloads at probes 32/64/128/256")
+  }
+  plot_columns <- c(
+    "mode", "workload", "nprobe", "recall", "qps", "qps_trial_count",
+    "qps_trial_min", "qps_trial_max", "graph_signature_pruning", "top_graph_maxcheck"
+  )
+  for (column in setdiff(plot_columns, names(rows))) rows[[column]] <- NA
+  rows <- rows[plot_columns]
+  for (side in c("old", "new")) {
+    values <- paired[paste0(side, "_", metrics)]
+    if (any(!is.finite(as.matrix(values))) ||
+        any(values[[1]] <= 0 | values[[2]] <= 0 |
+            values[[2]] > values[[1]] | values[[1]] > values[[3]]) ||
+        any(values[[4]] < 0 | values[[4]] > 1)) {
+      stop("invalid paired recall or QPS range")
+    }
+    added <- data.frame(
+      mode = if (side == "old") "H3PairedOld" else "H3Current",
+      workload = paired$workload, nprobe = paired$nprobe,
+      recall = values[[4]], qps = values[[1]], qps_trial_count = 3,
+      qps_trial_min = values[[2]], qps_trial_max = values[[3]],
+      graph_signature_pruning = FALSE, top_graph_maxcheck = 512
+    )
+    rows <- rbind(rows, added[plot_columns])
+  }
+}
+
 navigation_labels <- c(
   H1Only = "H1-only (previous)",
   H2Only = "H2-only (previous)",
@@ -44,6 +86,17 @@ navigation_colors <- c(
   H1Only = "#2166AC", H2Only = "#B2182B", H3Hierarchy = "#1B9E77"
 )
 navigation_shapes <- c(H1Only = 16, H2Only = 17, H3Hierarchy = 15)
+navigation_lines <- c(H1Only = "solid", H2Only = "solid", H3Hierarchy = "solid")
+if (has_paired) {
+  navigation_labels["H3Hierarchy"] <- "H3 (published, old budgets)"
+  navigation_labels <- c(
+    navigation_labels, H3PairedOld = "H3 old (paired rerun)",
+    H3Current = "H3 current (lightweight rescue)"
+  )
+  navigation_colors <- c(navigation_colors, H3PairedOld = "#555555", H3Current = "#E66101")
+  navigation_shapes <- c(navigation_shapes, H3PairedOld = 1, H3Current = 18)
+  navigation_lines <- c(navigation_lines, H3PairedOld = "dashed", H3Current = "solid")
+}
 if (any(!rows$mode %in% names(navigation_labels))) {
   stop("unknown navigation mode in benchmark results")
 }
@@ -83,7 +136,11 @@ make_workload_plot <- function(workload_id, full_recall_range) {
   ggplot(workload_rows, aes(
     x = recall, y = qps, color = mode, shape = mode, group = mode
   )) +
-    geom_path(linewidth = 0.65) +
+    geom_path(aes(linetype = mode), linewidth = 0.65) +
+    {if (has_paired) geom_linerange(
+      data = workload_rows[workload_rows$mode %in% c("H3PairedOld", "H3Current"), ],
+      aes(ymin = qps_trial_min, ymax = qps_trial_max), linewidth = 0.45
+    )} +
     geom_point(aes(size = nprobe), alpha = 0.9) +
     geom_vline(
       xintercept = c(0.90, 0.95), linetype = "dashed",
@@ -91,6 +148,7 @@ make_workload_plot <- function(workload_id, full_recall_range) {
     ) +
     scale_color_manual(values = navigation_colors, labels = navigation_labels) +
     scale_shape_manual(values = navigation_shapes, labels = navigation_labels) +
+    scale_linetype_manual(values = navigation_lines) +
     scale_size_continuous(
       range = c(1.8, 4.8), limits = probe_limits, breaks = probe_breaks
     ) +
@@ -127,7 +185,9 @@ draw_comparison_legend <- function() {
     y <- 0.83 - (index - 1) * 0.07
     grid::grid.lines(
       x = c(0.12, 0.25), y = c(y, y),
-      gp = grid::gpar(col = navigation_colors[[mode]], lwd = 1.5)
+      gp = grid::gpar(
+        col = navigation_colors[[mode]], lwd = 1.5, lty = navigation_lines[[mode]]
+      )
     )
     grid::grid.points(
       x = 0.185, y = y, pch = navigation_shapes[[mode]],
@@ -136,11 +196,12 @@ draw_comparison_legend <- function() {
     )
     grid::grid.text(
       navigation_labels[[mode]], x = 0.29, y = y, just = "left",
-      gp = grid::gpar(fontsize = 9)
+      gp = grid::gpar(fontsize = if (has_paired) 8 else 9)
     )
   }
+  size_shift <- if (has_paired) -0.04 else 0
   grid::grid.text(
-    "Point size: nprobe", x = 0.12, y = 0.54, just = "left",
+    "Point size: nprobe", x = 0.12, y = 0.54 + size_shift, just = "left",
     gp = grid::gpar(fontsize = 9)
   )
   size_scale <- ggplot_build(plots[[1]])$plot$scales$get_scales("size")
@@ -148,12 +209,12 @@ draw_comparison_legend <- function() {
   positions <- seq(0.18, 0.8, length.out = length(probe_breaks))
   for (index in seq_along(probe_breaks)) {
     grid::grid.points(
-      x = positions[index], y = 0.46, pch = 16,
+      x = positions[index], y = 0.46 + size_shift, pch = 16,
       size = grid::unit(point_sizes[index], "mm"),
       gp = grid::gpar(col = "grey40")
     )
     grid::grid.text(
-      probe_breaks[index], x = positions[index], y = 0.4,
+      probe_breaks[index], x = positions[index], y = 0.4 + size_shift,
       gp = grid::gpar(fontsize = 8)
     )
   }
@@ -176,7 +237,7 @@ draw_comparison_legend <- function() {
   } else if (has_fixed_hierarchy) {
     notes <- c(
       notes,
-      "H3: fixed routing + bounded sparse fallback."
+      "H3: fixed routing; consult run metadata for historical completion policy."
     )
   }
   hierarchy_rows <- rows[rows$mode == "H3Hierarchy", , drop = FALSE]
@@ -206,10 +267,22 @@ draw_comparison_legend <- function() {
     notes <- c(notes, "H3 top MaxCheck = max(128, 2*nprobe).")
   }
   notes <- c(notes, "Historical H1/H2 measurements kept unchanged.")
+  if (has_paired) {
+    notes <- c(
+      "100 warm-up + 900 measured queries; 1 thread.",
+      "Paired rerun: probes 32/64/128/256; 3-run medians.",
+      "Vertical bars: paired QPS min/max (not confidence intervals).",
+      "Paired: MaxCheck 2048; hierarchy 512; search pages 12.",
+      "Published H3: MaxCheck 8192; hierarchy max(128, 2*nprobe).",
+      "Historical curves use their original, different budgets.",
+      "Current: shared ratio 0.16; H build cut 16 + rescue tail.",
+      "End-to-end comparison, not an isolated rescue effect."
+    )
+  }
   grid::grid.text(
     paste(notes, collapse = "\n"),
-    x = 0.12, y = 0.36, just = c("left", "top"),
-    gp = grid::gpar(fontsize = 7.5, lineheight = 1.15)
+    x = 0.12, y = 0.36 + size_shift, just = c("left", "top"),
+    gp = grid::gpar(fontsize = if (has_paired) 6.8 else 7.5, lineheight = 1.15)
   )
 }
 
@@ -229,7 +302,9 @@ draw_combined_plot <- function() {
     layout.pos.col = 1:3
   ))
   grid::grid.text(
-    if (has_hierarchy) {
+    if (has_paired) {
+      "SIFT1M recall-QPS: historical curves and current H3 paired comparison"
+    } else if (has_hierarchy) {
       "SIFT1M H1-only vs H2-only vs H3 hierarchy"
     } else {
       "SIFT1M H1-only vs H2-only head navigation"
