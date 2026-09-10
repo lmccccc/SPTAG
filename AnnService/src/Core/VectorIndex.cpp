@@ -830,36 +830,20 @@ VectorIndex::GetHeadNodeHierWidths() const
 
 bool VectorIndex::HeadNodeMatchesQuery(
     SizeType p_sampleId,
-    const Cache::HierarchicalPostingMask& p_queryMask,
-    const std::vector<uint8_t>& p_routedNodeMask) const
+    const Cache::HierarchicalPostingMask& p_queryMask) const
 {
     return HeadNodeMatchesQuery(
         p_sampleId, p_queryMask,
-        p_routedNodeMask,
         GetHeadNodeHierWidths());
 }
 
 bool VectorIndex::HeadNodeMatchesQuery(
     SizeType p_sampleId,
     const Cache::HierarchicalPostingMask& p_queryMask,
-    const std::vector<uint8_t>& p_routedNodeMask,
     const Cache::HierWidthTable& p_hierWidths) const
 {
     // Only consider heads that are head-only (have their own tags)
     if (!IsHeadNodeHeadOnly(p_sampleId)) return false;
-
-    // If routedNodeMask is provided (non-empty), check bundle node routing.
-    // Use per-node byte allow-list so N can exceed 32 (uint32 bitmask broke
-    // node ablations at N=64/256).
-    if (!p_routedNodeMask.empty()) {
-        int16_t bundleNodeId = GetHeadNodeBundleNodeId(p_sampleId);
-        if (bundleNodeId >= 0) {
-            if (static_cast<size_t>(bundleNodeId) >= p_routedNodeMask.size() ||
-                p_routedNodeMask[static_cast<size_t>(bundleNodeId)] == 0) {
-                return false;
-            }
-        }
-    }
 
     // Check hierarchical mask intersection
     const auto* hierMask = GetHeadNodeHierMask(p_sampleId);
@@ -919,7 +903,6 @@ void VectorIndex::SetThreadLocalPostingScanStats(uint64_t p_readPostings, uint64
                                                  uint64_t p_prePSPostings,
                                                  uint64_t p_scannedVectors,
                                                  uint64_t p_matchedVectors,
-                                                 uint64_t p_primaryHeadCandidates,
                                                  uint64_t p_postingPageReads,
                                                  uint64_t p_postingLogicalBytes,
                                                  uint64_t p_postingPhysicalBytes,
@@ -940,7 +923,6 @@ void VectorIndex::SetThreadLocalPostingScanStats(uint64_t p_readPostings, uint64
     g_threadLocalPostingScanStats.m_dedupSkippedVectors = p_dedupSkippedVectors;
     g_threadLocalPostingScanStats.m_uniqueMatchedPostings = p_uniqueMatchedPostings;
     g_threadLocalPostingScanStats.m_uniqueMatchedVectors = p_uniqueMatchedVectors;
-    g_threadLocalPostingScanStats.m_primaryHeadCandidates = p_primaryHeadCandidates;
     g_threadLocalPostingScanStats.m_postingPageReads = p_postingPageReads;
     g_threadLocalPostingScanStats.m_postingLogicalBytes = p_postingLogicalBytes;
     g_threadLocalPostingScanStats.m_postingPhysicalBytes = p_postingPhysicalBytes;

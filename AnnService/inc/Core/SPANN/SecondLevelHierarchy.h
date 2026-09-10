@@ -6,7 +6,6 @@
 
 #include "inc/Core/Common/QueryResultSet.h"
 #include "inc/Core/Common/VisitedBitmap.h"
-#include "inc/Core/SPANN/LimitedTagSupport.h"
 #include "inc/Core/SPANN/SecondLevelHeadPostings.h"
 #include "inc/Core/VectorIndex.h"
 
@@ -34,32 +33,6 @@ namespace SPTAG
 namespace SPANN
 {
 
-inline Cache::PostingBitmask BuildHierarchyQuerySignature(
-    const std::vector<std::uint32_t>& p_anchors,
-    const LimitedTagSupport& p_support,
-    const std::vector<SecondLevelHeadPostings>& p_postings)
-{
-    Cache::PostingBitmask signature;
-    signature.Clear();
-    for (std::uint32_t tag : p_anchors)
-    {
-        for (const auto& layer : p_postings)
-        {
-            // Legacy CSR domains are authenticated metadata, not routing
-            // thresholds. One unrepresented OR anchor disables all signature
-            // pruning, while exact H1/posting admission and navigation remain.
-            if (!p_support.TagSelectivityInRange(
-                    tag, layer.SignatureMinSelectivity(), layer.SignatureMaxSelectivity()))
-            {
-                signature.Clear();
-                return signature;
-            }
-        }
-        signature.Insert(tag);
-    }
-    return signature;
-}
-
 struct SecondLevelHierarchyLayerTimes
 {
     double m_graphMs = 0.0;
@@ -77,8 +50,6 @@ struct SecondLevelHierarchySearchStats
     double m_vectorMs = 0.0;
     double m_sortMs = 0.0;
     std::uint64_t m_graphScanned = 0;
-    std::uint64_t m_graphSignatureChecks = 0;
-    std::uint64_t m_graphSignatureRejects = 0;
     std::uint64_t m_uniqueScanned = 0;
     std::uint64_t m_assignments = 0;
     int m_topProbe = 0;
@@ -515,7 +486,6 @@ ErrorCode SearchSecondLevelHierarchy(
     int p_resultBudget,
     int p_maxCheck,
     double p_initialProbeRatio,
-    const Cache::PostingBitmask& p_querySignature,
     const std::function<bool(SizeType)>& p_headAdmission,
     const std::shared_ptr<VectorIndex>& p_distanceIndex,
     const std::vector<std::shared_ptr<VectorIndex>>& p_indexes,
@@ -524,12 +494,9 @@ ErrorCode SearchSecondLevelHierarchy(
     SecondLevelHierarchySearchStats& p_stats,
     std::string* p_workLog = nullptr,
     bool p_profile = false,
-    const LimitedTagSupport* p_headSupport = nullptr,
-    // A null distance offers a nonrouting H1 point; true reports a new distance evaluation.
     const std::function<bool(SizeType, const float*)>& p_headPointCandidate = nullptr,
     SecondLevelHierarchyDetail::SearchWorkspace* p_workspace = nullptr,
-    bool p_batchVectorPrefetch = false,
-    bool p_graphSignaturePruning = false)
+    bool p_batchVectorPrefetch = false)
 {
     const int levels = static_cast<int>(p_postings.size());
     if (p_resultBudget <= 0 || p_resultBudget > p_results.GetResultNum() || p_maxCheck <= 0 ||
@@ -567,36 +534,16 @@ ErrorCode SearchSecondLevelHierarchy(
     int routingBudget = (std::max)(
         1, (std::min)(p_resultBudget, static_cast<int>(std::ceil(
             static_cast<long double>(p_resultBudget) * p_initialProbeRatio))));
-    const bool hasSignature = p_querySignature.Popcount() > 0;
-    const auto postingMatches =
-        [&p_querySignature, hasSignature](
-            const SecondLevelHeadPostings& p_layer,
-            SizeType p_upper) {
-            if (!hasSignature) return true;
-            const auto* signature = p_layer.SignatureAt(p_upper);
-            // Nonempty query signatures contain only represented anchors.
-            return signature != nullptr && signature->MayIntersect(p_querySignature);
-        };
     static thread_local SecondLevelHierarchyDetail::SearchWorkspace fallbackWorkspace;
     auto& workspace = p_workspace != nullptr ? *p_workspace : fallbackWorkspace;
     auto& children = workspace.m_children;
     auto& headNearest = workspace.m_headNearest;
-    constexpr size_t kScanBatch = LimitedTagSupport::LookupBatchSize;
+    std::vector<std::uint8_t> headAdmissions;
     const size_t vectorBytes =
         static_cast<size_t>(p_distanceIndex->GetFeatureDim()) * sizeof(T);
     const SizeType headCount = p_distanceIndex->GetNumSamples();
     if (headCount <= 0 || headCount != p_postings.front().FirstLevelHeadCount() ||
-        p_indexes.back()->GetNumSamples() != topCount ||
-        (p_headSupport != nullptr && p_headSupport->HeadCount() != headCount))
-        return ErrorCode::Fail;
-    const auto* headLookupData = p_headSupport == nullptr ? nullptr : p_headSupport->HeadLookupData(0);
-    const size_t headLookupStride = p_headSupport == nullptr ? 0 : p_headSupport->HeadLookupStride();
-    const bool filterHeadPoints = hasSignature && p_headPointCandidate && p_headSupport != nullptr;
-    const auto* headAttributes = filterHeadPoints ? p_headSupport->HeadAttributes(0) : nullptr;
-    const size_t headAttributeStride = filterHeadPoints ? p_headSupport->HeadAttributeStride() : 0;
-    const int headKeyColumn = filterHeadPoints ? p_headSupport->KeyColumn() : 0;
-    if (filterHeadPoints && (headAttributes == nullptr || headKeyColumn < 0 ||
-        headKeyColumn >= p_headSupport->AttributeCount()))
+        p_indexes.back()->GetNumSamples() != topCount)
         return ErrorCode::Fail;
     workspace.m_layers.resize(static_cast<size_t>(levels) + 1);
     for (int level = 0; level < levels; ++level)
@@ -619,41 +566,17 @@ ErrorCode SearchSecondLevelHierarchy(
     const auto observeTop = [&](SizeType id, float distance) {
         if (topState.m_seen.CheckAndSet(static_cast<size_t>(id))) return;
         ++p_stats.m_layerCandidates[static_cast<size_t>(levels)];
-        if (distance < MaxDist && postingMatches(topPostings, id))
-            topState.Push(distance, id);
+        if (distance < MaxDist) topState.Push(distance, id);
     };
 
-    // Matching top results, not an unfiltered top-k, consume the routing ceiling.
-    // Native result admission continues the same graph/tree frontier when
-    // underfilled; later CSR widening never restarts that search.
+    // The top graph is always traversed by vector distance alone. Attribute
+    // membership is evaluated only after the same spatial descent reaches H1.
     COMMON::QueryResultSet<T> topResults(p_results.GetTarget(), fullTopProbe);
     p_stats.m_topProbe = fullTopProbe;
     p_stats.m_maxCheck = p_maxCheck;
     const auto graphStart = now();
-    ErrorCode graphStatus;
-    if (hasSignature)
-    {
-        const std::function<bool(SizeType)> graphAdmission = [&](SizeType id) {
-            ++p_stats.m_graphSignatureChecks;
-            if (id < 0 || id >= topCount)
-            {
-                invalidSample = true;
-                return false;
-            }
-            const bool admitted = postingMatches(topPostings, id);
-            if (!admitted) ++p_stats.m_graphSignatureRejects;
-            return admitted;
-        };
-        graphStatus = p_graphSignaturePruning
-            ? p_indexes.back()->SearchIndexWithTraversalFilter(
-                  topResults, graphAdmission, p_maxCheck)
-            : p_indexes.back()->SearchIndexWithResultFilter(
-                  topResults, graphAdmission, p_maxCheck);
-    }
-    else
-    {
-        graphStatus = p_indexes.back()->SearchIndexWithMaxCheck(topResults, p_maxCheck);
-    }
+    const ErrorCode graphStatus =
+        p_indexes.back()->SearchIndexWithMaxCheck(topResults, p_maxCheck);
     if (graphStatus != ErrorCode::Success) return graphStatus;
     if (invalidSample) return ErrorCode::Fail;
     p_stats.m_graphMs = elapsed(graphStart);
@@ -717,7 +640,6 @@ ErrorCode SearchSecondLevelHierarchy(
                 {
                     const SizeType ahead = selected[row + kRowLookahead];
                     SecondLevelHierarchyDetail::PrefetchL1(postings.Begin(ahead));
-                    SecondLevelHierarchyDetail::PrefetchL1(postings.SignatureAt(ahead));
                 }
                 const SizeType upper = selected[row];
                 if (upper < 0 || upper >= postings.SecondLevelHeadCount())
@@ -744,84 +666,28 @@ ErrorCode SearchSecondLevelHierarchy(
             if (p_profile)
                 p_stats.m_layerTimes[static_cast<size_t>(level)].m_mergeMs += mergeMs;
 
-            const auto tagStart = now();
-            if (level == 0 || hasSignature)
+            if (level == 0)
             {
-                size_t admitted = 0;
-                const bool prefetchExtraPayload =
-                    p_headSupport != nullptr && p_headSupport->NeedsExtraLookupPrefetch();
-                for (size_t batch = 0; batch < children.size(); batch += kScanBatch)
+                const auto tagStart = now();
+                headAdmissions.assign(children.size(), 0);
+                std::uint64_t admitted = 0;
+                for (size_t pos = 0; pos < children.size(); ++pos)
                 {
-                    const size_t end = (std::min)(children.size(), batch + kScanBatch);
-                    for (size_t pos = batch; pos < end; ++pos)
+                    if (p_headAdmission(children[pos]))
                     {
-                        if (level > 0)
-                            SecondLevelHierarchyDetail::PrefetchL1(
-                                p_postings[static_cast<size_t>(level - 1)].SignatureAt(children[pos]));
-                        else if (headLookupData != nullptr)
-                        {
-                            const size_t head = static_cast<size_t>(children[pos]);
-                            SecondLevelHierarchyDetail::PrefetchL1(headLookupData + head * headLookupStride);
-                            if (headAttributes != nullptr)
-                                SecondLevelHierarchyDetail::PrefetchL1(
-                                    headAttributes + head * headAttributeStride);
-                        }
-                    }
-                    if (level == 0 && prefetchExtraPayload)
-                    {
-                        std::array<SizeType, kScanBatch> extraTagHeads;
-                        size_t extraTagHeadCount = 0;
-                        for (size_t pos = batch; pos < end; ++pos)
-                        {
-                            if (const auto* offsets = p_headSupport->ExtraHeadLookupData(children[pos]))
-                            {
-                                SecondLevelHierarchyDetail::PrefetchL1(offsets);
-                                SecondLevelHierarchyDetail::PrefetchL1(offsets + 1);
-                                extraTagHeads[extraTagHeadCount++] = children[pos];
-                            }
-                        }
-                        // Resolve the prefetched offsets before admitting this batch.
-                        for (size_t row = 0; row < extraTagHeadCount; ++row)
-                        {
-                            const auto tags = p_headSupport->ExtraLookupTagRange(extraTagHeads[row]);
-                            if (tags.first != nullptr)
-                            {
-                                SecondLevelHierarchyDetail::PrefetchL1(tags.first);
-                                SecondLevelHierarchyDetail::PrefetchL1(tags.second - 1);
-                            }
-                        }
-                    }
-                    for (size_t pos = batch; pos < end; ++pos)
-                    {
-                        const SizeType child = children[pos];
-                        if (level == 0 ? p_headAdmission(child)
-                            : postingMatches(p_postings[static_cast<size_t>(level - 1)], child))
-                            children[admitted++] = child;
-                        else if (level == 0 && p_headPointCandidate)
-                        {
-                            if (headAttributes != nullptr)
-                            {
-                                const auto* attributes =
-                                    headAttributes + static_cast<size_t>(child) * headAttributeStride;
-                                // Local visited is already set. A coarse own-key
-                                // rejection never evaluates the exact point predicate.
-                                if (!p_querySignature.MayContain(attributes[headKeyColumn])) continue;
-                            }
-                            if (p_headPointCandidate(child, nullptr))
-                            {
-                                ++p_stats.m_layerDistances.front();
-                                ++p_stats.m_uniqueScanned;
-                            }
-                        }
+                        headAdmissions[pos] = 1;
+                        ++admitted;
                     }
                 }
-                children.resize(admitted);
+                p_stats.m_layerEligible.front() += admitted;
+                const double tagMs = elapsed(tagStart);
+                p_stats.m_tagMs += tagMs;
+                if (p_profile) p_stats.m_layerTimes.front().m_tagMs += tagMs;
             }
-            p_stats.m_layerEligible[static_cast<size_t>(level)] += children.size();
-            const double tagMs = elapsed(tagStart);
-            p_stats.m_tagMs += tagMs;
-            if (p_profile)
-                p_stats.m_layerTimes[static_cast<size_t>(level)].m_tagMs += tagMs;
+            else
+            {
+                p_stats.m_layerEligible[static_cast<size_t>(level)] += children.size();
+            }
 
             const auto vectorStart = now();
             const size_t prefetchAhead = p_batchVectorPrefetch ? 64 : 16;
@@ -864,9 +730,12 @@ ErrorCode SearchSecondLevelHierarchy(
                 if (level == 0)
                 {
                     if (p_headPointCandidate) p_headPointCandidate(children[pos], &distance);
-                    SecondLevelHierarchyDetail::RetainNearest(
-                        headNearest, {distance, children[pos]});
-                    ++scoredHeads;
+                    if (headAdmissions[pos] != 0)
+                    {
+                        SecondLevelHierarchyDetail::RetainNearest(
+                            headNearest, {distance, children[pos]});
+                        ++scoredHeads;
+                    }
                 }
                 else state.Push(distance, children[pos]);
             }
@@ -888,10 +757,7 @@ ErrorCode SearchSecondLevelHierarchy(
             if (p_profile)
                 p_stats.m_layerTimes[static_cast<size_t>(level)].m_sortMs += sortMs;
         }
-        if (p_stats.m_layerRetained.front() >= static_cast<std::uint64_t>(p_resultBudget) ||
-            routingBudget >= p_resultBudget)
-            break;
-        routingBudget = p_resultBudget;
+        break;
     }
 
     const auto sortStart = now();
@@ -932,12 +798,7 @@ ErrorCode SearchSecondLevelHierarchy(
             }
             if (level == levels)
                 *p_workLog += ",graph_checked=" +
-                    std::to_string(p_stats.m_graphScanned) +
-                    ",graph_sig_checks=" + std::to_string(p_stats.m_graphSignatureChecks) +
-                    ",graph_sig_rejects=" + std::to_string(p_stats.m_graphSignatureRejects) +
-                    ",graph_result_filter=" + std::to_string(hasSignature) +
-                    ",graph_traversal_filter=" +
-                    std::to_string(hasSignature && p_graphSignaturePruning);
+                    std::to_string(p_stats.m_graphScanned);
             if (p_profile)
             {
                 const auto& times = p_stats.m_layerTimes[static_cast<size_t>(level)];

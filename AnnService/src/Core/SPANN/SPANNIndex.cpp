@@ -8,7 +8,6 @@
 #include "inc/Core/SPANN/ExtraDynamicSearcher.h"
 #include "inc/Core/SPANN/ExtraStaticSearcher.h"
 #include "inc/Core/SPANN/HeadCrossEdgeBuilder.h"
-#include "inc/Core/SPANN/PrimaryHeadCSR.h"
 #include "inc/Core/SPANN/SecondLevelHierarchy.h"
 #include "inc/Core/SPANN/HierarchyVectorCatalog.h"
 #include "inc/Core/SPANN/HeadNodeMetadata.h"
@@ -83,39 +82,10 @@ constexpr std::int32_t kHeadBundleManifestVersion = 2;
 constexpr int kRequiredHybridBaseGraphDegree = 32;
 constexpr int kRequiredHybridGraphDegree = 16;
 
-bool ValidHybridRouteConfig(const Options& p_options)
-{
-    return
-        p_options.m_hybridRouteSampleCount >= 2 &&
-        p_options.m_hybridRouteSampleCount <=
-            static_cast<int>(
-                kMaxHybridRouteSamples) &&
-        std::isfinite(
-            p_options
-                .m_hybridRouteSelectivityThreshold) &&
-        p_options.m_hybridRouteSelectivityThreshold >=
-            0.0f &&
-        p_options.m_hybridRouteSelectivityThreshold <=
-            1.0f &&
-        std::isfinite(
-            p_options
-                .m_hybridRouteDeformationThreshold) &&
-        p_options.m_hybridRouteDeformationThreshold >=
-            0.0f;
-}
-
 bool ValidHierarchyNavigationConfig(
     const Options& p_options)
 {
-    const bool validNavigationMode =
-        Helper::StrUtils::StrEqualIgnoreCase(
-            p_options.m_headNavigationMode.c_str(), "Auto") ||
-        Helper::StrUtils::StrEqualIgnoreCase(
-            p_options.m_headNavigationMode.c_str(), "H1Only") ||
-        Helper::StrUtils::StrEqualIgnoreCase(
-            p_options.m_headNavigationMode.c_str(), "H2Only");
     return
-        validNavigationMode &&
         std::isfinite(
             p_options
                 .m_secondLevelInitialProbeRatio) &&
@@ -591,7 +561,6 @@ bool ValidLimitedTagArtifactLayout(
         p_options.m_checksumFile,
         p_options.m_postingPureCountsFile,
         p_options.m_headRoleFile,
-        p_options.m_primaryHeadCSRFile,
         p_options.m_updateVectorFile,
         p_options.m_secondLevelHeadVectorFile,
         p_options.m_secondLevelHeadIDFile,
@@ -602,10 +571,8 @@ bool ValidLimitedTagArtifactLayout(
         "metadataIndex.bin",
         "quantizer.bin",
         "signatures_bitmask.bin",
-        "sparse_tags.bin",
         "tag_level_offsets.bin",
         "numeric_meta.bin",
-        "tagpure_meta.bin",
         "tag_routing_stats.bin",
         "head_select_state.bin",
         "limited_tag_ho_ready.bin",
@@ -738,17 +705,14 @@ bool ValidSecondLevelArtifactLayout(
         p_options.m_checksumFile,
         p_options.m_postingPureCountsFile,
         p_options.m_headRoleFile,
-        p_options.m_primaryHeadCSRFile,
         p_options.m_updateVectorFile,
         "indexloader.ini",
         "metadata.bin",
         "metadataIndex.bin",
         "quantizer.bin",
         "signatures_bitmask.bin",
-        "sparse_tags.bin",
         "tag_level_offsets.bin",
         "numeric_meta.bin",
-        "tagpure_meta.bin",
         "tag_routing_stats.bin",
         "head_select_state.bin",
         "limited_tag_ho_ready.bin",
@@ -2332,20 +2296,6 @@ ErrorCode Index<T>::LoadHeadHybridGraph() const
     std::string configError;
     HybridDistanceConfig distance;
 
-    if (!ValidHybridRouteConfig(m_options)) {
-        SPTAGLIB_LOG(
-            Helper::LogLevel::LL_Error,
-            "Invalid hybrid route sampling config "
-            "(samples=%d selectivity=%.6g deformation=%.6g).\n",
-            m_options.m_hybridRouteSampleCount,
-            static_cast<double>(
-                m_options
-                    .m_hybridRouteSelectivityThreshold),
-            static_cast<double>(
-                m_options
-                    .m_hybridRouteDeformationThreshold));
-        return ErrorCode::FailedParseValue;
-    }
     if (candidateCount <= 0 ||
         !HybridDistanceConfig::Parse(
             GetParameter(
@@ -2521,14 +2471,8 @@ ErrorCode Index<T>::LoadHybridRoutingStats()
         !m_extraSearcher->HasHybridPurePostings()) {
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
-            "Enabled hybrid routing requires a loaded STATIC hybrid pure "
-            "prefix in the primary posting.\n");
-        return ErrorCode::Fail;
-    }
-    if (!ValidHybridRouteConfig(m_options)) {
-        SPTAGLIB_LOG(
-            Helper::LogLevel::LL_Error,
-            "Enabled hybrid routing has an invalid sampling configuration.\n");
+            "Enabled hybrid format requires a loaded STATIC pure prefix "
+            "in the primary posting.\n");
         return ErrorCode::Fail;
     }
     std::string path = m_options.m_indexDirectory;
@@ -2560,7 +2504,7 @@ ErrorCode Index<T>::LoadHybridRoutingStats()
             error)) {
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
-            "Cannot load enabled hybrid routing statistics: %s.\n",
+            "Cannot load enabled hybrid posting-layout statistics: %s.\n",
             error.c_str());
         return ErrorCode::Fail;
     }
@@ -2603,7 +2547,7 @@ ErrorCode Index<T>::LoadHybridRoutingStats()
                 .m_averageRecords)) {
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
-            "Hybrid routing statistics do not match loaded posting layouts "
+            "Hybrid posting-layout statistics do not match loaded layouts "
             "(records full %.6f/%.6f pure %.6f/%.6f).\n",
             originalRecords,
             m_hybridRoutingStats.m_original.m_layout
@@ -2630,7 +2574,7 @@ ErrorCode Index<T>::LoadHybridRoutingStats()
         refreshLayout(m_hybridRoutingStats.m_hybrid, true);
         SPTAGLIB_LOG(
         Helper::LogLevel::LL_Info,
-        "Loaded hybrid route stats: full pure+tail %.2f rec/%.2f pages, "
+        "Loaded hybrid posting-layout stats: full pure+tail %.2f rec/%.2f pages, "
         "pure %.2f rec/%.2f pages, masks=%zu.\n",
         m_hybridRoutingStats.m_original.m_layout
             .m_averageRecords,
@@ -4318,9 +4262,7 @@ template <typename T>
 ErrorCode Index<T>::SearchSecondLevelHeads(
     COMMON::QueryResultSet<T>* p_queryResults,
     int p_graphResultNum,
-    const Cache::PostingBitmask& p_querySignature,
     const std::function<bool(SizeType)>& p_headAdmission,
-    const LimitedTagSupport* p_headSupport,
     int& p_scannedOut,
     ExtraWorkSpace* p_workspace,
     const std::function<bool(SizeType, const float*)>& p_headPointCandidate) const
@@ -4357,20 +4299,17 @@ ErrorCode Index<T>::SearchSecondLevelHeads(
         p_graphResultNum,
         m_options.m_secondLevelMaxCheck,
         m_options.m_secondLevelInitialProbeRatio,
-        p_querySignature,
         p_headAdmission,
         m_index,
         m_secondLevelIndexes,
         m_secondLevelCatalogs,
         m_secondLevelPostings,
         hierarchyStats,
-        m_options.m_logAdaptiveNprobe ? &workLog : nullptr,
+        m_options.m_logPathStats ? &workLog : nullptr,
         m_options.m_logPhaseTime,
-        p_headSupport,
         p_headPointCandidate,
         p_workspace != nullptr ? &p_workspace->m_hierarchy : nullptr,
-        batchVectorPrefetch,
-        m_options.m_secondLevelGraphSignaturePruning);
+        batchVectorPrefetch);
     if (status != ErrorCode::Success) return status;
 
     g_secondLevelProfile.m_graphMs = hierarchyStats.m_graphMs;
@@ -4427,7 +4366,6 @@ ErrorCode Index<T>::EnsureHeadHybridGraph()
          !Helper::StrUtils::StrEqualIgnoreCase(
              m_options.m_postingQuantizer.c_str(),
              "None")) ||
-        m_options.m_unfilterPureDistanceScanPercent != 100 ||
         m_pendingNodeHeadSelections.size() !=
             m_loadedHeadBundleIndexes.size()) {
         SPTAGLIB_LOG(
@@ -5139,8 +5077,7 @@ bool Index<T>::SearchStaticTailCrossGraph(
     COMMON::QueryResultSet<T> results(p_target, p_candidateCount);
     int scanned = 0;
     ErrorCode status = SearchHeadBundleCrossEdgesNative(
-        &results, p_ownerNode, p_candidateCount, scanned,
-        false, nullptr, 0, nullptr);
+        &results, p_ownerNode, p_candidateCount, scanned);
     if (status != ErrorCode::Success) {
         std::vector<int> candidateNodes;
         candidateNodes.reserve(m_headBundleNodes.size());
@@ -5172,28 +5109,17 @@ ErrorCode Index<T>::SearchHeadBundleCrossEdgesNative(
     COMMON::QueryResultSet<T>* p_queryResults,
     int p_entryNode,
     int p_graphResultNum,
-    int& p_scannedOut,
-    bool p_useHybrid,
-    const std::uint32_t* p_queryTags,
-    int p_numQueryTags,
-    const Cache::DNFPredicate* p_queryDNF) const
+    int& p_scannedOut) const
 {
     p_scannedOut = 0;
     if (p_queryResults == nullptr || p_graphResultNum <= 0 ||
         p_entryNode < 0 ||
         p_entryNode >= static_cast<int>(m_headBundleNodes.size()) ||
         LoadHeadCrossEdges() != ErrorCode::Success ||
-        (p_useHybrid &&
-         LoadHeadHybridGraph() != ErrorCode::Success) ||
-        (p_useHybrid
-             ? (!m_headInlineEdgesHybrid ||
-                m_headInlineCrossEdgeSize !=
-                    kRequiredHybridGraphDegree ||
-                m_headInlineCrossEdgeTotal == 0)
-             : (m_headCrossEdgesDirty.load(std::memory_order_acquire) ||
-                m_headInlineEdgesHybrid ||
-                m_headInlineCrossEdgeSize <= 0 ||
-                m_headInlineCrossEdgeTotal == 0)) ||
+        m_headCrossEdgesDirty.load(std::memory_order_acquire) ||
+        m_headInlineEdgesHybrid ||
+        m_headInlineCrossEdgeSize <= 0 ||
+        m_headInlineCrossEdgeTotal == 0 ||
         EnsureHeadBundleDenseMaps() != ErrorCode::Success)
     {
         return ErrorCode::Fail;
@@ -5204,77 +5130,7 @@ ErrorCode Index<T>::SearchHeadBundleCrossEdgesNative(
     context.m_entryNode = p_entryNode;
     context.m_locatorLocalBits = m_headLocatorLocalBits;
     context.m_locatorLocalMask = m_headLocatorLocalMask;
-    context.m_useHybridDistance = p_useHybrid;
-    if (p_useHybrid) {
-        std::vector<std::pair<int, std::uint32_t>>
-            flatCategoricalValues;
-        HybridQueryDistanceTransform vectorDistanceTransform;
-        if (m_options.m_distCalcMethod ==
-            DistCalcMethod::Cosine) {
-            vectorDistanceTransform =
-                HybridQueryDistanceTransform::ForCosine(
-                    static_cast<const T*>(
-                        p_queryResults
-                            ->GetQuantizedTarget()),
-                    GetFeatureDim());
-        }
-        const auto* threadContext =
-            VectorIndex::GetThreadLocalSearchContext();
-        const std::vector<std::uint32_t>* levelOffsets =
-            threadContext != nullptr &&
-                    !threadContext->m_tagLevelOffsets.empty()
-                ? &threadContext->m_tagLevelOffsets
-                : nullptr;
-        flatCategoricalValues.reserve(
-            static_cast<size_t>((std::max)(0, p_numQueryTags)));
-        for (int index = 0; index < p_numQueryTags; ++index) {
-            int column = TagLevelFromId(p_queryTags[index]);
-            if (levelOffsets != nullptr) {
-                column = 0;
-                for (size_t level = 0;
-                     level < levelOffsets->size(); ++level) {
-                    if (p_queryTags[index] >=
-                        (*levelOffsets)[level]) {
-                        column = static_cast<int>(level);
-                    }
-                    else {
-                        break;
-                    }
-                }
-            }
-            flatCategoricalValues.emplace_back(
-                column, p_queryTags[index]);
-        }
-        context.m_queryDistance =
-            [this, p_queryDNF,
-             vectorDistanceTransform,
-             flatCategoricalValues = std::move(
-                 flatCategoricalValues)](
-                int p_nodeID,
-                SizeType p_localHead,
-                float p_vectorDistance) {
-                if (p_nodeID < 0 ||
-                    p_nodeID >= static_cast<int>(
-                        m_hybridHeadGraph.m_nodes.size())) {
-                    return MaxDist;
-                }
-                const auto& node =
-                    m_hybridHeadGraph.m_nodes[
-                        static_cast<size_t>(p_nodeID)];
-                const auto* attributes = node.Attributes(
-                    p_localHead,
-                    m_hybridHeadGraph.m_numTagColumns);
-                if (attributes == nullptr) return MaxDist;
-                return m_hybridDistance.Combine(
-                    vectorDistanceTransform.Apply(
-                        p_vectorDistance),
-                    m_hybridDistance.PredicateDistance(
-                        attributes,
-                        m_hybridHeadGraph.m_numTagColumns,
-                        p_queryDNF,
-                        flatCategoricalValues));
-            };
-    }
+    context.m_useHybridDistance = false;
 
     int loadedNodes = 0;
     for (size_t nodeId = 0; nodeId < m_headBundleNodes.size(); ++nodeId)
@@ -5295,10 +5151,6 @@ ErrorCode Index<T>::SearchHeadBundleCrossEdgesNative(
         }
         context.m_nodes[nodeId].m_index = nodeIndex;
         context.m_nodes[nodeId].m_localToGlobal = &localToGlobal;
-        if (p_useHybrid &&
-            nodeId >= m_hybridHeadGraph.m_nodes.size()) {
-            return ErrorCode::Fail;
-        }
         ++loadedNodes;
     }
 
@@ -5324,16 +5176,15 @@ ErrorCode Index<T>::SearchHeadBundleCrossEdgesNative(
     p_scannedOut = stats.m_checked;
     g_bktSeedMs = stats.m_treeSearchMs;
     g_pqGraphMs = stats.m_graphSearchMs;
-    if (m_options.m_logAdaptiveNprobe)
+    if (m_options.m_logPathStats)
     {
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Info,
-            "HeadBundleGraph: nodes=%d totalSeeded=%d checks=%d hybrid=%d "
+            "HeadBundleGraph: nodes=%d totalSeeded=%d checks=%d "
             "nodesVisited=%d crossEdgesSeen=%d\n",
             loadedNodes,
             stats.m_seeded,
             stats.m_expanded,
-            p_useHybrid ? 1 : 0,
             stats.m_checked,
             stats.m_crossEdges);
     }
@@ -5363,10 +5214,7 @@ ErrorCode Index<T>::SearchHeadBundlesNative(
     COMMON::QueryResultSet<T>* p_queryResults,
     const std::vector<int>& p_candidateNodes,
     int p_graphResultNum,
-    int& p_scannedOut,
-    const std::function<bool(SizeType)>&
-        p_globalResultFilter,
-    int p_resultFilterMaxCheck) const
+    int& p_scannedOut) const
 {
     p_scannedOut = 0;
     if (p_queryResults == nullptr || p_graphResultNum <= 0 ||
@@ -5408,28 +5256,7 @@ ErrorCode Index<T>::SearchHeadBundlesNative(
         if (nodeResultNum <= 0) continue;
         COMMON::QueryResultSet<T> nodeResults(
             p_queryResults->GetTarget(), nodeResultNum);
-        ErrorCode status = ErrorCode::Success;
-        if (p_globalResultFilter) {
-            status = nodeIndex->SearchIndexWithResultFilter(
-                nodeResults,
-                [&localToGlobal,
-                 &p_globalResultFilter](SizeType p_localID) {
-                    return p_localID >= 0 &&
-                        static_cast<size_t>(p_localID) <
-                            localToGlobal.size() &&
-                        p_globalResultFilter(
-                            localToGlobal[
-                                static_cast<size_t>(
-                                    p_localID)]);
-                },
-                p_resultFilterMaxCheck > 0
-                    ? p_resultFilterMaxCheck
-                    : m_options.m_maxCheck,
-                false);
-        } else {
-            status = nodeIndex->SearchIndex(
-                nodeResults, false);
-        }
+        const ErrorCode status = nodeIndex->SearchIndex(nodeResults, false);
         if (status != ErrorCode::Success)
         {
             return status;
@@ -5585,8 +5412,7 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
             "HierarchyInitialProbeRatio must be in (0,1], "
-            "HierarchyMaxCheck must be positive, and HeadNavigationMode "
-            "must be Auto, H1Only, or H2Only.\n");
+            "and HierarchyMaxCheck must be positive.\n");
         return ErrorCode::FailedParseValue;
     }
     if (m_options.m_selectSecondLevel &&
@@ -5896,189 +5722,6 @@ ErrorCode Index<T>::LoadIndexData(const std::vector<std::shared_ptr<Helper::Disk
     return ErrorCode::Success;
 }
 
-template <typename T>
-bool Index<T>::BuildPrimaryHeadCSRBackfill(const void* vectors, SizeType vectorCount,
-                                           const uint32_t* tags, int numTagsPerVec)
-{
-    if (vectors == nullptr || tags == nullptr || vectorCount <= 0 || numTagsPerVec < 5 ||
-        (!m_options.m_columnTypes.empty() &&
-         m_options.Schema().text != "categorical,categorical,categorical,categorical,numeric") ||
-        m_headBundleNodes.empty() || m_loadedHeadBundleIndexes.empty()) {
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                     "[PrimaryHeadCSR] backfill requires vectors, five tags, and loaded head bundles.\n");
-        return false;
-    }
-
-    const SizeType headCount = TotalHeadSampleCount();
-    if (headCount <= 0 || headCount > std::numeric_limits<std::uint32_t>::max()) {
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "[PrimaryHeadCSR] invalid head count for backfill.\n");
-        return false;
-    }
-
-    std::uint32_t tagBases[4] = {
-        std::numeric_limits<std::uint32_t>::max(),
-        std::numeric_limits<std::uint32_t>::max(),
-        std::numeric_limits<std::uint32_t>::max(),
-        std::numeric_limits<std::uint32_t>::max()
-    };
-    for (SizeType vid = 0; vid < vectorCount; ++vid) {
-        const uint32_t* row = tags + static_cast<size_t>(vid) * numTagsPerVec;
-        for (int level = 0; level < 4; ++level) tagBases[level] = std::min(tagBases[level], row[level]);
-    }
-    for (SizeType vid = 0; vid < vectorCount; ++vid) {
-        const uint32_t* row = tags + static_cast<size_t>(vid) * numTagsPerVec;
-        for (int level = 0; level < 4; ++level) {
-            if (row[level] - tagBases[level] > 0xffU) {
-                SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                             "[PrimaryHeadCSR] categorical level %d exceeds uint8 packing range.\n", level);
-                return false;
-            }
-        }
-    }
-
-    // The persisted SIFT bundle layout routes level-0 (org) tag 0..3 to
-    // bundle node 0..3. Refuse a schema that cannot satisfy that invariant.
-    std::vector<int> bundleForOrg(256, -1);
-    for (size_t bundle = 0; bundle < m_headBundleNodes.size(); ++bundle) {
-        const int nodeId = m_headBundleNodes[bundle].nodeId;
-        if (nodeId >= 0 && nodeId < static_cast<int>(bundleForOrg.size())) {
-            bundleForOrg[static_cast<size_t>(nodeId)] = nodeId;
-        }
-    }
-
-    std::vector<std::uint32_t> primaryHeads(static_cast<size_t>(vectorCount),
-                                            std::numeric_limits<std::uint32_t>::max());
-    std::atomic<SizeType> nextVID(0);
-    std::atomic<bool> failed(false);
-    const T* typedVectors = reinterpret_cast<const T*>(vectors);
-    const int workers = std::max(1, m_options.m_iSSDNumberOfThreads);
-    std::vector<std::thread> threads;
-    threads.reserve(workers);
-    for (int worker = 0; worker < workers; ++worker) {
-        threads.emplace_back([&, worker]() {
-            (void)worker;
-            while (!failed.load(std::memory_order_relaxed)) {
-                const SizeType vid = nextVID.fetch_add(1, std::memory_order_relaxed);
-                if (vid >= vectorCount) return;
-                const uint32_t* row = tags + static_cast<size_t>(vid) * numTagsPerVec;
-                const std::uint32_t org = row[0] - tagBases[0];
-                if (org >= bundleForOrg.size()) {
-                    failed.store(true, std::memory_order_relaxed);
-                    return;
-                }
-                const int nodeId = bundleForOrg[org];
-                if (nodeId < 0 || nodeId >= static_cast<int>(m_loadedHeadBundleIndexes.size()) ||
-                    m_loadedHeadBundleIndexes[static_cast<size_t>(nodeId)] == nullptr ||
-                    m_headBundleLocalToGlobalHIDs[static_cast<size_t>(nodeId)].empty()) {
-                    failed.store(true, std::memory_order_relaxed);
-                    return;
-                }
-
-                COMMON::QueryResultSet<T> result(
-                    typedVectors + static_cast<size_t>(vid) * m_options.m_dim, 1);
-                if (m_loadedHeadBundleIndexes[static_cast<size_t>(nodeId)]->SearchIndex(result) != ErrorCode::Success) {
-                    failed.store(true, std::memory_order_relaxed);
-                    return;
-                }
-                BasicResult* nearest = result.GetResult(0);
-                if (nearest == nullptr || nearest->VID < 0 ||
-                    nearest->VID >= static_cast<SizeType>(
-                        m_headBundleLocalToGlobalHIDs[static_cast<size_t>(nodeId)].size())) {
-                    failed.store(true, std::memory_order_relaxed);
-                    return;
-                }
-                primaryHeads[static_cast<size_t>(vid)] = static_cast<std::uint32_t>(
-                    m_headBundleLocalToGlobalHIDs[static_cast<size_t>(nodeId)]
-                                                   [static_cast<size_t>(nearest->VID)]);
-
-                if ((vid & ((1 << 20) - 1)) == 0) {
-                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
-                                 "[PrimaryHeadCSR] assignment %d/%d\n",
-                                 static_cast<int>(vid), static_cast<int>(vectorCount));
-                }
-            }
-        });
-    }
-    for (auto& thread : threads) thread.join();
-    if (failed.load(std::memory_order_relaxed)) {
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "[PrimaryHeadCSR] nearest-head assignment failed.\n");
-        return false;
-    }
-
-    std::vector<std::uint32_t> offsets(static_cast<size_t>(headCount) + 1, 0);
-    for (std::uint32_t head : primaryHeads) {
-        if (head >= headCount || offsets[static_cast<size_t>(head) + 1] == std::numeric_limits<std::uint32_t>::max()) {
-            SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "[PrimaryHeadCSR] invalid primary head assignment.\n");
-            return false;
-        }
-        ++offsets[static_cast<size_t>(head) + 1];
-    }
-    for (SizeType head = 0; head < headCount; ++head) {
-        const std::uint64_t next = static_cast<std::uint64_t>(offsets[static_cast<size_t>(head)]) +
-                                   offsets[static_cast<size_t>(head) + 1];
-        if (next > std::numeric_limits<std::uint32_t>::max()) {
-            SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "[PrimaryHeadCSR] offset overflow.\n");
-            return false;
-        }
-        offsets[static_cast<size_t>(head) + 1] = static_cast<std::uint32_t>(next);
-    }
-
-    std::unique_ptr<std::atomic_uint32_t[]> cursors(
-        new std::atomic_uint32_t[static_cast<size_t>(headCount)]);
-    for (SizeType head = 0; head < headCount; ++head) {
-        cursors[static_cast<size_t>(head)].store(offsets[static_cast<size_t>(head)], std::memory_order_relaxed);
-    }
-    std::vector<PrimaryHeadCSREntry> entries(static_cast<size_t>(vectorCount));
-    nextVID.store(0, std::memory_order_relaxed);
-    threads.clear();
-    for (int worker = 0; worker < workers; ++worker) {
-        threads.emplace_back([&, worker]() {
-            (void)worker;
-            while (true) {
-                const SizeType vid = nextVID.fetch_add(1, std::memory_order_relaxed);
-                if (vid >= vectorCount) return;
-                const std::uint32_t head = primaryHeads[static_cast<size_t>(vid)];
-                const std::uint32_t pos =
-                    cursors[static_cast<size_t>(head)].fetch_add(1, std::memory_order_relaxed);
-                const uint32_t* row = tags + static_cast<size_t>(vid) * numTagsPerVec;
-                std::uint32_t packedTags = 0;
-                for (int level = 0; level < 4; ++level) {
-                    packedTags |= ((row[level] - tagBases[level]) & 0xffU) << (level * 8);
-                }
-                entries[pos].vid = static_cast<std::uint32_t>(vid);
-                entries[pos].attributes = static_cast<std::uint64_t>(packedTags) |
-                                          (static_cast<std::uint64_t>(row[4]) << 32);
-            }
-        });
-    }
-    for (auto& thread : threads) thread.join();
-
-    PrimaryHeadCSRHeader header;
-    header.headCount = static_cast<std::uint32_t>(headCount);
-    header.entryCount = static_cast<std::uint64_t>(vectorCount);
-    for (int level = 0; level < 4; ++level) header.tagBases[level] = tagBases[level];
-    const std::string path = m_options.m_indexDirectory + FolderSep + m_options.m_primaryHeadCSRFile;
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    if (!output) {
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "[PrimaryHeadCSR] cannot create %s.\n", path.c_str());
-        return false;
-    }
-    output.write(reinterpret_cast<const char*>(&header), sizeof(header));
-    output.write(reinterpret_cast<const char*>(offsets.data()),
-                 static_cast<std::streamsize>(offsets.size() * sizeof(std::uint32_t)));
-    output.write(reinterpret_cast<const char*>(entries.data()),
-                 static_cast<std::streamsize>(entries.size() * sizeof(PrimaryHeadCSREntry)));
-    output.close();
-    if (!output) {
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "[PrimaryHeadCSR] write failed for %s.\n", path.c_str());
-        return false;
-    }
-    SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
-                 "[PrimaryHeadCSR] backfilled %d vectors across %d heads to %s.\n",
-                 static_cast<int>(vectorCount), static_cast<int>(headCount), path.c_str());
-    return true;
-}
-
 template <typename T> ErrorCode Index<T>::SaveConfig(std::shared_ptr<Helper::DiskIO> p_configOut)
 {
     if (!m_options.ValidateTagSchema()) return ErrorCode::FailedParseValue;
@@ -6197,14 +5840,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     SPTAG::VectorIndex::ResetThreadLocalPostingScanStats();
 
     const auto* threadLocalSearchContext = SPTAG::VectorIndex::GetThreadLocalSearchContext();
-    static const std::vector<SizeType> kEmptyDirectPostingIDs;
     static const std::function<bool(int)> kEmptyPostingFilter;
-    const std::vector<SizeType>& directPostingIDs = threadLocalSearchContext != nullptr
-        ? threadLocalSearchContext->m_directPostingIDs
-        : kEmptyDirectPostingIDs;
-    const std::vector<SizeType>& directHeadLocalIDs = threadLocalSearchContext != nullptr
-        ? threadLocalSearchContext->m_directHeadLocalIDs
-        : kEmptyDirectPostingIDs;
     const uint32_t* queryTags = threadLocalSearchContext != nullptr
         ? threadLocalSearchContext->QueryTags()
         : nullptr;
@@ -6219,10 +5855,10 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             ? threadLocalSearchContext
                   ->m_limitedTagQueryValues
             : kEmptyLimitedTagQueryValues;
-    const bool limitedTagRouteEligible =
+    const bool limitedTagMembershipEligible =
         threadLocalSearchContext != nullptr &&
         threadLocalSearchContext
-            ->m_limitedTagRouteEligible &&
+            ->m_limitedTagMembershipEligible &&
         !limitedTagQueryValues.empty();
     const SPTAG::Cache::DNFPredicate* queryDNF = threadLocalSearchContext != nullptr
         ? threadLocalSearchContext->DNF()
@@ -6238,12 +5874,6 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                     return ErrorCode::FailedParseValue;
                 }
     }
-    const float filterSelectivity = threadLocalSearchContext != nullptr
-        ? threadLocalSearchContext->m_filterSelectivity
-        : 1.0f;
-    const float routeSelectivity = threadLocalSearchContext != nullptr
-        ? threadLocalSearchContext->m_routeSelectivity
-        : 1.0f;
     const std::function<bool(int)>& postingFilter = threadLocalSearchContext != nullptr
         ? threadLocalSearchContext->m_postingFilter
         : kEmptyPostingFilter;
@@ -6260,9 +5890,9 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         m_extraSearcher != nullptr &&
         m_extraSearcher
             ->LimitedTagPostingRegionsReady();
-    const bool useLimitedTagPure =
+    const bool useLimitedTagMembership =
         limitedTagRegionsReady &&
-        hasExactFilter && limitedTagRouteEligible;
+        hasExactFilter && limitedTagMembershipEligible;
     const auto limitedSupportMatchesPredicate =
         [this, &limitedTagQueryValues](
             SizeType p_head) {
@@ -6302,297 +5932,22 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         };
     std::function<bool(SizeType)>
         limitedTagHeadAdmission;
-    const bool primaryHeadBypassRequested =
-        m_options.m_enablePrimaryHeadBypass &&
-        m_extraSearcher != nullptr &&
-        m_extraSearcher->CanSearchPrimaryHeadCandidates(
-            queryTags, numQueryTags, queryDNF);
-    if (useLimitedTagPure) {
+    if (useLimitedTagMembership) {
         limitedTagHeadAdmission =
             [&](SizeType p_head) {
                 return limitedSupportMatchesPredicate(
                            p_head) &&
-                    (primaryHeadBypassRequested ||
-                     (m_extraSearcher != nullptr &&
-                      m_extraSearcher
-                          ->CheckValidPosting(
-                              p_head, nullptr)));
+                    m_extraSearcher != nullptr &&
+                    m_extraSearcher->CheckValidPosting(
+                        p_head, nullptr);
             };
     }
-    static const std::vector<int> kEmptySearchHeadBundleNodes;
-    const std::vector<int>& searchHeadBundleNodes = threadLocalSearchContext != nullptr
-        ? threadLocalSearchContext->m_searchHeadBundleNodes
-        : kEmptySearchHeadBundleNodes;
     const bool graphlessH1 =
         m_metadataOnlyHeadStore &&
         !m_options.m_buildH1Graph;
-    const bool requestedH1Navigation =
-        Helper::StrUtils::StrEqualIgnoreCase(
-            m_options.m_headNavigationMode.c_str(),
-            "H1Only");
-    const bool requestedH2Navigation =
-        Helper::StrUtils::StrEqualIgnoreCase(
-            m_options.m_headNavigationMode.c_str(),
-            "H2Only");
-    if (graphlessH1 && requestedH1Navigation) {
-        SPTAGLIB_LOG(
-            Helper::LogLevel::LL_Error,
-            "HeadNavigationMode=H1Only is unavailable when BuildH1Graph=false.\n");
-        return ErrorCode::FailedParseValue;
-    }
-    const bool forceH1Navigation = requestedH1Navigation;
-    const bool forceH2Navigation =
-        requestedH2Navigation || graphlessH1;
+    const bool forceH2Navigation = graphlessH1;
     const bool useHierarchyNavigation =
-        !forceH1Navigation &&
-        (forceH2Navigation || m_options.m_selectSecondLevel);
-
-    // ═══ Sparse tag fast path: skip graph search, read postings directly ═══
-    if (!forceH1Navigation &&
-        !useHierarchyNavigation &&
-        !directPostingIDs.empty() &&
-        m_extraSearcher != nullptr)
-    {
-        if (directPostingIDs.size() > static_cast<size_t>((std::numeric_limits<int>::max)()) ||
-            directHeadLocalIDs.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) {
-            return ErrorCode::Fail;
-        }
-        auto workSpace = m_workSpaceFactory->GetWorkSpace();
-        if (!workSpace) {
-            workSpace.reset(new ExtraWorkSpace());
-            m_extraSearcher->InitWorkSpace(workSpace.get(), false);
-        } else {
-            m_extraSearcher->InitWorkSpace(workSpace.get(), true);
-        }
-        workSpace->m_queryTags = queryTags;
-        workSpace->m_numQueryTags = numQueryTags;
-        workSpace->m_dnf = queryDNF;
-        workSpace->m_deduper.clear();
-        workSpace->m_postingIDs.clear();
-        workSpace->m_postingFilter = nullptr;  // no PS needed, we know exact postings
-        workSpace->m_postingProbeStats.Reset();
-
-        const int directPostingCount = static_cast<int>(directPostingIDs.size());
-        if (directPostingCount > m_options.m_searchInternalResultNum) {
-            const bool isStaticStorage = m_options.m_storage == Storage::STATIC;
-            const int maxPages = isStaticStorage
-                ? m_extraSearcher->GetPostingBufferBytes(false)
-                : ((std::max)(m_options.m_postingPageLimit, m_options.m_searchPostingPageLimit)
-                    + m_options.m_bufferLength + m_options.m_unfilterTailBufferLength) << PageSizeEx;
-            // ExtraStaticSearcher indexes m_diskRequests by posting ordinal, so
-            // its workspace must retain one request per posting rather than the
-            // dynamic block-I/O request layout.
-            workSpace->Clear(directPostingCount, maxPages, !isStaticStorage,
-                             m_options.m_enableDataCompression);
-            // Clear() may have allocated new requests; initialize their static
-            // I/O context IDs before the scan.
-            m_extraSearcher->InitWorkSpace(workSpace.get(), true);
-        }
-        workSpace
-            ->m_limitedTagRegionsReadySnapshotValid =
-            true;
-        workSpace
-            ->m_limitedTagRegionsReadySnapshot =
-            limitedTagRegionsReady;
-        workSpace->m_useHybridPure =
-            useLimitedTagPure;
-        workSpace->m_scanFullPostingForFilter =
-            limitedTagRegionsReady &&
-            hasExactFilter &&
-            !useLimitedTagPure;
-
-        const int directResultNum = (std::max)(
-            m_options.m_searchInternalResultNum,
-            static_cast<int>(directHeadLocalIDs.size()));
-        COMMON::QueryResultSet<T> *p_queryResults;
-        if (p_query.GetResultNum() >= directResultNum)
-            p_queryResults = (COMMON::QueryResultSet<T> *)&p_query;
-        else
-            p_queryResults = new COMMON::QueryResultSet<T>((const T *)p_query.GetTarget(), directResultNum);
-
-        auto translateHeadVID = [&](SizeType localHid) -> SizeType {
-            if (m_index == nullptr || localHid < 0 ||
-                localHid >= m_index->GetNumSamples()) {
-                return MaxSize;
-            }
-            if (m_index->HasHeadNodeMeta()) {
-                SizeType metaVID =
-                    m_index->GetHeadNodeGlobalVID(localHid);
-                if (metaVID != MaxSize) return metaVID;
-            }
-            if (localHid <
-                static_cast<SizeType>(
-                    m_vectorTranslateMap.R())) {
-                return static_cast<SizeType>(
-                    *(m_vectorTranslateMap[localHid]));
-            }
-            return MaxSize;
-        };
-
-        if (!directHeadLocalIDs.empty() && m_index != nullptr)
-        {
-            const bool hasTagFilter = queryTags != nullptr && numQueryTags > 0;
-            const auto headHierWidths =
-                m_index->GetHeadNodeHierWidths();
-            SPTAG::Cache::HierarchicalPostingMask queryHierMask;
-            if (hasTagFilter) {
-                queryHierMask.Clear();
-                for (int i = 0; i < numQueryTags; ++i) {
-                    queryHierMask.Insert(
-                        TagLevelFromId(queryTags[i]),
-                        queryTags[i],
-                        headHierWidths);
-                }
-            }
-
-            auto shouldKeepHeadResult = [&](SizeType localHid) -> bool {
-                if (limitedTagRegionsReady &&
-                    hasExactFilter) {
-                    return limitedHeadMatchesExactPredicate(
-                        localHid);
-                }
-                if (!hasTagFilter) return true;
-                static const std::vector<uint8_t> kNoRouteMask;
-                return m_index->HasHeadNodeMeta() &&
-                    m_index->HeadNodeMatchesQuery(
-                        localHid, queryHierMask,
-                        kNoRouteMask,
-                        headHierWidths);
-            };
-
-            for (SizeType localHid : directHeadLocalIDs) {
-                if (localHid < 0 || localHid >= m_index->GetNumSamples() ||
-                    !shouldKeepHeadResult(localHid)) {
-                    continue;
-                }
-                const void* headSample = m_index->GetSample(localHid);
-                const SizeType globalVID = translateHeadVID(localHid);
-                if (headSample == nullptr || globalVID == MaxSize || m_versionMap.Deleted(globalVID) ||
-                    workSpace->m_deduper.CheckAndSet(globalVID)) {
-                    continue;
-                }
-                const float distance = m_index->ComputeDistance(
-                    p_queryResults->GetQuantizedTarget(), headSample);
-                p_queryResults->AddPoint(globalVID, distance);
-            }
-        }
-
-        // Directly inject all target posting IDs for sparse brute-force.
-        int maxPostings = directPostingCount;
-        for (SizeType pid : directPostingIDs) {
-            if ((int)workSpace->m_postingIDs.size() >= maxPostings) break;
-            if (m_extraSearcher->CheckValidPosting(pid)) {
-                workSpace->m_postingIDs.emplace_back(pid);
-            }
-        }
-
-        // Read postings and scan with inline tag filter
-        ErrorCode ret = m_extraSearcher->SearchIndex(workSpace.get(), *p_queryResults,
-                                                     m_index, nullptr, nullptr, nullptr);
-        SPTAG::VectorIndex::SetThreadLocalPostingScanStats(
-            workSpace->m_postingProbeStats.m_readPostings,
-            workSpace->m_postingProbeStats.m_matchedPostings,
-            workSpace->m_postingProbeStats.m_prePSPostings,
-            workSpace->m_postingProbeStats.m_scannedVectors,
-            workSpace->m_postingProbeStats.m_matchedVectors,
-            workSpace->m_postingProbeStats.m_primaryHeadCandidates,
-            workSpace->m_postingProbeStats.m_postingPageReads,
-            workSpace->m_postingProbeStats.m_postingLogicalBytes,
-            workSpace->m_postingProbeStats.m_postingPhysicalBytes,
-            workSpace->m_postingProbeStats.m_adcScannedVectors,
-            workSpace->m_postingProbeStats.m_adcSurvivors,
-            workSpace->m_postingProbeStats.m_rerankCandidates,
-            workSpace->m_postingProbeStats.m_rerankReadRequests,
-            workSpace->m_postingProbeStats.m_rerankPhysicalBytes,
-            workSpace->m_postingProbeStats.m_uniqueMatchedPostings,
-            workSpace->m_postingProbeStats.m_uniqueMatchedVectors,
-            workSpace->m_postingProbeStats.m_dedupSkippedVectors);
-
-        if (ret == ErrorCode::Success &&
-            directHeadLocalIDs.empty() &&
-            m_index != nullptr &&
-            ((limitedTagRegionsReady &&
-              hasExactFilter) ||
-             (queryTags != nullptr &&
-              numQueryTags > 0)))
-        {
-            const auto headHierWidths =
-                m_index->GetHeadNodeHierWidths();
-            SPTAG::Cache::HierarchicalPostingMask queryHierMask;
-            queryHierMask.Clear();
-            for (int i = 0; i < numQueryTags; ++i) {
-                queryHierMask.Insert(
-                    TagLevelFromId(queryTags[i]),
-                    queryTags[i],
-                    headHierWidths);
-            }
-
-            const bool useLimitedHeadSupport =
-                limitedTagRegionsReady &&
-                hasExactFilter;
-            const SizeType sampleCount =
-                useLimitedHeadSupport
-                    ? (std::min)(
-                          m_limitedTagSupport.HeadCount(),
-                          m_index->GetNumSamples())
-                    : m_index
-                          ->GetHeadNodeMetaSampleCount();
-            for (SizeType sampleId = 0; sampleId < sampleCount; ++sampleId) {
-                bool matches = false;
-                if (useLimitedHeadSupport) {
-                    matches =
-                        limitedHeadMatchesExactPredicate(
-                            sampleId);
-                } else {
-                    static const std::vector<uint8_t>
-                        kNoRouteMask;
-                    matches =
-                        m_index->HeadNodeMatchesQuery(
-                            sampleId, queryHierMask,
-                            kNoRouteMask,
-                            headHierWidths);
-                }
-                if (!matches) {
-                    continue;
-                }
-
-                const void* headSample = m_index->GetSample(sampleId);
-                if (headSample == nullptr) {
-                    continue;
-                }
-
-                const SizeType globalVID =
-                    translateHeadVID(sampleId);
-                if (globalVID == MaxSize ||
-                    m_versionMap.Deleted(globalVID)) {
-                    continue;
-                }
-
-                // Dedup against posting-scan results: a head VID that also lives
-                // in a scanned posting (via its replicas) would otherwise be
-                // AddPoint'd twice, pushing valid GT off top-K.
-                if (workSpace->m_deduper.CheckAndSet(globalVID)) {
-                    continue;
-                }
-
-                auto distance = m_index->ComputeDistance(p_queryResults->GetQuantizedTarget(), headSample);
-                p_queryResults->AddPoint(globalVID, distance);
-            }
-        }
-
-        p_queryResults->SortResult();
-        if (p_queryResults != (COMMON::QueryResultSet<T>*)&p_query) {
-            // Copy results back
-            for (int i = 0; i < p_query.GetResultNum(); ++i) {
-                auto* src = p_queryResults->GetResult(i);
-                auto* dst = p_query.GetResult(i);
-                dst->VID = src->VID;
-                dst->Dist = src->Dist;
-            }
-            delete p_queryResults;
-        }
-        return ret;
-    }
+        forceH2Navigation || m_options.m_selectSecondLevel;
 
     const int dumpHeadsLimit = std::max(0, m_options.m_dumpHeads);
     static std::atomic<int> s_dumpHeadsQueryCount{0};
@@ -6601,52 +5956,18 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     const bool dumpHeads =
         dumpHeadsQueryId >= 0 && dumpHeadsQueryId < dumpHeadsLimit;
 
-    // ═══ Normal path: graph search + post-graph PS + inline filter ═══
-    // Adaptive nprobe: when tag filter is active, choose enough postings to
-    // satisfy both (1) expected filtered top-k coverage and (2) graph-routing
-    // coverage under the current selectivity.
-    // expected_matches_per_posting ~= avg_posting_size * selectivity
-    // postings_for_recall ~= target_recall * topk / expected_matches_per_posting
-    // postings_for_coverage ~= nprobe_base / selectivity^coverage_exponent
-    // final postingTarget = max(base, postings_for_recall, postings_for_coverage)
-    // filterSelectivity is supplied by the thread-local ACL context at tenant
-    // scope; for routed head-bundle queries we rescale it to candidate-node
-    // scope before deriving postingTarget.
-    int nprobeBase = std::max(m_options.m_searchInternalResultNum, p_query.GetResultNum());
-    int postingTarget = nprobeBase;
-    const bool adaptiveFilteredNprobeEnabled = m_options.m_enableAdaptiveFilteredNprobe;
+    // Every query uses the same configured graph result budget.
+    const int graphResultNum =
+        std::max(m_options.m_searchInternalResultNum, p_query.GetResultNum());
+    const int postingTarget = graphResultNum;
 
     const bool useHeadBundleRuntime = !m_headBundleNodes.empty() &&
         (m_metadataOnlyHeadStore || m_headBundleNodes.size() > 1);
     std::vector<int> candidateNodes;
-    if (useHeadBundleRuntime && !searchHeadBundleNodes.empty())
+    if (useHeadBundleRuntime)
     {
-        // Routed (filtered) queries restrict navigation to the bundle nodes
-        // their tags map to. Single-bundle indexes (size==1) route to node 0
-        // and must be handled here too — the previous `size > 1` guard left
-        // them with an empty candidate set (no head search ran). When the
-        // routed set covers all nodes the result is identical to the
-        // unfilter all-nodes branch below.
-        candidateNodes.reserve(searchHeadBundleNodes.size());
-        for (int nodeId : searchHeadBundleNodes)
-        {
-            if (nodeId < 0 || nodeId >= static_cast<int>(m_headBundleNodes.size())) {
-                continue;
-            }
-            if (m_headBundleNodes[static_cast<size_t>(nodeId)].headCount == 0 ||
-                m_headBundleNodes[static_cast<size_t>(nodeId)].postingCount == 0) {
-                continue;
-            }
-            candidateNodes.push_back(nodeId);
-        }
-    }
-    else if (useHeadBundleRuntime && searchHeadBundleNodes.empty())
-    {
-        // v5: unfilter (no tag scope) always routes through cross-edge unified
-        // traversal across all per-bundle subgraphs. The global m_index is no
-        // longer used for navigation in any code path. A single-bundle index
-        // (size==1) is also handled here so its sole node is searched instead
-        // of falling through to the (metadata-only-disabled) global fallback.
+        // Filtering never selects a graph subset. Every query traverses the
+        // same physical bundle graph with the same configured budget.
         candidateNodes.reserve(m_headBundleNodes.size());
         for (size_t i = 0; i < m_headBundleNodes.size(); ++i) {
             const auto& bn = m_headBundleNodes[i];
@@ -6654,113 +5975,6 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             candidateNodes.push_back(static_cast<int>(bn.nodeId));
         }
     }
-    if (adaptiveFilteredNprobeEnabled && filterSelectivity < 1.0f) {
-        const SizeType totalHeads = TotalHeadSampleCount();
-        const double globalTenantSize = static_cast<double>(m_options.m_vectorSize > 0 ? m_options.m_vectorSize : totalHeads);
-        const SizeType globalPostingCount = std::max<SizeType>(1, totalHeads);
-        const double globalAvgPosting = std::max(1.0, globalTenantSize / static_cast<double>(globalPostingCount));
-
-        float recallTarget = m_options.m_filteredSearchTargetRecall;
-        if (recallTarget < 0.01f) recallTarget = 0.01f;
-        if (recallTarget > 1.0f) recallTarget = 1.0f;
-
-        float coverageExponent = m_options.m_filteredSearchCoverageExponent;
-        if (coverageExponent < 0.0f) coverageExponent = 0.0f;
-        if (coverageExponent > 2.0f) coverageExponent = 2.0f;
-
-        int filteredTopK = p_query.GetResultNum();
-        if (filteredTopK <= 0) filteredTopK = 10;
-
-        auto computeAdaptivePostingTargetForScope = [&](double scopeTenantSize,
-                                                        SizeType scopePostingCount,
-                                                        double scopeSelectivity) -> int {
-            if (scopeTenantSize <= 0.0 || scopePostingCount == 0) {
-                return nprobeBase;
-            }
-
-            double sel = scopeSelectivity;
-            if (sel < 1e-6) sel = 1e-6;
-            if (sel > 1.0) sel = 1.0;
-
-            double postingCount = static_cast<double>(scopePostingCount);
-            double avgPosting = scopeTenantSize / postingCount;
-            if (avgPosting < 1.0) avgPosting = 1.0;
-
-            double expectedMatchesPerPosting = avgPosting * sel;
-            if (expectedMatchesPerPosting < 1e-6) expectedMatchesPerPosting = 1e-6;
-
-            int postingsForRecall = static_cast<int>(std::ceil(
-                (static_cast<double>(filteredTopK) * static_cast<double>(recallTarget)) /
-                expectedMatchesPerPosting));
-
-            int target = std::max(nprobeBase, postingsForRecall);
-
-            // Optional coverage term: only when explicitly enabled (exponent > 0).
-            // The 1/sel^exp scaling has no theoretical basis and tends to dominate
-            // postingsForRecall for low-sel queries, so it is opt-in.
-            if (coverageExponent > 1e-6f) {
-                double coverageDenominator = std::pow(sel, static_cast<double>(coverageExponent));
-                if (coverageDenominator < 1e-6) coverageDenominator = 1e-6;
-                int postingsForCoverage = static_cast<int>(std::ceil(
-                    static_cast<double>(nprobeBase) / coverageDenominator));
-                target = std::max(target, postingsForCoverage);
-            }
-
-            return std::min(static_cast<int>(scopePostingCount), target);
-        };
-
-        SizeType postingCountCap = globalPostingCount;
-        double candidateTenantSize = globalTenantSize;
-        double aggregateSelectivity = static_cast<double>(filterSelectivity);
-        if (!candidateNodes.empty()) {
-            SizeType candidatePostingCount = 0;
-            double candidateAssignmentCount = 0.0;
-            for (int nodeId : candidateNodes)
-            {
-                const auto& nodeInfo = m_headBundleNodes[static_cast<size_t>(nodeId)];
-                candidatePostingCount += nodeInfo.postingCount;
-                candidateAssignmentCount += static_cast<double>(nodeInfo.assignmentCount);
-            }
-
-            if (candidatePostingCount > 0) {
-                postingCountCap = candidatePostingCount;
-                candidateTenantSize = (candidateAssignmentCount > 0.0)
-                    ? candidateAssignmentCount
-                    : globalAvgPosting * static_cast<double>(candidatePostingCount);
-
-                if (candidateTenantSize > 0.0 && globalTenantSize > 0.0) {
-                    aggregateSelectivity *= (globalTenantSize / candidateTenantSize);
-                }
-            }
-        }
-
-        int aggregatePostingTarget = computeAdaptivePostingTargetForScope(
-            candidateTenantSize,
-            postingCountCap,
-            aggregateSelectivity);
-
-        postingTarget = aggregatePostingTarget;
-
-
-    }
-
-    if (m_options.m_logAdaptiveNprobe && adaptiveFilteredNprobeEnabled) {
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
-            "AdaptiveNprobe: sel=%.4g topK=%d recallTarget=%.3g coverageExp=%.3g "
-            "nprobeBase=%d nodes=%zu cap=%d -> postingTarget=%d\n",
-            static_cast<double>(filterSelectivity),
-            p_query.GetResultNum(),
-            static_cast<double>(m_options.m_filteredSearchTargetRecall),
-            static_cast<double>(m_options.m_filteredSearchCoverageExponent),
-            nprobeBase,
-            candidateNodes.size(),
-            static_cast<int>(TotalHeadSampleCount()),
-            postingTarget);
-    }
-
-    // Route selection must happen before graph traversal and must not change
-    // postingTarget. nprobe therefore selects only a point on the chosen route.
-    const int graphResultNum = postingTarget;
     std::unique_ptr<COMMON::QueryResultSet<T>>
         temporaryQueryResults;
     COMMON::QueryResultSet<T>* p_queryResults;
@@ -6778,251 +5992,8 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             temporaryQueryResults.get();
     }
 
-    bool useHybridRoute = false;
-    HybridRouteDeformationEstimate routeDeformation;
-    double routeSelectivityValue =
-        std::isfinite(routeSelectivity)
-            ? (std::max)(
-                  0.0,
-                  (std::min)(
-                      1.0,
-                      static_cast<double>(
-                          routeSelectivity)))
-            : 1.0;
-    double routeEstimateUS = 0.0;
-    if (m_options.m_enableHybridDistance &&
-        hasExactFilter &&
-        m_extraSearcher != nullptr &&
-        m_extraSearcher->HasHybridPurePostings() &&
-        !m_hybridRoutingStats.Empty()) {
-        const auto routeStart =
-            m_options.m_logHybridRoute
-                ? std::chrono::high_resolution_clock::now()
-                : std::chrono::high_resolution_clock::
-                      time_point{};
-        if (routeSelectivityValue <=
-            m_options
-                .m_hybridRouteSelectivityThreshold) {
-        std::vector<std::pair<int, std::uint32_t>>
-            flatCategoricalValues;
-        flatCategoricalValues.reserve(
-            static_cast<size_t>(
-                (std::max)(0, numQueryTags)));
-        const std::vector<std::uint32_t>* levelOffsets =
-            threadLocalSearchContext != nullptr &&
-                    !threadLocalSearchContext
-                         ->m_tagLevelOffsets.empty()
-                ? &threadLocalSearchContext
-                       ->m_tagLevelOffsets
-                : nullptr;
-        for (int tag = 0; tag < numQueryTags; ++tag) {
-            int column = TagLevelFromId(queryTags[tag]);
-            if (levelOffsets != nullptr) {
-                column = 0;
-                for (size_t level = 0;
-                     level < levelOffsets->size();
-                     ++level) {
-                    if (queryTags[tag] >=
-                        (*levelOffsets)[level]) {
-                        column =
-                            static_cast<int>(level);
-                    } else {
-                        break;
-                    }
-                }
-            }
-            flatCategoricalValues.emplace_back(
-                column, queryTags[tag]);
-        }
-
-        const ErrorCode hybridStatus =
-            LoadHeadHybridGraph();
-        if (hybridStatus != ErrorCode::Success ||
-            !ValidHybridRouteConfig(m_options) ||
-            m_hybridHeadGraph.m_nodes.size() != 1 ||
-            m_loadedHeadBundleIndexes.size() != 1 ||
-            m_loadedHeadBundleIndexes.front() == nullptr ||
-            m_loadedHeadBundleIndexes.front()
-                    ->GetQuantizer() != nullptr) {
-            if (p_queryResults !=
-                (COMMON::QueryResultSet<T>*)&p_query) {
-                temporaryQueryResults.reset();
-            }
-            SPTAGLIB_LOG(
-                Helper::LogLevel::LL_Error,
-                "Hybrid route sampling cannot access the loaded head graph.\n");
-            return hybridStatus == ErrorCode::Success
-                ? ErrorCode::Fail
-                : hybridStatus;
-        }
-
-        const auto& hybridNode =
-            m_hybridHeadGraph.m_nodes.front();
-        const auto& headIndex =
-            m_loadedHeadBundleIndexes.front();
-        const SizeType headCount =
-            hybridNode.m_headCount;
-        if (headCount !=
-            headIndex->GetNumSamples()) {
-            if (p_queryResults !=
-                (COMMON::QueryResultSet<T>*)&p_query) {
-                temporaryQueryResults.reset();
-            }
-            SPTAGLIB_LOG(
-                Helper::LogLevel::LL_Error,
-                "Hybrid route head count mismatch (%d/%d).\n",
-                static_cast<int>(headCount),
-                static_cast<int>(
-                    headIndex->GetNumSamples()));
-            return ErrorCode::Fail;
-        }
-        const size_t sampleCount =
-            headCount > 0
-                ? static_cast<size_t>(
-                      (std::min)(
-                          headCount,
-                          static_cast<SizeType>(
-                              m_options
-                                  .m_hybridRouteSampleCount)))
-                : 0;
-        std::array<float, kMaxHybridRouteSamples>
-            vectorComponents{};
-        std::array<double, kMaxHybridRouteSamples>
-            attributeDistances{};
-        HybridQueryDistanceTransform
-            vectorDistanceTransform;
-        if (m_options.m_distCalcMethod ==
-            DistCalcMethod::Cosine) {
-            vectorDistanceTransform =
-                HybridQueryDistanceTransform::ForCosine(
-                    static_cast<const T*>(
-                        p_queryResults
-                            ->GetQuantizedTarget()),
-                    GetFeatureDim());
-        }
-
-        if (sampleCount >= 2) {
-            const std::uint64_t offset =
-                m_hybridRoutingStats
-                    .m_generationFingerprint %
-                static_cast<std::uint64_t>(
-                    headCount);
-            for (size_t sample = 0;
-                 sample < sampleCount;
-                 ++sample) {
-                const std::uint64_t center =
-                    ((2ULL * sample + 1ULL) *
-                     static_cast<std::uint64_t>(
-                         headCount)) /
-                    (2ULL * sampleCount);
-                const SizeType localHead =
-                    static_cast<SizeType>(
-                        (offset + center) %
-                        static_cast<std::uint64_t>(
-                            headCount));
-                const void* headVector =
-                    headIndex->GetSample(localHead);
-                const std::uint32_t* attributes =
-                    hybridNode.Attributes(
-                        localHead,
-                        m_hybridHeadGraph
-                            .m_numTagColumns);
-                if (headVector == nullptr ||
-                    attributes == nullptr) {
-                    if (p_queryResults !=
-                        (COMMON::QueryResultSet<T>*)&p_query) {
-                        temporaryQueryResults.reset();
-                    }
-                    SPTAGLIB_LOG(
-                        Helper::LogLevel::LL_Error,
-                        "Hybrid route sample %d has no vector or attributes.\n",
-                        static_cast<int>(localHead));
-                    return ErrorCode::Fail;
-                }
-
-                const float vectorDistance =
-                    headIndex->ComputeDistance(
-                        p_queryResults
-                            ->GetQuantizedTarget(),
-                        headVector);
-                vectorComponents[sample] =
-                    m_hybridDistance.m_vectorWeight *
-                    vectorDistanceTransform.Apply(
-                        vectorDistance);
-                attributeDistances[sample] =
-                    m_hybridDistance
-                        .PredicateDistance(
-                            attributes,
-                            m_hybridHeadGraph
-                                .m_numTagColumns,
-                            queryDNF,
-                            flatCategoricalValues);
-            }
-            routeDeformation =
-                EstimateHybridRouteDeformation(
-                    vectorComponents.data(),
-                    attributeDistances.data(),
-                    sampleCount);
-        }
-
-        useHybridRoute = ShouldUseHybridRoute(
-            routeSelectivityValue,
-            routeDeformation,
-            m_options
-                .m_hybridRouteSelectivityThreshold,
-            m_options
-                .m_hybridRouteDeformationThreshold);
-        }
-
-        if (m_options.m_logHybridRoute) {
-            routeEstimateUS =
-                std::chrono::duration<double, std::micro>(
-                    std::chrono::high_resolution_clock::
-                        now() -
-                    routeStart)
-                    .count();
-            SPTAGLIB_LOG(
-                Helper::LogLevel::LL_Info,
-                "HybridRoute: sel=%.6g/%.6g samples=%zu "
-                "attrRMS=%.6g vectorSpan=%.6g "
-                "deformation=%.6g/%.6g route=%s "
-                "postingTarget=%d estimate=%.3fus\n",
-                routeSelectivityValue,
-                static_cast<double>(
-                    m_options
-                        .m_hybridRouteSelectivityThreshold),
-                routeDeformation.m_samples,
-                routeDeformation.m_attributeRMS,
-                routeDeformation.m_nearVectorSpan,
-                routeDeformation.m_deformation,
-                static_cast<double>(
-                    m_options
-                        .m_hybridRouteDeformationThreshold),
-                useHybridRoute ? "hybrid"
-                               : "original",
-                postingTarget,
-                routeEstimateUS);
-        }
-    }
-
     ErrorCode ret;
     bool usedHeadBundleSearch = false;
-    Cache::PostingBitmask hierarchyQuerySignature;
-    hierarchyQuerySignature.Clear();
-    if (useLimitedTagPure && useHierarchyNavigation)
-    {
-        if (m_secondLevelPostings.empty() ||
-            std::any_of(m_secondLevelPostings.begin(), m_secondLevelPostings.end(),
-                [](const SecondLevelHeadPostings& layer) { return !layer.Loaded(); }))
-        {
-            SPTAGLIB_LOG(
-                Helper::LogLevel::LL_Error,
-                "Hierarchy signatures requested before hierarchy postings are loaded.\n");
-            return ErrorCode::Fail;
-        }
-        hierarchyQuerySignature = BuildHierarchyQuerySignature(
-            limitedTagQueryValues, m_limitedTagSupport, m_secondLevelPostings);
-    }
     const std::function<bool(SizeType)>
         secondLevelHeadAdmission =
             limitedTagHeadAdmission
@@ -7038,15 +6009,6 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         SecondLevelSearchProfile();
     bool usedSecondLevelSearch = false;
     double secondLevelRouteMs = 0.0;
-    if (m_options.m_logAdaptiveNprobe &&
-        useLimitedTagPure)
-    {
-        SPTAGLIB_LOG(
-            Helper::LogLevel::LL_Info,
-            "LimitedRoute: route=%s signature_pruning=%d.\n",
-            useHierarchyNavigation ? "hierarchy" : "H1",
-            hierarchyQuerySignature.Popcount() > 0 ? 1 : 0);
-    }
     auto _phT0 = s_phaseTime ? std::chrono::high_resolution_clock::now()
                              : std::chrono::high_resolution_clock::time_point{};
 
@@ -7066,13 +6028,13 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         else m_extraSearcher->InitWorkSpace(hierarchyWorkspace.get(), true);
         hierarchyState = hierarchyWorkspace.get();
         hierarchyState->m_deduper.clear();
-        if (!primaryHeadBypassRequested &&
-            (!hasExactFilter || m_limitedTagSupport.AttributeCount() > 0))
+        if (!hasExactFilter || m_limitedTagSupport.AttributeCount() > 0)
         {
             headPointResults = &hierarchyState->m_hierarchy.m_headPointResults;
             headPointResults->assign(static_cast<size_t>(p_query.GetResultNum()), {MaxDist, -1});
             admitHeadPoint = [&](SizeType head, const float* knownDistance) {
-                if (head < 0 || head >= m_vectorTranslateMap.R())
+                if (knownDistance == nullptr ||
+                    head < 0 || head >= m_vectorTranslateMap.R())
                 {
                     invalidHeadPoint = true;
                     return false;
@@ -7080,7 +6042,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 const auto& worst = headPointResults->front();
                 // A head farther than k already accepted heads cannot enter the
                 // final top-k. Its posting routing remains independent.
-                if (knownDistance != nullptr && !(*knownDistance <= worst.first)) return false;
+                if (!(*knownDistance <= worst.first)) return false;
                 const std::uint64_t mapped = *m_vectorTranslateMap[head];
                 if (mapped >= static_cast<std::uint64_t>(MaxSize) ||
                     mapped >= static_cast<std::uint64_t>(m_versionMap.Count()))
@@ -7091,28 +6053,11 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 const SizeType vid = static_cast<SizeType>(mapped);
                 if (hierarchyState->m_deduper.CheckAndSet(vid) ||
                     m_versionMap.Deleted(vid)) return false;
-                if (knownDistance != nullptr &&
-                    *knownDistance == worst.first && vid >= worst.second) return false;
-                if (knownDistance == nullptr && useLimitedTagPure &&
-                    !limitedSupportMatchesPredicate(head)) return false;
+                if (*knownDistance == worst.first && vid >= worst.second) return false;
                 if (hasExactFilter && !limitedHeadMatchesExactPredicate(head)) return false;
-                float distance;
-                if (knownDistance != nullptr)
-                {
-                    distance = *knownDistance;
-                }
-                else
-                {
-                    const void* sample = m_index->GetSample(head);
-                    if (sample == nullptr)
-                    {
-                        invalidHeadPoint = true;
-                        return false;
-                    }
-                    distance = m_index->ComputeDistance(p_queryResults->GetQuantizedTarget(), sample);
-                }
-                SecondLevelHierarchyDetail::RetainNearest(*headPointResults, {distance, vid});
-                return knownDistance == nullptr;
+                SecondLevelHierarchyDetail::RetainNearest(
+                    *headPointResults, {*knownDistance, vid});
+                return false;
             };
         }
     }
@@ -7127,9 +6072,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         int scanned = 0;
         ret = SearchSecondLevelHeads(
             p_queryResults, graphResultNum,
-            hierarchyQuerySignature,
             secondLevelHeadAdmission,
-            useLimitedTagPure ? &m_limitedTagSupport : nullptr,
             scanned, hierarchyState, admitHeadPoint);
         if (invalidHeadPoint)
         {
@@ -7144,7 +6087,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 "Hierarchy head navigation failed.\n");
             return ret;
         }
-        if (m_options.m_logAdaptiveNprobe)
+        if (m_options.m_logPathStats)
         {
             int admitted = 0;
             for (; admitted < graphResultNum;
@@ -7178,12 +6121,12 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             p_queryResults->SetScanned(scanned);
             usedSecondLevelSearch = true;
             usedHeadBundleSearch = true;
-            if (m_options.m_logAdaptiveNprobe)
+            if (m_options.m_logPathStats)
             {
                 SPTAGLIB_LOG(
                     Helper::LogLevel::LL_Info,
                     "Using %d-level head hierarchy with %d top nodes and "
-                    "signature-admitted downward CSR expansion.\n",
+                    "fixed distance-only downward CSR expansion.\n",
                     static_cast<int>(
                         m_secondLevelPostings.size()),
                     static_cast<int>(
@@ -7232,59 +6175,31 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 }
             }
 
-            const bool unfiltered = !hasExactFilter;
-            const bool useCrossEdges = canUseHeadBundle && unfiltered &&
+            const bool useCrossEdges = canUseHeadBundle &&
                 candidateNodes.size() > 1 &&
                 !m_headCrossEdgesDirty.load(std::memory_order_acquire) &&
                 !m_options.m_disableCrossEdges &&
                 LoadHeadCrossEdges() == ErrorCode::Success &&
+                !m_headInlineEdgesHybrid &&
                 m_headInlineCrossEdgeSize > 0 &&
                 m_headInlineCrossEdgeTotal > 0;
 
             if (m_options.m_logPathStats) {
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
-                    "PathStats: nodes=%d cross=%d hybrid=%d\n",
+                    "PathStats: nodes=%d cross=%d\n",
                     static_cast<int>(candidateNodes.size()),
-                    useCrossEdges ? 1 : 0,
-                    useHybridRoute ? 1 : 0);
+                    useCrossEdges ? 1 : 0);
             }
 
             if (canUseHeadBundle)
             {
-                if (useHybridRoute)
-                {
-                    if (LoadHeadHybridGraph() !=
-                            ErrorCode::Success ||
-                        candidateNodes.size() != 1) {
-                        return ErrorCode::Fail;
-                    }
-                    ret = SearchHeadBundleCrossEdgesNative(
-                        p_queryResults,
-                        candidateNodes.front(),
-                        graphResultNum,
-                        scanned,
-                        true,
-                        queryTags,
-                        numQueryTags,
-                        queryDNF);
-                    if (ret != ErrorCode::Success) {
-                        SPTAGLIB_LOG(
-                            Helper::LogLevel::LL_Error,
-                            "Hybrid head traversal failed for enabled hybrid route.\n");
-                        return ret;
-                    }
-                }
-                else if (useCrossEdges)
+                if (useCrossEdges)
                 {
                     ret = SearchHeadBundleCrossEdgesNative(
                         p_queryResults,
                         candidateNodes.front(),
                         graphResultNum,
-                        scanned,
-                        false,
-                        nullptr,
-                        0,
-                        nullptr);
+                        scanned);
                     if (ret != ErrorCode::Success)
                     {
                         p_queryResults->Reset();
@@ -7292,9 +6207,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                             p_queryResults,
                             candidateNodes,
                             graphResultNum,
-                            scanned,
-                            nullptr,
-                            0);
+                            scanned);
                     }
                 }
                 else
@@ -7303,14 +6216,12 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                         p_queryResults,
                         candidateNodes,
                         graphResultNum,
-                        scanned,
-                        nullptr,
-                        0);
+                        scanned);
                 }
                 if (ret != ErrorCode::Success) {
                     canUseHeadBundle = false;
                     p_queryResults->Reset();
-                } else if (m_options.m_logAdaptiveNprobe) {
+                } else if (m_options.m_logPathStats) {
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
                                  "Using native head bundle search across %d nodes (cross=%d).\n",
                                  static_cast<int>(candidateNodes.size()),
@@ -7436,8 +6347,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             int maxPages = isStaticStorage
                 ? m_extraSearcher
                       ->GetPostingBufferBytes(
-                          useHybridRoute ||
-                          useLimitedTagPure)
+                          useLimitedTagMembership)
                 : ((std::max)(
                        m_options.m_postingPageLimit,
                        m_options.m_searchPostingPageLimit) +
@@ -7459,13 +6369,10 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         // H1 traversal remains distance-only, while result admission collects
         // supported heads until the posting target is filled before disk I/O.
         workSpace->m_useHybridPure =
-            useHybridRoute ||
-            useLimitedTagPure;
+            useLimitedTagMembership;
         const bool scanGlobalTailForFilter =
-            (m_options.m_enableHybridDistance &&
-             hasExactFilter && !useHybridRoute) ||
             (limitedTagRegionsReady &&
-             hasExactFilter && !useLimitedTagPure);
+             hasExactFilter && !useLimitedTagMembership);
         workSpace->m_scanFullPostingForFilter =
             scanGlobalTailForFilter;
         // Pure-prefix signatures are safe only for the column-aware DNF hybrid
@@ -7478,16 +6385,9 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                       m_options.m_storage !=
                           Storage::STATIC)
                 ? tailPostingFilter
-                : (useLimitedTagPure
+                : (useLimitedTagMembership
                        ? limitedTagHeadAdmission
-                       : (m_options
-                                      .m_enableHybridDistance &&
-                                  hasExactFilter &&
-                                  (!useHybridRoute ||
-                                   queryDNF == nullptr ||
-                                   queryDNF->Empty())
-                              ? nullptr
-                              : postingFilter));
+                       : postingFilter);
         // Propagate inline tag filter (for per-vector exact tag check in posting scan)
         workSpace->m_queryTags = queryTags;
         workSpace->m_numQueryTags = numQueryTags;
@@ -7521,41 +6421,6 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 return static_cast<SizeType>(*(m_vectorTranslateMap[localHid]));
             return MaxSize;
         };
-        auto pureHeadDistance =
-            [&](SizeType globalHid) -> float {
-                if (!useHybridRoute || globalHid < 0 ||
-                    static_cast<size_t>(globalHid) >=
-                        m_headBundleNodeByB.size() ||
-                    static_cast<size_t>(globalHid) >=
-                        m_headBundleLocalByB.size()) {
-                    return MaxDist;
-                }
-                const int node =
-                    m_headBundleNodeByB[
-                        static_cast<size_t>(globalHid)];
-                const SizeType local =
-                    m_headBundleLocalByB[
-                        static_cast<size_t>(globalHid)];
-                if (node < 0 ||
-                    node >= static_cast<int>(
-                        m_loadedHeadBundleIndexes.size()) ||
-                    m_loadedHeadBundleIndexes[
-                        static_cast<size_t>(node)] ==
-                        nullptr ||
-                    local < 0 ||
-                    local >=
-                        m_loadedHeadBundleIndexes[
-                            static_cast<size_t>(node)]
-                            ->GetNumSamples()) {
-                    return MaxDist;
-                }
-                const auto& nodeIndex =
-                    m_loadedHeadBundleIndexes[
-                        static_cast<size_t>(node)];
-                return nodeIndex->ComputeDistance(
-                    p_queryResults->GetQuantizedTarget(),
-                    nodeIndex->GetSample(local));
-            };
         auto shouldKeepHeadResult = [&](SizeType localHid) -> bool {
                 if (limitedTagRegionsReady &&
                     hasExactFilter) {
@@ -7568,7 +6433,6 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             // VID's own tag is NOT guaranteed to match the query even when its
             // posting members do; rejecting them here ensures top-K is sourced
             // only from posting scans (and the rare head-only ghost vectors).
-            static const std::vector<uint8_t> kNoRouteMask;
             if (queryDNF != nullptr && !queryDNF->Empty()) {
                 if (m_options.m_enableHybridDistance &&
                     localHid >= 0 &&
@@ -7675,32 +6539,25 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                    m_index->HasHeadNodeMeta() &&
                    m_index->HeadNodeMatchesQuery(
                        localHid, queryHierMask,
-                       kNoRouteMask,
                        headHierWidths);
         };
 
         float limitDist = p_queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio;
-        const bool usePrimaryHeadBypass = primaryHeadBypassRequested;
         int i = 0;
         for (; i < graphResultNum; ++i)
         {
             if ((int)workSpace->m_postingIDs.size() >= postingTarget) break;
             auto res = p_queryResults->GetResult(i);
             if (res->VID == -1 ||
-                (!useLimitedTagPure &&
-                 limitDist > 0.1 &&
+                (limitDist > 0.1 &&
                  res->Dist > limitDist))
                 break;
             SizeType localHid = res->VID;
-            if (usePrimaryHeadBypass ||
-                m_extraSearcher->CheckValidPosting(
+            if (m_extraSearcher->CheckValidPosting(
                     localHid, workSpace.get()))
             {
-                // The primary-owner sidecar is independent of the retained physical
-                // posting membership. It must receive every graph head, including
-                // heads whose current posting mask rejects this query.
-                if (usePrimaryHeadBypass ||
-                    !workSpace->m_postingFilter || workSpace->m_postingFilter(localHid)) {
+                if (!workSpace->m_postingFilter ||
+                    workSpace->m_postingFilter(localHid)) {
                     workSpace->m_postingIDs.emplace_back(localHid);
                 }
             }
@@ -7712,43 +6569,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 res->Dist = MaxDist;
             } else {
                 res->VID = globalVID;
-                if (useHybridRoute) {
-                    const float distance =
-                        pureHeadDistance(localHid);
-                    if (distance == MaxDist) {
-                        res->VID = -1;
-                    } else {
-                        res->Dist = distance;
-                    }
-                }
             }
-        }
-
-        if (usePrimaryHeadBypass) {
-            ret = m_extraSearcher->SearchPrimaryHeadCandidates(
-                workSpace.get(), *p_queryResults,
-                m_index);
-            if (ret != ErrorCode::Success) {
-                m_workSpaceFactory->ReturnWorkSpace(
-                    std::move(workSpace));
-                if (p_queryResults !=
-                    (COMMON::QueryResultSet<T>*)&p_query) {
-                    temporaryQueryResults.reset();
-                }
-                return ret;
-            }
-            SPTAG::VectorIndex::SetThreadLocalPostingScanStats(
-                0, 0, 0, 0, 0, workSpace->m_postingProbeStats.m_primaryHeadCandidates);
-            m_workSpaceFactory->ReturnWorkSpace(std::move(workSpace));
-            p_queryResults->SortResult();
-            if (p_queryResults != (COMMON::QueryResultSet<T> *)&p_query) {
-                std::copy(p_queryResults->GetResults(),
-                          p_queryResults->GetResults() + p_query.GetResultNum(),
-                          p_query.GetResults());
-                p_query.SetScanned(p_queryResults->GetScanned());
-                temporaryQueryResults.reset();
-            }
-            return ErrorCode::Success;
         }
 
         if (headPointResults == nullptr)
@@ -7767,15 +6588,6 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                     res->Dist = MaxDist;
                 } else {
                     res->VID = globalVID;
-                    if (useHybridRoute) {
-                        const float distance =
-                            pureHeadDistance(localHid);
-                        if (distance == MaxDist) {
-                            res->VID = -1;
-                        } else {
-                            res->Dist = distance;
-                        }
-                    }
                 }
             }
 
@@ -7834,7 +6646,6 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             workSpace->m_postingProbeStats.m_prePSPostings,
             workSpace->m_postingProbeStats.m_scannedVectors,
             workSpace->m_postingProbeStats.m_matchedVectors,
-            workSpace->m_postingProbeStats.m_primaryHeadCandidates,
             workSpace->m_postingProbeStats.m_postingPageReads,
             workSpace->m_postingProbeStats.m_postingLogicalBytes,
             workSpace->m_postingProbeStats.m_postingPhysicalBytes,
@@ -7858,14 +6669,13 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         double postMs  = std::chrono::duration<double, std::milli>(_phT2 - _phT1).count();
         uint32_t firstTag = (queryTags != nullptr && numQueryTags > 0) ? queryTags[0] : 0u;
         SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
-            "PhaseTime: tag=%u nprobe=%d routeSel=%.6f twoLayer=%d h2=%.3f "
+            "PhaseTime: tag=%u nprobe=%d twoLayer=%d h2=%.3f "
             "h2Graph=%.3f h2Merge=%.3f h2Tag=%.3f h2Vec=%.3f h2Sort=%.3f "
             "h2Upper=%llu h2Unique=%llu h2Assign=%llu h2Probe=%d h2MaxCheck=%d h2Iter=%d "
             "heads=%d headScanned=%d headMaxCheck=%d headR50=%.3f headR90=%.3f headRMax=%.3f "
             "headAt110=%d headAt125=%d headAt150=%d headAt200=%d headAt400=%d headAt800=%d "
             "postIO=%d postPages=%d bkt=%.3f pq=%.3f graphOther=%.3f post=%.3f io=%.3f scan=%.3f postOther=%.3f total=%.3f\n",
             firstTag, postingTarget,
-            static_cast<double>(routeSelectivity),
             usedSecondLevelSearch ? 1 : 0,
             secondLevelRouteMs,
             g_secondLevelProfile.m_graphMs,
@@ -8067,6 +6877,7 @@ ErrorCode Index<T>::SearchIndexWithFilter(QueryResult &p_query, std::function<bo
             !m_headCrossEdgesDirty.load(std::memory_order_acquire) &&
             candidateNodes.size() > 1 &&
             LoadHeadCrossEdges() == ErrorCode::Success &&
+            !m_headInlineEdgesHybrid &&
             m_headInlineCrossEdgeSize > 0 &&
             m_headInlineCrossEdgeTotal > 0 &&
             !m_options.m_disableCrossEdges;
@@ -8075,11 +6886,7 @@ ErrorCode Index<T>::SearchIndexWithFilter(QueryResult &p_query, std::function<bo
                 &headResults,
                 candidateNodes.front(),
                 headSearchNum,
-                scanned,
-                false,
-                nullptr,
-                0,
-                nullptr);
+                scanned);
             if (headSearchStatus != ErrorCode::Success) {
                 headResults.Reset();
                 headSearchStatus = SearchHeadBundlesNative(
@@ -9269,8 +8076,7 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
             "HierarchyInitialProbeRatio must be in (0,1], "
-            "HierarchyMaxCheck must be positive, and HeadNavigationMode "
-            "must be Auto, H1Only, or H2Only.\n");
+            "and HierarchyMaxCheck must be positive.\n");
         return ErrorCode::FailedParseValue;
     }
     if (!ValidSecondLevelArtifactLayout(
@@ -13646,7 +12452,6 @@ ErrorCode Index<T>::AddIndexWithTags(const void* p_data, SizeType p_vectorNum,
          m_options.m_tailReplicaCount != 0 ||
          m_options.m_enableWAL ||
          m_options.m_selectSecondLevel ||
-         m_options.m_enablePrimaryHeadBypass ||
          !m_extraSearcher
               ->SupportsLimitedTagUpdates() ||
          !m_extraSearcher

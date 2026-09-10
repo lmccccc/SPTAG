@@ -91,9 +91,7 @@ namespace SPTAG {
             std::string m_secondLevelGenerationFingerprint;
             double m_secondLevelInitialProbeRatio;
             int m_secondLevelMaxCheck;
-            bool m_secondLevelGraphSignaturePruning;
             std::string m_secondLevelPrefetchMode;
-            std::string m_headNavigationMode;
 
             // Section 3: for build head
             bool m_buildHead;
@@ -123,10 +121,6 @@ namespace SPTAG {
             std::string m_hybridNumericCols;
             std::string m_hybridNumericWeights;
             int m_hybridCandidateCount;
-            int m_hybridRouteSampleCount;
-            float m_hybridRouteSelectivityThreshold;
-            float m_hybridRouteDeformationThreshold;
-            bool m_logHybridRoute;
             bool m_enableDataCompression;
             bool m_enableDictTraining;
             int m_minDictTraingBufferSize;
@@ -228,25 +222,11 @@ namespace SPTAG {
             int m_searchPostingPageLimit;
             int m_searchInternalResultNum;
             bool m_collectPostingContributionStats;
-            bool m_forceDenseTagSearch;
-            int m_directSparseMaxPostings;
-            float m_filteredSearchNprobeSafety;
-            float m_filteredSearchTargetRecall;
-            float m_filteredSearchCoverageExponent;
-            bool m_enableAdaptiveFilteredNprobe;
-            bool m_logAdaptiveNprobe;
             bool m_logPhaseTime;
             bool m_disableCrossEdges;
             bool m_logCrossStats;
             bool m_logPathStats;
             int m_dumpHeads;
-            bool m_filterKeepUExtra;
-            bool m_enableUnfilterTail;
-            bool m_ablateUExtra;
-            bool m_ablateTail;
-            bool m_unfilterPurePages;
-            int m_unfilterExtraTailPages;
-            int m_unfilterPureDistanceScanPercent;
             int m_rerank;
             bool m_recall_analysis;
             int m_debugBuildInternalResultNum;
@@ -329,12 +309,6 @@ namespace SPTAG {
             bool m_shareDB;
             std::shared_ptr<Helper::KeyValueIO> m_externalDB;
 
-            // Primary-head CSR bypass for sparse categorical filters.
-            bool m_buildPrimaryHeadCSR;
-            std::string m_primaryHeadCSRFile;
-            bool m_enablePrimaryHeadBypass;
-            int m_primaryHeadBypassRerankL;
-
             // In-posting quantization (unified config interface). See ParameterDefinitionList.h.
             std::string m_postingQuantizer;   // None|RaBitQ|OPQ|PipePQ
             int m_postingQuantM;              // OPQ/PipePQ code bytes per vector
@@ -395,7 +369,6 @@ namespace SPTAG {
                     {"SecondLevelGenerationFingerprint", "HierarchyGenerationFingerprint", true},
                     {"SecondLevelInitialProbeRatio", "HierarchyInitialProbeRatio", false},
                     {"SecondLevelMaxCheck", "HierarchyMaxCheck", false},
-                    {"SecondLevelGraphSignaturePruning", "HierarchyGraphSignaturePruning", false},
                     {"SecondLevelPrefetchMode", "HierarchyPrefetchMode", false},
                 };
                 for (const auto& alias : aliases)
@@ -441,7 +414,18 @@ namespace SPTAG {
                                             "TagOffset", "BKTSeed", "TPTSeed",
                                             "SparseFallbackMaxHeads", "SparseFallbackMaxPostingPages",
                                             "HierarchySignatureMinSelectivity", "HierarchySignatureMaxSelectivity",
-                                            "SecondLevelSignatureMinSelectivity", "SecondLevelSignatureMaxSelectivity"}) {
+                                            "SecondLevelSignatureMinSelectivity", "SecondLevelSignatureMaxSelectivity",
+                                            "HierarchyGraphSignaturePruning", "SecondLevelGraphSignaturePruning",
+                                            "HeadNavigationMode", "ForceDenseTagSearch", "DirectSparseMaxPostings",
+                                            "FilteredSearchNprobeSafety", "FilteredSearchTargetRecall",
+                                            "FilteredSearchCoverageExponent", "EnableAdaptiveFilteredNprobe",
+                                            "LogAdaptiveNprobe", "FilterKeepUExtra",
+                                            "BuildPrimaryHeadCSR", "PrimaryHeadCSRFile",
+                                            "EnablePrimaryHeadBypass", "PrimaryHeadBypassRerankL",
+                                            "HybridRouteSampleCount", "HybridRouteSelectivityThreshold",
+                                            "HybridRouteDeformationThreshold", "LogHybridRoute",
+                                            "EnableUnfilterTail", "UnfilterPurePages", "UnfilterExtraTailPages",
+                                            "UnfilterPureDistanceScanPercent", "AblateUExtra", "AblateTail"}) {
                     if (Helper::StrUtils::StrEqualIgnoreCase(name, removed)) return true;
                 }
                 return false;
@@ -449,6 +433,9 @@ namespace SPTAG {
 
             static bool IsRemovedSectionAlias(const char* section, const char* name)
             {
+                if (Helper::StrUtils::StrEqualIgnoreCase(section, "SearchSSDIndex") &&
+                    (Helper::StrUtils::StrEqualIgnoreCase(name, "EnableOrderedPageStart") ||
+                     Helper::StrUtils::StrEqualIgnoreCase(name, "OrderedPageStartAttrs"))) return true;
                 if (!Helper::StrUtils::StrEqualIgnoreCase(section, "MultiTenant")) return false;
                 for (const char* native : {"CrossEdges", "CrossExtraEdges", "DualPoolAugment",
                                           "DualPoolExtraRatio", "UExtraIDFile"}) {
@@ -457,8 +444,27 @@ namespace SPTAG {
                 return false;
             }
 
+            static bool ValidatePostingRuntimeEnvironment()
+            {
+                for (const char* removed : {"SPTAG_OPQ_PREFILTER", "SPTAG_PAGE_SELECT", "SPTAG_PAGE_DIAG",
+                                            "SPTAG_DNF_NODROP",
+                                            "SPTAG_RBQ_EXHAUSTIVE", "SPTAG_UNFILTER_TAIL",
+                                            "SPTAG_UNFILTER_PURE_PAGES", "SPTAG_UNFILTER_EXTRA_TAIL_PAGES",
+                                            "SPTAG_UNFILTER_PURE_DISTANCE_SCAN_PERCENT",
+                                            "SPTAG_ABLATE_UEXTRA", "SPTAG_ABLATE_TAIL"}) {
+                    if (std::getenv(removed) != nullptr) {
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                            "%s was removed: posting reads use the native codec and shared SearchPostingPageLimit.\n",
+                            removed);
+                        return false;
+                    }
+                }
+                return true;
+            }
+
             static bool ValidateNativeEnvironment()
             {
+                if (!ValidatePostingRuntimeEnvironment()) return false;
                 for (const char* removed : {"SPTAG_ACL_COLS", "SPTAG_HIER_LEVEL_WIDTHS",
                                             "SPTAG_PIVOT_FORCE_NODE_COUNT", "SPTAG_DISABLE_PIVOT_ESTIMATOR",
                                             "SPTAG_ROUTING_COLS", "SPTAG_ROUTING_ONLY",

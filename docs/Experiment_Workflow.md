@@ -63,6 +63,13 @@ artifacts are byte-exact with the in-posting convention:
 | `opq_codes_m25.bin` `(N,25)` uint8 | `--gen-opq-codes` | raw OPQ codes (raw-widen, ADC=false, header-less) — **not** the normalizing `Release/quantizer` |
 | `opq_quantizer.bin` | copied | the OPQ codebook (search-time ADC) |
 
+Declare the five original columns in `[Tags]` as
+`ColumnTypes=categorical,categorical,categorical,categorical,numeric`.
+No attribute-partition grouping file is a build input. The tag file remains
+headerless row-major `uint32`, beginning at byte zero; vector input must use
+its genuine native container (`DEFAULT`, `TXT`, or `XVEC`), not a relabeled
+headerless `RAW` file. The raw OPQ codes above are a separate codec sidecar.
+
 ```bash
 Tools/benchmarks/prep_spacev1b_inputs.sh        # full 1B
 Tools/benchmarks/prep_spacev1b_inputs.sh 2000000  # smoke subset (first N vectors)
@@ -104,12 +111,12 @@ python3 Tools/benchmarks/generate_query_tenant_tag_groundtruth.py \
 
 ## (4) Build index  —  `run_spann_attr_build.sh`
 
-Thin launcher over the native `.ini`. It derives all paths FROM the `.ini` via
-`sed`, runs `spannbuilder -c <config>`, then reuses the cross-edge sidecar built
-before STATIC tail construction (or, for older builders, runs the fallback gated by
-`[BuildSSDIndex] CrossEdges`)
-runs the post-build `augmentheadgraph` cross-graph step and copies the OPQ
-codebook into `tenant_0/`.
+Thin launcher over the native `.ini`. It validates removed interfaces before
+building and derives paths from their native INI sections. It runs
+`spannbuilder -c <config>`, reuses any configured cross-edge sidecar built
+before STATIC tail construction (or runs the legacy `augmentheadgraph`
+fallback gated by `[BuildSSDIndex] CrossEdges`), and copies the OPQ codebook
+into `tenant_0/`.
 
 ```bash
 Tools/benchmarks/run_spann_attr_build.sh Tools/benchmarks/build_spann_attr_spacev1b_opq25.ini
@@ -117,12 +124,29 @@ Tools/benchmarks/run_spann_attr_build.sh Tools/benchmarks/build_spann_attr_space
 #             + Release/augmentheadgraph -d $IDX/tenant_0/HeadIndex -k 15 -m N -t T -w true
 ```
 
-Build phases in the log: global spatial `BKT` head selection → optional `DualPoolAugment` (U_extra)
-→ `Begin Build Head` (BKT + RNG graph over the heads) → `BuildSSDIndex` (slim
-in-posting postings) → in-place `SaveAll`. For the three **unfilter-enhancement
-layers** (cross-graph / U_extra / unfilter-tail), see **AGENTS.md → "Unfilter
-Enhancement Pipeline"**. They are not requirements of the current single global
-H/O hierarchy; attribute partitioning and its grouping files are removed.
+Fresh builds refuse an existing `IndexDirectory`, even an empty directory;
+they never wipe it. Select a new output path, or explicitly enable
+`[MultiTenant] ResumeBuild=true` only for a compatible SelectHead checkpoint.
+This does not provide arbitrary O/H-stage resume. Inherited resume/in-place
+environment flags cannot override the INI.
+
+When `[Build] BuildSignatures=true`, the launcher creates a unique primary-build
+INI that changes only this entry to `false`. It prints the exact path and retains
+the file on success or failure in the configured `TmpDir` (or the repository's
+`build/primary-build-configs` directory when `TmpDir` is absent). Signature
+construction then runs in a fresh process with the original INI. Keep both
+INIs with the run's logs, binaries and source hashes; no stage-preservation
+patch to a frozen launcher is needed.
+
+Build phases in the log: global spatial `BKT` head selection → optional
+`[SelectHead] DualPoolAugment` (U_extra) → `Begin Build Head` (BKT + RNG graph
+over the heads) → `BuildSSDIndex` (in-posting vectors/codes and attributes) →
+`SaveAll`, in place when configured. Cross edges, U_extra and legacy tail
+replicas are construction/layout choices, not an unfiltered-only query
+pipeline. Any retained cross-edge policy and spatial candidate/page budgets
+apply to every predicate. Attribute partitioning and its grouping files are
+removed; the current limited-tag hierarchy uses one spatial traversal with
+H/O posting membership.
 Billion-scale knobs (resume checkpoint, pinned BKT
 balance factor, in-place build, slim SSD block-pool sizing) are documented in
 **AGENTS.md → "Billion-scale build options"**.
@@ -134,9 +158,22 @@ The 3M-scale sibling config is `Script_AE/iniFile/build_spann_attr_spacev_opq25.
 ## (5) Query / benchmark  —  native persisted search config
 
 Build and search parameters are persisted in the same native `.ini`:
-`[SearchSSDIndex] InternalResultNum`, `MaxCheck`, and `EnableUnfilterTail`.
-Validated head/posting signatures are used automatically for filtering. Do **not** override build or search parameters
-through environment variables.
+`[SearchSSDIndex] InternalResultNum`, `MaxCheck`, and `SearchPostingPageLimit`.
+All predicates use the same spatial traversal and page budget; exact attributes
+only admit results and select H/O membership. Ordinary legacy tails remain in
+the common readable prefix. Signatures do not choose a navigation path, prune
+graph/posting candidates, or enlarge a query budget. BKT/KDT stopping uses an
+independent unfiltered distance heap and the same initial-pivot/neighbor caps,
+so an underfilled exact result set does not continue the tree frontier.
+Sparse or budget-limited queries may legitimately return fewer than top-k,
+including no results. Count these queries in recall; do not retry or complete
+them through a support-head scan.
+
+Unfiltered-only tail/page controls (including `EnableUnfilterTail`) and
+`SPTAG_OPQ_PREFILTER` are removed and rejected, including false/zero.
+`TailReplicaCount` and `UnfilterTailBufferLength` remain construction settings,
+not runtime exceptions. Do **not** override build or search parameters through
+environment variables.
 
 For the committed Float STM1 SIFT-1M fixture, build the native benchmark target
 and run it directly against `.npy` queries and local-ID groundtruth:
@@ -150,8 +187,8 @@ Tools/benchmarks/run_spann_attr_build.sh "$CFG"
 IDX=/datadisk/yfcc_fast/sptag_sift1m_tagged_vs_upstream/index_tagged_4node_static_fullfloat_tail_unbounded_prefilter
 QDIR=/home/v-mochengli/datasets/sift1m/multitenant/query
 
-# Exact project ACL check. nprobe and the STM1 posting-mask prefilter come from
-# the persisted [SearchSSDIndex] values in $IDX/tenant_0/indexloader.ini.
+# Exact project ACL admission. Spatial candidate/check and posting-page budgets
+# come from persisted [SearchSSDIndex] values in $IDX/tenant_0/indexloader.ini.
 Release/spannaclbench \
   --index "$IDX" \
   --queries "$QDIR/query_vectors.npy" \
@@ -174,7 +211,7 @@ as done by the benchmark artifacts under `Tools/benchmarks/`.
 | Stage | Script | Key output |
 | --- | --- | --- |
 | 1. attributes | `gen_spacev_attrs.py` | `tags.npy`, `num_attr.npy`, `query/` |
-| 2. builder inputs | `prep_spacev1b_inputs.sh` | `*_tags5.u32`, `*_group_tags.txt`, `opq_codes_m25.bin` |
+| 2. builder inputs | `prep_spacev1b_inputs.sh` | `*_tags5.u32`, `opq_codes_m25.bin`, `opq_quantizer.bin` |
 | 3. groundtruth | `generate_query_tenant_tag_groundtruth.py` | `groundtruth_{unfilter,org,dept,team,project}_local_ids.npy` |
 | 4. build | `run_spann_attr_build.sh <ini>` | `$IDX/tenant_0/` (HeadIndex + SSD postings + cross-edges) |
 | 5. query | `spannaclbench` | JSON `{recall, qps, latency, posting metrics}` |

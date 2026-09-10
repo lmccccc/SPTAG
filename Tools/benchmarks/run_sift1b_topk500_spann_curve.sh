@@ -63,14 +63,12 @@ make_overlay() {
     set_ini_value "$tenant/indexloader.ini" SearchInternalResultNum "$nprobe"
     set_ini_value "$tenant/indexloader.ini" FixedNprobe "$nprobe"
     set_ini_value "$tenant/indexloader.ini" LogPhaseTime false
-    set_ini_value "$tenant/indexloader.ini" ForceDenseTagSearch true
     for expected in \
         "IndexDirectory=${tenant}" \
         "ResultNum=${TOPK}" \
         "RerankL=${RERANK_L}" \
         "SearchInternalResultNum=${nprobe}" \
-        "FixedNprobe=${nprobe}" \
-        'ForceDenseTagSearch=true'; do
+        "FixedNprobe=${nprobe}"; do
         grep -qx "$expected" "$tenant/indexloader.ini"
     done
     printf '%s\n' "$overlay"

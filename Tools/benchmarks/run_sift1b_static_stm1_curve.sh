@@ -126,7 +126,6 @@ make_overlay() {
     set_ini_value "$tenant/indexloader.ini" SearchSSDIndex MaxDistRatio 8.0
     set_ini_value "$tenant/indexloader.ini" SearchSSDIndex PostingPageLimit 3
     set_ini_value "$tenant/indexloader.ini" SearchSSDIndex IOThreadsPerHandler 1
-    set_ini_value "$tenant/indexloader.ini" SearchSSDIndex ForceDenseTagSearch true
 
     grep -Fqx "IndexDirectory=$tenant" "$tenant/indexloader.ini"
     grep -Fqx 'NumberOfThreads=1' "$tenant/indexloader.ini"
@@ -134,7 +133,6 @@ make_overlay() {
     grep -Fqx "InternalResultNum=$nprobe" "$tenant/indexloader.ini"
     grep -Fqx "MaxCheck=$maxcheck" "$tenant/indexloader.ini"
     grep -Fqx 'IOThreadsPerHandler=1' "$tenant/indexloader.ini"
-    grep -Fqx 'ForceDenseTagSearch=true' "$tenant/indexloader.ini"
     [ -s "$tenant/HeadIndex/head_node_meta.bin" ]
     ! grep -Eiq '^[[:space:]]*(FixedNprobe|PinnedPostingTarget|TagAwareHeadExpansion)[[:space:]]*=' \
         "$tenant/indexloader.ini"
@@ -189,8 +187,6 @@ if any(row["nprobe"] != nprobe or row["configured_search_internal_result_num"] !
     raise RuntimeError(f"Native InternalResultNum was not applied: {rows}")
 if any(row["maxcheck"] != maxcheck for row in rows):
     raise RuntimeError(f"Native MaxCheck was not applied: {rows}")
-if any(not row["force_dense_tag_search"] for row in rows):
-    raise RuntimeError(f"ForceDenseTagSearch was not applied: {rows}")
 with curve_path.open("a", encoding="utf-8") as handle:
     for row in rows:
         row.update(

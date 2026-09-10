@@ -45,7 +45,7 @@
 
 %pythoncode %{
 def _tenant_get_tag_routing_stats(self, tenant_id):
-    """Return exact tag routing stats for one tenant as a sorted list of dicts."""
+    """Return exact tag/posting diagnostics for one tenant."""
     import struct as _struct
 
     payload = self.GetTagRoutingStatsBlob(int(tenant_id))
@@ -65,7 +65,7 @@ def _tenant_get_tag_routing_stats(self, tenant_id):
 
 
 def _tenant_get_column_aware_tag_routing_stats(self, tenant_id):
-    """Return exact column-aware tag routing stats for one tenant."""
+    """Return exact column-aware tag/posting diagnostics for one tenant."""
     import struct as _struct
 
     payload = self.GetColumnAwareTagRoutingStatsBlob(int(tenant_id))

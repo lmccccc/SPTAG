@@ -46,6 +46,40 @@
 
 using namespace SPTAG;
 
+namespace SPTAG
+{
+namespace SPANN
+{
+template <typename T>
+ErrorCode SearchSecondLevelHierarchy(
+    COMMON::QueryResultSet<T>& p_results,
+    int p_resultBudget,
+    int p_maxCheck,
+    double p_probeRatio,
+    const Cache::PostingBitmask&,
+    const std::function<bool(SizeType)>& p_headAdmission,
+    const std::shared_ptr<VectorIndex>& p_distanceIndex,
+    const std::vector<std::shared_ptr<VectorIndex>>& p_indexes,
+    const std::vector<std::shared_ptr<VectorSet>>& p_catalogs,
+    const std::vector<SecondLevelHeadPostings>& p_postings,
+    SecondLevelHierarchySearchStats& p_stats,
+    std::string* p_workLog = nullptr,
+    bool p_profile = false,
+    const LimitedTagSupport* = nullptr,
+    const std::function<bool(SizeType, const float*)>& p_headPointCandidate = nullptr,
+    SecondLevelHierarchyDetail::SearchWorkspace* p_workspace = nullptr,
+    bool p_batchVectorPrefetch = false,
+    bool = false)
+{
+    return SearchSecondLevelHierarchy(
+        p_results, p_resultBudget, p_maxCheck, p_probeRatio,
+        p_headAdmission, p_distanceIndex, p_indexes, p_catalogs,
+        p_postings, p_stats, p_workLog, p_profile,
+        p_headPointCandidate, p_workspace, p_batchVectorPrefetch);
+}
+}
+}
+
 namespace SPFreshTest
 {
 SizeType N = 10000;
@@ -1281,7 +1315,6 @@ BOOST_AUTO_TEST_CASE(StaticBundleMetadataRootBuildAndReload)
         set("BuildSSDIndex", "SSDIndexFileNum", "1");
         set("BuildSSDIndex", "ReplicaCount", "2");
         set("BuildSSDIndex", "TailReplicaCount", "1");
-        set("BuildSSDIndex", "EnableUnfilterTail", "true");
         set("BuildSSDIndex", "UnfilterTailBufferLength", "-1");
         set("BuildSSDIndex", "CrossEdges", "1");
         set("BuildSSDIndex", "CrossExtraEdges", "2");
@@ -1319,19 +1352,15 @@ BOOST_AUTO_TEST_CASE(StaticBundleMetadataRootBuildAndReload)
     BOOST_CHECK_GE(query.GetResult(0)->VID, 0);
     const SizeType fullPostingScans = query.GetScanned();
 
-    typedSpann->GetOptions()->m_unfilterPureDistanceScanPercent = 50;
-    COMMON::QueryResultSet<float> distancePrefixQuery(data, 10);
-    BOOST_REQUIRE(index->SearchIndex(distancePrefixQuery) == ErrorCode::Success);
-    BOOST_CHECK_GE(distancePrefixQuery.GetResult(0)->VID, 0);
-    BOOST_CHECK_LE(distancePrefixQuery.GetScanned(), fullPostingScans);
-    typedSpann->GetOptions()->m_unfilterPureDistanceScanPercent = 100;
+    COMMON::QueryResultSet<float> repeatedQuery(data, 10);
+    BOOST_REQUIRE(index->SearchIndex(repeatedQuery) == ErrorCode::Success);
+    BOOST_CHECK_GE(repeatedQuery.GetResult(0)->VID, 0);
+    BOOST_CHECK_EQUAL(repeatedQuery.GetScanned(), fullPostingScans);
 
     {
         VectorIndex::ThreadLocalSearchContext filterContext;
         filterContext.m_active = true;
         filterContext.m_queryTags.assign(tags.begin(), tags.begin() + tagCount);
-        filterContext.m_filterSelectivity = 0.5f;
-        filterContext.m_searchHeadBundleNodes = {0};
         VectorIndex::ThreadLocalSearchContextGuard filterGuard(
             std::move(filterContext));
         COMMON::QueryResultSet<float> filteredQuery(data, 10);
@@ -1481,14 +1510,12 @@ BOOST_AUTO_TEST_CASE(StaticBundleMetadataRootBuildAndReload)
     COMMON::QueryResultSet<float> reloadedQuery(data, 10);
     BOOST_REQUIRE(reloaded->SearchIndex(reloadedQuery) == ErrorCode::Success);
     BOOST_CHECK_GE(reloadedQuery.GetResult(0)->VID, 0);
-    reloadedTyped->GetOptions()->m_unfilterPureDistanceScanPercent = 50;
-    COMMON::QueryResultSet<float> rejectedAttributePrefixQuery(data, 10);
-    BOOST_CHECK(
-        reloaded->SearchIndex(rejectedAttributePrefixQuery) == ErrorCode::Fail);
+    BOOST_CHECK(reloaded->SetParameter("UnfilterPureDistanceScanPercent", "50",
+        "SearchSSDIndex") == ErrorCode::FailedParseValue);
     std::filesystem::remove_all(indexDirectory);
 }
 
-BOOST_AUTO_TEST_CASE(StaticHybridBuildRouteAndReload)
+BOOST_AUTO_TEST_CASE(StaticHybridBuildMembershipAndReload)
 {
     constexpr SizeType baseCount = 256;
     constexpr DimensionType dimension = 8;
@@ -1612,8 +1639,6 @@ BOOST_AUTO_TEST_CASE(StaticHybridBuildRouteAndReload)
             set("BuildSSDIndex",
                 "TailReplicaCount", "2");
             set("BuildSSDIndex",
-                "EnableUnfilterTail", "true");
-            set("BuildSSDIndex",
                 "UnfilterTailBufferLength",
                 "-1");
             set("BuildSSDIndex", "CrossEdges",
@@ -1644,14 +1669,6 @@ BOOST_AUTO_TEST_CASE(StaticHybridBuildRouteAndReload)
                 "0.01");
             set("BuildSSDIndex",
                 "HybridCandidateCount", "32");
-            set("BuildSSDIndex",
-                "HybridRouteSampleCount", "16");
-            set("BuildSSDIndex",
-                "HybridRouteSelectivityThreshold",
-                "1");
-            set("BuildSSDIndex",
-                "HybridRouteDeformationThreshold",
-                "0");
         };
 
     auto index = VectorIndex::CreateInstance(
@@ -1949,12 +1966,6 @@ BOOST_AUTO_TEST_CASE(StaticHybridBuildRouteAndReload)
         VectorIndex::ThreadLocalSearchContext
             context;
         context.m_active = true;
-        context.m_routeSelectivity =
-            1.0f /
-            static_cast<float>(baseCount);
-        context.m_filterSelectivity =
-            context.m_routeSelectivity;
-        context.m_searchHeadBundleNodes = {0};
         Cache::DNFClause clause;
         clause.lits.push_back(
             {0,
@@ -2002,10 +2013,6 @@ BOOST_AUTO_TEST_CASE(StaticHybridBuildRouteAndReload)
         index->SearchIndex(
             unfilteredHybridCosts) ==
         ErrorCode::Success);
-    typed->GetOptions()
-        ->m_hybridRouteSelectivityThreshold = 1;
-    typed->GetOptions()
-        ->m_hybridRouteDeformationThreshold = 0;
     COMMON::QueryResultSet<float>
         unfilteredOriginalCosts(data, 10);
     BOOST_REQUIRE(
@@ -2031,21 +2038,10 @@ BOOST_AUTO_TEST_CASE(StaticHybridBuildRouteAndReload)
     }
 
     const auto runFiltered =
-        [&](bool useHybrid) {
-            typed->GetOptions()
-                ->m_hybridRouteSelectivityThreshold =
-                useHybrid ? 1.0f : 0.0f;
-            typed->GetOptions()
-                ->m_hybridRouteDeformationThreshold =
-                0.0f;
+        [&]() {
             VectorIndex::ThreadLocalSearchContext
                 context;
             context.m_active = true;
-            context.m_routeSelectivity =
-                1.0f / 32.0f;
-            context.m_filterSelectivity =
-                context.m_routeSelectivity;
-            context.m_searchHeadBundleNodes = {0};
             Cache::DNFClause clause;
             clause.lits.push_back(
                 {0, 0, Cache::DNF_EQ, 0});
@@ -2091,20 +2087,10 @@ BOOST_AUTO_TEST_CASE(StaticHybridBuildRouteAndReload)
                     64);
             }
         };
-    runFiltered(true);
-    runFiltered(false);
-
-    typed->GetOptions()
-        ->m_hybridRouteSelectivityThreshold = 1;
-    typed->GetOptions()
-        ->m_hybridRouteDeformationThreshold = 0;
+    runFiltered();
     {
         VectorIndex::ThreadLocalSearchContext context;
         context.m_active = true;
-        context.m_routeSelectivity = 1.0f / 32.0f;
-        context.m_filterSelectivity =
-            context.m_routeSelectivity;
-        context.m_searchHeadBundleNodes = {0};
         Cache::DNFClause clause;
         clause.lits.push_back(
             {0, 1, Cache::DNF_EQ, 0});
@@ -2166,17 +2152,9 @@ BOOST_AUTO_TEST_CASE(StaticHybridBuildRouteAndReload)
                 .GetResult(rank)
                 ->VID);
     }
-    reloadedTyped->GetOptions()
-        ->m_hybridRouteSelectivityThreshold = 1;
-    reloadedTyped->GetOptions()
-        ->m_hybridRouteDeformationThreshold = 0;
     {
         VectorIndex::ThreadLocalSearchContext context;
         context.m_active = true;
-        context.m_routeSelectivity = 1.0f / 32.0f;
-        context.m_filterSelectivity =
-            context.m_routeSelectivity;
-        context.m_searchHeadBundleNodes = {0};
         Cache::DNFClause clause;
         clause.lits.push_back(
             {0, 1, Cache::DNF_EQ, 0});
@@ -2615,15 +2593,15 @@ BOOST_AUTO_TEST_CASE(StaticDistanceOrderSerialization)
     }
 
     SPANN::ExtraWorkSpace::PostingReadRange range;
-    range.SetPureDistancePrefix(5, 9, 50);
+    range.SetContiguousRecordRange(0, 0, 9, static_cast<int>(stride));
     BOOST_CHECK_EQUAL(range.m_scanBegin, 0);
-    BOOST_CHECK_EQUAL(range.m_scanEnd, 3);
-    BOOST_CHECK_EQUAL(range.m_secondScanBegin, 5);
-    BOOST_CHECK_EQUAL(range.m_secondScanEnd, 9);
-    BOOST_CHECK_EQUAL(range.ScanCount(), 7);
+    BOOST_CHECK_EQUAL(range.m_scanEnd, 9);
+    BOOST_CHECK_EQUAL(range.m_secondScanBegin, -1);
+    BOOST_CHECK_EQUAL(range.m_secondScanEnd, -1);
+    BOOST_CHECK_EQUAL(range.ScanCount(), 9);
     int offset = 3;
     BOOST_CHECK(range.NormalizeScanOffset(offset));
-    BOOST_CHECK_EQUAL(offset, 5);
+    BOOST_CHECK_EQUAL(offset, 3);
 }
 
 BOOST_AUTO_TEST_CASE(LimitedTagSupportPersistenceValidation)
@@ -2998,22 +2976,16 @@ public:
     {
         return SearchTestPoints(p_results, p_maxCheck, nullptr);
     }
-    ErrorCode SearchIndexWithTraversalFilter(
-        QueryResult& p_results, const std::function<bool(SizeType)>& p_filter,
-        int p_maxCheck, bool = false) const override
-    {
-        ++m_traversalCalls;
-        return SearchTestPoints(p_results, p_maxCheck, p_filter);
-    }
     ErrorCode SearchIndexWithResultFilter(
         QueryResult& p_results, std::function<bool(SizeType)> p_filter,
         int p_maxCheck, bool = false) const override
     {
+        ++m_resultFilterCalls;
         return SearchTestPoints(p_results, p_maxCheck, p_filter);
     }
     mutable std::vector<int> m_probes;
     mutable size_t m_distanceCalls = 0;
-    mutable size_t m_traversalCalls = 0;
+    mutable size_t m_resultFilterCalls = 0;
 
 private:
     ErrorCode SearchTestPoints(
@@ -3170,7 +3142,7 @@ BOOST_AUTO_TEST_CASE(HierarchyPlacementRanksAllChildrenBeforeBeamSelection)
     BOOST_CHECK_EQUAL(replay.GetResult(1)->VID, count - 2);
 }
 
-BOOST_AUTO_TEST_CASE(HierarchyFiltersSignaturesBeforeBeamSelection)
+BOOST_AUTO_TEST_CASE(HierarchyMembershipAppliesAfterDistanceScoring)
 {
     using Signature = SPANN::SecondLevelHeadPostings::Signature;
     Signature query, other, both;
@@ -3194,11 +3166,15 @@ BOOST_AUTO_TEST_CASE(HierarchyFiltersSignaturesBeforeBeamSelection)
     BOOST_REQUIRE(SPANN::SearchSecondLevelHierarchy(
         results, 2, 64, 1.0, query, [](SizeType p_id) { return p_id >= 2; },
         heads, indexes, catalogs, postings, stats) == ErrorCode::Success);
-    BOOST_CHECK_EQUAL(results.GetResult(0)->VID, 2);
-    BOOST_CHECK_EQUAL(results.GetResult(1)->VID, 3);
+    BOOST_CHECK_EQUAL(heads->m_distanceCalls, 6U);
+    BOOST_CHECK_EQUAL(stats.m_layerCandidates[1], 4U);
+    BOOST_CHECK_EQUAL(stats.m_layerEligible[1], 4U);
+    BOOST_CHECK_EQUAL(stats.m_layerDistances[0], 2U);
+    BOOST_CHECK_EQUAL(results.GetResult(0)->VID, -1);
+    BOOST_CHECK_EQUAL(results.GetResult(1)->VID, -1);
 }
 
-BOOST_AUTO_TEST_CASE(HierarchyHeadSignaturesApplyInBothGraphModes)
+BOOST_AUTO_TEST_CASE(HierarchySignaturesNeverAffectTraversal)
 {
     using Signature = SPANN::SecondLevelHeadPostings::Signature;
     Signature query, other, both;
@@ -3226,23 +3202,20 @@ BOOST_AUTO_TEST_CASE(HierarchyHeadSignaturesApplyInBothGraphModes)
             results, 3, 64, 1.0, query, [](SizeType) { return true; },
             heads, indexes, catalogs, postings, stats, nullptr, false, nullptr,
             nullptr, &workspace, false, graphPruning) == ErrorCode::Success);
-        BOOST_CHECK_EQUAL(stats.m_layerEligible[2], 2U);
+        BOOST_CHECK_EQUAL(stats.m_layerEligible[2], 3U);
         BOOST_CHECK_EQUAL(stats.m_layerCandidates[1], 3U);
-        BOOST_CHECK_EQUAL(stats.m_layerEligible[1], 2U);
+        BOOST_CHECK_EQUAL(stats.m_layerEligible[1], 3U);
         for (int rank = 0; rank < 3; ++rank)
-            BOOST_CHECK_EQUAL(results.GetResult(rank)->VID, rank + 2);
-        BOOST_CHECK_EQUAL(stats.m_graphSignatureChecks, 3U);
-        BOOST_CHECK_EQUAL(stats.m_graphSignatureRejects, 1U);
+            BOOST_CHECK_EQUAL(results.GetResult(rank)->VID, rank);
     }
-    BOOST_CHECK_EQUAL(top->m_traversalCalls, 1U);
+    BOOST_CHECK_EQUAL(top->m_resultFilterCalls, 0U);
     COMMON::QueryResultSet<float> unfiltered(&target, 3);
     SPANN::SecondLevelHierarchySearchStats stats;
     BOOST_REQUIRE(SPANN::SearchSecondLevelHierarchy(
         unfiltered, 3, 64, 1.0, Signature(), [](SizeType) { return true; },
         heads, indexes, catalogs, postings, stats, nullptr, false, nullptr,
         nullptr, &workspace, false, true) == ErrorCode::Success);
-    BOOST_CHECK_EQUAL(top->m_traversalCalls, 1U);
-    BOOST_CHECK_EQUAL(stats.m_graphSignatureChecks, 0U);
+    BOOST_CHECK_EQUAL(top->m_resultFilterCalls, 0U);
     BOOST_CHECK_EQUAL(stats.m_layerEligible[2], 3U);
     BOOST_CHECK_EQUAL(stats.m_layerEligible[1], 3U);
 }
@@ -3270,7 +3243,7 @@ BOOST_AUTO_TEST_CASE(HierarchyTopProbeNeverExceedsLayerBudget)
     BOOST_CHECK(stats.m_layerTimes.empty());
 }
 
-BOOST_AUTO_TEST_CASE(HierarchyHighestLayerCompletesMatchingResultsWithinOneNativeBudget)
+BOOST_AUTO_TEST_CASE(HierarchyHighestLayerUsesUnfilteredNativeBudget)
 {
     class BoundedTop : public HierarchyTestIndex
     {
@@ -3332,33 +3305,31 @@ BOOST_AUTO_TEST_CASE(HierarchyHighestLayerCompletesMatchingResultsWithinOneNativ
                 results, 2, maxCheck, 0.5, query, [](SizeType) { return true; },
                 heads, indexes, catalogs, postings, stats, &workLog, false, nullptr,
                 [&](SizeType head, const float* distance) {
-                    BOOST_CHECK(top->finished);
                     BOOST_REQUIRE(distance != nullptr);
                     ++pointVisits[static_cast<size_t>(head)];
-                    BOOST_CHECK_EQUAL(*distance, head == 2 ? 16.0f : 9.0f);
+                    BOOST_CHECK_EQUAL(*distance, 10000.0f);
                     return false;
                 }) == ErrorCode::Success);
-            BOOST_CHECK_EQUAL(top->calls, 1);
+            BOOST_CHECK_EQUAL(top->calls, 0);
+            BOOST_CHECK(!top->finished);
             BOOST_REQUIRE_EQUAL(top->m_probes.size(), 1U);
             BOOST_CHECK_EQUAL(top->m_probes.front(), 2);
-            BOOST_CHECK_EQUAL(top->m_distanceCalls, static_cast<size_t>(maxCheck));
-            BOOST_CHECK_EQUAL(stats.m_graphScanned, static_cast<std::uint64_t>(maxCheck));
-            BOOST_CHECK_EQUAL(stats.m_graphSignatureChecks, static_cast<std::uint64_t>(maxCheck));
-            BOOST_CHECK_EQUAL(stats.m_graphSignatureRejects, 2U);
+            BOOST_CHECK_EQUAL(top->m_distanceCalls, 4U);
+            BOOST_CHECK_EQUAL(stats.m_graphScanned, 1U);
             BOOST_CHECK_LE(stats.m_layerCandidates.back(), 2U);
-            BOOST_CHECK_EQUAL(pointVisits[0], 0);
+            BOOST_CHECK_EQUAL(pointVisits[0], 1);
             BOOST_CHECK_EQUAL(pointVisits[1], 0);
-            BOOST_CHECK_EQUAL(pointVisits[2], maxCheck >= 3 ? 1 : 0);
-            BOOST_CHECK_EQUAL(pointVisits[3], maxCheck >= 4 ? 1 : 0);
-            BOOST_CHECK_EQUAL(results.GetResult(0)->VID, maxCheck == 2 ? -1 : maxCheck == 3 ? 2 : 3);
-            BOOST_CHECK_EQUAL(results.GetResult(1)->VID, maxCheck == 4 ? 2 : -1);
+            BOOST_CHECK_EQUAL(pointVisits[2], 0);
+            BOOST_CHECK_EQUAL(pointVisits[3], 0);
+            BOOST_CHECK_EQUAL(results.GetResult(0)->VID, 0);
+            BOOST_CHECK_EQUAL(results.GetResult(1)->VID, -1);
             BOOST_CHECK_NE(workLog.find("level=H" + std::to_string(levels + 1)), std::string::npos);
-            BOOST_CHECK_NE(workLog.find("graph_result_filter=1,graph_traversal_filter=0"), std::string::npos);
+            BOOST_CHECK_EQUAL(workLog.find("graph_result_filter"), std::string::npos);
         }
     }
 }
 
-BOOST_AUTO_TEST_CASE(HierarchyRejectsEmptySignaturesOnlyForRepresentedAnchors)
+BOOST_AUTO_TEST_CASE(HierarchyStoredSignaturesDoNotSkipDistances)
 {
     using Signature = SPANN::SecondLevelHeadPostings::Signature;
     Signature query;
@@ -3375,7 +3346,7 @@ BOOST_AUTO_TEST_CASE(HierarchyRejectsEmptySignaturesOnlyForRepresentedAnchors)
     BOOST_REQUIRE(SPANN::SearchSecondLevelHierarchy(
         results, 2, 64, 1.0, query, [](SizeType p_id) { return p_id == 1; },
         heads, indexes, catalogs, postings, stats) == ErrorCode::Success);
-    BOOST_CHECK_EQUAL(stats.m_uniqueScanned, 1U);
+    BOOST_CHECK_EQUAL(stats.m_uniqueScanned, 2U);
     BOOST_CHECK_EQUAL(results.GetResult(0)->VID, 1);
     BOOST_CHECK_EQUAL(results.GetResult(1)->VID, -1);
     BOOST_REQUIRE(SPANN::SearchSecondLevelHierarchy(
@@ -3386,91 +3357,39 @@ BOOST_AUTO_TEST_CASE(HierarchyRejectsEmptySignaturesOnlyForRepresentedAnchors)
     BOOST_CHECK_EQUAL(results.GetResult(1)->VID, 1);
 }
 
-BOOST_AUTO_TEST_CASE(HierarchyLegacyPartialSignatureDomainKeepsNavigation)
+BOOST_AUTO_TEST_CASE(HierarchyStoredSignaturesDoNotAffectTraversal)
 {
-    using Postings = SPANN::SecondLevelHeadPostings;
-    using Signature = Postings::Signature;
-    const std::string path = "hierarchy_legacy_partial_domain.bin";
-    struct Cleanup {
-        std::string path;
-        ~Cleanup() { std::error_code error; std::filesystem::remove(path, error); }
-    } cleanup{path};
-    SPANN::LimitedTagSupport support;
-    BOOST_REQUIRE(support.Initialize(3, 1, 1, 1, 2, 1));
-    BOOST_REQUIRE(support.SetTagVectorCounts(100, {{7, 1}, {9, 20}, {11, 79}}));
-    for (SizeType head = 0; head < 3; ++head)
+    using Signature = SPANN::SecondLevelHeadPostings::Signature;
+    Signature query, other;
+    query.Insert(7);
+    other.Insert(9);
+    auto heads = std::make_shared<HierarchyTestIndex>(std::vector<float>{0, 1, 2});
+    auto top = std::make_shared<HierarchyTestIndex>(std::vector<float>{0, 1, 2});
+    const std::vector<std::shared_ptr<VectorIndex>> indexes = {top};
+    const std::vector<std::shared_ptr<VectorSet>> catalogs = {
+        HierarchyTestCatalog({0, 1, 2})};
+    const std::vector<SPANN::SecondLevelHeadPostings> postings = {
+        HierarchyTestPostings(
+            3, 1, {0, 1, 2}, {0, 1, 2, 3}, {0, 1, 2},
+            {Signature(), query, other})};
+    const float target = 0;
+    for (const Signature& ignoredSignature : {Signature(), query, other})
     {
-        const std::uint32_t tag = 7 + 2 * head;
-        const std::uint32_t attributes[] = {100, tag};
-        BOOST_REQUIRE(support.SetHeadTags(head, {tag}));
-        BOOST_REQUIRE(support.SetHeadAttributes(head, attributes, 2));
-    }
-    BOOST_REQUIRE(support.Finalize());
-    std::vector<Signature> signatures(3);
-    signatures[1].Insert(9);
-    Postings legacy;
-    std::string error;
-    BOOST_REQUIRE(legacy.Initialize(
-        3, 3, 1, 1, 1, 0.01, 0.2, {0, 1, 2},
-        {0, 1, 2, 3}, {0, 1, 2}, signatures, &error));
-    BOOST_REQUIRE(legacy.Save(path, &error));
-    Postings loaded;
-    BOOST_REQUIRE(loaded.LoadPersisted(path, 3, 3, 1, 1, 1,
-        legacy.GenerationFingerprint(), {0, 1, 2}, &error));
-    BOOST_CHECK_EQUAL(loaded.SignatureMinSelectivity(), 0.01);
-    BOOST_CHECK_EQUAL(loaded.SignatureMaxSelectivity(), 0.2);
-    for (SizeType head = 0; head < 3; ++head)
-        signatures[head].Insert(7 + 2 * head);
-    const auto full = HierarchyTestPostings(
-        3, 1, {0, 1, 2}, {0, 1, 2, 3}, {0, 1, 2}, signatures);
-    for (int depth : {1, 4})
-    {
-        auto heads = std::make_shared<HierarchyTestIndex>(std::vector<float>{0, 1, 2});
-        auto top = std::make_shared<HierarchyTestIndex>(std::vector<float>{0, 1, 2});
-        std::vector<std::shared_ptr<VectorIndex>> indexes(depth);
-        indexes.back() = top;
-        const std::vector<std::shared_ptr<VectorSet>> catalogs(depth, HierarchyTestCatalog({0, 1, 2}));
-        for (int partialLayer = 0; partialLayer < depth; ++partialLayer)
-        {
-            std::vector<Postings> postings(depth, full);
-            postings[partialLayer] = loaded;
-            for (const std::vector<std::uint32_t>& anchors :
-                 {std::vector<std::uint32_t>{7}, {9}, {11}, {9, 7}, {9, 11}})
-            {
-                const auto signature = SPANN::BuildHierarchyQuerySignature(anchors, support, postings);
-                const bool represented = anchors == std::vector<std::uint32_t>{9};
-                BOOST_CHECK_EQUAL(signature.Popcount() > 0, represented);
-                BOOST_CHECK_GT(SPANN::BuildHierarchyQuerySignature(
-                    anchors, support, std::vector<Postings>(depth, full)).Popcount(), 0);
-                const auto admits = [&](SizeType head) {
-                    return std::any_of(anchors.begin(), anchors.end(),
-                        [&](std::uint32_t tag) { return support.Supports(head, tag); });
-                };
-                const float target = 0;
-                COMMON::QueryResultSet<float> results(&target, 3);
-                SPANN::SecondLevelHierarchySearchStats stats;
-                std::array<bool, 3> points{};
-                top->m_probes.clear();
-                BOOST_REQUIRE(SPANN::SearchSecondLevelHierarchy(
-                    results, 3, 64, 1.0, signature, admits, heads, indexes,
-                    catalogs, postings, stats, nullptr, false, &support,
-                    [&](SizeType head, const float*) {
-                        if (admits(head)) points[head] = true;
-                        return false;
-                    }) == ErrorCode::Success);
-                BOOST_REQUIRE_EQUAL(top->m_probes.size(), 1U);
-                BOOST_CHECK_EQUAL(stats.m_graphSignatureChecks > 0, represented);
-                std::vector<SizeType> actual;
-                for (int rank = 0; rank < 3; ++rank)
-                    if (results.GetResult(rank)->VID >= 0) actual.push_back(results.GetResult(rank)->VID);
-                BOOST_CHECK_EQUAL(actual.size(), anchors.size());
-                for (SizeType head = 0; head < 3; ++head)
-                {
-                    BOOST_CHECK_EQUAL(std::find(actual.begin(), actual.end(), head) != actual.end(), admits(head));
-                    BOOST_CHECK_EQUAL(points[head], admits(head));
-                }
-            }
-        }
+        COMMON::QueryResultSet<float> results(&target, 3);
+        SPANN::SecondLevelHierarchySearchStats stats;
+        top->m_probes.clear();
+        heads->m_distanceCalls = 0;
+        BOOST_REQUIRE(SPANN::SearchSecondLevelHierarchy(
+            results, 3, 64, 1.0, ignoredSignature,
+            [](SizeType head) { return head == 2; },
+            heads, indexes, catalogs, postings, stats) == ErrorCode::Success);
+        BOOST_REQUIRE_EQUAL(top->m_probes.size(), 1U);
+        BOOST_CHECK_EQUAL(top->m_resultFilterCalls, 0U);
+        BOOST_CHECK_EQUAL(stats.m_layerCandidates.back(), 3U);
+        BOOST_CHECK_EQUAL(stats.m_layerDistances.front(), 3U);
+        BOOST_CHECK_EQUAL(heads->m_distanceCalls, 3U);
+        BOOST_CHECK_EQUAL(results.GetResult(0)->VID, 2);
+        BOOST_CHECK_EQUAL(results.GetResult(1)->VID, -1);
     }
 }
 
@@ -3707,7 +3626,7 @@ BOOST_AUTO_TEST_CASE(HierarchyScoresLayersIndependentlyAndOnlyAdmitsH1Points)
     }
 }
 
-BOOST_AUTO_TEST_CASE(HierarchyWidensSavedFrontierAfterGraphBudgetIsSpent)
+BOOST_AUTO_TEST_CASE(HierarchyFixedBudgetDoesNotWidenSavedFrontier)
 {
     using Signature = SPANN::SecondLevelHeadPostings::Signature;
     auto heads = std::make_shared<HierarchyTestIndex>(
@@ -3731,13 +3650,16 @@ BOOST_AUTO_TEST_CASE(HierarchyWidensSavedFrontierAfterGraphBudgetIsSpent)
         heads, indexes, catalogs, postings, stats) == ErrorCode::Success);
     BOOST_REQUIRE_EQUAL(top->m_probes.size(), 1U);
     BOOST_CHECK_EQUAL(stats.m_graphScanned, 1U);
-    BOOST_CHECK_EQUAL(stats.m_iterations, 2);
-    BOOST_CHECK_EQUAL(stats.m_layerAssignments[0], 4U);
-    BOOST_CHECK_EQUAL(stats.m_layerAssignments[1], 2U);
-    for (int count : admissionCalls) BOOST_CHECK_EQUAL(count, 1);
+    BOOST_CHECK_EQUAL(stats.m_iterations, 1);
+    BOOST_CHECK_EQUAL(stats.m_layerAssignments[0], 2U);
+    BOOST_CHECK_EQUAL(stats.m_layerAssignments[1], 1U);
+    BOOST_CHECK_EQUAL(admissionCalls[0], 1);
+    BOOST_CHECK_EQUAL(admissionCalls[1], 1);
+    BOOST_CHECK_EQUAL(admissionCalls[2], 0);
+    BOOST_CHECK_EQUAL(admissionCalls[3], 0);
     for (auto retained : stats.m_layerRetained) BOOST_CHECK_LE(retained, 2U);
     BOOST_CHECK_EQUAL(results.GetResult(0)->VID, 0);
-    BOOST_CHECK_EQUAL(results.GetResult(1)->VID, 2);
+    BOOST_CHECK_EQUAL(results.GetResult(1)->VID, -1);
 }
 
 BOOST_AUTO_TEST_CASE(HierarchyUpperPointsNeverEnterFinalCandidates)
@@ -3806,12 +3728,10 @@ BOOST_AUTO_TEST_CASE(HierarchyH1PointAndPostingAdmissionStayIndependent)
     std::array<int, 4> pointVisits{};
     const auto admit = [&](SizeType head, const float* knownDistance) {
         ++pointVisits[static_cast<size_t>(head)];
-        BOOST_CHECK_EQUAL(knownDistance != nullptr, head == 1 || head == 2);
+        BOOST_REQUIRE(knownDistance != nullptr);
         if (head >= 2) return false;
-        const float distance = knownDistance != nullptr ? *knownDistance
-            : heads->ComputeDistance(&target, heads->GetSample(head));
-        points.AddPoint(head, distance);
-        return knownDistance == nullptr;
+        points.AddPoint(head, *knownDistance);
+        return false;
     };
     BOOST_REQUIRE(SPANN::SearchSecondLevelHierarchy(
         routing, 2, 64, 1.0, Signature(),
@@ -3824,8 +3744,8 @@ BOOST_AUTO_TEST_CASE(HierarchyH1PointAndPostingAdmissionStayIndependent)
     BOOST_CHECK_EQUAL(points.GetResult(0)->VID, 0);
     BOOST_CHECK_EQUAL(points.GetResult(1)->VID, 1);
     for (int visits : pointVisits) BOOST_CHECK_EQUAL(visits, 1);
-    BOOST_CHECK_EQUAL(heads->m_distanceCalls, 3U);
-    BOOST_CHECK_EQUAL(stats.m_layerDistances.front(), 3U);
+    BOOST_CHECK_EQUAL(heads->m_distanceCalls, 4U);
+    BOOST_CHECK_EQUAL(stats.m_layerDistances.front(), 4U);
     BOOST_CHECK_EQUAL(stats.m_layerAssignments.front(), 8U);
     BOOST_CHECK_EQUAL(stats.m_layerEligible.front(), 2U);
 
@@ -3861,12 +3781,12 @@ BOOST_AUTO_TEST_CASE(HierarchyH1PointAndPostingAdmissionStayIndependent)
     BOOST_CHECK_EQUAL(pointVisits[0], 1);
     BOOST_CHECK_EQUAL(pointVisits[1], 1);
     BOOST_CHECK_EQUAL(pointVisits[2], 1);
-    BOOST_CHECK_EQUAL(pointVisits[3], 0);
+    BOOST_CHECK_EQUAL(pointVisits[3], 1);
     BOOST_CHECK(workspace.m_layers.front().m_seen.CheckAndSet(3));
-    BOOST_CHECK_EQUAL(stats.m_layerDistances.front(), 3U);
+    BOOST_CHECK_EQUAL(stats.m_layerDistances.front(), 4U);
 }
 
-BOOST_AUTO_TEST_CASE(HierarchyUnderfilledAnchorWidensWithoutGlobalSupportScan)
+BOOST_AUTO_TEST_CASE(HierarchyUnderfilledMembershipDoesNotWiden)
 {
     using Signature = SPANN::SecondLevelHeadPostings::Signature;
     auto heads = std::make_shared<HierarchyTestIndex>(
@@ -3909,7 +3829,8 @@ BOOST_AUTO_TEST_CASE(HierarchyUnderfilledAnchorWidensWithoutGlobalSupportScan)
             heads, indexes, catalogs, postings, stats, nullptr, false, &support,
             [&](SizeType head, const float* distance) {
                 ++pointVisits[static_cast<size_t>(head)];
-                if (!allFiltered)
+                if (!allFiltered &&
+                    support.Supports(head, 7))
                 {
                     BOOST_REQUIRE(distance != nullptr);
                     points.AddPoint(head, *distance);
@@ -3918,26 +3839,30 @@ BOOST_AUTO_TEST_CASE(HierarchyUnderfilledAnchorWidensWithoutGlobalSupportScan)
             }, &workspace) == ErrorCode::Success);
         points.SortResult();
         BOOST_CHECK_EQUAL(top->m_probes.size(), 1U);
-        BOOST_CHECK_EQUAL(stats.m_iterations, 2);
+        BOOST_CHECK_EQUAL(stats.m_iterations, 1);
         BOOST_CHECK_EQUAL(stats.m_graphScanned, 1U);
-        BOOST_CHECK_EQUAL(stats.m_uniqueScanned, allFiltered ? 0U : 1U);
-        BOOST_CHECK_EQUAL(stats.m_layerAssignments.front(), 4U);
-        BOOST_CHECK_EQUAL(stats.m_layerBudgets.back(), 2U);
-        BOOST_CHECK_EQUAL(stats.m_layerDistances.front(), allFiltered ? 0U : 1U);
-        BOOST_CHECK_EQUAL(heads->m_distanceCalls, allFiltered ? 0U : 1U);
-        for (SizeType head = 0; head < 4; ++head)
-            BOOST_CHECK_EQUAL(admissionCalls[static_cast<size_t>(head)], 1);
+        BOOST_CHECK_EQUAL(stats.m_uniqueScanned, 2U);
+        BOOST_CHECK_EQUAL(stats.m_layerAssignments.front(), 2U);
+        BOOST_CHECK_EQUAL(stats.m_layerBudgets.back(), 1U);
+        BOOST_CHECK_EQUAL(stats.m_layerDistances.front(), 2U);
+        BOOST_CHECK_EQUAL(heads->m_distanceCalls, 2U);
+        BOOST_CHECK_EQUAL(admissionCalls[0], 1);
+        BOOST_CHECK_EQUAL(admissionCalls[1], 1);
+        BOOST_CHECK_EQUAL(admissionCalls[2], 0);
+        BOOST_CHECK_EQUAL(admissionCalls[3], 0);
         BOOST_CHECK_EQUAL(admissionCalls[4], 0);
-        BOOST_CHECK_EQUAL(pointVisits[2], 1);
+        BOOST_CHECK_EQUAL(pointVisits[0], 1);
+        BOOST_CHECK_EQUAL(pointVisits[1], 1);
+        BOOST_CHECK_EQUAL(pointVisits[2], 0);
         BOOST_CHECK_EQUAL(pointVisits[4], 0);
-        BOOST_CHECK_EQUAL(results.GetResult(0)->VID, allFiltered ? -1 : 2);
+        BOOST_CHECK_EQUAL(results.GetResult(0)->VID, -1);
         BOOST_CHECK_EQUAL(results.GetResult(1)->VID, -1);
-        BOOST_CHECK_EQUAL(points.GetResult(0)->VID, allFiltered ? -1 : 2);
+        BOOST_CHECK_EQUAL(points.GetResult(0)->VID, -1);
         BOOST_CHECK_EQUAL(points.GetResult(1)->VID, -1);
     }
 }
 
-BOOST_AUTO_TEST_CASE(HierarchyWideningPinsExpandedParentsDespiteCloserNewRows)
+BOOST_AUTO_TEST_CASE(HierarchyFixedBeamDoesNotRefillFilteredResults)
 {
     using Signature = SPANN::SecondLevelHeadPostings::Signature;
     Signature signature;
@@ -3963,14 +3888,15 @@ BOOST_AUTO_TEST_CASE(HierarchyWideningPinsExpandedParentsDespiteCloserNewRows)
             ++admissionCalls[static_cast<size_t>(id)];
             return id == 2 || id == 3 || id == 4;
         }, heads, indexes, catalogs, postings, stats) == ErrorCode::Success);
-    BOOST_CHECK_EQUAL(stats.m_iterations, 2);
+    BOOST_CHECK_EQUAL(stats.m_iterations, 1);
     BOOST_CHECK_EQUAL(top->m_probes.size(), 1U);
-    BOOST_CHECK_EQUAL(stats.m_layerRetained[1], 2U);
-    BOOST_CHECK_EQUAL(stats.m_layerAssignments[0], 3U);
-    BOOST_CHECK_EQUAL(admissionCalls[4], 1);
+    BOOST_CHECK_EQUAL(stats.m_layerRetained[1], 1U);
+    BOOST_CHECK_EQUAL(stats.m_layerAssignments[0], 1U);
+    BOOST_CHECK_EQUAL(admissionCalls[0], 1);
+    BOOST_CHECK_EQUAL(admissionCalls[4], 0);
     BOOST_CHECK_EQUAL(admissionCalls[3], 0);
-    BOOST_CHECK_EQUAL(results.GetResult(0)->VID, 4);
-    BOOST_CHECK_EQUAL(results.GetResult(1)->VID, 2);
+    BOOST_CHECK_EQUAL(results.GetResult(0)->VID, -1);
+    BOOST_CHECK_EQUAL(results.GetResult(1)->VID, -1);
 }
 
 BOOST_AUTO_TEST_CASE(BKTBoundedSearchPreservesNativeWorkspaceReuse)
@@ -4024,6 +3950,7 @@ BOOST_AUTO_TEST_CASE(BKTBoundedSearchPreservesNativeWorkspaceReuse)
             filteredReplay, keepEven, 32) == ErrorCode::Success);
         const auto iteratedReplay = firstIteratorBatch();
         BOOST_CHECK_EQUAL(plain.GetScanned(), replay.GetScanned());
+        BOOST_CHECK_EQUAL(plain.GetScanned(), filtered.GetScanned());
         BOOST_CHECK_EQUAL(filtered.GetScanned(), filteredReplay.GetScanned());
         for (int rank = 0; rank < 8; ++rank)
         {
@@ -4065,11 +3992,13 @@ BOOST_AUTO_TEST_CASE(NativeTopResultAdmissionSharesBudgetWithInitialPivots)
         BOOST_REQUIRE(index->BuildIndex(values.data(), count, dimension, true, false) == ErrorCode::Success);
         COMMON::QueryResultSet<float> plain(values.data(), 2), replay(values.data(), 2);
         BOOST_REQUIRE(index->SearchIndexWithMaxCheck(plain, 1) == ErrorCode::Success);
-        BOOST_CHECK_GT(plain.GetScanned(), 1);
+        BOOST_CHECK_LE(plain.GetScanned(), 1);
         for (int maxCheck : {1, 4, 64})
         {
             BOOST_REQUIRE(index->SetParameter(
                 "NumberOfInitialDynamicPivots", maxCheck == 64 ? "1" : "64") == ErrorCode::Success);
+            COMMON::QueryResultSet<float> reference(values.data(), 2);
+            BOOST_REQUIRE(index->SearchIndexWithMaxCheck(reference, maxCheck) == ErrorCode::Success);
             COMMON::QueryResultSet<float> filtered(values.data(), 2);
             std::array<int, count> visits{};
             BOOST_REQUIRE(index->SearchIndexWithResultFilter(
@@ -4079,28 +4008,18 @@ BOOST_AUTO_TEST_CASE(NativeTopResultAdmissionSharesBudgetWithInitialPivots)
                 }, maxCheck) == ErrorCode::Success);
             BOOST_CHECK_LE(filtered.GetScanned(), maxCheck);
             BOOST_CHECK_GT(filtered.GetScanned(), 0);
+            BOOST_CHECK_EQUAL(filtered.GetScanned(), reference.GetScanned());
             for (int visited : visits) BOOST_CHECK_LE(visited, 1);
             BOOST_CHECK_EQUAL(filtered.GetResult(1)->VID, -1);
-            if (maxCheck == 64)
-            {
-                BOOST_CHECK_EQUAL(filtered.GetResult(0)->VID, count - 1);
-                BOOST_CHECK_GT(filtered.GetScanned(), 1);
-            }
+            BOOST_CHECK_EQUAL(filtered.GetResult(0)->VID,
+                visits.back() > 0 ? count - 1 : -1);
             COMMON::QueryResultSet<float> empty(values.data(), 2);
             BOOST_REQUIRE(index->SearchIndexWithResultFilter(
                 empty, [](SizeType) { return false; }, maxCheck) == ErrorCode::Success);
             BOOST_CHECK_LE(empty.GetScanned(), maxCheck);
+            BOOST_CHECK_EQUAL(empty.GetScanned(), reference.GetScanned());
             BOOST_CHECK_LT(empty.GetResult(0)->VID, 0);
             BOOST_CHECK_LT(empty.GetResult(1)->VID, 0);
-            if (algorithm == IndexAlgoType::BKT)
-            {
-                empty.Reset();
-                BOOST_REQUIRE(index->SearchIndexWithTraversalFilter(
-                    empty, [](SizeType) { return false; }, maxCheck) == ErrorCode::Success);
-                BOOST_CHECK_LE(empty.GetScanned(), maxCheck);
-                BOOST_CHECK_LT(empty.GetResult(0)->VID, 0);
-                if (maxCheck == 64) BOOST_CHECK_GT(empty.GetScanned(), 1);
-            }
         }
         BOOST_REQUIRE(index->SetParameter("NumberOfInitialDynamicPivots", "64") == ErrorCode::Success);
         BOOST_REQUIRE(index->SearchIndexWithMaxCheck(replay, 1) == ErrorCode::Success);
@@ -4141,7 +4060,7 @@ BOOST_AUTO_TEST_CASE(NativeTopResultAdmissionSharesBudgetWithInitialPivots)
             BOOST_REQUIRE(SPANN::SearchSecondLevelHierarchy(
                 results, 2, count, 0.5, query, [](SizeType) { return true; },
                 index, indexes, catalogs, postings, stats) == ErrorCode::Success);
-            BOOST_CHECK_EQUAL(results.GetResult(0)->VID, count - 1);
+            BOOST_CHECK_EQUAL(results.GetResult(0)->VID, 0);
             BOOST_CHECK_EQUAL(results.GetResult(1)->VID, -1);
             BOOST_CHECK_LE(stats.m_graphScanned, static_cast<std::uint64_t>(count));
             BOOST_CHECK_EQUAL(stats.m_topProbe, 2);
@@ -4178,11 +4097,11 @@ BOOST_AUTO_TEST_CASE(HierarchyInitialBeamKeepsTheH1PostingTarget)
     BOOST_REQUIRE(SPANN::SearchSecondLevelHierarchy(
         results, 2, 64, 0.5, Signature(), [](SizeType id) { return id % 2 == 0; },
         heads, indexes, catalogs, postings, stats) == ErrorCode::Success);
-    BOOST_CHECK_EQUAL(stats.m_iterations, 2);
-    BOOST_CHECK_EQUAL(stats.m_layerBudgets[1], 2U);
+    BOOST_CHECK_EQUAL(stats.m_iterations, 1);
+    BOOST_CHECK_EQUAL(stats.m_layerBudgets[1], 1U);
     BOOST_CHECK_EQUAL(stats.m_layerBudgets[0], 2U);
     BOOST_CHECK_EQUAL(results.GetResult(0)->VID, 0);
-    BOOST_CHECK_EQUAL(results.GetResult(1)->VID, 2);
+    BOOST_CHECK_EQUAL(results.GetResult(1)->VID, -1);
     for (int probe : top->m_probes) BOOST_CHECK_LE(probe, 2);
 
     BOOST_CHECK(SPANN::SearchSecondLevelHierarchy(
@@ -4594,7 +4513,12 @@ BOOST_AUTO_TEST_CASE(RedundantFilteringParametersAreRejected)
                             "hierarchyrouteselectivitythreshold", "secondlevelrouteselectivitythreshold",
                             "BKTSeed", "TPTSeed", "HierarchySignatureMinSelectivity",
                             "HierarchySignatureMaxSelectivity", "SecondLevelSignatureMinSelectivity",
-                            "SecondLevelSignatureMaxSelectivity"}) {
+                            "SecondLevelSignatureMaxSelectivity", "EnableUnfilterTail",
+                            "UnfilterPurePages", "UnfilterExtraTailPages", "UnfilterPureDistanceScanPercent",
+                            "AblateUExtra", "AblateTail", "ForceDenseTagSearch", "DirectSparseMaxPostings",
+                            "EnableAdaptiveFilteredNprobe", "FilteredSearchNprobeSafety",
+                            "FilteredSearchTargetRecall", "FilteredSearchCoverageExponent",
+                            "HeadNavigationMode", "HierarchyGraphSignaturePruning"}) {
         BOOST_CHECK(options.SetParameter("BuildSSDIndex", key, "0") == ErrorCode::FailedParseValue);
         BOOST_CHECK(options.SetParameter("SearchSSDIndex", key, "1") == ErrorCode::FailedParseValue);
         BOOST_CHECK(index->SetParameter(key, "0", "BuildHead") == ErrorCode::FailedParseValue);
@@ -4609,8 +4533,6 @@ BOOST_AUTO_TEST_CASE(RedundantFilteringParametersAreRejected)
     BOOST_REQUIRE(options.SetParameter("BuildSSDIndex", "SearchInternalResultNum", "9") == ErrorCode::Success);
     BOOST_CHECK_EQUAL(options.m_secondLevelMaxCheck, 19);
     BOOST_CHECK_EQUAL(options.m_searchInternalResultNum, 9);
-    BOOST_CHECK(options.m_enableUnfilterTail);
-    BOOST_CHECK_EQUAL(options.m_unfilterPureDistanceScanPercent, 100);
 }
 
 BOOST_AUTO_TEST_CASE(SpatialHeadSelectionIgnoresAttributePartitions)
@@ -4980,8 +4902,6 @@ BOOST_AUTO_TEST_CASE(SecondLevelResumeRebuildsPartialGraph)
             set("BuildSSDIndex",
                 "TailReplicaCount", "0");
             set("BuildSSDIndex",
-                "EnableUnfilterTail", "true");
-            set("BuildSSDIndex",
                 "UnfilterTailBufferLength", "0");
             set("BuildSSDIndex", "CrossEdges", "0");
             set("BuildSSDIndex", "ExcludeHead",
@@ -5076,7 +4996,7 @@ BOOST_AUTO_TEST_CASE(SecondLevelResumeRebuildsPartialGraph)
     std::filesystem::remove_all(indexDirectory);
 }
 
-BOOST_AUTO_TEST_CASE(HierarchyHeadOnlyTopAdmissionAndWideRoutingKey)
+BOOST_AUTO_TEST_CASE(HierarchyHeadOnlyMembershipMayUnderfill)
 {
     constexpr SizeType count = 512;
     constexpr DimensionType dimension = 4;
@@ -5132,10 +5052,8 @@ BOOST_AUTO_TEST_CASE(HierarchyHeadOnlyTopAdmissionAndWideRoutingKey)
         set("BuildSSDIndex", "PostingPageLimit", "1");
         set("BuildSSDIndex", "TailReplicaCount", "0");
         set("BuildSSDIndex", "UnfilterTailBufferLength", "0");
-        set("BuildSSDIndex", "EnableUnfilterTail", "true");
         set("BuildSSDIndex", "CrossEdges", "0");
         set("BuildSSDIndex", "ExcludeHead", "true");
-        set("BuildSSDIndex", "EnablePrimaryHeadBypass", "false");
         set("BuildSSDIndex", "NumTagsPerVec", std::to_string(columns));
         set("BuildSSDIndex", "StaticACLTagCols", std::to_string(columns));
         if (keyColumn == 1)
@@ -5157,7 +5075,7 @@ BOOST_AUTO_TEST_CASE(HierarchyHeadOnlyTopAdmissionAndWideRoutingKey)
             context.m_dnf.clauses.push_back({{
                 {static_cast<std::uint32_t>(keyColumn), 1000 + count - 1, Cache::DNF_EQ, 0},
                 {0, 0, Cache::DNF_EQ, 1}}});
-            context.m_limitedTagRouteEligible = true;
+            context.m_limitedTagMembershipEligible = true;
             context.m_limitedTagQueryValues = {1000 + count - 1};
             VectorIndex::ThreadLocalSearchContextGuard guard(std::move(context));
             COMMON::QueryResultSet<float> results(data, 1);
@@ -5178,7 +5096,7 @@ BOOST_AUTO_TEST_CASE(HierarchyHeadOnlyTopAdmissionAndWideRoutingKey)
         const auto search = [&](bool pureRoute, std::uint32_t tag) {
             VectorIndex::ThreadLocalSearchContext context;
             context.m_queryTags = {tag};
-            context.m_limitedTagRouteEligible = pureRoute;
+            context.m_limitedTagMembershipEligible = pureRoute;
             if (pureRoute) context.m_limitedTagQueryValues = {tag};
             VectorIndex::ThreadLocalSearchContextGuard guard(std::move(context));
             COMMON::QueryResultSet<float> results(data, 1);
@@ -5186,11 +5104,11 @@ BOOST_AUTO_TEST_CASE(HierarchyHeadOnlyTopAdmissionAndWideRoutingKey)
             return results.GetResult(0)->VID;
         };
         set("SearchSSDIndex", "InternalResultNum", std::to_string(count));
-        BOOST_CHECK_EQUAL(search(true, 1000 + count - 1), count - 1);
+        BOOST_CHECK_LT(search(true, 1000 + count - 1), 0);
         set("SearchSSDIndex", "InternalResultNum", "8");
-        BOOST_CHECK_EQUAL(search(true, 1000 + count - 1), count - 1);
+        BOOST_CHECK_LT(search(true, 1000 + count - 1), 0);
         BOOST_CHECK_EQUAL(search(true, 1000), 0);
-        BOOST_CHECK_EQUAL(search(true, 1000 + count - 1), count - 1);
+        BOOST_CHECK_LT(search(true, 1000 + count - 1), 0);
         if (keyColumn > 1) BOOST_CHECK_EQUAL(search(false, 0), 0);
         if (keyColumn == 1) BOOST_CHECK_LT(search(false, 0), 0);
         if (keyColumn == 1 || keyColumn == 3) {
@@ -5202,17 +5120,17 @@ BOOST_AUTO_TEST_CASE(HierarchyHeadOnlyTopAdmissionAndWideRoutingKey)
             clause.lits.push_back({0, 0, Cache::DNF_EQ, 1});
             predicate.clauses.push_back(clause);
             context.m_dnf = predicate;
-            context.m_limitedTagRouteEligible = true;
+            context.m_limitedTagMembershipEligible = true;
             context.m_limitedTagQueryValues = {1000 + count - 1};
             VectorIndex::ThreadLocalSearchContextGuard guard(std::move(context));
             COMMON::QueryResultSet<float> results(data, 1);
             BOOST_REQUIRE(index->SearchIndex(results) == ErrorCode::Success);
-            BOOST_CHECK_EQUAL(results.GetResult(0)->VID, count - 1);
+            BOOST_CHECK_LT(results.GetResult(0)->VID, 0);
         }
         {
             VectorIndex::ThreadLocalSearchContext context;
             context.m_queryTags = {1000 + count};
-            context.m_limitedTagRouteEligible = true;
+            context.m_limitedTagMembershipEligible = true;
             context.m_limitedTagQueryValues = context.m_queryTags;
             VectorIndex::ThreadLocalSearchContextGuard guard(std::move(context));
             COMMON::QueryResultSet<float> results(data, 3);
@@ -5331,7 +5249,6 @@ BOOST_AUTO_TEST_CASE(LimitedTagNativeBuildAndSearchPageLimits)
         set("BuildSSDIndex", "PostingVectorLimit", std::to_string(vectorLimit));
         set("BuildSSDIndex", "SearchPostingPageLimit", "2");
         set("BuildSSDIndex", "ExcludeHead", "true");
-        set("BuildSSDIndex", "EnablePrimaryHeadBypass", "false");
         set("BuildSSDIndex", "NumTagsPerVec", "2");
         set("BuildSSDIndex", "StaticACLTagCols", "1");
         set("BuildSSDIndex", "ColumnTypes", "categorical,numeric");
@@ -5664,10 +5581,8 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagOExpansionFixedHeads)
         set("BuildSSDIndex", "SearchPostingPageLimit", "1");
         set("BuildSSDIndex", "TailReplicaCount", "0");
         set("BuildSSDIndex", "UnfilterTailBufferLength", "0");
-        set("BuildSSDIndex", "EnableUnfilterTail", "true");
         set("BuildSSDIndex", "CrossEdges", "0");
         set("BuildSSDIndex", "ExcludeHead", "true");
-        set("BuildSSDIndex", "EnablePrimaryHeadBypass", "false");
         set("BuildSSDIndex", "NumTagsPerVec", "1");
         set("BuildSSDIndex", "StaticACLTagCols", "1");
         set("BuildSSDIndex", "EnableLimitedTagPosting", "true");
@@ -5775,7 +5690,7 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagOExpansionFixedHeads)
         {
             VectorIndex::ThreadLocalSearchContext context;
             context.m_queryTags = {tags[static_cast<size_t>(vid)]};
-            context.m_limitedTagRouteEligible = true;
+            context.m_limitedTagMembershipEligible = true;
             context.m_limitedTagQueryValues = context.m_queryTags;
             VectorIndex::ThreadLocalSearchContextGuard guard(std::move(context));
             COMMON::QueryResultSet<float> results(data, 1);
@@ -5895,8 +5810,6 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
             set("BuildSSDIndex", "ReplicaCount", "8");
             set("BuildSSDIndex", "RNGFactor", "100");
             set("BuildSSDIndex", "TailReplicaCount", "0");
-            set("BuildSSDIndex",
-                "EnableUnfilterTail", "true");
             set("BuildSSDIndex",
                 "UnfilterTailBufferLength", "0");
             set("BuildSSDIndex", "CrossEdges", "0");
@@ -6257,7 +6170,7 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
             defaultConfig.find(
                 "HierarchyMaxCheck=112") !=
             std::string::npos);
-        BOOST_CHECK(defaultConfig.find("HierarchyGraphSignaturePruning=false") != std::string::npos);
+        BOOST_CHECK(defaultConfig.find("HierarchyGraphSignaturePruning") == std::string::npos);
         defaultLoader.close();
         defaultIndex.reset();
 
@@ -6280,13 +6193,9 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
             reloadedTyped->GetOptions()
                 ->m_secondLevelMaxCheck,
             112);
-        BOOST_CHECK(!reloadedTyped->GetOptions()->m_secondLevelGraphSignaturePruning);
-        BOOST_REQUIRE(reloadedDefault->SetParameter(
-            "SecondLevelGraphSignaturePruning", "true", "SearchSSDIndex") == ErrorCode::Success);
-        BOOST_CHECK(reloadedTyped->GetOptions()->m_secondLevelGraphSignaturePruning);
-        BOOST_REQUIRE(reloadedDefault->SetParameter(
-            "SecondLevelGraphSignaturePruning", "false", "SearchSSDIndex") == ErrorCode::Success);
-        BOOST_CHECK(!reloadedTyped->GetOptions()->m_secondLevelGraphSignaturePruning);
+        BOOST_CHECK(reloadedDefault->SetParameter(
+            "SecondLevelGraphSignaturePruning", "true",
+            "SearchSSDIndex") == ErrorCode::FailedParseValue);
         BOOST_CHECK_SMALL(
             reloadedTyped->GetOptions()
                     ->m_secondLevelInitialProbeRatio -
@@ -6335,8 +6244,9 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
         BOOST_CHECK(!std::filesystem::exists(indexDirectory + "/SPTAGHeadVectors.bin.owned"));
         BOOST_CHECK(!std::filesystem::exists(indexDirectory + "/SPTAGSecondLevelHeadVectors.bin.level2"));
         BOOST_CHECK(!std::filesystem::exists(indexDirectory + "/SecondLevelHeadIndex/head_node_meta.bin"));
-        BOOST_REQUIRE(compactIndex->SetParameter(
-            "HeadNavigationMode", "H2Only", "SearchSSDIndex") == ErrorCode::Success);
+        BOOST_CHECK(compactIndex->SetParameter(
+            "HeadNavigationMode", "H2Only",
+            "SearchSSDIndex") == ErrorCode::FailedParseValue);
         BOOST_REQUIRE(compactIndex->SetParameter(
             "InternalResultNum", "16", "SearchSSDIndex") == ErrorCode::Success);
         const auto headIndex = spann->GetMemoryIndex();
@@ -6497,7 +6407,7 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
         {
             VectorIndex::ThreadLocalSearchContext context;
             context.m_queryTags = {tags.front()};
-            context.m_limitedTagRouteEligible = true;
+            context.m_limitedTagMembershipEligible = true;
             context.m_limitedTagQueryValues = context.m_queryTags;
             VectorIndex::ThreadLocalSearchContextGuard guard(std::move(context));
             COMMON::QueryResultSet<float> expected(data, 10), actual(data, 10);
@@ -6641,29 +6551,19 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
         }
 
         const auto search = [&](const std::shared_ptr<VectorIndex>& target,
-                                const char* navigationMode,
-                                bool limitedRoute,
-                                ErrorCode expectedStatus = ErrorCode::Success) {
-            BOOST_REQUIRE(
-                target->SetParameter(
-                    "HeadNavigationMode", navigationMode,
-                    "SearchSSDIndex") == ErrorCode::Success);
+                                bool limitedMembership) {
             const std::uint32_t tag = slotTags.front();
             VectorIndex::ThreadLocalSearchContext context;
             context.m_active = true;
             context.m_queryTags = {tag};
-            context.m_filterSelectivity =
-                1.0f / slotDistinctTags;
-            context.m_routeSelectivity =
-                context.m_filterSelectivity;
-            context.m_limitedTagRouteEligible = limitedRoute;
+            context.m_limitedTagMembershipEligible =
+                limitedMembership;
             context.m_limitedTagQueryValues = {tag};
             VectorIndex::ThreadLocalSearchContextGuard guard(
                 std::move(context));
             COMMON::QueryResultSet<float> result(data, 10);
             const ErrorCode status = target->SearchIndex(result);
-            BOOST_REQUIRE(status == expectedStatus);
-            if (status != ErrorCode::Success) return;
+            BOOST_REQUIRE(status == ErrorCode::Success);
             int resultCount = 0;
             for (int rank = 0;
                  rank < result.GetResultNum(); ++rank) {
@@ -6680,12 +6580,11 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
             BOOST_CHECK_GT(resultCount, 0);
         };
         const auto verifySearch = [&](const std::shared_ptr<VectorIndex>& target) {
-            for (const char* mode : {"Auto", "H1Only"})
-            {
-                search(target, mode, false);
-                search(target, mode, true);
-            }
-            search(target, "H2Only", true, ErrorCode::Fail);
+            search(target, false);
+            search(target, true);
+            BOOST_CHECK(target->SetParameter(
+                "HeadNavigationMode", "H1Only",
+                "SearchSSDIndex") == ErrorCode::FailedParseValue);
         };
         verifySearch(slotIndex);
         slotIndex.reset();
@@ -7368,11 +7267,7 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
                 context;
             context.m_active = true;
             context.m_queryTags = {tag};
-            context.m_filterSelectivity =
-                1.0f / distinctTags;
-            context.m_routeSelectivity =
-                context.m_filterSelectivity;
-            context.m_limitedTagRouteEligible =
+            context.m_limitedTagMembershipEligible =
                 true;
             context.m_limitedTagQueryValues = {
                 tag};
@@ -7426,18 +7321,15 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
     const auto searchFiltered =
         [&](const std::shared_ptr<VectorIndex>& target,
             std::uint32_t tag,
-            float routeSelectivity) {
+            float ignoredSelectivity) {
+            (void)ignoredSelectivity;
             const SizeType queryVID =
                 static_cast<SizeType>(tag);
             VectorIndex::ThreadLocalSearchContext context;
             context.m_active = true;
             context.m_queryTags = {tag};
-            context.m_limitedTagRouteEligible = true;
+            context.m_limitedTagMembershipEligible = true;
             context.m_limitedTagQueryValues = {tag};
-            context.m_filterSelectivity =
-                1.0f / distinctTags;
-            context.m_routeSelectivity =
-                routeSelectivity;
             VectorIndex::ThreadLocalSearchContextGuard guard(
                 std::move(context));
             COMMON::QueryResultSet<float> result(
@@ -7470,24 +7362,17 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
     const auto verifySelectivityIndependentNavigation =
         [&](const std::shared_ptr<VectorIndex>& target) {
             const auto expected = searchFiltered(target, 3, 0.01f);
-            for (const char* mode : {"Auto", "H2Only"})
+            for (float selectivity : {0.0f, 0.01f, 0.25f, 1.0f, -1.0f,
+                                     std::numeric_limits<float>::quiet_NaN()})
             {
-                BOOST_REQUIRE(target->SetParameter(
-                    "HeadNavigationMode", mode, "SearchSSDIndex") == ErrorCode::Success);
-                for (float selectivity : {0.0f, 0.01f, 0.25f, 1.0f, -1.0f,
-                                         std::numeric_limits<float>::quiet_NaN()})
-                {
-                    const auto actual = searchFiltered(target, 3, selectivity);
-                    BOOST_CHECK_EQUAL_COLLECTIONS(expected.begin(), expected.end(), actual.begin(), actual.end());
-                }
+                const auto actual = searchFiltered(target, 3, selectivity);
+                BOOST_CHECK_EQUAL_COLLECTIONS(
+                    expected.begin(), expected.end(),
+                    actual.begin(), actual.end());
             }
-            BOOST_REQUIRE(target->SetParameter(
-                "HeadNavigationMode", "H1Only", "SearchSSDIndex") == ErrorCode::Success);
-            // This fixture retains its native H1 graph; the explicit legacy
-            // override remains available, but Auto no longer selects it.
-            BOOST_CHECK(!searchFiltered(target, 3, 0.25f).empty());
-            BOOST_REQUIRE(target->SetParameter(
-                "HeadNavigationMode", "Auto", "SearchSSDIndex") == ErrorCode::Success);
+            BOOST_CHECK(target->SetParameter(
+                "HeadNavigationMode", "H1Only",
+                "SearchSSDIndex") == ErrorCode::FailedParseValue);
         };
 
     const auto verifyHeadSources =
@@ -7504,10 +7389,6 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
                    context;
                context.m_active = true;
                context.m_queryTags = {tag};
-               context.m_filterSelectivity =
-                   1.0f / distinctTags;
-               context.m_routeSelectivity =
-                   context.m_filterSelectivity;
                VectorIndex::ThreadLocalSearchContextGuard
                    guard(std::move(context));
                COMMON::QueryResultSet<float> result(
@@ -7552,10 +7433,6 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
            context.m_active = true;
            context.m_queryTags = {
                first, second};
-           context.m_filterSelectivity =
-               2.0f / distinctTags;
-           context.m_routeSelectivity =
-               context.m_filterSelectivity;
            if (useDNF) {
                Cache::DNFClause firstClause;
                firstClause.lits.push_back(
@@ -7616,8 +7493,6 @@ BOOST_AUTO_TEST_CASE(StaticLimitedTagBuildSearchReloadAndCorruption)
                 VectorIndex::ThreadLocalSearchContext
                     context;
                 context.m_active = true;
-                context.m_directPostingIDs =
-                    allPostingIDs;
                 if (useDNF) {
                     Cache::DNFClause clause;
                     clause.lits.push_back(
@@ -8345,7 +8220,6 @@ BOOST_AUTO_TEST_CASE(LimitedTagPageRangeClampsWholeRecordsAtBothBoundaries)
 BOOST_AUTO_TEST_CASE(StaticHybridWorkspaceResetAndOptionDefaults)
 {
     SPANN::Options opt;
-    BOOST_CHECK(!opt.m_secondLevelGraphSignaturePruning);
     BOOST_CHECK(!opt.m_enableHybridDistance);
     BOOST_CHECK_EQUAL(opt.m_hybridVectorWeight, 1.0f);
     BOOST_CHECK(opt.m_hybridCategoricalCols.empty());
@@ -8353,15 +8227,6 @@ BOOST_AUTO_TEST_CASE(StaticHybridWorkspaceResetAndOptionDefaults)
     BOOST_CHECK(opt.m_hybridNumericCols.empty());
     BOOST_CHECK(opt.m_hybridNumericWeights.empty());
     BOOST_CHECK_EQUAL(opt.m_hybridCandidateCount, 128);
-    BOOST_CHECK_EQUAL(opt.m_hybridRouteSampleCount, 64);
-    BOOST_CHECK_EQUAL(
-        opt.m_hybridRouteSelectivityThreshold,
-        0.02f);
-    BOOST_CHECK_EQUAL(
-        opt.m_hybridRouteDeformationThreshold,
-        1.0f);
-    BOOST_CHECK(!opt.m_logHybridRoute);
-
     SPANN::ExtraWorkSpace workspace;
     workspace.m_postingProbeStats.m_dedupSkippedVectors = 7;
     workspace.m_postingProbeStats.Reset();
@@ -8886,9 +8751,8 @@ BOOST_AUTO_TEST_CASE(TaggedPureTailUpdate)
                                  const std::vector<std::uint32_t>& queryTags) {
         VectorIndex::ThreadLocalSearchContext context;
         context.m_active = true;
-        context.m_directPostingIDs = postings;
         context.m_queryTags = queryTags;
-        context.m_limitedTagRouteEligible =
+        context.m_limitedTagMembershipEligible =
             !queryTags.empty();
         context.m_limitedTagQueryValues =
             queryTags;
@@ -9025,7 +8889,6 @@ BOOST_AUTO_TEST_CASE(TaggedPureTailUpdate)
     {
         VectorIndex::ThreadLocalSearchContext context;
         context.m_active = true;
-        context.m_directPostingIDs = {mergePosting};
         VectorIndex::ThreadLocalSearchContextGuard guard(std::move(context));
         COMMON::QueryResultSet<float> result(overflowVectors.data(), 10);
         BOOST_REQUIRE(reloaded->SearchIndex(result) == ErrorCode::Success);
@@ -9921,26 +9784,18 @@ BOOST_AUTO_TEST_CASE(LimitedTagDualRegionInsert)
     const auto containsVID =
         [&](const std::vector<SizeType>& postings,
             const std::vector<std::uint32_t>& queryTags,
-            bool limitedRouteEligible = true) {
-            VectorIndex::ThreadLocalSearchContext context;
-            context.m_active = true;
-            context.m_directPostingIDs = postings;
-            context.m_queryTags = queryTags;
-            context.m_limitedTagRouteEligible =
-                limitedRouteEligible &&
-                !queryTags.empty();
-            if (context
-                    .m_limitedTagRouteEligible) {
-                context
-                    .m_limitedTagQueryValues =
-                    queryTags;
-            }
-            VectorIndex::ThreadLocalSearchContextGuard guard(
-                std::move(context));
+            bool limitedMembershipEligible = true) {
+            SPANN::ExtraWorkSpace workspace;
+            disk->InitWorkSpace(&workspace, false);
+            workspace.m_postingIDs = postings;
+            workspace.m_queryTags = queryTags.empty() ? nullptr : queryTags.data();
+            workspace.m_numQueryTags = static_cast<int>(queryTags.size());
+            workspace.m_useHybridPure = limitedMembershipEligible && !queryTags.empty();
             COMMON::QueryResultSet<float> result(
                 updateVector.data(), 10);
             BOOST_REQUIRE(
-                index->SearchIndex(result) ==
+                disk->SearchIndex(&workspace, result, spann->GetMemoryIndex(),
+                    nullptr, nullptr, nullptr) ==
                 ErrorCode::Success);
             for (int i = 0;
                  i < result.GetResultNum(); ++i) {
@@ -9953,8 +9808,9 @@ BOOST_AUTO_TEST_CASE(LimitedTagDualRegionInsert)
         };
 
     disk->SetLimitedTagReadRangesReady(false);
+    // Without validated H/O boundaries the fixed prefix cannot reach this O row.
     BOOST_CHECK(
-        containsVID(
+        !containsVID(
             {reloadedOPosting}, {}));
     disk->SetLimitedTagReadRangesReady(true);
     BOOST_CHECK(
@@ -9975,16 +9831,11 @@ BOOST_AUTO_TEST_CASE(LimitedTagDualRegionInsert)
             false));
     auto* options = spann->GetOptions();
     BOOST_REQUIRE(options != nullptr);
-    options->m_enableUnfilterTail = false;
+    for (const char* key : {"EnableUnfilterTail", "AblateTail"})
+        BOOST_CHECK(options->SetParameter("SearchSSDIndex", key, "0") == ErrorCode::FailedParseValue);
     BOOST_CHECK(
         containsVID(
             {reloadedOPosting}, {}));
-    options->m_enableUnfilterTail = true;
-    options->m_ablateTail = true;
-    BOOST_CHECK(
-        containsVID(
-            {reloadedOPosting}, {}));
-    options->m_ablateTail = false;
 
     {
         SPANN::ExtraWorkSpace workspace;
@@ -10018,7 +9869,7 @@ BOOST_AUTO_TEST_CASE(LimitedTagDualRegionInsert)
                 result.GetResult(i)->VID ==
                     updateVID;
         }
-        BOOST_CHECK(found);
+        BOOST_CHECK(!found);
     }
 
     std::vector<std::shared_ptr<
@@ -10458,17 +10309,14 @@ BOOST_AUTO_TEST_CASE(LimitedTagDualRegionInsert)
     spann->GetOptions()->m_rngFactor = 100.0f;
     const auto queueMergeCandidate =
         [&](SizeType head) {
-        VectorIndex::ThreadLocalSearchContext
-            context;
-        context.m_active = true;
-        context.m_directPostingIDs = {
-            head};
-        VectorIndex::ThreadLocalSearchContextGuard
-            guard(std::move(context));
+        SPANN::ExtraWorkSpace workspace;
+        disk->InitWorkSpace(&workspace, false);
+        workspace.m_postingIDs = {head};
         COMMON::QueryResultSet<float> result(
             splitVectors.data(), 10);
         BOOST_REQUIRE(
-            index->SearchIndex(result) ==
+            disk->SearchIndex(&workspace, result, spann->GetMemoryIndex(),
+                nullptr, nullptr, nullptr) ==
             ErrorCode::Success);
         };
     BOOST_CHECK(

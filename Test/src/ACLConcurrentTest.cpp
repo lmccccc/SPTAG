@@ -187,7 +187,9 @@ BOOST_AUTO_TEST_CASE(RemovedAttributeOrganizationRejectedBeforeBuild)
     for (const char* name : {"ACLCols", "HierLevelWidths", "PivotForceNodeCount",
                              "DisablePivotEstimator", "RoutingCols", "PerVectorTagsFile",
                              "LimitedTagVoteHeadCount", "TagOffset", "BKTSeed", "TPTSeed",
-                             "HierarchySignatureMinSelectivity", "HierarchySignatureMaxSelectivity"}) {
+                             "HierarchySignatureMinSelectivity", "HierarchySignatureMaxSelectivity",
+                             "EnableUnfilterTail", "UnfilterPurePages", "UnfilterExtraTailPages",
+                             "UnfilterPureDistanceScanPercent", "AblateUExtra", "AblateTail"}) {
         TenantIndexManager builder(2, "SPANN", "Float");
         builder.SetBuildParam(name, "0", "MultiTenant");
         BOOST_CHECK(!builder.BuildFromData(vectors, ByteArray(), 1, false, true));
@@ -198,6 +200,131 @@ BOOST_AUTO_TEST_CASE(RemovedAttributeOrganizationRejectedBeforeBuild)
     TenantIndexManager builder(2, "SPANN", "Float");
     builder.SetBuildParam("SelectHeadType", "PerTagBKT", "SelectHead");
     BOOST_CHECK(!builder.BuildFromData(vectors, ByteArray(), 1, false, true));
+}
+
+BOOST_AUTO_TEST_CASE(LegacyTailUsesOnePostingBudgetForEveryPredicate)
+{
+    constexpr int dimension = 128;
+    constexpr int count = 256;
+    constexpr std::uint32_t commonTag = 9;
+    constexpr std::uint32_t sparseTag = 0x10000003U;
+    std::vector<float> vectors(count * dimension);
+    FillNormalizedVectors(vectors, count, dimension);
+    std::vector<std::uint32_t> tags(count * 3);
+    for (int row = 0; row < count; ++row) {
+        tags[row * 3] = commonTag;
+        tags[row * 3 + 1] = 0x10000000U + row % 4;
+        tags[row * 3 + 2] = row;
+    }
+
+    ScopedTempDir saved(MakeTempDir());
+    ScopedEnvironmentVariable inPlace("SPTAG_SPANN_INPLACE_DIR", saved.path.c_str());
+    TenantIndexManager builder(dimension, "SPANN", "Float");
+    builder.SetStorageBackend("STATIC");
+    builder.SetBuildParam("DistCalcMethod", "L2", "Base");
+    builder.SetBuildParam("IndexAlgoType", "BKT", "Base");
+    builder.SetBuildParam("SelectHeadType", "BKT", "SelectHead");
+    builder.SetBuildParam("Ratio", "0.125", "SelectHead");
+    builder.SetBuildParam("BKTLambdaFactor", "1", "SelectHead");
+    builder.SetBuildParam("NumberOfThreads", "1", "SelectHead");
+    builder.SetBuildParam("NumberOfThreads", "1", "BuildHead");
+    builder.SetBuildParam("RefineIterations", "1", "BuildHead");
+    builder.SetSSDBuildParam("NumberOfThreads", "1");
+    builder.SetSSDBuildParam("InternalResultNum", "32");
+    builder.SetSSDBuildParam("SearchInternalResultNum", "8");
+    builder.SetSSDBuildParam("ReplicaCount", "1");
+    builder.SetSSDBuildParam("PostingPageLimit", "1");
+    builder.SetSSDBuildParam("TailReplicaCount", "4");
+    builder.SetSSDBuildParam("UnfilterTailBufferLength", "2");
+    builder.SetSSDBuildParam("ColumnTypes", "categorical,categorical,numeric");
+    builder.SetSSDBuildParam("EnableOrderedPageStart", "true");
+    builder.SetSSDBuildParam("OrderedPageStartAttrs", "1");
+    builder.SetSSDBuildParam("UseDirectIO", "false");
+    builder.SetSSDBuildParam("CrossEdges", "0");
+    builder.SetSSDBuildParam("TmpDir", saved.path.c_str());
+    BOOST_REQUIRE(builder.BuildFromDataWithTagsSingleTenant(
+        ByteArray(reinterpret_cast<std::uint8_t*>(vectors.data()), vectors.size() * sizeof(float), false),
+        0, count,
+        ByteArray(reinterpret_cast<std::uint8_t*>(tags.data()), tags.size() * sizeof(std::uint32_t), false),
+        3, false, true));
+    BOOST_REQUIRE(builder.SaveAll(saved.path.c_str()));
+
+    std::shared_ptr<SPTAG::VectorIndex> native;
+    BOOST_REQUIRE(SPTAG::VectorIndex::LoadIndex(saved.path + "/tenant_0", native) ==
+        SPTAG::ErrorCode::Success);
+    auto* spann = dynamic_cast<SPTAG::SPANN::Index<float>*>(native.get());
+    BOOST_REQUIRE(spann != nullptr);
+    auto disk = spann->GetDiskIndex();
+    BOOST_REQUIRE(disk != nullptr);
+    int posting = -1;
+    for (int head = 0; head < disk->GetPostingCount(); ++head) {
+        if (disk->GetPostingPageCount(head) > disk->GetPostingPageCount(head, true)) {
+            posting = head;
+            break;
+        }
+    }
+    BOOST_REQUIRE_GE(posting, 0);
+
+    for (const char* limit : {"0", "1", "2"}) {
+        BOOST_REQUIRE(native->SetParameter("SearchPostingPageLimit", limit, "SearchSSDIndex") ==
+            SPTAG::ErrorCode::Success);
+        std::uint64_t baselinePages = 0;
+        std::uint64_t baselineScanned = 0;
+        std::vector<int> baselineIDs;
+        for (int predicate = 0; predicate < 4; ++predicate) {
+            BOOST_TEST_CONTEXT("page limit=" << limit << ", predicate=" << predicate) {
+                SPTAG::SPANN::ExtraWorkSpace workspace;
+                disk->InitWorkSpace(&workspace);
+                workspace.m_postingIDs = {posting};
+                std::uint32_t queryTag = commonTag;
+                SPTAG::Cache::DNFPredicate dnf;
+                if (predicate == 1) {
+                    workspace.m_queryTags = &queryTag;
+                    workspace.m_numQueryTags = 1;
+                } else if (predicate >= 2) {
+                    SPTAG::Cache::DNFClause clause;
+                    if (predicate == 2) {
+                        clause.lits.push_back({1, sparseTag, SPTAG::Cache::DNF_EQ, 0});
+                        clause.lits.push_back({2, 0, SPTAG::Cache::DNF_GE, 1});
+                    } else {
+                        clause.lits.push_back({2, count, SPTAG::Cache::DNF_GE, 1});
+                    }
+                    dnf.clauses.push_back(clause);
+                    workspace.m_dnf = &dnf;
+                }
+                SPTAG::COMMON::QueryResultSet<float> results(vectors.data(), count);
+                SPTAG::SPANN::SearchStats stats;
+                BOOST_REQUIRE(disk->SearchIndex(&workspace, results, spann->GetMemoryIndex(),
+                    &stats, nullptr, nullptr) == SPTAG::ErrorCode::Success);
+                const auto& probe = workspace.m_postingProbeStats;
+                std::vector<int> ids;
+                for (int slot = 0; slot < results.GetResultNum(); ++slot) {
+                    const int id = results.GetResult(slot)->VID;
+                    if (id < 0) continue;
+                    BOOST_REQUIRE_LT(id, count);
+                    ids.push_back(id);
+                    if (predicate == 2) BOOST_CHECK_EQUAL(tags[id * 3 + 1], sparseTag);
+                }
+                std::sort(ids.begin(), ids.end());
+                if (predicate == 0) {
+                    baselinePages = probe.m_postingPageReads;
+                    baselineScanned = probe.m_scannedVectors;
+                    baselineIDs = ids;
+                    if (limit[0] == '0') {
+                        BOOST_CHECK_EQUAL(baselineScanned, disk->GetPostingVectorCount(posting, false));
+                        BOOST_CHECK(!ids.empty());
+                    } else {
+                        BOOST_CHECK_LE(baselinePages, static_cast<unsigned>(limit[0] - '0'));
+                    }
+                } else {
+                    BOOST_CHECK_EQUAL(probe.m_postingPageReads, baselinePages);
+                    BOOST_CHECK_EQUAL(probe.m_scannedVectors, baselineScanned);
+                    if (predicate == 1) BOOST_CHECK(ids == baselineIDs);
+                    if (predicate == 3) BOOST_CHECK(ids.empty());
+                }
+            }
+        }
+    }
 }
 
 BOOST_AUTO_TEST_CASE(SearchWithACLSameTenantThreadLocalState)
@@ -228,7 +355,7 @@ BOOST_AUTO_TEST_CASE(SearchWithACLSameTenantThreadLocalState)
     }
 
     TenantIndexManager builder(kDim, "SPANN", "Float");
-    BOOST_REQUIRE(builder.BuildFromDataWithTags(
+        BOOST_REQUIRE(builder.BuildFromDataWithTags(
         ByteArray(reinterpret_cast<std::uint8_t*>(vectors.data()), vectors.size() * sizeof(float), false),
         ByteArray(reinterpret_cast<std::uint8_t*>(metadata.data()), metadata.size(), false),
         kNumVectors,
@@ -391,9 +518,7 @@ BOOST_AUTO_TEST_CASE(FlatACLSignaturesDoNotInferCategoricalColumns)
                 builder.SetSSDBuildParam("LimitedTagSlotsPerHead", overlapping ? "2" : "1");
             builder.SetSSDBuildParam("LimitedTagMinHeadCount", "1");
             builder.SetSSDBuildParam("EnableHybridDistance", "false");
-            builder.SetSSDBuildParam("ForceDenseTagSearch", "true");
             builder.SetSSDBuildParam("ExcludeHead", "true");
-            builder.SetSSDBuildParam("EnableUnfilterTail", "true");
             builder.SetSSDBuildParam("TailReplicaCount", "0");
             builder.SetSSDBuildParam("UnfilterTailBufferLength", "0");
             BOOST_REQUIRE(builder.BuildFromDataWithTags(vectorBytes, metadataBytes,
@@ -499,7 +624,6 @@ BOOST_AUTO_TEST_CASE(BuildSignaturesRejectsMismatchedSchemaWidth)
             builder.SetSSDBuildParam("LimitedTagMinHeadCount", "1");
             builder.SetSSDBuildParam("EnableHybridDistance", "false");
             builder.SetSSDBuildParam("ExcludeHead", "true");
-            builder.SetSSDBuildParam("EnableUnfilterTail", "true");
             builder.SetSSDBuildParam("TailReplicaCount", "0");
             builder.SetSSDBuildParam("UnfilterTailBufferLength", "0");
             builder.SetSSDBuildParam("CrossEdges", "0");
@@ -802,7 +926,6 @@ BOOST_AUTO_TEST_CASE(GraphlessHeadMetadataUsesCanonicalVIDs)
         builder.SetSSDBuildParam("ReplicaCount", "2");
         builder.SetSSDBuildParam("TailReplicaCount", "0");
         builder.SetSSDBuildParam("UnfilterTailBufferLength", "0");
-        builder.SetSSDBuildParam("EnableUnfilterTail", "true");
         builder.SetSSDBuildParam("CrossEdges", "0");
         builder.SetSSDBuildParam("ExcludeHead", "true");
         builder.SetSSDBuildParam("StaticACLTagCols", "1");
@@ -1104,7 +1227,6 @@ BOOST_AUTO_TEST_CASE(HybridTagRoutingStatsPersistRepairAndReload)
     builder.SetSSDBuildParam("SearchPostingPageLimit", "2");
     builder.SetSSDBuildParam("ReplicaCount", "3");
     builder.SetSSDBuildParam("TailReplicaCount", "2");
-    builder.SetSSDBuildParam("EnableUnfilterTail", "true");
     builder.SetSSDBuildParam("UnfilterTailBufferLength", "-1");
     builder.SetSSDBuildParam("CrossEdges", "0");
     builder.SetSSDBuildParam("CrossExtraEdges", "4");
@@ -1273,7 +1395,16 @@ BOOST_AUTO_TEST_CASE(HybridTagRoutingStatsPersistRepairAndReload)
     BOOST_REQUIRE(loaded.LoadAll(saveDir.path.c_str()));
     BOOST_CHECK_GT(
         loaded.GetColumnAwareTagRoutingStatsBlob(0).Length(), 0);
-    BOOST_REQUIRE(filteredSearch(loaded) != nullptr);
+    const auto baselineFiltered = filteredSearch(loaded);
+    BOOST_REQUIRE(baselineFiltered != nullptr);
+    const auto baselineFilteredIds = ExtractValidIds(baselineFiltered);
+    const auto requireDiagnosticIndependentResults = [&](TenantIndexManager& manager) {
+        const auto result = filteredSearch(manager);
+        BOOST_REQUIRE(result != nullptr);
+        const auto ids = ExtractValidIds(result);
+        BOOST_CHECK_EQUAL_COLLECTIONS(ids.begin(), ids.end(),
+            baselineFilteredIds.begin(), baselineFilteredIds.end());
+    };
 
     const std::vector<std::uint32_t> mixedOrDNF = {
         0x444E4633U, 2,
@@ -1300,10 +1431,8 @@ BOOST_AUTO_TEST_CASE(HybridTagRoutingStatsPersistRepairAndReload)
     BOOST_REQUIRE(mixedResult != nullptr);
     const auto mixedIds =
         ExtractValidIds(mixedResult);
-    BOOST_CHECK(
-        std::find(
-            mixedIds.begin(), mixedIds.end(),
-            200) != mixedIds.end());
+    // Fixed spatial budgets may underfill; every returned point must match.
+    BOOST_CHECK_LE(mixedIds.size(), static_cast<size_t>(kResultNum));
     for (int vectorId : mixedIds) {
         const bool categoricalMatch =
             tags[static_cast<size_t>(vectorId) *
@@ -1342,10 +1471,7 @@ BOOST_AUTO_TEST_CASE(HybridTagRoutingStatsPersistRepairAndReload)
     BOOST_REQUIRE(columnResult != nullptr);
     const auto columnIds =
         ExtractValidIds(columnResult);
-    BOOST_REQUIRE(
-        std::find(
-            columnIds.begin(), columnIds.end(),
-            2) != columnIds.end());
+    BOOST_CHECK_LE(columnIds.size(), static_cast<size_t>(kResultNum));
     for (int vectorId : columnIds) {
         BOOST_CHECK_EQUAL(
             tags[static_cast<size_t>(vectorId) *
@@ -1556,18 +1682,20 @@ BOOST_AUTO_TEST_CASE(HybridTagRoutingStatsPersistRepairAndReload)
     }
     TenantIndexManager stale(kDim, "SPANN", "Float");
     BOOST_REQUIRE(stale.LoadAll(saveDir.path.c_str()));
-    BOOST_CHECK(filteredSearch(stale) == nullptr);
+    requireDiagnosticIndependentResults(stale);
     BOOST_REQUIRE(stale.BuildSignatures(
         0, tagBytes, kNumVectors, kNumTagsPerVec));
-    BOOST_REQUIRE(filteredSearch(stale) != nullptr);
+    requireDiagnosticIndependentResults(stale);
+    BOOST_CHECK_GT(stale.GetColumnAwareTagRoutingStatsBlob(0).Length(), 0);
 
     BOOST_REQUIRE(std::remove(routeStats.c_str()) == 0);
     TenantIndexManager missing(kDim, "SPANN", "Float");
     BOOST_REQUIRE(missing.LoadAll(saveDir.path.c_str()));
-    BOOST_CHECK(filteredSearch(missing) == nullptr);
+    requireDiagnosticIndependentResults(missing);
     BOOST_REQUIRE(missing.BuildSignatures(
         0, tagBytes, kNumVectors, kNumTagsPerVec));
-    BOOST_REQUIRE(filteredSearch(missing) != nullptr);
+    requireDiagnosticIndependentResults(missing);
+    BOOST_CHECK_GT(missing.GetColumnAwareTagRoutingStatsBlob(0).Length(), 0);
 
     {
         FILE* file = std::fopen(
@@ -1588,11 +1716,12 @@ BOOST_AUTO_TEST_CASE(HybridTagRoutingStatsPersistRepairAndReload)
     TenantIndexManager corrupt(kDim, "SPANN", "Float");
     BOOST_REQUIRE(
         corrupt.LoadAll(saveDir.path.c_str()));
-    BOOST_CHECK(filteredSearch(corrupt) == nullptr);
+    requireDiagnosticIndependentResults(corrupt);
     BOOST_REQUIRE(corrupt.BuildSignatures(
         0, tagBytes, kNumVectors,
         kNumTagsPerVec));
-    BOOST_REQUIRE(filteredSearch(corrupt) != nullptr);
+    requireDiagnosticIndependentResults(corrupt);
+    BOOST_CHECK_GT(corrupt.GetColumnAwareTagRoutingStatsBlob(0).Length(), 0);
 
     {
         FILE* file = std::fopen(
@@ -1726,8 +1855,6 @@ BOOST_AUTO_TEST_CASE(SingleLabelIntegerCosineUsesNativeScale)
         "ReplicaCount", "2");
     builder.SetSSDBuildParam(
         "TailReplicaCount", "0");
-    builder.SetSSDBuildParam(
-        "EnableUnfilterTail", "true");
     builder.SetSSDBuildParam(
         "UnfilterTailBufferLength", "0");
     builder.SetSSDBuildParam("CrossEdges", "0");

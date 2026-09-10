@@ -16,6 +16,7 @@ cd "$(dirname "$0")/../.."          # -> repo root (SPTAG/)
 ROOT=$(pwd)
 
 CFG="${1:-$ROOT/Script_AE/iniFile/build_spann_attr_spacev_opq25.ini}"
+[[ "$CFG" = /* ]] || CFG="$ROOT/$CFG"
 [ -f "$CFG" ] || { echo "config not found: $CFG"; exit 2; }
 python3 "$ROOT/Tools/benchmarks/validate_spann_hierarchy_config.py" "$CFG"
 
@@ -33,15 +34,16 @@ fi
 export GLIBC_TUNABLES=glibc.rtld.optional_static_tls=2000000
 
 # --- derive paths from the ini (single source of truth) ---
-ini() { sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\([^#]*\).*/\1/p" "$CFG" | head -1 | sed 's/[[:space:]]*$//'; }
 ini_section() {
   awk -F= -v section="$1" -v key="$2" '
     BEGIN {
       wanted_section = "[" tolower(section) "]";
       wanted_key = tolower(key);
     }
-    /^\[/ {
-      in_section = (tolower($0) == wanted_section);
+    /^[[:space:]]*\[/ {
+      header = $0;
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", header);
+      in_section = (tolower(header) == wanted_section);
       next;
     }
     in_section && NF >= 2 {
@@ -56,15 +58,16 @@ ini_section() {
     }
   ' "$CFG"
 }
-OUT=$(ini IndexDirectory)
-STORAGE=$(ini Storage); [ -z "$STORAGE" ] && STORAGE=FILEIO
-TMPROOT=$(ini TmpDir)
-QFILE=$(ini PostingQuantizerFile)        # optional; e.g. .../opq_codes_m25.bin
+OUT=$(ini_section Base IndexDirectory)
+[ -n "$OUT" ] || { echo "[launcher] missing [Base] IndexDirectory"; exit 2; }
+STORAGE=$(ini_section BuildSSDIndex Storage); [ -z "$STORAGE" ] && STORAGE=FILEIO
+TMPROOT=$(ini_section BuildSSDIndex TmpDir)
+QFILE=$(ini_section BuildSSDIndex PostingQuantizerFile) # optional; e.g. .../opq_codes_m25.bin
 SID=""
 if [ -n "$QFILE" ]; then
   SID=$(dirname "$QFILE")
 fi
-PIPEPQ_PIVOTS=$(ini PipePQPivotsFile)
+PIPEPQ_PIVOTS=$(ini_section BuildSSDIndex PipePQPivotsFile)
 
 # (1) existing cross-graph knobs.
 #   CrossEdges       : 1 = build/reuse head_cross_edges.bin. New STATIC bundle
@@ -81,7 +84,7 @@ CROSS_EDGE_SEARCH_TOPK=$CROSS_EXTRA_EDGES
 [ "$CROSS_EDGE_SEARCH_TOPK" -lt 15 ] && CROSS_EDGE_SEARCH_TOPK=15
 CROSS_EDGE_BUILD_THREADS=$(ini_section BuildSSDIndex NumberOfThreads)
 [ -z "$CROSS_EDGE_BUILD_THREADS" ] && CROSS_EDGE_BUILD_THREADS=1
-ORDERED_PAGE_START=$(ini EnableOrderedPageStart); [ -z "$ORDERED_PAGE_START" ] && ORDERED_PAGE_START=false
+ORDERED_PAGE_START=$(ini_section BuildSSDIndex EnableOrderedPageStart); [ -z "$ORDERED_PAGE_START" ] && ORDERED_PAGE_START=false
 HYBRID_ENABLED=$(ini_section BuildSSDIndex EnableHybridDistance)
 [ -z "$HYBRID_ENABLED" ] && HYBRID_ENABLED=false
 
@@ -92,8 +95,8 @@ HYBRID_ENABLED=$(ini_section BuildSSDIndex EnableHybridDistance)
 #                       Default 0 (off; original behavior, smaller index).
 #   ResumeBuild       : 1 = reuse an existing index dir + head_select_state.bin and
 #                       skip the BKT (requires PersistSelectHead). Default 0.
-PERSIST_SELECTHEAD=$(ini PersistSelectHead); [ -z "$PERSIST_SELECTHEAD" ] && PERSIST_SELECTHEAD=0
-RESUME_BUILD=$(ini ResumeBuild);             [ -z "$RESUME_BUILD" ] && RESUME_BUILD=0
+PERSIST_SELECTHEAD=$(ini_section MultiTenant PersistSelectHead); [ -z "$PERSIST_SELECTHEAD" ] && PERSIST_SELECTHEAD=0
+RESUME_BUILD=$(ini_section MultiTenant ResumeBuild);             [ -z "$RESUME_BUILD" ] && RESUME_BUILD=0
 
 # (3) In-place build knob ([MultiTenant], single source of truth).
 #   InPlaceBuild : 1 = build the SPANN index DIRECTLY into the final IndexDirectory
@@ -102,7 +105,7 @@ RESUME_BUILD=$(ini ResumeBuild);             [ -z "$RESUME_BUILD" ] && RESUME_BU
 #                  is pre-allocated + incrementally flushed in the final dir, and
 #                  SaveAll skips the copy. Avoids the transient 2x disk footprint
 #                  and the copy time -- essential at billion scale. Default 0.
-INPLACE_BUILD=$(ini InPlaceBuild);           [ -z "$INPLACE_BUILD" ] && INPLACE_BUILD=0
+INPLACE_BUILD=$(ini_section MultiTenant InPlaceBuild); [ -z "$INPLACE_BUILD" ] && INPLACE_BUILD=0
 
 is_true() {
   case "$1" in
@@ -110,6 +113,20 @@ is_true() {
     *) return 1 ;;
   esac
 }
+
+if is_true "$RESUME_BUILD"; then
+  [ -d "$OUT" ] ||
+    { echo "[launcher] ResumeBuild requires an existing IndexDirectory: $OUT"; exit 2; }
+  echo "[launcher] RESUME: keeping existing index dir; only compatible SelectHead checkpoints may resume"
+else
+  if [ -e "$OUT" ] || [ -L "$OUT" ]; then
+    echo "[launcher] refusing fresh build: IndexDirectory already exists: $OUT"
+    echo "[launcher] choose a new output path or explicitly set [MultiTenant] ResumeBuild=true"
+    exit 2
+  fi
+  mkdir -p -- "$(dirname -- "$OUT")"
+  mkdir -- "$OUT"
+fi
 
 if [ -n "$TMPROOT" ]; then
   mkdir -p "$TMPROOT/work"
@@ -120,23 +137,41 @@ fi
 
 # BuildSignatures scans every posting and retains its filtering sidecars in
 # memory. Run it in a fresh process after the memory-intensive index build.
-BUILD_SIGNATURES=$(ini BuildSignatures); [ -z "$BUILD_SIGNATURES" ] && BUILD_SIGNATURES=false
+BUILD_SIGNATURES=$(ini_section Build BuildSignatures); [ -z "$BUILD_SIGNATURES" ] && BUILD_SIGNATURES=false
 PRIMARY_CFG="$CFG"
 if is_true "$BUILD_SIGNATURES"; then
-  PRIMARY_CFG=$(mktemp "${TMPDIR:-/tmp}/spann-primary-build.XXXXXX.ini")
-  trap 'rm -f "$PRIMARY_CFG"' EXIT HUP INT TERM
-  awk '
-    /^\[Build\][[:space:]]*$/ { in_build = 1 }
-    /^\[/ && $0 !~ /^\[Build\][[:space:]]*$/ { in_build = 0 }
-    in_build && /^[[:space:]]*BuildSignatures[[:space:]]*=/ {
-      print "BuildSignatures=false"
-      replaced = 1
-      next
-    }
-    { print }
-    END { exit replaced ? 0 : 1 }
-  ' "$CFG" > "$PRIMARY_CFG"
+  PRIMARY_CFG=$(python3 - "$CFG" "${TMPROOT:-$ROOT/build/primary-build-configs}" <<'PY'
+import os
+import re
+import sys
+import uuid
+from pathlib import Path
+
+with Path(sys.argv[1]).open(encoding="utf-8", newline="") as source:
+    lines = source.readlines()
+section = ""
+replaced = 0
+for index, line in enumerate(lines):
+    header = re.fullmatch(r"\s*\[([^\]]+)\]\s*", line)
+    if header:
+        section = header.group(1).lower()
+    elif section == "build" and re.match(r"\s*buildsignatures\s*=", line, re.IGNORECASE):
+        ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+        lines[index] = line.split("=", 1)[0] + "=false" + ending
+        replaced += 1
+if replaced != 1:
+    raise SystemExit("[launcher] primary config requires exactly one [Build] BuildSignatures entry")
+directory = Path(sys.argv[2]).resolve()
+directory.mkdir(parents=True, exist_ok=True)
+destination = directory / f"spann-primary-build-{uuid.uuid4().hex}.ini"
+descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
+    output.writelines(lines)
+print(destination)
+PY
+)
 fi
+echo "[launcher] primary build config (preserved): $PRIMARY_CFG"
 
 validate_runtime_config() {
   local runtime_ini="$OUT/tenant_0/indexloader.ini"
@@ -289,8 +324,8 @@ print(
 PY
     fi
     local key expected actual
-    for key in TailReplicaCount UnfilterTailBufferLength EnableUnfilterTail; do
-        expected=$(ini "$key")
+    for key in TailReplicaCount UnfilterTailBufferLength; do
+      expected=$(ini_section BuildSSDIndex "$key")
       [ -z "$expected" ] && continue
       actual=$(sed -n "s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*//Ip" "$runtime_ini" | head -1)
       [ "$actual" = "$expected" ] ||
@@ -338,7 +373,7 @@ for key, expected in required.items():
     if actual != expected:
         raise SystemExit(f"[launcher] {key} mismatch: expected {expected}, got {actual}")
 
-dual_pool = config.get(("MultiTenant", "DualPoolAugment"), "0").lower()
+dual_pool = config.get(("SelectHead", "DualPoolAugment"), "0").lower()
 enabled = dual_pool in {"1", "true", "yes", "on"}
 if enabled != head_role_path.exists():
     state = "present" if head_role_path.exists() else "absent"
@@ -382,24 +417,25 @@ else:
 PY
 }
 
-if [ "$PERSIST_SELECTHEAD" = "1" ] || [ "$PERSIST_SELECTHEAD" = "true" ]; then
+if is_true "$PERSIST_SELECTHEAD"; then
   export SPTAG_PERSIST_SELECTHEAD=1
+else
+  unset SPTAG_PERSIST_SELECTHEAD
 fi
-if [ "$RESUME_BUILD" = "1" ] || [ "$RESUME_BUILD" = "true" ]; then
+if is_true "$RESUME_BUILD"; then
   export SPTAG_RESUME_BUILD=1
+else
+  unset SPTAG_RESUME_BUILD
 fi
-if [ "$INPLACE_BUILD" = "1" ] || [ "$INPLACE_BUILD" = "true" ]; then
+if is_true "$INPLACE_BUILD"; then
   export SPTAG_SPANN_INPLACE_DIR="$OUT"
   echo "[launcher] IN-PLACE build: SPTAG_SPANN_INPLACE_DIR=$OUT (no final copy)"
+else
+  unset SPTAG_SPANN_INPLACE_DIR
 fi
 
 echo "[launcher] config = $CFG"
 echo "[launcher] index  = $OUT"
-if [ "${SPTAG_RESUME_BUILD:-0}" = "1" ]; then
-  echo "[launcher] RESUME: keeping existing index dir, skipping BKT if head_select_state.bin present"
-else
-  rm -rf "$OUT"
-fi
 
 # --- build: ALL params from the ini ---
 /usr/bin/time -v "$ROOT/Release/spannbuilder" -c "$PRIMARY_CFG" 2>&1
@@ -451,6 +487,4 @@ if [ -n "$PIPEPQ_PIVOTS" ] && [ -f "$PIPEPQ_PIVOTS" ]; then
     { echo "[launcher] failed to repoint PipePQ pivots to tenant_0"; exit 1; }
   echo "[launcher] copied pipepq_pivots.bin into tenant_0"
 fi
-RUNTIME_TAIL=$(sed -n 's/^[[:space:]]*EnableUnfilterTail[[:space:]]*=[[:space:]]*//Ip' \
-  "$OUT/tenant_0/indexloader.ini" | head -1)
-echo "[launcher] done. SEARCH-time unfilter tail: EnableUnfilterTail=${RUNTIME_TAIL:-true} (persisted INI)"
+echo "[launcher] done. Posting reads use the persisted SearchPostingPageLimit for every predicate."

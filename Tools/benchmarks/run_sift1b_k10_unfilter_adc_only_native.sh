@@ -31,7 +31,7 @@ for entry in "$SOURCE_INDEX/tenant_0"/*; do
 done
 
 cp "$SOURCE_INI" "$TENANT_DIR/indexloader.ini"
-for key in RerankL SearchInternalResultNum FixedNprobe ForceDenseTagSearch \
+for key in RerankL SearchInternalResultNum FixedNprobe \
            LogPhaseTime QuantADCOnly MaxDistRatio; do
     sed -i "/^${key}=/d" "$TENANT_DIR/indexloader.ini"
 done
@@ -39,7 +39,6 @@ cat >> "$TENANT_DIR/indexloader.ini" <<'EOF'
 RerankL=500
 SearchInternalResultNum=120
 FixedNprobe=120
-ForceDenseTagSearch=true
 LogPhaseTime=true
 QuantADCOnly=true
 MaxDistRatio=8
@@ -48,7 +47,6 @@ EOF
 grep -qx 'RerankL=500' "$TENANT_DIR/indexloader.ini"
 grep -qx 'SearchInternalResultNum=120' "$TENANT_DIR/indexloader.ini"
 grep -qx 'FixedNprobe=120' "$TENANT_DIR/indexloader.ini"
-grep -qx 'ForceDenseTagSearch=true' "$TENANT_DIR/indexloader.ini"
 grep -qx 'LogPhaseTime=true' "$TENANT_DIR/indexloader.ini"
 grep -qx 'QuantADCOnly=true' "$TENANT_DIR/indexloader.ini"
 grep -qx 'MaxDistRatio=8' "$TENANT_DIR/indexloader.ini"

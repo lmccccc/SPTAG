@@ -203,7 +203,7 @@ mapped two-column attribute table before STATIC construction. Limited-tag
 STATIC placement also retains only emitted RNG edges for both `H` and `O`
 instead of allocating fixed `N * ReplicaCount` arrays.
 
-For the current five-level routing-only model, use
+For the current five-level spatial hierarchy, use
 `Tools/benchmarks/build_spann_attr_sift1b_zipf200_limited_tag_h5.ini`.
 It retains the SIFT1B baseline above: UInt8/L2, H1 ratio `.12`, SelectHead
 thresholds `10/25`, 45 build threads, build beam 64, MaxCheck 16324, replica
@@ -232,6 +232,7 @@ HierarchyReplicaCount=8
 BuildH1Graph=false
 CompactHierarchyVectors=false
 MinHeadsPerTag=0
+ParallelBKTBuild=true
 
 [Tags]
 TagFile=sift1b/sift1b_build/sift1b_zipf200_sparse399_numeric_attrs.u32
@@ -264,8 +265,8 @@ columns are supported without reordering, for example
 The selected key must be categorical. Single-label means one value per vector
 in that key column, not that every input must have only one categorical column.
 Saved schema/version/fingerprint metadata binds the original column layout.
-New signed hierarchy records cover every categorical label; the signature
-min/max selectivity pair is removed. CPU BKT/TPT RNG follows upstream `5619bb1`:
+Hierarchy signatures are not consulted by query traversal; the historical
+signature min/max selectivity pair is removed. CPU BKT/TPT RNG follows upstream `5619bb1`:
 BKT centers and TPT projections use the global C RNG; TPT workers shuffle with
 default `std::mt19937` engines and call `Sleep(i * 100)` then `std::srand(clock())`
 per tree. There is no custom fixed seed or external seed parameter, and even
@@ -275,21 +276,26 @@ columns remain exact-filter record fields, not partitions.
 `HierarchyLevels` counts H1, so `5` selects H1 through H5. Do not add a separate
 upper-level ratio. `HierarchyInitialProbeRatio` is a search beam fraction, not
 a head-selection ratio.
+The production SIFT1B recipe enables `ParallelBKTBuild=true` so sibling BKT
+nodes are processed concurrently instead of serializing the long recursive
+H1 selection. This increases temporary memory because each concurrent node
+owns k-means workspace; confirm host headroom before launch.
 The expected layer sizes are approximately 120M / 14.4M / 1.728M / 207.36K / 24.88K;
 BKT selection determines the actual counts. Only H5 retains a navigation
 graph. H4/H3/H2/H1 use CSR descent and independent vector catalogs; intermediate
 graphs are temporary construction aids. This SIFT1B recipe selects categorical
 column 0 as its key, with column 1 used for exact numeric filtering.
-Anchored queries use CSR signatures to admit results from one highest-layer
-graph/tree search. Nonmatching nodes remain traversable by default; an
-underfilled result continues the same frontier within `HierarchyMaxCheck`,
-rather than enumerating H1 supports or restarting the graph search.
-`SparseFallbackMaxHeads`, `SparseFallbackMaxPostingPages` and
-`HierarchyRouteSelectivityThreshold` are removed. Auto navigation uses the
-enabled hierarchy independently of selectivity. `HierarchyGraphSignaturePruning`
-is a separate, default-off traversal restriction. Both software prefetch modes
-remain available through `HierarchyPrefetchMode`: `Rolling16` (default) and
-`Batch64`.
+Every filtered and unfiltered request runs the same distance-only highest-layer
+search and one fixed-beam CSR descent. `HierarchyInitialProbeRatio` fixes the
+beam fraction and `HierarchyMaxCheck` fixes the shared graph budget. Every
+reached H1 child is distance-scored before exact membership admission.
+Predicates do not prune graph/CSR traversal, choose another graph, widen the
+beam, retry search, or enumerate tag supports. Consequently a sparse predicate
+may return fewer than top-k. `HeadNavigationMode`,
+`HierarchyGraphSignaturePruning`, `SparseFallbackMaxHeads`,
+`SparseFallbackMaxPostingPages`, and hierarchy route-selectivity settings are
+removed and rejected. Both software prefetch modes remain available through
+`HierarchyPrefetchMode`: `Rolling16` (default) and `Batch64`.
 O-derived support expansion adds support relationships rather than real heads.
 H and O each independently apply the same native construction parameters
 (`PostingPageLimit`, raised by `PostingVectorLimit`), not a combined H+O limit:
@@ -336,7 +342,10 @@ process-loader settings are external execution controls. For an unattended run,
 use a detached supervisor that retains PID, start/end times, exit status and
 resource/log files. The launcher first builds with signatures deferred, then
 runs `spannbuilder -c <run.ini> --build-signatures-only` in a fresh process and
-validates the saved runtime configuration. Use the matching
+validates the saved runtime configuration. It refuses an existing fresh-build
+`IndexDirectory`, reports the actual primary-build INI path, and preserves
+that INI on success or failure. Keep it with the original run configuration.
+Use the matching
 `spannsupportaudit <IndexDirectory>/tenant_0 <report-prefix>` after completion
 before interpreting filtered-query results. No build completion or performance
 claim follows merely from starting the supervisor.
@@ -363,36 +372,47 @@ navigation search. Explicit `LimitedTagVoteHeadCount` settings are rejected.
 For immutable legacy read/export compatibility, see the support provenance
 policy in `Tools/benchmarks/README.md`; old support is not silently relabeled.
 `H` and `O` retain separate
-`(head distance, VID)` order. The persisted boundary lets filtered queries scan
-only `H`, while unfiltered and exact fallback routes read the self-contained
-original `O` suffix directly. Limited-tag mode sets `TailReplicaCount=0` because
+`(head distance, VID)` order. The persisted boundary lets predicates safely anchored on the limited-tag key
+scan `H`, while unfiltered and other predicates read the self-contained
+original `O` suffix directly. This is posting-region membership, not graph
+routing: both paths use the same spatial traversal and fixed budgets.
+Limited-tag mode sets `TailReplicaCount=0` because
 it does not append supplemental unfilter-tail replicas.
 
+Filtered BKT/KDT searches maintain an independent unfiltered distance heap for
+native stopping. Exact result admission cannot extend that stopping condition;
+filtered and unfiltered calls obey the same initial-pivot and neighbor
+`MaxCheck` caps. An underfilled result set does not continue a tree frontier,
+widen the hierarchy beam, restart traversal, or trigger direct tag-to-head
+completion. Sparse or budget-limited queries may return fewer than top-k,
+including zero. These are valid ANN results, not failures to repair; keep them
+in recall accounting.
+
 `SearchPostingPageLimit` actively caps physical reads in the selected region.
-In constrained `H | O` snapshots, anchored filtered queries read H, while
-unfiltered or predicates requiring the full-O path start at the persisted H/O
-boundary and read O. Neither path bypasses the positive page limit to read the
-complete region; only complete records in the readable prefix are scanned.
+In constrained `H | O` snapshots, eligible anchored predicates read H, while
+unfiltered or other predicates start at the persisted H/O boundary and read O.
+Neither region bypasses the positive page limit to read the complete region;
+only complete records in the readable prefix are scanned.
 Zero disables this read cap and must not be substituted in a capped benchmark.
 `UseDirectIO=false` selects buffered I/O. To match
 the SIFT1B paper protocol, warm the complete query set and then measure the same
 query set so its posting working set can reside in the Linux page cache.
 
-The following legacy tail sweeps concern ordinary pure-plus-tail layouts,
-not the canonical limited-tag H/O recipe above. For a benchmark-only
-bounded-tail sweep, set `UnfilterPurePages=true` and
-`UnfilterExtraTailPages=N` in the native `[SearchSSDIndex]` section. `N=0`
-still scans tail records that share the final physical page of the pure prefix;
-positive values permit at most `N` additional tail pages. Keep the documented
-default (`UnfilterPurePages=false`, `UnfilterExtraTailPages=0`) for normal
-adaptive reads, still subject to `SearchPostingPageLimit`.
+Ordinary legacy pure-plus-tail layouts use the same contiguous posting prefix
+for filtered and unfiltered requests, including any tail records within
+`SearchPostingPageLimit`. Exact categorical/numerical checks apply to every
+admitted record. `TailReplicaCount` and `UnfilterTailBufferLength` retain their
+construction meaning; no posting bytes or tail boundaries need rewriting.
 
-For a distance-prefix computation sweep, keep the complete tail and set
-`UnfilterPureDistanceScanPercent` to a value in `[1,100]`. The reader scans the
-nearest percentage of the distance-ordered pure prefix plus every tail record;
-`100` is the normal full-posting path. This option is rejected for
-attribute-ordered snapshots and cannot be combined with `UnfilterPurePages` or
-`UnfilterExtraTailPages`.
+`EnableUnfilterTail`, `UnfilterPurePages`, `UnfilterExtraTailPages`,
+`UnfilterPureDistanceScanPercent`, `AblateUExtra` and `AblateTail` are removed
+and rejected, including explicit false/zero/defaults. Do not replace them with
+a different predicate-dependent budget. Remove retired entries only in a
+separate writable configuration clone, preserving historical artifacts.
+Existing ordered-page directories remain layout metadata, not permission to
+jump to predicate-selected pages. Native OPQ/PipePQ load their configured
+codec; `SPTAG_OPQ_PREFILTER`, `SPTAG_PAGE_SELECT` and
+`SPTAG_RBQ_EXHAUSTIVE` are rejected rather than enabling alternate paths.
 
 #### **Current SIFT1M limited-tag comparison**
 
@@ -430,7 +450,7 @@ measurement of cap removal or the two rescue records.
 | Mixed DNF | -1.43% to +0.17% | +0.62 to +2.00 percentage points |
 | Sparse tag | Budget-dependent trade-off | At nprobe32: QPS -24.86%, recall 79.57% to 93.42%; at nprobe256: QPS -8.89%, recall 100% to 99.97% |
 
-Historical direct-H1 completion is absent in current navigation; the older
+Historical direct-H1 completion is absent in current traversal; the older
 upper-layer ratio also differs. Do not attribute every difference to rescue
 or claim uniformly unchanged performance. The local run and raw measurements
 are preserved under

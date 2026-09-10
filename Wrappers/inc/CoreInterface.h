@@ -236,11 +236,11 @@ public:
     // Returns 0 when the tenant has no HeadIndex workdir.
     uint64_t GetTenantHeadIndexSize(int p_tenantId) const;
 
-    // Get tag routing stats using the legacy packed layout:
+    // Get exact tag/posting diagnostics using the legacy packed layout:
     // uint32_t tag, int32_t vectorCount, int32_t postingCount.
     ByteArray GetTagRoutingStatsBlob(int p_tenantId) const;
 
-    // Get exact column-aware tag routing stats as a packed byte buffer.
+    // Get exact column-aware tag/posting diagnostics as a packed byte buffer.
     // Each entry uses the layout: uint32_t column, uint32_t tag,
     // int32_t vectorCount, int32_t postingCount.
     ByteArray GetColumnAwareTagRoutingStatsBlob(int p_tenantId) const;
@@ -276,7 +276,6 @@ public:
     uint64_t GetLastPostingPrePS() const;
     uint64_t GetLastScannedVectors() const;
     uint64_t GetLastMatchedVectors() const;
-    uint64_t GetLastPrimaryHeadCandidateCount() const;
 
     // Enable/disable dropping OS page cache on HeadIndex eviction (for benchmarking)
     void SetDropPageCacheOnEvict(bool enable) { m_dropPageCacheOnEvict = enable; }
@@ -290,11 +289,6 @@ public:
     // Each vector can have multiple tags (e.g. org, dept, team, project).
     bool BuildSignatures(int p_tenantId, ByteArray p_tags, int p_numVectors,
                          int p_numTagsPerVec);
-
-    // Recompute each vector's nearest persisted head and write primary_head_csr.bin
-    // without touching the posting store. Intended for an existing SPANN index.
-    bool BackfillPrimaryHeadCSR(int p_tenantId, ByteArray p_vectors, int p_numVectors,
-                                ByteArray p_tags, int p_numTagsPerVec);
 
     // Build index with per-vector tags integrated. Call BuildSignatures
     // explicitly after the index build to generate PS/NS sidecars.
@@ -356,31 +350,6 @@ private:
     uint64_t m_loadedHeadIndexBytes = 0;  // current estimated total loaded HeadIndex size
     std::map<int, uint64_t> m_tenantHeadIndexAccountedBytes;
 
-    // Per-tenant sparse tag index: tag → [posting_ids] for low-selectivity tags
-    std::map<int, std::shared_ptr<SPTAG::Cache::SparseTagIndex>> m_tenantSparseIdx;
-
-    // Per-tenant tag-pure postings (chunked, stored inside the same KV/FileIO
-    // backend that holds the regular SPANN postings — reuses its cache).
-    // Each metadata entry carries the chunk-key list + per-chunk entry counts;
-    // payload bytes live in the KV store under keys [numHeads, numHeads+N).
-    std::map<int, std::unordered_map<uint32_t,
-        std::shared_ptr<SPTAG::Cache::TagPurePosting>>> m_tenantTagPurePostings;
-
-    // Cached KV-store handle per tenant for the tag-pure path. Populated at
-    // BuildSignatures time. Used by the predicate-search fast path to issue
-    // MultiGet without re-resolving the SPANN index pointer chain.
-    std::map<int, std::shared_ptr<SPTAG::Helper::KeyValueIO>> m_tenantTagPureKV;
-
-    // Per-tenant key cursor for tag-pure chunks; monotonically advances each
-    // BuildSignatures call (no reuse — drops the old keys from the LRU).
-    std::map<int, SPTAG::SizeType> m_tenantTagPureNextKey;
-
-    // Per-tenant FileIO page budget snapshot (postingPageLimit + bufferLength + 1
-    // pages and the per-chunk page count). Used to size the per-query
-    // ExtraWorkSpace used by MultiGet on the fast path.
-    std::map<int, int> m_tenantTagPureBlockLimit;
-    std::map<int, int> m_tenantTagPurePagesPerChunk;
-
     // Temporary storage during BuildFromDataWithTags
     ByteArray m_buildTags;
     int m_buildNumTagsPerVec = 0;
@@ -390,7 +359,7 @@ private:
     // tenant_id -> vector count mapping  
     std::map<int, int> m_tenantVectorCounts;
 
-    // Exact per-tag routing stats computed by BuildSignatures.
+    // Exact per-tag diagnostics computed by BuildSignatures.
     std::map<int, TagRoutingStatsMap> m_tenantTagRoutingStats;
 
     // Per-level tag value offsets (minimum tag value at each hierarchical
@@ -507,19 +476,9 @@ private:
     bool SaveUnifiedStorage(const char* p_baseDir);
     bool LoadUnifiedStorage(const char* p_baseDir);
 
-    // Load per-tenant sparse_tags.bin sidecars into m_tenantSparseIdx.
-    // Called from both LoadUnifiedStorage and the legacy load path; safe to
-    // call repeatedly (skips tenants that already have an entry).
-    void LoadTenantSparseIndices();
-
-    // Load optional extreme_sparse_tags.bin sidecars. The file header is
-    // self-describing and is validated again against the loaded SPANN options
-    // before a query can use it.
-
-    // Load per-tenant tagpure_meta.bin sidecars into m_tenantTagPurePostings.
-    // Also resolves and caches the KV store handle + page budget needed by
-    // the predicate-search fast path. Mirrors LoadTenantSparseIndices.
-    void LoadTenantTagPureIndices();
+    // Load tag-level offsets and numeric domains used by exact membership
+    // checks and posting-admission masks.
+    void LoadTenantFilterMetadata();
 
     // Reload exact per-tag selectivity statistics used by hybrid cost routing.
     bool LoadTenantTagRoutingStats();

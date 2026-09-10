@@ -85,24 +85,39 @@ def validate(config, *, runtime=False):
                "hierarchyrouteselectivitythreshold", "secondlevelrouteselectivitythreshold",
                "vectoroffset", "vectorcount", "withmetaindex", "sharebuildownership", "tagoffset",
                "bktseed", "tptseed", "hierarchysignatureminselectivity", "hierarchysignaturemaxselectivity",
-               "secondlevelsignatureminselectivity", "secondlevelsignaturemaxselectivity"}
+               "secondlevelsignatureminselectivity", "secondlevelsignaturemaxselectivity",
+               "hierarchygraphsignaturepruning", "secondlevelgraphsignaturepruning",
+               "headnavigationmode", "forcedensetagsearch", "directsparsemaxpostings",
+               "filteredsearchnprobesafety", "filteredsearchtargetrecall", "filteredsearchcoverageexponent",
+               "enableadaptivefilterednprobe", "logadaptivenprobe", "filterkeepuextra",
+               "buildprimaryheadcsr", "primaryheadcsrfile", "enableprimaryheadbypass", "primaryheadbypassrerankl",
+               "hybridroutesamplecount", "hybridrouteselectivitythreshold", "hybridroutedeformationthreshold",
+               "loghybridroute",
+               "enableunfiltertail", "unfilterpurepages", "unfilterextratailpages",
+               "unfilterpuredistancescanpercent", "ablateuextra", "ablatetail"}
     for section, values in config.items():
         for key, value in values.items():
             section_alias = section == "multitenant" and key in {
                 "crossedges", "crossextraedges", "dualpoolaugment", "dualpoolextraratio", "uextraidfile"}
+            runtime_layout = section == "searchssdindex" and key in {
+                "enableorderedpagestart", "orderedpagestartattrs"}
             derived_bulk = not runtime and (
                 (section == "tags" and key == "tenant") or
                 (section in {"buildssdindex", "searchssdindex"} and key == "numtagspervec") or
                 key == "staticacltagcols")
             if not runtime and key == "columntypes" and section != "tags":
                 raise ValueError("Specify ColumnTypes only in [Tags]")
-            if key in removed or section_alias or derived_bulk or (key in {"selectheadtype", "selecttype"} and
+            if key in removed or section_alias or runtime_layout or derived_bulk or (key in {"selectheadtype", "selecttype"} and
                                   value.lower() == "pertagbkt"):
                 raise ValueError(f"[{section}] {key} was removed; use canonical native options")
     for key in ("SPTAG_ACL_COLS", "SPTAG_HIER_LEVEL_WIDTHS", "SPTAG_PIVOT_FORCE_NODE_COUNT",
                 "SPTAG_DISABLE_PIVOT_ESTIMATOR", "SPTAG_ROUTING_COLS", "SPTAG_ROUTING_ONLY",
                 "SPTAG_PER_VECTOR_TAGS_FILE", "SPTAG_PERTAG_HEAD_RATIO", "SPTAG_SELECT_TYPE_OVERRIDE",
-                "SPTAG_NUMERIC_COLS", "SPTAG_TAG_OFFSET", "SPTAG_TAGS_OFFSET"):
+                "SPTAG_NUMERIC_COLS", "SPTAG_TAG_OFFSET", "SPTAG_TAGS_OFFSET",
+                "SPTAG_OPQ_PREFILTER", "SPTAG_PAGE_SELECT", "SPTAG_PAGE_DIAG",
+                "SPTAG_DNF_NODROP", "SPTAG_RBQ_EXHAUSTIVE",
+                "SPTAG_UNFILTER_TAIL", "SPTAG_UNFILTER_PURE_PAGES", "SPTAG_UNFILTER_EXTRA_TAIL_PAGES",
+                "SPTAG_UNFILTER_PURE_DISTANCE_SCAN_PERCENT", "SPTAG_ABLATE_UEXTRA", "SPTAG_ABLATE_TAIL"):
         if key in os.environ:
             raise ValueError(f"{key} was removed; use canonical native options")
     if not runtime and "SPTAG_BUILD_SHARE_OWNERSHIP" in os.environ:

@@ -295,21 +295,21 @@ Categorical/numeric records, exact filters, support assignments, H/O regions
 and signed spatial hierarchy CSR remain supported. Generic physical bundles
 and optional cross-edges/tails remain for geometry and upstream CRUD.
 
-#### Unfilter enhancement layers
+#### Spatial enhancement layers
 
 For good **unfiltered** recall/QPS on a physical multi-bundle
 index, build the cross-graph stitch plus H1 unfilter-tail replicas. U_extra is
 optional and defaults OFF in canonical SPACEV configs after ablation showed no
 recall gain once H1 tails are enabled. Without cross-graph/tail, unfilter
 degrades to a bare per-node fan-out across the ACL bundle nodes. See
-**AGENTS.md → "Unfilter Enhancement Pipeline"** and
+**AGENTS.md → "Unified Spatial Query Pipeline"** and
 **[docs/MultiTenant_SIFT1M_UnfilterTail.md](docs/MultiTenant_SIFT1M_UnfilterTail.md)**.
 
 | Layer | Enable (build) | Enable (search) |
 | ----- | -------------- | --------------- |
 | ① cross-graph | post-build: `Release/augmentheadgraph -d <index>/tenant_0/HeadIndex -k 15 -m 10 -t N -w true` | (auto) |
-| ② U_extra (~10% extra unfilter-only heads; optional) | `[MultiTenant] DualPoolAugment=1` `DualPoolExtraRatio=0.1` | (auto) |
-| ③ unfilter-tail (K nearest-head tail copies/vector) | `[BuildSSDIndex] TailReplicaCount=K` `UnfilterTailBufferLength=P` (P=max extra physical tail pages beyond pure pages) | `[SearchSSDIndex] EnableUnfilterTail=true` |
+| ② U_extra (~10% extra spatial heads; optional) | `[SelectHead] DualPoolAugment=1` `DualPoolExtraRatio=0.1` | same spatial policy for all predicates |
+| ③ legacy tail (K nearest-head tail copies/vector) | `[BuildSSDIndex] TailReplicaCount=K` `UnfilterTailBufferLength=P` (P=max extra physical tail pages beyond pure pages) | common `SearchPostingPageLimit` prefix, independent of predicates |
 
 #### Native `.ini` build config (recommended — single source of truth)
 
@@ -335,8 +335,11 @@ Tools/benchmarks/run_spann_attr_build.sh [config.ini]   # launcher derives paths
   types may be interleaved and width is derived. `LimitedTagColumn` is an
   absolute categorical column index, not a partition identifier. `[SearchSSDIndex]`
   carries persisted query behavior such as `InternalResultNum`
-  (internally `SearchInternalResultNum`),
-  and `EnableUnfilterTail`. Validated posting prefiltering is automatic.
+  (internally `SearchInternalResultNum`), `MaxCheck`, and
+  `SearchPostingPageLimit`. Exact attributes admit results and choose H/O
+  membership only; posting signatures do not prune reads.
+  Unfiltered-only tail/page controls and `SPTAG_OPQ_PREFILTER` are removed
+  and rejected even when explicitly disabled.
   Retired partition/EST settings and duplicate `[MultiTenant]` aliases are
   rejected; see the [reduced configuration](Tools/benchmarks/README.md#reduced-filtering-configuration).
 - Comments MUST start with `;`; an explicit CLI flag overrides any ini value.

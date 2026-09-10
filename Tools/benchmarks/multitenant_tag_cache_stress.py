@@ -20,15 +20,6 @@ DEFAULT_QUERY_FILE = "/home/v-mochengli/dataset/sift/sift_query.fvecs"
 DEFAULT_OUTPUT_ROOT = Path("/tmp")
 MB = 1024 * 1024
 LEVEL_NAMES = ("org", "dept", "team", "project")
-DEFAULT_SEARCH_PARAMS = {
-    "force_dense_tag_search": False,
-    "direct_sparse_max_postings": 320,
-    "filtered_search_nprobe_safety": 1.0,
-    "filtered_search_target_recall": 1.0,
-    "filtered_search_coverage_exponent": 0.5,
-}
-
-
 def import_sptag_module():
     def supports_required_api(module) -> bool:
         manager_cls = getattr(module, "TenantIndexManager", None)
@@ -553,19 +544,6 @@ def run_batches(manager, batches: list[dict], tenant_infos: dict[str, dict], top
     return batch_rows, overall
 
 
-def apply_search_params(manager, search_params: dict[str, object]) -> None:
-    if bool(search_params["force_dense_tag_search"]):
-        manager.SetSearchParam("ForceDenseTagSearch", "true", "BuildSSDIndex")
-    manager.SetSearchParam("DirectSparseMaxPostings", str(search_params["direct_sparse_max_postings"]), "BuildSSDIndex")
-    manager.SetSearchParam("FilteredSearchNprobeSafety", str(search_params["filtered_search_nprobe_safety"]), "BuildSSDIndex")
-    manager.SetSearchParam("FilteredSearchTargetRecall", str(search_params["filtered_search_target_recall"]), "BuildSSDIndex")
-    manager.SetSearchParam(
-        "FilteredSearchCoverageExponent",
-        str(search_params["filtered_search_coverage_exponent"]),
-        "BuildSSDIndex",
-    )
-
-
 def meta_to_text_lines(meta: dict) -> list[str]:
     lines = []
     for key in sorted(meta):
@@ -633,11 +611,7 @@ def write_outputs(output_dir: Path, payload: dict, meta: dict) -> None:
         "",
         "## Search Params",
         "",
-        f"- ForceDenseTagSearch: {payload['search_params']['force_dense_tag_search']}",
-        f"- DirectSparseMaxPostings: {payload['search_params']['direct_sparse_max_postings']}",
-        f"- FilteredSearchNprobeSafety: {payload['search_params']['filtered_search_nprobe_safety']}",
-        f"- FilteredSearchTargetRecall: {payload['search_params']['filtered_search_target_recall']}",
-        f"- FilteredSearchCoverageExponent: {payload['search_params']['filtered_search_coverage_exponent']}",
+        f"- Query traversal: {payload['search_params']['query_traversal']}",
         "",
         "## HeadIndex Sizes",
         "",
@@ -780,18 +754,11 @@ def run_rss_budget_sweep(args: argparse.Namespace, output_dir: Path) -> None:
             "--tenant-range", args.tenant_range,
             "--seed", str(args.seed),
             "--rss-high-water-mb", spec,
-            "--direct-sparse-max-postings", str(args.direct_sparse_max_postings),
-            "--filtered-search-nprobe-safety", str(args.filtered_search_nprobe_safety),
-            "--filtered-search-target-recall", str(args.filtered_search_target_recall),
-            "--filtered-search-coverage-exponent", str(args.filtered_search_coverage_exponent),
         ]
         if args.cache_limit_mb is not None:
             cmd.extend(["--cache-limit-mb", str(args.cache_limit_mb)])
         if args.drop_page_cache_on_evict:
             cmd.append("--drop-page-cache-on-evict")
-        if args.force_dense_tag_search:
-            cmd.append("--force-dense-tag-search")
-
         print(f"\n[{index}/{len(budget_specs)}] Running RSS budget {spec} -> {child_dir}")
         subprocess.run(cmd, check=True)
 
@@ -907,15 +874,6 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated RSS high-water specs. Each token accepts the same format as --rss-high-water-mb, for example 'off,+64,+128,1024'.",
     )
     parser.add_argument("--drop-page-cache-on-evict", action="store_true")
-    parser.add_argument("--force-dense-tag-search", action="store_true")
-    parser.add_argument("--direct-sparse-max-postings", type=int, default=DEFAULT_SEARCH_PARAMS["direct_sparse_max_postings"])
-    parser.add_argument("--filtered-search-nprobe-safety", type=float, default=DEFAULT_SEARCH_PARAMS["filtered_search_nprobe_safety"])
-    parser.add_argument("--filtered-search-target-recall", type=float, default=DEFAULT_SEARCH_PARAMS["filtered_search_target_recall"])
-    parser.add_argument(
-        "--filtered-search-coverage-exponent",
-        type=float,
-        default=DEFAULT_SEARCH_PARAMS["filtered_search_coverage_exponent"],
-    )
     return parser.parse_args()
 
 
@@ -973,11 +931,7 @@ def main() -> None:
     del tags
 
     search_params = {
-        "force_dense_tag_search": bool(args.force_dense_tag_search),
-        "direct_sparse_max_postings": int(args.direct_sparse_max_postings),
-        "filtered_search_nprobe_safety": float(args.filtered_search_nprobe_safety),
-        "filtered_search_target_recall": float(args.filtered_search_target_recall),
-        "filtered_search_coverage_exponent": float(args.filtered_search_coverage_exponent),
+        "query_traversal": "fixed_spatial_graph",
     }
 
     print("=" * 90)
@@ -1009,7 +963,6 @@ def main() -> None:
         cache_limit_source = "auto"
     cache_limit_policy = "max(2 * largest_head_index, total_head_index / 4), rounded up to MB" if cache_limit_source == "auto" else "user-specified"
 
-    apply_search_params(manager, search_params)
     build_signatures(manager, tenant_infos, selected_tenants)
 
     tenant_rows = []

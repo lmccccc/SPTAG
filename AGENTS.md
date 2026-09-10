@@ -97,20 +97,35 @@ python setup.py build_ext --inplace
 - Dataset destructor safety patch location:
   - `AnnService/inc/Core/Common/Dataset.h`
 
-## Unfilter Enhancement Pipeline (DO NOT DROP)
+## Unified Spatial Query Pipeline (DO NOT REGRESS)
 Current attribute SPANN uses one global spatial H1..H5 hierarchy. Attribute
 pivot planning, per-tag head selection, grouping files and tag-to-bundle routing
 are removed; removed INI/environment interfaces fail explicitly. Do not restore
-them. Keep exact categorical/numeric filtering, support assignments, H/O
-regions, signatures and signed spatial CSR. Generic physical bundle APIs and
-their cross-graph/unfilter-tail machinery remain for geometry and upstream CRUD,
-not attribute organization. U_extra remains optional and defaults OFF.
+them. Filtered and unfiltered requests use the same graph nodes, distance
+calculations, beams, max-check limits, posting target, and cross-edge policy.
+Tags may select an H/O posting region and admit exact results, but they must not
+select a graph, prune graph traversal, widen a budget, trigger a retry, or invoke
+a direct/exhaustive posting path. Sparse predicates may return fewer than top-k.
+Keep exact categorical/numeric filtering, support assignments, H/O regions and
+signed spatial CSR. Persisted signatures in legacy artifacts are compatibility
+metadata only and must not affect traversal.
 
 | Layer | What it builds | How to enable | Code |
 | ----- | -------------- | ------------- | ---- |
-| ① cross-graph | `head_cross_edges.bin` stitching the bundle nodes | existing `CrossEdges=1` + `CrossExtraEdges=N` build the sidecar atomically **before** STATIC Phase 4. The builder derives K as `max(15, N)` and reuses `BuildSSDIndex.NumberOfThreads`; the launcher reuses the sidecar and `augmentheadgraph` remains the fallback/rebuild tool. `CrossEdges=0` skips it. Search-time kill switch: env `SPTAG_DISABLE_CROSS_EDGES=1`; filter queries skip cross edges unless `SPTAG_FILTER_KEEP_CROSS=1` | shared builder `HeadCrossEdgeBuilder.cpp`; build-time tail callback and runtime traversal in `SPANNIndex.cpp` |
-| ② U_extra (~10% extra unfilter-only heads; optional, default OFF) | `head_role.bin` | ini `[SelectHead] DualPoolAugment=1` (+ `DualPoolExtraRatio=0.1`) if explicitly needed; canonical SPACEV config uses `DualPoolAugment=0` | `SPANNIndex.cpp` DualPoolAugment (~3098-3192) |
-| ③ unfilter-tail (K nearest-head tail copies/vector) | tail edges appended after each pure prefix, ordered by true head distance | build: native SSD params `[BuildSSDIndex] TailReplicaCount=K` + `UnfilterTailBufferLength=P`, where P is max extra physical tail pages beyond pure pages (tail may fill pure-page slack); search env `SPTAG_UNFILTER_TAIL=1` | `ExtraDynamicSearcher.h` Phase 4 (~4035-4090); SSD params `TailReplicaCount`/`UnfilterTailBufferLength` |
+| ① cross-graph | `head_cross_edges.bin` stitching physical bundle nodes | Native `[BuildSSDIndex] CrossEdges=1` plus `CrossExtraEdges=N`; `CrossEdges=0` skips it. Runtime uses the same spatial policy for filtered and unfiltered requests. | `HeadCrossEdgeBuilder.cpp`, `SPANNIndex.cpp` |
+| ② supplemental heads (optional, default OFF) | `head_role.bin` | Native `[SelectHead] DualPoolAugment=1` plus `DualPoolExtraRatio`; all configured bundle nodes participate regardless of predicates. | `SPANNIndex.cpp` |
+| ③ legacy tail layout | distance-ordered tail records after each pure prefix | Native `[BuildSSDIndex] TailReplicaCount=K` plus `UnfilterTailBufferLength=P` retain their construction meaning. All predicates scan the same native `SearchPostingPageLimit` prefix, including tail records within it. | `ExtraDynamicSearcher.h`, `ExtraStaticSearcher.h` |
+
+`EnableUnfilterTail`, `UnfilterPurePages`, `UnfilterExtraTailPages`,
+`UnfilterPureDistanceScanPercent`, `AblateUExtra` and `AblateTail` are removed
+and rejected, including explicit false/zero. Constrained H/O membership still
+selects its region, with the same native page limit in either region. Legacy
+ordinary pure+tail files remain readable without changing their construction.
+Ordered-page directories are layout compatibility metadata, never query-time
+pruning; their construction settings cannot be used as search overlays.
+`SPTAG_OPQ_PREFILTER`, `SPTAG_PAGE_SELECT`, `SPTAG_PAGE_DIAG`,
+`SPTAG_DNF_NODROP`, and `SPTAG_RBQ_EXHAUSTIVE` are rejected on presence.
+No predicate diagnostic may trigger a whole-posting-store scan during search.
 
 ### Billion-scale build options (resume / pin-balance / in-place)
 
@@ -120,10 +135,9 @@ not attribute organization. U_extra remains optional and defaults OFF.
 
 **In-place build (no final copy)** (avoid the transient 2× disk footprint + copy time at billion scale): by default the SPANN index is staged in a per-tenant **work dir** (`$SPTAG_SPANN_WORK_DIR/sptag_spann_tenant_<id>`, default `/tmp`) and `SaveAll` copies it to `IndexDirectory/tenant_<id>` at the end — which needs room for the postings *twice* (work + final) and re-writes the whole block pool. ini `[MultiTenant] InPlaceBuild=1` (→ launcher exports `SPTAG_SPANN_INPLACE_DIR=$IndexDirectory`) makes the build write the head index + SSD block pool **directly** into `IndexDirectory/tenant_<id>`. `SaveAll`/`SaveUnifiedStorage` then hit the `srcDir == dstDir` branch (`CoreInterface.cpp` ~3405, logs "already saved in place") and skip the copy. Note: the `StartFileSizeGB` block pool is pre-allocated in `IndexDirectory`'s filesystem, so that disk must hold it (for SPACEV-1B: `/datadisk`, 420–560GB). The SSD postings are already flushed incrementally to the FILEIO block pool during BuildSSDIndex, so in-place gives true streaming-to-final with no extra disk. Impl: work-dir computation in `CoreInterface.cpp` (~2334, honors `SPTAG_SPANN_INPLACE_DIR`).
 
-Search side: unfilter routes to all bundle nodes via cross-edge unified
-traversal (`SPANNIndex.cpp` ~1618; `m_globalHeadGraph` is no longer used for
-navigation). Cross-edge search toggles: `SPTAG_DISABLE_CROSS_EDGES`,
-`SPTAG_CROSSEDGE_UNFILTER`, `SPTAG_FILTER_KEEP_CROSS`.
+Search side: every request routes through all configured bundle nodes using the
+same spatial traversal (`SPANNIndex.cpp`; `m_globalHeadGraph` is no longer used
+for navigation). Do not introduce environment-variable search overrides.
 
 Full mode matrix and reproduce commands: `docs/MultiTenant_DualPool_Usage.md`,
 `docs/MultiTenant_SIFT1M_UnfilterTail.md`.
@@ -138,7 +152,7 @@ read by `Helper::IniReader` (the same loader the classic `IndexBuilder` uses) �
   `Release/spannbuilder -c <config.ini>`.
 - `Tools/benchmarks/run_spann_attr_build.sh` — thin launcher. Carries ONLY what is
   not a build param (process-loader env + cross-edge fallback/reuse + copying
-  `opq_quantizer.bin`); derives every path FROM the ini via `sed`.
+  `opq_quantizer.bin`); derives every path from its native INI section.
   SPACEV/four-categorical templates declare their known original schema.
   Legacy headerless vector recipes still need explicit native input migration.
 
@@ -230,25 +244,18 @@ How the `.ini` maps to the engine (`Wrappers/src/SpannAttrBuilder.cpp` `-c` read
   saved-index audits report beyond-cut H, not an inferred rescue count.
   The independent
   `LimitedTagMaxExpandedPostingPages` option is removed and rejected.
-  Hierarchy query navigation is one top-graph search followed by signed CSR
-  descent and saved-frontier budget widening, independently of selectivity.
-  HierarchyRouteSelectivityThreshold and
-  SecondLevelRouteSelectivityThreshold are removed/rejected. Auto always uses
-  an enabled hierarchy, including numeric-only full-O and unfiltered queries;
-  disabled hierarchies retain native H1. Explicit H1Only requires an H1 graph,
-  and H2Only requires a loaded hierarchy. Legacy partial CSR signature domains
-  only guard pruning: any unrepresented query anchor clears the signature,
-  preserving navigation and exact admission. Migrate retired route INI keys
-  only in a separate writable clone; never rewrite historical index artifacts.
-  Anchored queries admit top
-  results using that highest layer's CSR signatures. Underfilled matching
-  results continue the same native graph/tree frontier within the shared
-  HierarchyMaxCheck and InternalResultNum ceiling, before any descent; no
-  second graph search or whole-layer scan. BKT/KDT result-only admission keeps
-  nonmatching bridges traversable. Explicit HierarchyGraphSignaturePruning
-  remains a separate BKT traversal restriction. Filtered initial pivots share
-  MaxCheck; BKT counts checked leaves/graph-neighbor evaluations, not every internal
-  tree-pivot distance (do not report it as an exact distance ceiling).
+  Hierarchy query navigation is exactly one distance-only top-graph search
+  followed by fixed-beam signed CSR descent. `HierarchyInitialProbeRatio` is
+  the one-pass beam fraction and `HierarchyMaxCheck` is a fixed shared budget;
+  neither depends on predicates or underfill. Every reached H1 child is
+  distance-scored before membership admission. There is no saved-frontier
+  widening, signature admission/pruning, second pass, graph restart, or
+  whole-layer scan. `HeadNavigationMode`,
+  `HierarchyGraphSignaturePruning`, `HierarchyRouteSelectivityThreshold` and
+  their legacy aliases are removed and rejected. An enabled hierarchy is used
+  for sparse, dense, numeric-only and unfiltered requests alike; a disabled
+  hierarchy retains native H1. Migrate retired keys only in a writable clone;
+  never rewrite historical index artifacts.
   Direct tag-to-H1 completion,
   its early-widening stop callback, and `SparseFallbackMaxHeads`/
   `SparseFallbackMaxPostingPages` are removed and rejected (even explicit zero).
@@ -341,9 +348,10 @@ the slim `[meta | code]` end-state hits disk.
   `spannbuilder --gen-opq-codes` (see prep script). Internals: `TransformInPostings*`
   / build-slim writers in `ExtraDynamicSearcher.h` (markers `inpost_rbq.bin`,
   `inpost_opq.bin`, `inpost_pipepq.bin`).
-- **Search**: RaBitQ async path = env `SPTAG_INPOST_RBQ=1` (+ `SPTAG_INPOST_RBQ_FILE`),
-  with rerank via the **deep-queue libaio** reader (`SPTAG_INPOST_LIBAIO_RERANK=1`,
-  `RerankBaseDirectBatch()` — one `io_submit` for all `L` candidates, ~12µs/read vs
-  ~56µs serial). **Do NOT set `SPTAG_OPQ_PREFILTER`** with the RaBitQ async path — it
-  routes to the serial `SearchIndexOPQ` path (~6× slower cold). OPQ in-posting uses the
-  matching codebook (`opq_quantizer.bin`, ADC) on the same libaio rerank fast path.
+- **Search**: native `PostingQuantizer`, `PostingQuantizerFile`, `FullVectorFile`
+  and `RerankL` select the posting codec and exact-rerank source. RaBitQ uses
+  its in-posting codes; OPQ uses the matching `opq_quantizer.bin` ADC codebook,
+  not a neighboring RaBitQ sidecar. The deep-queue libaio reader
+  (`RerankBaseDirectBatch()`) batches survivor reads. Missing or incompatible
+  native OPQ/PipePQ initialization fails loading instead of treating code bytes
+  as full vectors. No prefilter environment switch is needed or accepted.

@@ -118,13 +118,8 @@ def write_markdown(output_path: Path, payload: dict, rows: list[dict]) -> None:
         f"- Tenant: 0 (internal_id={payload['tenant_internal_id']})",
         f"- Num queries: {payload['num_queries']}",
         f"- TopK: {payload['topk']}",
-        f"- ForceDenseTagSearch: {payload['force_dense_tag_search']}",
         f"- SearchInternalResultNum: {payload['search_internal_result_num']}",
-        f"- DirectSparseMaxPostings: {payload['direct_sparse_max_postings']}",
-        f"- FilteredSearchNprobeSafety: {payload['filtered_search_nprobe_safety']}",
-        f"- FilteredSearchTargetRecall: {payload['filtered_search_target_recall']}",
-        f"- FilteredSearchCoverageExponent: {payload['filtered_search_coverage_exponent']}",
-        f"- EnableAdaptiveFilteredNprobe: {payload['enable_adaptive_filtered_nprobe']}",
+        "- Query traversal: fixed spatial graph",
         f"- WarmupQueries: {payload['warmup_queries']}",
         "",
         "| Level | Tag | Selectivity | Match Count | Recall | QPS | Avg Latency | P95 | P99 | Avg Nprobe(PostingRead) | Avg Valid | FP Rate |",
@@ -155,21 +150,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="comma-separated org,dept,team,project tags; use -1 for auto by highest frequency",
     )
-    parser.add_argument("--force-dense-tag-search", action="store_true")
     parser.add_argument(
         "--search-internal-result-num",
         type=int,
         default=None,
         help="Set SearchInternalResultNum before running queries; use 64 to force fixed nprobe=64",
-    )
-    parser.add_argument("--direct-sparse-max-postings", type=int, default=320)
-    parser.add_argument("--filtered-search-nprobe-safety", type=float, default=1.0)
-    parser.add_argument("--filtered-search-target-recall", type=float, default=1.0)
-    parser.add_argument("--filtered-search-coverage-exponent", type=float, default=0.5)
-    parser.add_argument(
-        "--disable-adaptive-filtered-nprobe",
-        action="store_true",
-        help="Disable adaptive filtered nprobe growth and keep postingTarget at the base nprobe",
     )
     parser.add_argument(
         "--warmup-queries",
@@ -228,19 +213,8 @@ def main() -> None:
     if manager.BuildSignatures(tenant_internal_id, tenant0_tags.tobytes(), tenant0_size, tenant0_tags.shape[1]) is False:
         raise RuntimeError("BuildSignatures failed for tenant 0")
 
-    if args.force_dense_tag_search:
-        manager.SetSearchParam("ForceDenseTagSearch", "true", "BuildSSDIndex")
     if args.search_internal_result_num is not None:
         manager.SetSearchParam("SearchInternalResultNum", str(args.search_internal_result_num), "BuildSSDIndex")
-    manager.SetSearchParam("DirectSparseMaxPostings", str(args.direct_sparse_max_postings), "BuildSSDIndex")
-    manager.SetSearchParam("FilteredSearchNprobeSafety", str(args.filtered_search_nprobe_safety), "BuildSSDIndex")
-    manager.SetSearchParam("FilteredSearchTargetRecall", str(args.filtered_search_target_recall), "BuildSSDIndex")
-    manager.SetSearchParam("FilteredSearchCoverageExponent", str(args.filtered_search_coverage_exponent), "BuildSSDIndex")
-    manager.SetSearchParam(
-        "EnableAdaptiveFilteredNprobe",
-        "false" if args.disable_adaptive_filtered_nprobe else "true",
-        "BuildSSDIndex",
-    )
 
     rows: list[dict] = []
     query_workload = []
@@ -338,15 +312,9 @@ def main() -> None:
         "tenant_internal_id": tenant_internal_id,
         "num_queries": args.num_queries,
         "topk": args.topk,
-        "force_dense_tag_search": bool(args.force_dense_tag_search),
         "search_internal_result_num": (
             int(args.search_internal_result_num) if args.search_internal_result_num is not None else None
         ),
-        "direct_sparse_max_postings": int(args.direct_sparse_max_postings),
-        "filtered_search_nprobe_safety": float(args.filtered_search_nprobe_safety),
-        "filtered_search_target_recall": float(args.filtered_search_target_recall),
-        "filtered_search_coverage_exponent": float(args.filtered_search_coverage_exponent),
-        "enable_adaptive_filtered_nprobe": not bool(args.disable_adaptive_filtered_nprobe),
         "warmup_queries": int(args.warmup_queries),
         "rows": rows,
     }

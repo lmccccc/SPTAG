@@ -100,9 +100,7 @@ make_overlay() {
     set_ini_value "$tenant/indexloader.ini" SearchSSDIndex HashTableExponent 4
     set_ini_value "$tenant/indexloader.ini" SearchSSDIndex MaxDistRatio 8.0
     set_ini_value "$tenant/indexloader.ini" SearchSSDIndex SearchPostingPageLimit 3
-    set_ini_value "$tenant/indexloader.ini" SearchSSDIndex EnableAdaptiveFilteredNprobe false
     set_ini_value "$tenant/indexloader.ini" SearchSSDIndex LogPhaseTime false
-    set_ini_value "$tenant/indexloader.ini" SearchSSDIndex ForceDenseTagSearch true
     for expected in \
         "IndexDirectory=${tenant}" \
         'PostingQuantizer=OPQ' \
@@ -111,8 +109,7 @@ make_overlay() {
         "ResultNum=${TOPK}" \
         "RerankL=${RERANK_L}" \
         "SearchInternalResultNum=${nprobe}" \
-        "FixedNprobe=${nprobe}" \
-        'ForceDenseTagSearch=true'; do
+        "FixedNprobe=${nprobe}"; do
         grep -Fqx "$expected" "$tenant/indexloader.ini"
     done
     printf '%s\n' "$overlay"

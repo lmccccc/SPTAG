@@ -215,7 +215,6 @@ def render_ini_variant(
     set_ini_value(rendered, "SearchSSDIndex", "InternalResultNum", 64)
     set_ini_value(rendered, "SearchSSDIndex", "MaxCheck", 2048)
     set_ini_value(rendered, "SearchSSDIndex", "HierarchyMaxCheck", 128)
-    set_ini_value(rendered, "SearchSSDIndex", "HierarchyGraphSignaturePruning", False)
     set_ini_value(rendered, "SearchSSDIndex", "NumberOfThreads", 1)
     set_ini_value(rendered, "MultiTenant", "InPlaceBuild", True)
     set_ini_value(rendered, "MultiTenant", "PersistSelectHead", 0)
@@ -250,12 +249,6 @@ def render_search_ini(
         max(128, 2 * nprobe),
     )
     set_ini_value(rendered, "SearchSSDIndex", "NumberOfThreads", 1)
-    set_ini_value(
-        rendered,
-        "SearchSSDIndex",
-        "HierarchyGraphSignaturePruning",
-        False,
-    )
     return rendered
 
 
@@ -1260,8 +1253,6 @@ def parse_search_ini_metadata(path: Path) -> dict[str, Any]:
         "max_check": int(section["MaxCheck"]),
         "second_level_max_check": int(section.get("HierarchyMaxCheck", section.get("SecondLevelMaxCheck"))),
         "threads": int(section["NumberOfThreads"]),
-        "graph_signature_pruning": parse_native_bool(section.get(
-            "HierarchyGraphSignaturePruning", section.get("SecondLevelGraphSignaturePruning"))),
     }
 
 
@@ -1395,7 +1386,6 @@ def benchmark_run(args: argparse.Namespace) -> None:
                                 "workload": workload_name,
                                 "nprobe": sweep_meta["internal_result_num"],
                                 "second_level_max_check": sweep_meta["second_level_max_check"],
-                                "graph_signature_pruning": sweep_meta["graph_signature_pruning"],
                             }
                         )
                         jsonl.write(json.dumps(row) + "\n")
@@ -1513,7 +1503,6 @@ def finalize_run(args: argparse.Namespace) -> None:
                 "search_api": exemplar["search_api"],
                 "search_ini": exemplar["search_ini"],
                 "second_level_max_check": int(exemplar["second_level_max_check"]),
-                "graph_signature_pruning": bool(exemplar["graph_signature_pruning"]),
                 **{key: value for key, value in exemplar.items()
                    if key.endswith("_per_query") or key in {
                        "match_rate", "unique_match_rate", "scanned_occurrence_to_unique_ratio"}},

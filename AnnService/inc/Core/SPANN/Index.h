@@ -94,8 +94,6 @@ namespace SPTAG
             virtual void SetNodeVectorAssignments(const std::vector<std::vector<SizeType>>& nodeVectorAssignments) = 0;
             virtual void SetPrimaryNodeVectorAssignments(const std::vector<std::vector<SizeType>>& primaryNodeVectorAssignments) = 0;
             virtual void SetSharedDB(std::shared_ptr<Helper::KeyValueIO> p_db) = 0;
-            virtual bool BuildPrimaryHeadCSRBackfill(const void* vectors, SizeType vectorCount,
-                                                     const uint32_t* tags, int numTagsPerVec) = 0;
             virtual ErrorCode AddIndexWithTags(const void* data, SizeType vectorNum,
                                                 DimensionType dimension, const uint32_t* tags,
                                                 int numTagsPerVec, bool normalized) = 0;
@@ -290,9 +288,6 @@ namespace SPTAG
             {
                 m_pendingPrimaryNodeVectorAssignments = primaryNodeVectorAssignments;
             }
-
-            bool BuildPrimaryHeadCSRBackfill(const void* vectors, SizeType vectorCount,
-                                             const uint32_t* tags, int numTagsPerVec) override;
 
             // Shared-DB hook: when set BEFORE BuildIndex / LoadIndex, the
             // ExtraDynamicSearcher will reuse this KeyValueIO instead of opening
@@ -493,11 +488,8 @@ namespace SPTAG
             ErrorCode SearchSecondLevelHeads(
                 COMMON::QueryResultSet<T>* p_queryResults,
                 int p_graphResultNum,
-                const Cache::PostingBitmask&
-                    p_querySignature,
                 const std::function<bool(SizeType)>&
                     p_headAdmission,
-                const LimitedTagSupport* p_headSupport,
                 int& p_scannedOut,
                 ExtraWorkSpace* p_workspace = nullptr,
                 const std::function<bool(SizeType, const float*)>& p_headPointCandidate = nullptr) const;
@@ -513,19 +505,12 @@ namespace SPTAG
                 COMMON::QueryResultSet<T>* p_queryResults,
                 int p_entryNode,
                 int p_graphResultNum,
-                int& p_scannedOut,
-                bool p_useHybrid,
-                const std::uint32_t* p_queryTags,
-                int p_numQueryTags,
-                const Cache::DNFPredicate* p_queryDNF) const;
+                int& p_scannedOut) const;
             ErrorCode SearchHeadBundlesNative(
                 COMMON::QueryResultSet<T>* p_queryResults,
                 const std::vector<int>& p_candidateNodes,
                 int p_graphResultNum,
-                int& p_scannedOut,
-                const std::function<bool(SizeType)>&
-                    p_globalResultFilter = {},
-                int p_resultFilterMaxCheck = 0) const;
+                int& p_scannedOut) const;
 
             ErrorCode SetParameter(const char* p_param, const char* p_value, const char* p_section = nullptr);
             std::string GetParameter(const char* p_param, const char* p_section = nullptr) const;

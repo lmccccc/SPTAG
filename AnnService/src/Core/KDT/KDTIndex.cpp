@@ -220,25 +220,16 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
     const std::function<bool(SizeType)>& p_resultFilter) const
 {
     std::shared_lock<std::shared_timed_mutex> lock(*(m_pTrees.m_lock));
-    m_pTrees.InitSearchTrees<T, Q>(m_pSamples, m_fComputeDistance, p_query, p_space,
-        static_cast<bool>(p_resultFilter));
+    // Admission must never feed back into the native spatial stopping heap.
+    std::unique_ptr<COMMON::QueryResultSet<T>> unfilteredResults;
+    if (p_resultFilter)
+        unfilteredResults = std::make_unique<COMMON::QueryResultSet<T>>(p_query);
+    auto& navigationResults = unfilteredResults ? *unfilteredResults : p_query;
+    m_pTrees.InitSearchTrees<T, Q>(m_pSamples, m_fComputeDistance, p_query, p_space);
     m_pTrees.SearchTrees<T, Q>(m_pSamples, m_fComputeDistance, p_query, p_space,
-        p_resultFilter ? (std::min)(p_space.m_iMaxCheck, m_iNumberOfInitialDynamicPivots)
-                       : m_iNumberOfInitialDynamicPivots);
-    while (true)
+        (std::min)(p_space.m_iMaxCheck, m_iNumberOfInitialDynamicPivots));
+    while (!p_space.m_NGQueue.empty())
     {
-        if (p_space.m_NGQueue.empty())
-        {
-            if (!p_resultFilter || p_query.worstDist() < MaxDist ||
-                p_space.m_iNumberOfCheckedLeaves >= p_space.m_iMaxCheck ||
-                p_space.m_SPTQueue.empty())
-                break;
-            m_pTrees.SearchTrees<T, Q>(m_pSamples, m_fComputeDistance, p_query, p_space,
-                p_space.m_iNumberOfCheckedLeaves + (std::min)(
-                    p_space.m_iMaxCheck - p_space.m_iNumberOfCheckedLeaves,
-                    (std::max)(1, m_iNumberOfOtherDynamicPivots)));
-            if (p_space.m_NGQueue.empty()) continue;
-        }
         NodeDistPair gnode = p_space.m_NGQueue.pop();
         const SizeType *node = m_pGraph[gnode.node];
         _mm_prefetch((const char *)node, _MM_HINT_T0);
@@ -250,21 +241,23 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
             _mm_prefetch((const char *)(m_pSamples)[futureNode], _MM_HINT_T0);
         }
 
-        if (notDeleted(m_deletedID, gnode.node) &&
-            (!p_resultFilter || p_resultFilter(gnode.node)))
+        if (notDeleted(m_deletedID, gnode.node))
         {
-            if (!p_query.AddPoint(gnode.node, gnode.distance) && p_space.m_iNumberOfCheckedLeaves > p_space.m_iMaxCheck)
+            if (p_resultFilter && p_resultFilter(gnode.node))
+                p_query.AddPoint(gnode.node, gnode.distance);
+            if (!navigationResults.AddPoint(gnode.node, gnode.distance) &&
+                p_space.m_iNumberOfCheckedLeaves > p_space.m_iMaxCheck)
             {
                 p_query.SortResult();
                 return;
             }
         }
 
-        float upperBound = max(p_query.worstDist(), gnode.distance);
+        float upperBound = max(navigationResults.worstDist(), gnode.distance);
         bool bLocalOpt = true;
         for (DimensionType i = 0; i < m_pGraph.m_iNeighborhoodSize; i++)
         {
-            if (p_resultFilter && p_space.m_iNumberOfCheckedLeaves >= p_space.m_iMaxCheck) break;
+            if (p_space.m_iNumberOfCheckedLeaves >= p_space.m_iMaxCheck) break;
             SizeType nn_index = node[i];
             if (nn_index < 0)
                 break;
@@ -287,12 +280,11 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
             if (p_space.m_iNumberOfTreeCheckedLeaves <= p_space.m_iNumberOfCheckedLeaves / 10)
             {
                 m_pTrees.SearchTrees<T, Q>(m_pSamples, m_fComputeDistance, p_query, p_space,
-                    p_resultFilter ? p_space.m_iNumberOfCheckedLeaves + (std::min)(
+                    p_space.m_iNumberOfCheckedLeaves + (std::min)(
                         p_space.m_iMaxCheck - p_space.m_iNumberOfCheckedLeaves,
-                        (std::max)(1, m_iNumberOfOtherDynamicPivots))
-                    : m_iNumberOfOtherDynamicPivots + p_space.m_iNumberOfCheckedLeaves);
+                        m_iNumberOfOtherDynamicPivots));
             }
-            else if (gnode.distance > p_query.worstDist())
+            else if (gnode.distance > navigationResults.worstDist())
             {
                 break;
             }

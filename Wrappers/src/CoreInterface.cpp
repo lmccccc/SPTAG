@@ -1078,363 +1078,6 @@ uint64_t GetCurrentProcessRSSBytes()
 
 namespace {
 
-int TagLevel(uint32_t tag)
-{
-    return static_cast<int>(tag / 1000U);
-}
-
-float EstimateQueryVectorSelectivity(
-    int tenantSize,
-    const TenantIndexManager::TagRoutingStatsMap* tagStats,
-    const uint32_t* queryTags,
-    int numQueryTags,
-    const SPTAG::Cache::DNFPredicate* dnf,
-    int hierarchyColumnCount,
-    int numericBaseColumn,
-    const SPTAG::Cache::NumQuantParam*
-        numericParams,
-    size_t numericParamCount,
-    const SPTAG::TagSchema* schema = nullptr)
-{
-    if (tenantSize <= 0 || tagStats == nullptr) {
-        return 1.0f;
-    }
-
-    if (dnf != nullptr && !dnf->Empty()) {
-        struct EstimatedClause {
-            std::unordered_map<uint32_t, uint32_t>
-                categoricalByColumn;
-            std::vector<std::tuple<
-                uint8_t, uint8_t, uint32_t, uint32_t>>
-                canonical;
-            double selectivity = 1.0;
-        };
-        std::vector<EstimatedClause> estimates;
-        std::set<std::vector<std::tuple<
-            uint8_t, uint8_t, uint32_t, uint32_t>>>
-            seenClauses;
-        bool sawNonemptyClause = false;
-        for (const auto& clause : dnf->clauses) {
-            if (clause.lits.empty()) continue;
-            sawNonemptyClause = true;
-            std::vector<std::tuple<
-                uint8_t, uint8_t, uint32_t, uint32_t>>
-                canonical;
-            canonical.reserve(clause.lits.size());
-            for (const auto& literal : clause.lits) {
-                canonical.emplace_back(
-                    literal.kind, literal.op,
-                    literal.col, literal.val);
-            }
-            std::sort(canonical.begin(),
-                      canonical.end());
-            canonical.erase(
-                std::unique(canonical.begin(),
-                            canonical.end()),
-                canonical.end());
-            if (!seenClauses.insert(canonical).second) {
-                continue;
-            }
-            double hierarchySelectivity = 1.0;
-            double independentSelectivity = 1.0;
-            double numericSelectivity = 1.0;
-            bool estimatedLiteral = false;
-            std::unordered_map<uint32_t, uint32_t> categoricalByColumn;
-            bool impossibleClause = false;
-            for (const auto& literal : clause.lits) {
-                if (literal.kind != 0 ||
-                    literal.op != SPTAG::Cache::DNF_EQ) {
-                    continue;
-                }
-                const auto inserted =
-                    categoricalByColumn.emplace(literal.col, literal.val);
-                if (!inserted.second &&
-                    inserted.first->second != literal.val) {
-                    impossibleClause = true;
-                    break;
-                }
-                const auto stat = tagStats->find(
-                    MakeTagRoutingKey(
-                        literal.col, literal.val));
-                if (stat == tagStats->end()) {
-                    impossibleClause = true;
-                    break;
-                }
-                const double literalSelectivity =
-                    static_cast<double>(
-                        stat->second.vectorCount) /
-                    static_cast<double>(tenantSize);
-                if (hierarchyColumnCount < 0 ||
-                    static_cast<int>(literal.col) <
-                        hierarchyColumnCount) {
-                    hierarchySelectivity = std::min(
-                        hierarchySelectivity,
-                        literalSelectivity);
-                } else {
-                    independentSelectivity *=
-                        literalSelectivity;
-                }
-                estimatedLiteral = true;
-            }
-            std::unordered_map<
-                uint32_t,
-                std::pair<std::uint64_t,
-                          std::uint64_t>>
-                numericRanges;
-            for (const auto& literal : clause.lits) {
-                if (literal.kind == 0 ||
-                    (schema != nullptr ? schema->NumericLane(literal.col) < 0 :
-                     static_cast<int>(literal.col) < numericBaseColumn) ||
-                    numericParams == nullptr) {
-                    continue;
-                }
-                const size_t numericIndex =
-                    static_cast<size_t>(
-                        schema != nullptr ? schema->NumericLane(literal.col) :
-                        static_cast<int>(literal.col) - numericBaseColumn);
-                if (numericIndex >=
-                    numericParamCount) {
-                    continue;
-                }
-                const auto& domain =
-                    numericParams[numericIndex];
-                if (domain.hi < domain.lo) {
-                    impossibleClause = true;
-                    break;
-                }
-                auto inserted = numericRanges.emplace(
-                    literal.col,
-                    std::make_pair(
-                        static_cast<std::uint64_t>(
-                            domain.lo),
-                        static_cast<std::uint64_t>(
-                            domain.hi)));
-                auto& range = inserted.first->second;
-                const std::uint64_t value =
-                    literal.val;
-                switch (literal.op) {
-                case SPTAG::Cache::DNF_EQ:
-                    range.first = (std::max)(
-                        range.first, value);
-                    range.second = (std::min)(
-                        range.second, value);
-                    break;
-                case SPTAG::Cache::DNF_LT:
-                    if (value == 0) {
-                        impossibleClause = true;
-                    } else {
-                        range.second = (std::min)(
-                            range.second, value - 1);
-                    }
-                    break;
-                case SPTAG::Cache::DNF_LE:
-                    range.second = (std::min)(
-                        range.second, value);
-                    break;
-                case SPTAG::Cache::DNF_GT:
-                    if (value ==
-                        (std::numeric_limits<
-                            uint32_t>::max)()) {
-                        impossibleClause = true;
-                    } else {
-                        range.first = (std::max)(
-                            range.first, value + 1);
-                    }
-                    break;
-                case SPTAG::Cache::DNF_GE:
-                    range.first = (std::max)(
-                        range.first, value);
-                    break;
-                default:
-                    impossibleClause = true;
-                    break;
-                }
-                if (impossibleClause ||
-                    range.first > range.second) {
-                    impossibleClause = true;
-                    break;
-                }
-            }
-            if (impossibleClause) continue;
-            for (const auto& numeric :
-                 numericRanges) {
-                const size_t numericIndex =
-                    static_cast<size_t>(
-                        schema != nullptr ? schema->NumericLane(numeric.first) :
-                        static_cast<int>(numeric.first) - numericBaseColumn);
-                const auto& domain =
-                    numericParams[numericIndex];
-                const long double selected =
-                    static_cast<long double>(
-                        numeric.second.second -
-                        numeric.second.first) +
-                    1.0L;
-                const long double total =
-                    static_cast<long double>(
-                        static_cast<std::uint64_t>(
-                            domain.hi) -
-                        static_cast<std::uint64_t>(
-                            domain.lo)) +
-                    1.0L;
-                numericSelectivity *=
-                    static_cast<double>(
-                        selected / total);
-                estimatedLiteral = true;
-            }
-            if (impossibleClause) continue;
-            const double clauseSelectivity =
-                estimatedLiteral
-                ? hierarchySelectivity *
-                      independentSelectivity *
-                      numericSelectivity
-                : 1.0;
-            estimates.push_back({
-                std::move(categoricalByColumn),
-                std::move(canonical),
-                clauseSelectivity});
-        }
-        if (estimates.empty()) {
-            return sawNonemptyClause ? 1e-6f : 1.0f;
-        }
-        for (size_t candidate = 0;
-             candidate < estimates.size();) {
-            bool redundant = false;
-            for (size_t broader = 0;
-                 broader < estimates.size(); ++broader) {
-                if (candidate == broader ||
-                    estimates[broader].canonical.size() >=
-                        estimates[candidate]
-                            .canonical.size()) {
-                    continue;
-                }
-                if (std::includes(
-                        estimates[candidate]
-                            .canonical.begin(),
-                        estimates[candidate]
-                            .canonical.end(),
-                        estimates[broader]
-                            .canonical.begin(),
-                        estimates[broader]
-                            .canonical.end())) {
-                    redundant = true;
-                    break;
-                }
-            }
-            if (redundant) {
-                estimates.erase(
-                    estimates.begin() + candidate);
-            } else {
-                ++candidate;
-            }
-        }
-        bool pairwiseDisjoint = estimates.size() > 1;
-        for (size_t left = 0;
-             left < estimates.size() && pairwiseDisjoint;
-             ++left) {
-            for (size_t right = left + 1;
-                 right < estimates.size(); ++right) {
-                bool conflicts = false;
-                for (const auto& column :
-                     estimates[left].categoricalByColumn) {
-                    const auto other = estimates[right]
-                        .categoricalByColumn.find(
-                            column.first);
-                    if (other != estimates[right]
-                                     .categoricalByColumn.end() &&
-                        other->second != column.second) {
-                        conflicts = true;
-                        break;
-                    }
-                }
-                if (!conflicts) {
-                    pairwiseDisjoint = false;
-                    break;
-                }
-            }
-        }
-        double unionSelectivity = 0.0;
-        if (pairwiseDisjoint) {
-            for (const auto& estimate : estimates) {
-                unionSelectivity +=
-                    estimate.selectivity;
-            }
-        } else {
-            double productNotSelected = 1.0;
-            for (const auto& estimate : estimates) {
-                productNotSelected *=
-                    std::max(
-                        0.0,
-                        1.0 -
-                            estimate.selectivity);
-            }
-            unionSelectivity =
-                1.0 - productNotSelected;
-        }
-        return static_cast<float>(std::clamp(
-            unionSelectivity, 1e-6, 1.0));
-    }
-
-    if (queryTags == nullptr || numQueryTags <= 0) return 1.0f;
-
-    std::unordered_set<uint32_t> seenTags;
-    std::unordered_map<int, double> levelSelectivities;
-    for (int index = 0; index < numQueryTags; ++index) {
-        uint32_t tag = queryTags[index];
-        if (!seenTags.insert(tag).second) {
-            continue;
-        }
-
-        std::int64_t vectorCount = 0;
-        const auto exactLegacy = tagStats->find(
-            MakeTagRoutingKey(
-                kLegacyRoutingColumn, tag));
-        if (exactLegacy != tagStats->end()) {
-            vectorCount =
-                exactLegacy->second.vectorCount;
-        } else {
-            for (const auto& entry : *tagStats) {
-                if (static_cast<std::uint32_t>(
-                        entry.first) == tag) {
-                    vectorCount = (std::min)(
-                        static_cast<std::int64_t>(
-                            tenantSize),
-                        vectorCount +
-                            static_cast<std::int64_t>(
-                                entry.second.vectorCount));
-                }
-            }
-        }
-        if (vectorCount <= 0) {
-            continue;
-        }
-
-        double tagSelectivity =
-            static_cast<double>(vectorCount) /
-            static_cast<double>(tenantSize);
-        int level = TagLevel(tag);
-        double& levelSel = levelSelectivities[level];
-        levelSel = std::min(1.0, levelSel + tagSelectivity);
-    }
-
-    if (levelSelectivities.empty()) {
-        return 1.0f;
-    }
-
-    double productNotSelected = 1.0;
-    for (const auto& [level, selectivity] : levelSelectivities) {
-        (void)level;
-        productNotSelected *= std::max(0.0, 1.0 - selectivity);
-    }
-
-    double unionSelectivity = 1.0 - productNotSelected;
-    unionSelectivity = std::clamp(unionSelectivity, 1e-6, 1.0);
-    return static_cast<float>(unionSelectivity);
-}
-
-} // namespace
-
-namespace {
-
 enum class DNFBlobEncoding
 {
     Legacy,
@@ -2928,9 +2571,6 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
     m_tenantVectorCounts.clear();
     m_tenantSpannWorkDirs.clear();
     m_tenantTagRoutingStats.clear();
-    m_tenantSparseIdx.clear();
-    m_tenantTagPurePostings.clear();
-    m_tenantTagPureKV.clear();
     m_tenantTagLevelOffsets.clear();
     m_tenantNumericMeta.clear();
     m_tenantGlobalIndices.clear();
@@ -4094,8 +3734,7 @@ bool TenantIndexManager::LoadAll(const char* p_baseDir)
             m_tenantSpannWorkDirs[tenantId] = baseDir + "/tenant_" + std::to_string(tenantId) + "/index";
         }
         if (!LoadTenantTagRoutingStats()) return false;
-        LoadTenantSparseIndices();
-        LoadTenantTagPureIndices();
+        LoadTenantFilterMetadata();
         return true;
     }
 }
@@ -4144,9 +3783,10 @@ bool TenantIndexManager::LoadTenantTagRoutingStats()
                             .m_generationFingerprint) {
                     fprintf(
                         stderr,
-                        "[WARN] Tenant %d: tag routing stats generation "
-                        "does not match the primary hybrid posting; filtered search is "
-                        "disabled until BuildSignatures regenerates it\n",
+                        "[WARN] Tenant %d: tag statistics generation "
+                        "does not match the primary hybrid posting; "
+                        "diagnostic statistics are unavailable until "
+                        "BuildSignatures regenerates them\n",
                         tenantId);
                     continue;
                 }
@@ -4159,44 +3799,16 @@ bool TenantIndexManager::LoadTenantTagRoutingStats()
             entry.second + "/indexloader.ini");
         if (required) {
             fprintf(stderr,
-                    "[WARN] Tenant %d: hybrid routing requires a valid %s; "
-                    "filtered search is disabled until BuildSignatures "
-                    "generates it\n",
+                    "[WARN] Tenant %d: hybrid tag diagnostics have no valid %s; "
+                    "filtered search remains available without these statistics\n",
                     tenantId, path.c_str());
         }
     }
     return true;
 }
 
-void TenantIndexManager::LoadTenantSparseIndices()
+void TenantIndexManager::LoadTenantFilterMetadata()
 {
-    // Sparse-tag fast-path index is small (<<1MB/tenant) but the saved
-    // m_tenantSparseIdx map is only populated at build time. Without this
-    // load step, query-side sparse routing in SearchWithTags is a no-op on
-    // any process that only Load()s the index.
-    int loadedCount = 0;
-    for (const auto& kv : m_tenantSpannWorkDirs)
-    {
-        int tenantId = kv.first;
-        if (m_tenantSparseIdx.count(tenantId)) continue;
-        const std::string sparsePath = kv.second + "/sparse_tags.bin";
-        struct stat st{};
-        if (stat(sparsePath.c_str(), &st) != 0) continue;
-        auto sparseIdx = std::make_shared<SPTAG::Cache::SparseTagIndex>();
-        if (!sparseIdx->Load(sparsePath))
-        {
-            fprintf(stderr, "[WARN] Tenant %d: failed to load sparse_tags.bin (%s)\n",
-                    tenantId, sparsePath.c_str());
-            continue;
-        }
-        m_tenantSparseIdx[tenantId] = std::move(sparseIdx);
-        ++loadedCount;
-    }
-    if (loadedCount > 0)
-    {
-        fprintf(stderr, "[INFO] Loaded sparse tag indices for %d tenants\n", loadedCount);
-    }
-
     // Load per-level tag offsets (used to map a raw query tag value to its
     // hierarchical level). Independent of sparse_tags availability.
     for (const auto& kv : m_tenantSpannWorkDirs)
@@ -4260,104 +3872,6 @@ void TenantIndexManager::LoadTenantSparseIndices()
                 "numeric posting pruning is disabled\n",
                 tenantId, nmPath.c_str());
         }
-    }
-}
-
-void TenantIndexManager::LoadTenantTagPureIndices()
-{
-    // Tag-pure chunks live inside the SPANN KV store (FileIO mapping / RocksDB).
-    // The chunk data persists across runs because BuildSignatures explicitly
-    // calls extra->Checkpoint() after writing chunks. The sidecar holds the
-    // metadata (tag → chunkKeys, chunkCounts, count). Without loading it
-    // back, predicate search would fall through the fast path.
-    //
-    // When the OPQ prefilter is enabled, every single-tag query is served by
-    // OPQTagPureSearch (resident codes + the canonical vid->vector store),
-    // so the tag-pure full-vector chunks are a redundant SECOND copy of the
-    // vectors. Skip loading their metadata entirely: this drops the in-memory
-    // tag->chunkKeys map and guarantees the dead chunk path is never taken,
-    // realizing the single-vector-copy goal. (The chunk bytes embedded in the
-    // index KV file remain inert; a clean rebuild without chunks reclaims them.)
-    static const bool s_opqPrefilterSkipChunks = []() {
-        const char* v = std::getenv("SPTAG_OPQ_PREFILTER");
-        return v && v[0] == '1';
-    }();
-    if (s_opqPrefilterSkipChunks) {
-        fprintf(stderr,
-            "[INFO] OPQ prefilter ON: skipping tag-pure full-vector chunk load "
-            "(single canonical vector copy in opq_vecstore)\n");
-        return;
-    }
-    int loadedCount = 0;
-    for (const auto& kv : m_tenantSpannWorkDirs)
-    {
-        int tenantId = kv.first;
-        if (m_tenantTagPurePostings.count(tenantId)) continue;
-        const std::string metaPath = kv.second + "/tagpure_meta.bin";
-        struct stat st{};
-        if (stat(metaPath.c_str(), &st) != 0) continue;
-
-        int loadedDim = 0;
-        std::unordered_map<uint32_t, std::shared_ptr<SPTAG::Cache::TagPurePosting>> tags;
-        if (!SPTAG::Cache::TagPureBundle::Load(metaPath, loadedDim, tags))
-        {
-            fprintf(stderr, "[WARN] Tenant %d: failed to load tagpure_meta.bin (%s)\n",
-                    tenantId, metaPath.c_str());
-            continue;
-        }
-
-        // Resolve KV store + page budget from the (now loaded) SPANN index.
-        // EnsureTenantLoaded must succeed for the kvDb to be available.
-        if (!EnsureTenantLoaded(tenantId))
-        {
-            fprintf(stderr, "[WARN] Tenant %d: cannot ensure loaded for tag-pure attach\n",
-                    tenantId);
-            continue;
-        }
-
-        std::shared_ptr<SPTAG::Helper::KeyValueIO> kvDb;
-        int postingPageLimit = 3, bufferLength = 4;
-        SPTAG::SizeType nextKey = 0;
-        {
-            std::shared_lock<std::shared_mutex> rlock(m_tenantIndicesMutex);
-            auto it = m_tenantIndices.find(tenantId);
-            if (it != m_tenantIndices.end()) {
-                auto internalIdx = it->second->GetInternalIndex();
-                auto* spannIdx = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(internalIdx.get());
-                if (spannIdx != nullptr) {
-                    if (auto* opts = spannIdx->GetOptions()) {
-                        postingPageLimit = std::max(1, opts->m_postingPageLimit);
-                        bufferLength = std::max(0, opts->m_bufferLength);
-                    }
-                    auto extra = spannIdx->GetDiskIndex();
-                    if (extra) kvDb = extra->GetKVStore();
-                }
-            }
-        }
-        if (kvDb == nullptr) {
-            fprintf(stderr, "[WARN] Tenant %d: no KV store while attaching tag-pure metadata\n",
-                    tenantId);
-            continue;
-        }
-
-        // Highest chunk key + 1 — covers future incremental rebuilds.
-        for (const auto& tkv : tags) {
-            if (!tkv.second) continue;
-            for (int k : tkv.second->chunkKeys) {
-                if (k + 1 > nextKey) nextKey = k + 1;
-            }
-        }
-
-        m_tenantTagPurePostings[tenantId] = std::move(tags);
-        m_tenantTagPureKV[tenantId] = std::move(kvDb);
-        m_tenantTagPureBlockLimit[tenantId] = postingPageLimit + bufferLength + 1;
-        m_tenantTagPurePagesPerChunk[tenantId] = postingPageLimit;
-        m_tenantTagPureNextKey[tenantId] = nextKey;
-        ++loadedCount;
-    }
-    if (loadedCount > 0)
-    {
-        fprintf(stderr, "[INFO] Loaded tag-pure indices for %d tenants\n", loadedCount);
     }
 }
 
@@ -4481,8 +3995,7 @@ bool TenantIndexManager::LoadUnifiedStorage(const char* p_baseDir)
     }
 
     if (!LoadTenantTagRoutingStats()) return false;
-    LoadTenantSparseIndices();
-    LoadTenantTagPureIndices();
+    LoadTenantFilterMetadata();
 
     return true;
 }
@@ -4795,11 +4308,6 @@ uint64_t TenantIndexManager::GetLastMatchedVectors() const
     return SPTAG::VectorIndex::GetThreadLocalPostingScanStats().m_matchedVectors;
 }
 
-uint64_t TenantIndexManager::GetLastPrimaryHeadCandidateCount() const
-{
-    return SPTAG::VectorIndex::GetThreadLocalPostingScanStats().m_primaryHeadCandidates;
-}
-
 bool TenantIndexManager::UnloadTenant(int p_tenantId)
 {
     std::unique_lock<std::shared_mutex> wlock(m_tenantIndicesMutex);
@@ -4923,11 +4431,6 @@ bool TenantIndexManager::BuildSignatures(
     if (wdIt == m_tenantSpannWorkDirs.end()) return false;
     std::string workDir = wdIt->second;
 
-    // DirectSparseMaxPostings is a native [BuildSSDIndex] parameter. The
-    // sparse-tag sidecar is built after the SPANN store, so retrieve the
-    // persisted option from the just-built (or reloaded) index instead of
-    // consulting a process environment override.
-    int directSparseMaxPostings = 320;
     bool hybridDistanceEnabled = false;
     bool staticStorage = false;
     bool limitedTagEnabled = false;
@@ -4945,17 +4448,6 @@ bool TenantIndexManager::BuildSignatures(
         if (it != m_tenantIndices.end()) {
             auto internalIdx = it->second->GetInternalIndex();
             if (internalIdx != nullptr) {
-                const std::string configured =
-                    internalIdx->GetParameter("DirectSparseMaxPostings", "BuildSSDIndex");
-                int parsed = 0;
-                if (SPTAG::Helper::Convert::ConvertStringTo<int>(configured.c_str(), parsed)
-                    && parsed > 0) {
-                    directSparseMaxPostings = parsed;
-                } else if (!configured.empty()) {
-                    fprintf(stderr,
-                            "[WARN] Tenant %d: invalid DirectSparseMaxPostings=%s; using %d\n",
-                            p_tenantId, configured.c_str(), directSparseMaxPostings);
-                }
                 const std::string hybridConfigured =
                     internalIdx->GetParameter(
                         "EnableHybridDistance",
@@ -5034,7 +4526,6 @@ bool TenantIndexManager::BuildSignatures(
         return false;
     }
 
-    const bool routingStatsRequired = hybridDistanceEnabled;
     if (staticACLTagCols < 0 ||
         staticACLTagCols > p_numTagsPerVec) {
         fprintf(
@@ -5077,24 +4568,16 @@ bool TenantIndexManager::BuildSignatures(
     }
 
     // ── Idempotent fast path ─────────────────────────────────────────────
-    // If all three persisted artifacts (PS bitmask, sparse tags, tag-pure
-    // metadata) are already on disk, the previous BuildSignatures call has
-    // saved them and LoadAll has loaded the latter two. We still need PS to
-    // be attached to the head index; EnsureTenantLoaded → EnsureHeadNodeMetaLoaded
-    // handles that lazily. Just confirm and return so subsequent process
-    // startups don't re-scan the entire posting file (~minutes for SIFT-1M).
+    // If the membership metadata is already on disk, attach it to the head
+    // index and avoid rescanning the complete posting file.
     {
         struct stat st{};
         const std::string sigPath     = workDir + "/signatures_bitmask.bin";
-        const std::string sparsePath  = workDir + "/sparse_tags.bin";
-        const std::string tagPurePath = workDir + "/tagpure_meta.bin";
         const std::string routeStatsPath =
             workDir + "/tag_routing_stats.bin";
         const std::string headMetaPath =
             workDir + "/HeadIndex/head_node_meta.bin";
         bool sigOk     = stat(sigPath.c_str(),     &st) == 0;
-        bool sparseOk  = stat(sparsePath.c_str(),  &st) == 0;
-        bool tagPureOk = stat(tagPurePath.c_str(), &st) == 0;
         bool routeStatsOk =
             stat(routeStatsPath.c_str(), &st) == 0;
         if (!staticStorage && sigOk) {
@@ -5108,7 +4591,7 @@ bool TenantIndexManager::BuildSignatures(
             stat(headMetaPath.c_str(), &st) == 0;
         const bool baseArtifactsOk = staticStorage
             ? headMetaOk
-            : (sigOk && sparseOk && tagPureOk);
+            : sigOk;
         bool numericMetadataValid =
             signatureNumericColumns == 0;
         std::uint64_t numericContentFingerprint =
@@ -5169,7 +4652,6 @@ bool TenantIndexManager::BuildSignatures(
             }
         }
         if (baseArtifactsOk &&
-            (!routingStatsRequired || routeStatsOk) &&
             numericMetadataValid) {
             // Make sure the PS signatures are attached to the head index.
             if (!EnsureTenantLoaded(p_tenantId)) {
@@ -5225,35 +4707,25 @@ bool TenantIndexManager::BuildSignatures(
                      numericContentFingerprint)) {
                 headMetadataValid = false;
             }
-            // tag-pure + sparse metadata is loaded by LoadAll; touch the
-            // loaders again for safety (idempotent — skips already-loaded).
-            LoadTenantSparseIndices();
-
-            LoadTenantTagPureIndices();
+            LoadTenantFilterMetadata();
             if (!LoadTenantTagRoutingStats()) {
                 return false;
             }
-            const auto loadedStats =
-                m_tenantTagRoutingStats.find(
-                    p_tenantId);
+            // Explicit signature construction also repairs diagnostic statistics;
+            // search itself never requires those statistics.
             if (headMetadataValid &&
-                (!routingStatsRequired ||
-                 (loadedStats !=
-                      m_tenantTagRoutingStats.end() &&
-                  !loadedStats->second.empty()))) {
+                m_tenantTagRoutingStats.find(p_tenantId) != m_tenantTagRoutingStats.end()) {
                 fprintf(stderr,
                         "[INFO] Tenant %d: BuildSignatures short-circuit "
-                        "(static=%d headmeta=%d sig=%d sparse=%d tagpure=%d "
-                        "routeStats=%d on disk)\n",
+                        "(static=%d headmeta=%d sig=%d routeStats=%d on disk)\n",
                         p_tenantId, (int)staticStorage, (int)headMetaOk,
-                        (int)sigOk, (int)sparseOk,
-                        (int)tagPureOk, (int)routeStatsOk);
+                        (int)sigOk, (int)routeStatsOk);
                 return true;
             }
             fprintf(stderr,
                     "[INFO] Tenant %d: rebuilding signatures because persisted "
-                    "head metadata, numeric metadata, or hybrid routing stats "
-                    "are invalid\n",
+                    "head/numeric metadata or diagnostic tag statistics "
+                    "are missing or invalid\n",
                     p_tenantId);
         }
     }
@@ -5522,7 +4994,7 @@ bool TenantIndexManager::BuildSignatures(
                     fprintf(
                         stderr,
                         "[ERROR] Tenant %d: cannot bind "
-                        "tag routing stats to the primary "
+                        "tag statistics to the primary "
                         "hybrid posting\n",
                         p_tenantId);
                     return false;
@@ -5827,18 +5299,6 @@ bool TenantIndexManager::BuildSignatures(
                 : 0,
             0);
 
-    // Tag-pure path: collect first-occurrence vector data per VID so we can
-    // materialize per-tag dense lists for very-sparse tags after the loop.
-    // Only enabled for Float value type (m_inputVectorSize == dim * 4).
-    const bool kTagPureEligible = (m_valueType == SPTAG::VectorValueType::Float)
-        && (m_inputVectorSize == (size_t)m_dimension * sizeof(float));
-    std::vector<uint8_t> vidSeen;            // 0/1 per VID
-    std::vector<float>   vidVecData;         // p_numVectors * dim, row-major
-    if (kTagPureEligible) {
-        vidSeen.assign(p_numVectors, 0);
-        vidVecData.assign((size_t)p_numVectors * (size_t)m_dimension, 0.0f);
-    }
-
     for (int pid = 0; pid < std::min(numPostings, numHeads); pid++) {
         int nVecs = postingSizes[pid];
         if (nVecs <= 0) continue;
@@ -5930,16 +5390,6 @@ bool TenantIndexManager::BuildSignatures(
                                         NUM_QUANT_WORDS,
                             c, bucket);
                 }
-            }
-
-            // First-occurrence capture of vector payload for tag-pure path.
-            // (Captured for any occurrence; tail copies are byte-identical to the
-            // pure home copy, so coverage is unaffected by the pure gate above.)
-            if (kTagPureEligible && !vidSeen[vid]) {
-                const uint8_t* src = raw.data() + offset + META_SIZE;
-                std::memcpy(vidVecData.data() + (size_t)vid * (size_t)m_dimension,
-                            src, m_inputVectorSize);
-                vidSeen[vid] = 1;
             }
         }
         std::sort(
@@ -6033,17 +5483,6 @@ bool TenantIndexManager::BuildSignatures(
         }
     }
 
-    std::unordered_map<uint32_t, int> tagPostingCounts;
-    tagPostingCounts.reserve(tagVectorCounts.size());
-    for (int pid = 0; pid < numHeads; ++pid) {
-        std::unordered_set<uint32_t> seenTags;
-        for (uint32_t tag : posting_tags[pid]) {
-            if (seenTags.insert(tag).second) {
-                ++tagPostingCounts[tag];
-            }
-        }
-    }
-
     auto& routeStats = m_tenantTagRoutingStats[p_tenantId];
     routeStats.clear();
     routeStats.reserve(tagVectorCounts.size());
@@ -6063,7 +5502,7 @@ bool TenantIndexManager::BuildSignatures(
                 hybridHeader)) {
             fprintf(
                 stderr,
-                "[ERROR] Tenant %d: cannot bind tag routing stats to "
+                "[ERROR] Tenant %d: cannot bind tag statistics to "
                 "the primary hybrid posting\n",
                 p_tenantId);
             return false;
@@ -6080,22 +5519,6 @@ bool TenantIndexManager::BuildSignatures(
                 p_tenantId);
         return false;
     }
-
-    // Sparse-path single native knob: [BuildSSDIndex]
-    // DirectSparseMaxPostings=N. A tag is materialized into sparse_tags.bin iff
-    // it appears in <= N postings.
-    // At query time, materialized tags ALWAYS route through the sparse path
-    // (no second-stage union-size gate) - this is the single fixed threshold.
-    auto sparseIdx = std::make_shared<SPTAG::Cache::SparseTagIndex>();
-    sparseIdx->Build(numHeads, posting_tags, tagPostingCounts, directSparseMaxPostings);
-
-    std::string sparsePath = workDir + "/sparse_tags.bin";
-    sparseIdx->Save(sparsePath);
-    m_tenantSparseIdx[p_tenantId] = sparseIdx;
-
-    // (Tag-pure postings are built after the head-iteration loop below, once
-    // both posting-side and head-side vector data have been captured into
-    // vidVecData / vidSeen.)
 
     // Build head tag table: VIDs NOT found in any posting are head vectors.
     // They need tag metadata for filtered search since inline tag filter
@@ -6218,19 +5641,6 @@ bool TenantIndexManager::BuildSignatures(
                     continue;
                 }
 
-                // Tag-pure: head VIDs are NOT in any posting; capture their
-                // vector data here so the sparse fast path covers them too.
-                if (kTagPureEligible
-                    && globalVID >= 0 && globalVID < static_cast<SizeType>(p_numVectors)
-                    && !vidSeen[globalVID]) {
-                    const void* hv = memoryIndex->GetSample(hid);
-                    if (hv != nullptr) {
-                        std::memcpy(vidVecData.data() + (size_t)globalVID * (size_t)m_dimension,
-                                    hv, m_inputVectorSize);
-                        vidSeen[globalVID] = 1;
-                    }
-                }
-
                 // Own-tags mask: a single-vector mask reflecting THIS head
                 // centroid's own tags. Used by HeadNodeMatchesQuery to gate
                 // whether the head's centroid is admissible as a top-K result
@@ -6305,243 +5715,10 @@ bool TenantIndexManager::BuildSignatures(
         m_tenantNumericMeta[p_tenantId] =
             std::move(metadata);
     }
-
-
-
-    // ── Tag-pure postings (chunked, KV-backed) ───────────────────────────
-    // For tags with selectivity strictly below SPTAG_TAG_PURE_THRESHOLD
-    // (default 0.01), build chunked (VID + normalized vector) payloads and
-    // write them into the same KeyValueIO that holds regular SPANN postings.
-    // That backend (FileIO ShardedLRUCache or RocksDB block cache) takes care
-    // of caching — no separate user-space LRU is introduced. Float dtype only.
-    // Runs AFTER the head-iteration loop so vidVecData covers heads too.
-    {
-        auto& purePostings = m_tenantTagPurePostings[p_tenantId];
-
-        // Resolve the KV store + posting page limit from the loaded SPANN
-        // index (configured at index build time, not from defaults).
-        std::shared_ptr<SPTAG::Helper::KeyValueIO> kvDb;
-        int postingPageLimit = 3;
-        int bufferLength = 4;
-        {
-            std::shared_lock<std::shared_mutex> rlock(m_tenantIndicesMutex);
-            auto it = m_tenantIndices.find(p_tenantId);
-            if (it != m_tenantIndices.end()) {
-                auto internalIdx2 = it->second->GetInternalIndex();
-                auto* spann2 = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(internalIdx2.get());
-                if (spann2 != nullptr) {
-                    if (auto* opts = spann2->GetOptions()) {
-                        postingPageLimit = std::max(1, opts->m_postingPageLimit);
-                        bufferLength = std::max(0, opts->m_bufferLength);
-                    }
-                    auto extra = spann2->GetDiskIndex();
-                    if (extra) kvDb = extra->GetKVStore();
-                }
-            }
-        }
-
-        // Drop chunks written by a previous BuildSignatures call (keep the KV
-        // store tidy — no leak in its block pool).
-        if (kvDb != nullptr) {
-            for (auto& [tag, pp] : purePostings) {
-                if (!pp) continue;
-                for (int k : pp->chunkKeys) {
-                    kvDb->Delete(static_cast<SPTAG::SizeType>(k));
-                }
-            }
-        }
-        purePostings.clear();
-        m_tenantTagPureKV.erase(p_tenantId);
-
-        if (kTagPureEligible && kvDb != nullptr) {
-            double pureThreshold = 0.01;
-            if (const char* env = std::getenv("SPTAG_TAG_PURE_THRESHOLD")) {
-                double parsed = 0.0;
-                if (SPTAG::Helper::Convert::ConvertStringTo<double>(env, parsed)
-                    && parsed > 0.0 && parsed <= 1.0) {
-                    pureThreshold = parsed;
-                }
-            }
-            int maxCount = (int)std::floor(pureThreshold * (double)p_numVectors);
-            if (maxCount < 1) maxCount = 1;
-
-            std::unordered_set<uint32_t> eligibleTags;
-            eligibleTags.reserve(tagVectorCounts.size());
-            for (const auto& [tag, vectorCount] : tagVectorCounts) {
-                if (vectorCount > 0 && vectorCount <= maxCount) {
-                    eligibleTags.insert(tag);
-                }
-            }
-
-            std::unordered_map<uint32_t, std::vector<int>> tagVids;
-            tagVids.reserve(eligibleTags.size());
-            size_t missingVecs = 0;
-            for (int vid = 0; vid < p_numVectors; ++vid) {
-                std::unordered_set<uint32_t> seenLocal;
-                bool anyHit = false;
-                for (int t : tagSchema.categorical) {
-                    uint32_t tag = p_tagsPtr[vid * p_numTagsPerVec + t];
-                    if (!seenLocal.insert(tag).second) continue;
-                    if (eligibleTags.count(tag) == 0) continue;
-                    if (!vidSeen[vid]) { anyHit = true; continue; }
-                    tagVids[tag].push_back(vid);
-                }
-                if (anyHit && !vidSeen[vid]) ++missingVecs;
-            }
-
-            // Chunk capacity: ≤ postingPageLimit pages per blob, matching the
-            // page budget that regular postings already obey in this index.
-            const int kRecBytes = (int)sizeof(int32_t) + m_dimension * (int)sizeof(float);
-            int chunkBytes = postingPageLimit * 4096;
-            int chunkCap = std::max(1, chunkBytes / kRecBytes);
-
-            // Allocate keys starting just past the head ID range. The
-            // FileIO mapping auto-grows; existing head keys are untouched.
-            SPTAG::SizeType keyCursor = static_cast<SPTAG::SizeType>(numHeads);
-            auto cursorIt = m_tenantTagPureNextKey.find(p_tenantId);
-            if (cursorIt != m_tenantTagPureNextKey.end() && cursorIt->second > keyCursor) {
-                keyCursor = cursorIt->second;
-            }
-
-            std::vector<float> normBuf;
-            std::vector<std::string> chunkBlobs;
-            int builtTags = 0;
-            size_t builtVecs = 0;
-            size_t totalChunks = 0;
-            size_t failedTags = 0;
-
-            // Workspace providing page-aligned buffers + iocb-initialized
-            // AsyncReadRequest entries — required by FileIO::Put's direct
-            // write path when the in-process LRU cache is disabled
-            // (CacheSizeGB=0). One workspace, reused across all Put calls.
-            const int blockLimit = postingPageLimit + bufferLength + 1;
-            SPTAG::SPANN::ExtraWorkSpace ws;
-            ws.Initialize(/*maxCheck*/16,
-                          /*hashExp*/4,
-                          /*internalResultNum*/1,
-                          /*maxPages bytes*/ blockLimit << SPTAG::PageSizeEx,
-                          /*blockIO*/true,
-                          /*enableDataCompression*/false);
-
-            for (auto& kv : tagVids) {
-                uint32_t tag = kv.first;
-                auto& vids = kv.second;
-                if (vids.empty()) continue;
-
-                // L2-normalize each vector once for cosine-as-1-IP at query.
-                normBuf.assign((size_t)vids.size() * (size_t)m_dimension, 0.0f);
-                for (size_t k = 0; k < vids.size(); ++k) {
-                    const float* src = vidVecData.data() + (size_t)vids[k] * (size_t)m_dimension;
-                    float n2 = 0.0f;
-                    for (int i = 0; i < m_dimension; ++i) n2 += src[i] * src[i];
-                    float inv = (n2 > 1e-30f) ? 1.0f / std::sqrt(n2) : 0.0f;
-                    float* dst = normBuf.data() + k * (size_t)m_dimension;
-                    for (int i = 0; i < m_dimension; ++i) dst[i] = src[i] * inv;
-                }
-
-                auto pure = std::make_shared<SPTAG::Cache::TagPurePosting>();
-                pure->dim = m_dimension;
-                pure->Pack(vids, normBuf, chunkCap, chunkBlobs);
-
-                bool ok = true;
-                pure->chunkKeys.clear();
-                pure->chunkKeys.reserve(chunkBlobs.size());
-                for (auto& blob : chunkBlobs) {
-                    SPTAG::SizeType key = keyCursor++;
-                    auto err = kvDb->Put(key, blob, std::chrono::microseconds(0), &ws.m_diskRequests);
-                    if (err != SPTAG::ErrorCode::Success) {
-                        fprintf(stderr,
-                                "[TagPure] Put failed tenant=%d tag=%u key=%d err=%d size=%zu\n",
-                                p_tenantId, tag, (int)key, (int)err, blob.size());
-                        ok = false;
-                        break;
-                    }
-                    pure->chunkKeys.push_back((int)key);
-                }
-                if (!ok) { ++failedTags; continue; }
-
-                builtVecs += pure->count;
-                ++builtTags;
-                totalChunks += pure->chunkKeys.size();
-                purePostings[tag] = std::move(pure);
-            }
-
-            m_tenantTagPureNextKey[p_tenantId] = keyCursor;
-            m_tenantTagPureKV[p_tenantId] = kvDb;
-            m_tenantTagPureBlockLimit[p_tenantId] = blockLimit;
-            m_tenantTagPurePagesPerChunk[p_tenantId] = postingPageLimit;
-
-            // Persist: 1) FileIO mapping + block pool so chunk addresses
-            // survive process restart; 2) sidecar metadata so we can attach
-            // the tag-pure structures at next LoadAll without re-scanning.
-            {
-                std::shared_ptr<SPTAG::SPANN::IExtraSearcher> extra;
-                {
-                    std::shared_lock<std::shared_mutex> rlock(m_tenantIndicesMutex);
-                    auto it = m_tenantIndices.find(p_tenantId);
-                    if (it != m_tenantIndices.end()) {
-                        auto internalIdx = it->second->GetInternalIndex();
-                        auto* spannIdx = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(internalIdx.get());
-                        if (spannIdx) extra = spannIdx->GetDiskIndex();
-                    }
-                }
-                if (extra) {
-                    auto ec = extra->Checkpoint(workDir);
-                    if (ec != SPTAG::ErrorCode::Success) {
-                        fprintf(stderr,
-                                "[TagPure] WARN tenant=%d kvDb checkpoint failed (err=%d); "
-                                "chunks will not persist across restart\n",
-                                p_tenantId, (int)ec);
-                    }
-                }
-                const std::string metaPath = workDir + "/tagpure_meta.bin";
-                if (!SPTAG::Cache::TagPureBundle::Save(metaPath, m_dimension, purePostings)) {
-                    fprintf(stderr,
-                            "[TagPure] WARN tenant=%d failed to write %s\n",
-                            p_tenantId, metaPath.c_str());
-                }
-            }
-
-            fprintf(stdout,
-                    "[TagPure] tenant=%d threshold=%.4f maxCount=%d tags=%d vecs=%zu "
-                    "chunks=%zu chunkCap=%d failed=%zu missing=%zu\n",
-                    p_tenantId, pureThreshold, maxCount, builtTags, builtVecs,
-                    totalChunks, chunkCap, failedTags, missingVecs);
-            fflush(stdout);
-        } else if (kTagPureEligible) {
-            fprintf(stderr, "[TagPure] tenant=%d: no KV store available, skipping\n", p_tenantId);
-        }
-    }
-
-    fprintf(stderr, "[INFO] Tenant %d: built PS + sparse index + %d head tags (%d postings, %llu assignments, sparse_max_postings=%d)\n",
+    fprintf(stderr, "[INFO] Tenant %d: built posting membership metadata + %d head tags (%d postings, %llu assignments)\n",
             p_tenantId, headTagCount, numHeads,
-            static_cast<unsigned long long>(totalAssignments),
-    directSparseMaxPostings);
+            static_cast<unsigned long long>(totalAssignments));
     return true;
-}
-
-bool TenantIndexManager::BackfillPrimaryHeadCSR(int p_tenantId, ByteArray p_vectors, int p_numVectors,
-                                                ByteArray p_tags, int p_numTagsPerVec)
-{
-    if (p_vectors.Data() == nullptr || p_tags.Data() == nullptr || p_numVectors <= 0 || p_numTagsPerVec < 5) {
-        return false;
-    }
-    if (!EnsureTenantLoaded(p_tenantId)) return false;
-
-    std::shared_ptr<AnnIndex> index;
-    {
-        std::shared_lock<std::shared_mutex> lock(m_tenantIndicesMutex);
-        const auto it = m_tenantIndices.find(p_tenantId);
-        if (it == m_tenantIndices.end()) return false;
-        index = it->second;
-    }
-    auto internal = index->GetInternalIndex();
-    auto* spann = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(internal.get());
-    if (spann == nullptr) return false;
-
-    return spann->BuildPrimaryHeadCSRBackfill(
-        p_vectors.Data(), static_cast<SizeType>(p_numVectors),
-        reinterpret_cast<const uint32_t*>(p_tags.Data()), p_numTagsPerVec);
 }
 
 std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
@@ -6566,7 +5743,6 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
     DNFBlobEncoding dnfEncoding =
         DNFBlobEncoding::Legacy;
     std::vector<uint32_t> dnfValues;
-    std::vector<uint32_t> denseFlatTags;
     const uint32_t* effTagsPtr = nullptr;
     int effNumTags = 0;
     std::string dnfError;
@@ -6619,31 +5795,12 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
     auto internalIdx = indexPtr->GetInternalIndex();
     auto _ck_d = s_wrapperTime ? std::chrono::high_resolution_clock::now()
                                : std::chrono::high_resolution_clock::time_point{};
-    bool forceDenseTagSearch = false;
-    bool adaptiveFilteredNprobeEnabled = false;
-    bool hybridDistanceEnabled = false;
-    bool hierarchyEnabled = false;
     bool limitedTagLayout = false;
     const SPTAG::SPANN::Options*
         spannSearchOptions = nullptr;
     int categoricalColumns = 0;
     SPTAG::TagSchema querySchema;
-    float filteredSearchNprobeSafety = 1.0f;
     if (internalIdx != nullptr) {
-        const std::string forceDenseParam = internalIdx->GetParameter("ForceDenseTagSearch", "BuildSSDIndex");
-        if (!forceDenseParam.empty()) {
-            SPTAG::Helper::Convert::ConvertStringTo<bool>(forceDenseParam.c_str(), forceDenseTagSearch);
-        }
-
-        const std::string filteredSearchNprobeSafetyParam = internalIdx->GetParameter("FilteredSearchNprobeSafety", "BuildSSDIndex");
-        if (!filteredSearchNprobeSafetyParam.empty()) {
-            float parsedFilteredSearchNprobeSafety = 1.0f;
-            if (SPTAG::Helper::Convert::ConvertStringTo<float>(filteredSearchNprobeSafetyParam.c_str(), parsedFilteredSearchNprobeSafety)
-                && parsedFilteredSearchNprobeSafety > 0.0f) {
-                filteredSearchNprobeSafety = parsedFilteredSearchNprobeSafety;
-            }
-        }
-
         auto* spannIndex = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(internalIdx.get());
         const auto* searchOptions = spannIndex != nullptr ? spannIndex->GetOptions() : nullptr;
         spannSearchOptions = searchOptions;
@@ -6654,30 +5811,6 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
         {
             querySchema = searchOptions->Schema();
             categoricalColumns = static_cast<int>(querySchema.categorical.size());
-        }
-        adaptiveFilteredNprobeEnabled =
-            searchOptions != nullptr && searchOptions->m_enableAdaptiveFilteredNprobe;
-        hierarchyEnabled =
-            searchOptions != nullptr &&
-            searchOptions->m_selectSecondLevel;
-        const std::string hybridDistanceParam =
-            internalIdx->GetParameter(
-                "EnableHybridDistance", "BuildSSDIndex");
-        if (!hybridDistanceParam.empty()) {
-            SPTAG::Helper::Convert::ConvertStringTo<bool>(
-                hybridDistanceParam.c_str(), hybridDistanceEnabled);
-        }
-        if (hybridDistanceEnabled) {
-            // Hybrid-enabled filtered queries must reach the core cost router.
-            // Tag-pure and sparse early returns cannot compare the original and
-            // hybrid navigation and posting scan-range costs, so they are not
-            // eligible here.
-            forceDenseTagSearch = true;
-        }
-        if (hierarchyEnabled) {
-            // Hierarchy navigation belongs to SPANN; wrapper-local
-            // tag-pure/sparse returns must not bypass the highest graph.
-            forceDenseTagSearch = true;
         }
     }
 
@@ -6713,79 +5846,8 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
         fflush(stdout);
     }
 
-    // ── Selectivity-based routing gate ──────────────────────────────────
-    // The OPQ tag-pure path exhaustively ADC-scans a tag's entire inverted
-    // vid list. For broad tags (large list AND high selectivity) that scan is
-    // more expensive than the dense BKT-graph ANN path. Route to OPQ tag-pure
-    // only when the tag is narrow by EITHER measure:
-    //     vidCount < SPTAG_OPQPURE_MAX_VIDS   OR   selectivity < SPTAG_OPQPURE_MAX_SEL
-    // Otherwise force the dense graph path. Defaults (MAX_VIDS=50000, MAX_SEL=0.1)
-    // enable selectivity routing out of the box: broad tags (e.g. org) go dense,
-    // narrower tags stay on tag-pure. Override the env vars to retune or disable.
-    // Defaults enable selectivity routing out of the box (Option A): broad tags
-    // (vidCount >= 50000 AND selectivity >= 0.1, e.g. org) route to the dense BKT
-    // graph; narrower tags stay on the exhaustive OPQ tag-pure path. Override via
-    // SPTAG_OPQPURE_MAX_VIDS / SPTAG_OPQPURE_MAX_SEL. Set MAX_VIDS very large and
-    // MAX_SEL=1.0 to force every single-tag query back to tag-pure.
-    static const std::int64_t s_opqPureMaxVids = []() {
-        const char* v = std::getenv("SPTAG_OPQPURE_MAX_VIDS");
-        return v ? std::strtoll(v, nullptr, 10) : (std::int64_t)50000;
-    }();
-    static const double s_opqPureMaxSel = []() {
-        const char* v = std::getenv("SPTAG_OPQPURE_MAX_SEL");
-        return v ? std::atof(v) : 0.1;
-    }();
-    static const bool s_gateDebug = (std::getenv("SPTAG_ROUTE_DEBUG") != nullptr);
-    if (!forceDenseTagSearch && p_numTags == 1 && queryTagsPtr != nullptr
-        && m_valueType == SPTAG::VectorValueType::Float && internalIdx != nullptr) {
-        auto* spannGateIdx = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(internalIdx.get());
-        if (spannGateIdx != nullptr) {
-            auto gateDisk = spannGateIdx->GetDiskIndex();
-            if (gateDisk != nullptr) {
-                std::int64_t cnt = gateDisk->GetOPQTagVidCount(queryTagsPtr[0]);
-                std::int64_t tot = gateDisk->GetOPQTotalVectors();
-                // Selectivity routing applies regardless of RaBitQ: broad tags still go to
-                // the dense BKT-graph path (graph navigation narrows the candidate set), and
-                // RaBitQ simply replaces PQ as the in-RAM scorer on that path. (An earlier
-                // experiment bypassed this gate under RaBitQ to force exhaustive tag-pure;
-                // that threw away graph navigation and tanked broad/unfilter QPS. Reverted.)
-                if (cnt >= 0 && tot > 0) {
-                    double sel = static_cast<double>(cnt) / static_cast<double>(tot);
-                    bool tagPureOK = (cnt < s_opqPureMaxVids) || (sel < s_opqPureMaxSel);
-                    if (!tagPureOK) {
-                        forceDenseTagSearch = true;
-                        if (s_gateDebug) {
-                            static std::atomic<int> g_c{0};
-                            if (g_c++ < 8)
-                                fprintf(stderr, "[ROUTE] tag=%u cnt=%lld sel=%.4f -> DENSE graph\n",
-                                        queryTagsPtr[0], (long long)cnt, sel);
-                        }
-                    } else if (s_gateDebug) {
-                        static std::atomic<int> g_c2{0};
-                        if (g_c2++ < 8)
-                            fprintf(stderr, "[ROUTE] tag=%u cnt=%lld sel=%.4f -> OPQ tag-pure\n",
-                                    queryTagsPtr[0], (long long)cnt, sel);
-                    }
-                }
-            }
-        }
-    }
-
-    const auto tagStatsIt = m_tenantTagRoutingStats.find(p_tenantId);
-    const auto* tagStats = (tagStatsIt != m_tenantTagRoutingStats.end()) ? &tagStatsIt->second : nullptr;
-    if (hybridDistanceEnabled &&
-        (tagStats == nullptr || tagStats->empty())) {
-        fprintf(
-            stderr,
-            "[ERROR] Tenant %d: hybrid filtered search requires "
-            "tag_routing_stats.bin; run BuildSignatures with the native "
-            "INI before serving filtered queries\n",
-            p_tenantId);
-        return nullptr;
-    }
-
-    // Effective categorical view used by dense signatures, selectivity, and
-    // routing. Numeric literals remain in the exact DNF predicate only.
+    // Effective categorical values feed only no-false-negative posting
+    // membership checks. Numeric literals remain in the exact DNF predicate.
     if (dnfMode)
     {
         dnfValues = dnf.AllValues();
@@ -6802,7 +5864,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
 
     std::vector<std::uint32_t>
         limitedTagQueryValues;
-    bool limitedTagRouteEligible = false;
+    bool limitedTagMembershipEligible = false;
     if (spannSearchOptions != nullptr &&
         limitedTagLayout)
     {
@@ -6810,7 +5872,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
             spannSearchOptions->m_limitedTagColumn;
         if (dnfMode && !dnf.Empty())
         {
-            limitedTagRouteEligible =
+            limitedTagMembershipEligible =
                 dnf.TryGetEqualityAnchors(
                     static_cast<std::uint32_t>(
                         keyColumn),
@@ -6821,7 +5883,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
                  categoricalColumns == 1 &&
                  querySchema.IsCategorical(keyColumn))
         {
-            limitedTagRouteEligible = true;
+            limitedTagMembershipEligible = true;
             limitedTagQueryValues.assign(
                 queryTagsPtr,
                 queryTagsPtr + p_numTags);
@@ -6836,157 +5898,11 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
         }
     }
 
-    auto _ck_routingStart = s_wrapperTime ? std::chrono::high_resolution_clock::now()
-                                          : std::chrono::high_resolution_clock::time_point{};
-
-    // Check if ALL query tags are sparse → use brute-force path
     auto _ck_routing = s_wrapperTime ? std::chrono::high_resolution_clock::now()
                                      : std::chrono::high_resolution_clock::time_point{};
-    if (s_wrapperTime) {
-        double t_idxParam = std::chrono::duration<double, std::milli>(_ck_afterIdx - _wrTotal0).count();
-        double t_tagStats = std::chrono::duration<double, std::milli>(_ck_routingStart - _ck_afterIdx).count();
-        double t_routeNodes = std::chrono::duration<double, std::milli>(_ck_routing - _ck_routingStart).count();
-        fprintf(stdout,
-            "[1] WrapperRouting: tag0=%u rn=%zu  idxParam=%.3f tagStats=%.3f routeNodes=%.3f\n",
-            (p_numTags > 0 && queryTagsPtr) ? queryTagsPtr[0] : 0u,
-            size_t{1}, t_idxParam, t_tagStats, t_routeNodes);
-        fflush(stdout);
-    }
-    static const bool s_disableSparsePath = []() {
-        const char* v = std::getenv("SPTAG_DISABLE_SPARSE_PATH");
-        return v && (v[0] == '1' || v[0] == 't' || v[0] == 'T');
-    }();
-    static const bool s_disableTagPurePath = []() {
-        const char* v = std::getenv("SPTAG_DISABLE_TAG_PURE_PATH");
-        return v && (v[0] == '1' || v[0] == 't' || v[0] == 'T');
-    }();
 
-    // ── Tag-pure fast path (chunked KV-backed) ──────────────────────────
-    // Single-tag query whose tag has materialized tag-pure chunks: MultiGet
-    // the chunks from the shared KV store (FileIO ShardedLRUCache / RocksDB
-    // block cache handles caching), decode (VID + normVec) entries and
-    // flat-scan for top-K. Bypasses BKT/SSD and gives R=1.0 by construction.
-    if (!s_disableTagPurePath && !forceDenseTagSearch && p_numTags == 1
-        && m_valueType == SPTAG::VectorValueType::Float) {
-        // OPQ-prefilter narrow path: load the tag's ids -> ADC screen -> fetch only
-        // L survivors -> exact rerank. Preserves the tag-pure exhaustiveness (screens
-        // ALL the tag's vids) while cutting read volume ~18x vs full-vector chunks.
-        static const bool s_opqPrefilter = []() {
-            const char* v = std::getenv("SPTAG_OPQ_PREFILTER");
-            return v && v[0] == '1';
-        }();
-        if (s_opqPrefilter && internalIdx != nullptr) {
-            auto* spannIdx = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(internalIdx.get());
-            if (spannIdx != nullptr) {
-                auto disk = spannIdx->GetDiskIndex();
-                if (disk != nullptr) {
-                    auto result = std::make_shared<SPTAG::COMMON::QueryResultSet<float>>(
-                        reinterpret_cast<const float*>(p_queryVector.Data()), p_resultNum);
-                    if (disk->OPQTagPureSearch(*result, queryTagsPtr[0])) {
-                        return result;
-                    }
-                }
-            }
-        }
-        auto pureIt = m_tenantTagPurePostings.find(p_tenantId);
-        auto kvIt = m_tenantTagPureKV.find(p_tenantId);
-        if (pureIt != m_tenantTagPurePostings.end() && kvIt != m_tenantTagPureKV.end()
-            && kvIt->second != nullptr) {
-            auto tagIt = pureIt->second.find(queryTagsPtr[0]);
-            if (tagIt != pureIt->second.end() && tagIt->second
-                && tagIt->second->count > 0
-                && tagIt->second->dim == m_dimension
-                && !tagIt->second->chunkKeys.empty()) {
-                const auto& pure = *tagIt->second;
-                auto& kvDb = kvIt->second;
-
-                std::vector<SPTAG::SizeType> keys;
-                keys.reserve(pure.chunkKeys.size());
-                for (int k : pure.chunkKeys) keys.push_back(static_cast<SPTAG::SizeType>(k));
-
-                int pagesPerChunk = 16;
-                auto pcIt = m_tenantTagPurePagesPerChunk.find(p_tenantId);
-                if (pcIt != m_tenantTagPurePagesPerChunk.end()) pagesPerChunk = pcIt->second;
-
-                // Workspace provides page-aligned per-chunk buffers and an
-                // AsyncReadRequest vector pre-sized to cover every page of
-                // every chunk. Required by FileIO::MultiGet for direct
-                // (no-cache) reads.
-                SPTAG::SPANN::ExtraWorkSpace ws;
-                ws.Initialize(/*maxCheck*/16,
-                              /*hashExp*/4,
-                              /*internalResultNum*/(int)keys.size(),
-                              /*maxPages bytes*/ pagesPerChunk << SPTAG::PageSizeEx,
-                              /*blockIO*/true,
-                              /*enableDataCompression*/false);
-
-                std::vector<std::string> values(keys.size());
-                auto err = kvDb->MultiGet(keys, &values,
-                                          std::chrono::microseconds(60000000),
-                                          &ws.m_diskRequests);
-                if (err == SPTAG::ErrorCode::Success) {
-                    std::vector<std::pair<float, int>> topK;
-                    pure.SearchTopK(reinterpret_cast<const float*>(p_queryVector.Data()),
-                                    values, p_resultNum, topK);
-                    auto result = std::make_shared<QueryResult>(
-                        p_queryVector.Data(), p_resultNum, false);
-                    for (int i = 0; i < p_resultNum; ++i) {
-                        if (i < (int)topK.size())
-                            result->SetResult(i, topK[i].second, topK[i].first);
-                        else
-                            result->SetResult(i, -1, SPTAG::MaxDist);
-                    }
-                    if (s_wrapperTime) {
-                        auto _ck_tp = std::chrono::high_resolution_clock::now();
-                        double t_total = std::chrono::duration<double, std::milli>(
-                            _ck_tp - _wrTotal0).count();
-                        fprintf(stdout,
-                            "[1] WrapperTagPure: tag=%u cands=%d chunks=%zu topK=%d total=%.3fms\n",
-                            queryTagsPtr[0], pure.count, keys.size(), p_resultNum, t_total);
-                        fflush(stdout);
-                    }
-                    return result;
-                }
-                // MultiGet failure → fall through to existing paths.
-                fprintf(stderr, "[TagPure] MultiGet failed tag=%u err=%d, fallback\n",
-                        queryTagsPtr[0], (int)err);
-            }
-        }
-    }
-
-    auto sparseIt = m_tenantSparseIdx.find(p_tenantId);
-    if (!s_disableSparsePath && !forceDenseTagSearch && sparseIt != m_tenantSparseIdx.end() && p_numTags > 0) {
-        auto& sparseIdx = sparseIt->second;
-        bool hasDirectPostingListsForAllTags = true;
-        // Collect posting IDs for all query tags
-        std::unordered_set<int> bfPostings;
-        for (int i = 0; i < p_numTags; i++) {
-            auto* pids = sparseIdx->GetPostings(queryTagsPtr[i]);
-            if (!pids) {
-                hasDirectPostingListsForAllTags = false;
-                break;
-            }
-            bfPostings.insert(pids->begin(), pids->end());
-        }
-
-        // Sparse fast-path policy: build-time `kSparseIndexBuildMaxPostings` is
-        // the single source of truth - if a tag's posting list was materialized
-        // at build, query-time always routes through the sparse path. No
-        // second-stage union-size cap: that would create a window where the
-        // sidecar was paid for but the path silently fell back to ANN.
-        if (hasDirectPostingListsForAllTags && !bfPostings.empty()) {
-            SPTAG::VectorIndex::ThreadLocalSearchContext searchContext;
-            searchContext.m_queryTags.assign(queryTagsPtr, queryTagsPtr + p_numTags);
-            searchContext.m_directPostingIDs.assign(bfPostings.begin(), bfPostings.end());
-            SPTAG::VectorIndex::ThreadLocalSearchContextGuard searchContextGuard(std::move(searchContext));
-
-            auto result = indexPtr->Search(p_queryVector, p_resultNum);
-            return result;
-        }
-    }
-
-    // Dense tag path: SPANN graph + bitmask PS + inline filter
-    // Build query bitmask from requested tags
+    // Build the no-false-negative posting membership mask used after the
+    // shared spatial graph traversal has selected candidate heads.
     auto _ck_sparse = s_wrapperTime ? std::chrono::high_resolution_clock::now()
                                     : std::chrono::high_resolution_clock::time_point{};
     SPTAG::Cache::PostingBitmask queryMask;
@@ -6997,12 +5913,6 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
         memoryIndex != nullptr
             ? memoryIndex->GetHeadNodeHierWidths()
             : SPTAG::Cache::HierWidthTable();
-    const std::vector<uint32_t>* levelOffsets = nullptr;
-    {
-        auto offIt = m_tenantTagLevelOffsets.find(p_tenantId);
-        if (offIt != m_tenantTagLevelOffsets.end() && !offIt->second.empty())
-            levelOffsets = &offIt->second;
-    }
     for (int i = 0; i < effNumTags; i++) {
         queryMask.Insert(effTagsPtr[i]);
     }
@@ -7018,15 +5928,10 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
     if (dnfMode && !dnf.Empty()) {
         searchContext.m_dnf = dnf;
     }
-    searchContext.m_limitedTagRouteEligible =
-        limitedTagRouteEligible;
+    searchContext.m_limitedTagMembershipEligible =
+        limitedTagMembershipEligible;
     searchContext.m_limitedTagQueryValues =
         limitedTagQueryValues;
-    // Retain offsets for downstream routing/selectivity, not for inferring
-    // categorical columns in flat ACL posting masks.
-    if (levelOffsets != nullptr) {
-        searchContext.m_tagLevelOffsets = *levelOffsets;
-    }
     if (internalIdx) {
             // Dense path posting pre-filter.
             //
@@ -7230,66 +6135,6 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
                         };
                 }
             }
-        if (adaptiveFilteredNprobeEnabled ||
-            hybridDistanceEnabled ||
-            (spannSearchOptions != nullptr && spannSearchOptions->m_logPhaseTime)) {
-            auto vcIt2 = m_tenantVectorCounts.find(p_tenantId);
-            int tenantSize2 = (vcIt2 != m_tenantVectorCounts.end()) ? vcIt2->second : 1;
-            float vectorSel = EstimateQueryVectorSelectivity(
-                tenantSize2, tagStats, effTagsPtr, effNumTags,
-                dnfMode && !dnf.Empty() ? &dnf : nullptr,
-                levelOffsets != nullptr
-                    ? static_cast<int>(
-                          levelOffsets->size())
-                    : -1,
-                hasNumericMeta
-                    ? numMeta.numBaseCols
-                    : 0,
-                hasNumericMeta &&
-                        !numMeta.params.empty()
-                    ? numMeta.params.data()
-                    : nullptr,
-                hasNumericMeta
-                    ? numMeta.params.size()
-                    : 0, &querySchema);
-            searchContext.m_routeSelectivity = vectorSel;
-            searchContext.m_filterSelectivity = std::clamp(
-                vectorSel / std::max(1.0f, filteredSearchNprobeSafety),
-                1e-6f, 1.0f);
-
-            // Per-query selectivity fallback is needed only by adaptive nprobe.
-            // Fixed-nprobe searches must not scan global head metadata for a value
-            // the core search path will ignore.
-            static const bool s_disableSelFallback = []() {
-                const char* e = std::getenv("SPTAG_DISABLE_SEL_FALLBACK");
-                return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
-            }();
-            static const SizeType kSelFallbackMaxSamples = []() -> SizeType {
-                const char* e = std::getenv("SPTAG_SEL_FALLBACK_MAXSAMPLES");
-                int v = e ? atoi(e) : 16384;
-                return static_cast<SizeType>(v > 0 ? v : 16384);
-            }();
-            if (adaptiveFilteredNprobeEnabled &&
-                !s_disableSelFallback && memoryIndex != nullptr &&
-                memoryIndex->HasHeadNodeMeta() && tenantSize2 > 0 &&
-                searchContext.m_filterSelectivity >= 1.0f) {
-                SizeType totalHeads = memoryIndex->GetHeadNodeMetaSampleCount();
-                SizeType stride = (totalHeads > kSelFallbackMaxSamples)
-                    ? (totalHeads + kSelFallbackMaxSamples - 1) / kSelFallbackMaxSamples
-                    : 1;
-                int passCount = 0, sampled = 0;
-                for (SizeType pid = 0; pid < totalHeads; pid += stride) {
-                    if (memoryIndex->HeadNodePSMayIntersect(pid, queryMask)) passCount++;
-                    sampled++;
-                }
-                totalHeads = (sampled > 0) ? static_cast<SizeType>(sampled) : totalHeads;
-                float fallbackVectorSel = (totalHeads > 0)
-                    ? static_cast<float>(passCount) / static_cast<float>(totalHeads)
-                    : 1.0f;
-                searchContext.m_filterSelectivity =
-                    std::clamp(fallbackVectorSel, 1e-6f, 1.0f);
-            }
-        }
     }
     SPTAG::VectorIndex::ThreadLocalSearchContextGuard searchContextGuard(std::move(searchContext));
     auto _ck_denseEnd = s_wrapperTime ? std::chrono::high_resolution_clock::now()

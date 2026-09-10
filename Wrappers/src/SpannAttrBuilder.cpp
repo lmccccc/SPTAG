@@ -1009,25 +1009,6 @@ int Run(int argc, char** argv) {
     fprintf(stderr, "[spannbuilder] %s ...\n",
             hasTags ? "BuildFromDataWithTagsSingleTenant"
                     : "BuildFromDataSingleTenant");
-    if (ArgFlag(argc, argv, "--backfill-primary-head-csr")) {
-        if (!hasTags) {
-            fprintf(stderr, "[spannbuilder] PRIMARY-HEAD-CSR requires tags\n");
-            return 2;
-        }
-        fprintf(stderr, "[spannbuilder] PRIMARY-HEAD-CSR: LoadAll(%s) ...\n", indexDir);
-        if (!mgr.LoadAll(indexDir) || mgr.GetTenantVectorCount(tenant) != n) {
-            fprintf(stderr, "[spannbuilder] PRIMARY-HEAD-CSR LoadAll FAILED\n");
-            return 1;
-        }
-        fprintf(stderr, "[spannbuilder] PRIMARY-HEAD-CSR: assigning nearest heads for %lld vectors ...\n", n);
-        if (!mgr.BackfillPrimaryHeadCSR(tenant, vectors, static_cast<int>(n), tags, numTagsPerVec)) {
-            fprintf(stderr, "[spannbuilder] PRIMARY-HEAD-CSR backfill FAILED\n");
-            return 1;
-        }
-        fprintf(stderr, "[spannbuilder] PRIMARY-HEAD-CSR done.\n");
-        return 0;
-    }
-
     if (ArgFlag(argc, argv, "--build-signatures-only")) {
         if (!hasTags) {
             fprintf(stderr, "[spannbuilder] BUILD-SIGNATURES-ONLY requires tags\n");

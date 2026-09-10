@@ -175,7 +175,6 @@ namespace SPTAG {
                 std::uint64_t m_dedupSkippedVectors = 0;
                 std::uint64_t m_uniqueMatchedPostings = 0;
                 std::uint64_t m_uniqueMatchedVectors = 0;
-                std::uint64_t m_primaryHeadCandidates = 0;
                 std::uint64_t m_postingPageReads = 0;
                 std::uint64_t m_postingLogicalBytes = 0;
                 std::uint64_t m_postingPhysicalBytes = 0;
@@ -195,7 +194,6 @@ namespace SPTAG {
                     m_dedupSkippedVectors = 0;
                     m_uniqueMatchedPostings = 0;
                     m_uniqueMatchedVectors = 0;
-                    m_primaryHeadCandidates = 0;
                     m_postingPageReads = 0;
                     m_postingLogicalBytes = 0;
                     m_postingPhysicalBytes = 0;
@@ -388,27 +386,6 @@ namespace SPTAG {
                     if (m_scanEnd == m_scanBegin) m_readPageCount = 0;
                 }
 
-                void SetPureDistancePrefix(int p_pureCount,
-                                           int p_totalCount,
-                                           int p_percent)
-                {
-                    const int pureCount = (std::max)(
-                        0, (std::min)(p_pureCount, p_totalCount));
-                    const int prefixCount = pureCount == 0
-                        ? 0
-                        : static_cast<int>(
-                            (static_cast<std::int64_t>(pureCount) * p_percent + 99) / 100);
-                    m_scanBegin = 0;
-                    m_scanEnd = (std::min)(pureCount, prefixCount);
-                    if (pureCount < p_totalCount) {
-                        m_secondScanBegin = pureCount;
-                        m_secondScanEnd = p_totalCount;
-                    } else {
-                        m_secondScanBegin = -1;
-                        m_secondScanEnd = -1;
-                    }
-                }
-
                 int ScanCount() const
                 {
                     const int first = (std::max)(0, m_scanEnd - m_scanBegin);
@@ -444,9 +421,8 @@ namespace SPTAG {
                 }
             };
 
-            // Query-local source/destination range for a selected posting. Static
-            // ordered ACL pages and dynamic limited-tag H/O reads populate this before
-            // issuing I/O.
+            // Query-local contiguous region and native page budget, populated
+            // before I/O. Exact H/O membership does not change the page limit.
             std::vector<PostingReadRange> m_postingReadRanges;
 
             COMMON::OptHashPosVector m_deduper;
@@ -554,37 +530,7 @@ namespace SPTAG {
 
             virtual ErrorCode SearchIndexWithoutParsing(ExtraWorkSpace* p_exWorkSpace) = 0;
 
-            // Exhaustive OPQ search over a single narrow tag's vids (load id -> ADC
-            // screen -> fetch survivors -> rerank). Returns false when unsupported or
-            // OPQ prefilter is off, so the caller can fall back.
-            virtual bool OPQTagPureSearch(QueryResult& /*p_queryResults*/, std::uint32_t /*tag*/) { return false; }
-
-            // Selectivity-routing helpers: number of (live + deleted) vids in a tag's
-            // exhaustive OPQ inverted list, and the tenant's total resident vector count.
-            // Return -1 when OPQ prefilter is off or the tag is unknown, so callers leave
-            // routing unchanged.
-            virtual std::int64_t GetOPQTagVidCount(std::uint32_t /*tag*/) { return -1; }
-            virtual std::int64_t GetOPQTotalVectors() { return -1; }
             virtual bool GetRaBitQEnabled() { return false; }
-
-            virtual bool HasPrimaryHeadCSR() const { return false; }
-            virtual bool CanSearchPrimaryHeadCandidates(
-                const std::uint32_t* /*p_queryTags*/,
-                int /*p_numQueryTags*/,
-                const SPTAG::Cache::DNFPredicate*
-                    /*p_queryDNF*/) const
-            {
-                return false;
-            }
-
-            // Expands in-memory primary owner lists for graph-selected heads and
-            // exact-reranks matching sparse-filter candidates without posting IO.
-            virtual ErrorCode SearchPrimaryHeadCandidates(ExtraWorkSpace* /*p_exWorkSpace*/,
-                                                           QueryResult& /*p_queryResults*/,
-                                                           std::shared_ptr<VectorIndex> /*p_index*/)
-            {
-                return ErrorCode::Fail;
-            }
 
             virtual ErrorCode SearchNextInPosting(ExtraWorkSpace* p_exWorkSpace, QueryResult& p_headResults,
                 QueryResult& p_queryResults,

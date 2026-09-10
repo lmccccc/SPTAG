@@ -963,8 +963,7 @@ break;
             }
 
             template <typename T>
-            void InitSearchTrees(const Dataset<T>& data, std::function<float(const T*, const T*, DimensionType)> fComputeDistance, COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_space,
-                const std::function<bool(SizeType)>& p_graphFilter = nullptr) const
+            void InitSearchTrees(const Dataset<T>& data, std::function<float(const T*, const T*, DimensionType)> fComputeDistance, COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_space) const
             {
                 const auto distanceToSample = [&](SizeType id) {
                     return fComputeDistance(p_query.GetQuantizedTarget(), data[id], data.C());
@@ -1007,8 +1006,7 @@ break;
                                     for (SizeType begin = tnode.childStart; begin < tnode.childEnd; begin++) {
                                         _mm_prefetch((const char*)(data[m_pTreeRoots[begin].centerid]), _MM_HINT_T0);
                                     }
-                                    if (!p_space.CheckAndSet(tnode.centerid) &&
-                                        (!p_graphFilter || p_graphFilter(tnode.centerid))) {
+                                    if (!p_space.CheckAndSet(tnode.centerid)) {
                                         p_space.m_NGQueue.insert(NodeDistPair(tnode.centerid, tmp.distance));
                                     }
                                     for (SizeType begin = tnode.childStart; begin < tnode.childEnd; begin++) {
@@ -1044,8 +1042,7 @@ break;
 
             template <typename T>
             void SearchTrees(const Dataset<T>& data, std::function<float(const T*, const T*, DimensionType)> fComputeDistance, COMMON::QueryResultSet<T> &p_query,
-                COMMON::WorkSpace &p_space, const int p_limits,
-                const std::function<bool(SizeType)>& p_graphFilter = nullptr) const
+                COMMON::WorkSpace &p_space, const int p_limits) const
             {
                 const auto distanceToSample = [&](SizeType id) {
                     return fComputeDistance(p_query.GetQuantizedTarget(), data[id], data.C());
@@ -1062,16 +1059,14 @@ break;
                         }
                         if (!p_space.CheckAndSet(tnode.centerid)) {
                             p_space.m_iNumberOfCheckedLeaves++;
-                            if (!p_graphFilter || p_graphFilter(tnode.centerid))
-                                p_space.m_NGQueue.insert(NodeDistPair(tnode.centerid, bcell.distance));
+                            p_space.m_NGQueue.insert(NodeDistPair(tnode.centerid, bcell.distance));
                         }
                     }
                     else {
                         for (SizeType begin = tnode.childStart; begin < tnode.childEnd; begin++) {
                             _mm_prefetch((const char*)(data[m_pTreeRoots[begin].centerid]), _MM_HINT_T0);
                         }
-                        if (!p_space.CheckAndSet(tnode.centerid) &&
-                            (!p_graphFilter || p_graphFilter(tnode.centerid))) {
+                        if (!p_space.CheckAndSet(tnode.centerid)) {
                             p_space.m_NGQueue.insert(NodeDistPair(tnode.centerid, bcell.distance));
                         }
                         for (SizeType begin = tnode.childStart; begin < tnode.childEnd; begin++) {

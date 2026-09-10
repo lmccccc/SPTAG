@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """efSearch (MaxCheck) sensitivity for MULTIPLE levels at a fixed nprobe.
 
-Tests whether the org filtered path is head-nav-budget limited relative to the
-unfilter global-head-graph path. MaxCheck is consumed at LoadAll (edited into
-the ini by the driver), so one process per MaxCheck value; within the process
-every requested level is benchmarked at the same fixed nprobe.
+Measures filtered and unfiltered queries on the same spatial traversal.
+MaxCheck is consumed at LoadAll (edited into the ini by the driver), so one
+process per MaxCheck value; every requested level uses the same fixed nprobe.
+Empty and underfilled successful results count as recall misses, not failures.
 
 ``MEASURE_OFFSET`` optionally selects a disjoint measured query range after
 the warmup prefix. This makes it possible to use queries [0, warmup) solely for
@@ -72,14 +72,6 @@ def read_ini_value_or_default(
         return default
 
 
-def parse_bool(value: str, key: str) -> bool:
-    if value.lower() in {"1", "true", "yes", "on"}:
-        return True
-    if value.lower() in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"{key} must be one of 0/1, false/true, no/yes, or off/on")
-
-
 def main() -> None:
     index_dir = os.environ["INDEX_DIR"]
     query_dir = os.environ["QUERY_DIR"]
@@ -99,11 +91,6 @@ def main() -> None:
     configured_search_internal_result_num = int(
         read_ini_value(index_dir, tenant, "SearchInternalResultNum")
     )
-    configured_force_dense_tag_search = parse_bool(
-        read_ini_value(index_dir, tenant, "ForceDenseTagSearch"),
-        "ForceDenseTagSearch",
-    )
-    force_dense_tag_search = configured_force_dense_tag_search
     effective_nprobe = configured_search_internal_result_num
 
     qdir = Path(query_dir)
@@ -151,9 +138,9 @@ def main() -> None:
         read_postings = 0
         scanned_vectors = 0
         matched_vectors = 0
-        primary_head_candidates = 0
         failed_searches = 0
         empty_results = 0
+        underfilled_results = 0
         t0 = time.perf_counter()
         for measured_index in range(nq):
             i = measure_offset + measured_index
@@ -161,7 +148,6 @@ def main() -> None:
             read_postings += int(mgr.GetLastPostingReadCount())
             scanned_vectors += int(mgr.GetLastScannedVectors())
             matched_vectors += int(mgr.GetLastMatchedVectors())
-            primary_head_candidates += int(mgr.GetLastPrimaryHeadCandidateCount())
             if result is None:
                 failed_searches += 1
                 continue
@@ -171,17 +157,18 @@ def main() -> None:
             gt_row = gt[i]
             gt_valid = gt_row[gt_row >= 0]
             k = min(topk, gt_valid.size)
+            if valid.size == 0:
+                empty_results += 1
+            if valid.size < k:
+                underfilled_results += 1
             if k > 0:
-                if valid.size == 0:
-                    empty_results += 1
-                    continue
                 hit += np.intersect1d(valid, gt_valid[:k]).size
                 denom += k
         elapsed = time.perf_counter() - t0
-        if failed_searches or empty_results:
+        if failed_searches:
             raise RuntimeError(
-                f"{level}: SearchWithACL produced {failed_searches} missing and "
-                f"{empty_results} empty results across {nq} measured queries"
+                f"{level}: SearchWithACL failed for {failed_searches} "
+                f"of {nq} measured queries"
             )
 
         out = {
@@ -194,14 +181,15 @@ def main() -> None:
             "measure_offset": int(measure_offset),
             "topk": int(topk),
             "value_type": value_type,
-            "force_dense_tag_search": force_dense_tag_search,
             "recall": round(hit / denom if denom else 0.0, 4),
+            "recall_denominator": int(denom),
+            "empty_results": int(empty_results),
+            "underfilled_results": int(underfilled_results),
             "qps": round(nq / elapsed, 1) if elapsed > 0 else 0.0,
             "load_s": round(load_s, 1),
             "read_postings_per_q": round(read_postings / nq, 1),
             "scanned_vecs_per_q": round(scanned_vectors / nq, 1),
             "matched_vecs_per_q": round(matched_vectors / nq, 1),
-            "primary_head_candidates_per_q": round(primary_head_candidates / nq, 1),
             "match_rate": round(matched_vectors / scanned_vectors, 6) if scanned_vectors else 0.0,
         }
         print("RESULT " + json.dumps(out), flush=True)

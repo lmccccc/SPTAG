@@ -45,11 +45,9 @@ make_overlay() {
     cp "$SOURCE_INI" "$tenant_dir/indexloader.ini"
     sed -i \
         -e "s/^RerankL=.*/RerankL=${rerank_l}/" \
-        -e 's/^ForceDenseTagSearch=.*/ForceDenseTagSearch=true/' \
         -e 's/^SearchInternalResultNum=.*/SearchInternalResultNum=64/' \
         "$tenant_dir/indexloader.ini"
     grep -qx "RerankL=${rerank_l}" "$tenant_dir/indexloader.ini"
-    grep -qx 'ForceDenseTagSearch=true' "$tenant_dir/indexloader.ini"
     grep -qx 'SearchInternalResultNum=64' "$tenant_dir/indexloader.ini"
     printf '%s\n' "$overlay"
 }

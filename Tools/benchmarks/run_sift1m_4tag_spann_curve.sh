@@ -50,14 +50,12 @@ make_overlay() {
         -e "s|^IndexDirectory=.*|IndexDirectory=${tenant}|" \
         -e "s/^FixedNprobe=.*/FixedNprobe=${nprobe}/" \
         -e 's/^LogPhaseTime=.*/LogPhaseTime=false/' \
-        -e 's/^ForceDenseTagSearch=.*/ForceDenseTagSearch=true/' \
         "$tenant/indexloader.ini"
     grep -qx "RerankL=${RERANK_L}" "$tenant/indexloader.ini"
     grep -qx 'ResultNum=10' "$tenant/indexloader.ini"
     grep -qx "SearchInternalResultNum=${nprobe}" "$tenant/indexloader.ini"
     grep -qx "FixedNprobe=${nprobe}" "$tenant/indexloader.ini"
     grep -qx "IndexDirectory=${tenant}" "$tenant/indexloader.ini"
-    grep -qx 'ForceDenseTagSearch=true' "$tenant/indexloader.ini"
     printf '%s\n' "$overlay"
 }
 

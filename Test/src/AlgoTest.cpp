@@ -257,7 +257,7 @@ BOOST_AUTO_TEST_CASE(BKTTest)
     Test<float>(SPTAG::IndexAlgoType::BKT, "L2");
 }
 
-BOOST_AUTO_TEST_CASE(BKTResultAdmissionFilter)
+BOOST_AUTO_TEST_CASE(NativeResultAdmissionFilter)
 {
     constexpr SPTAG::SizeType kVectorCount = 256;
     constexpr SPTAG::DimensionType kDimension = 4;
@@ -273,16 +273,6 @@ BOOST_AUTO_TEST_CASE(BKTResultAdmissionFilter)
         }
     }
 
-    auto index = SPTAG::VectorIndex::CreateInstance(
-        SPTAG::IndexAlgoType::BKT, SPTAG::VectorValueType::Float);
-    BOOST_REQUIRE(index != nullptr);
-    index->SetParameter("NumberOfThreads", "1");
-    index->SetParameter("MaxCheck", "4096");
-    BOOST_REQUIRE(
-        index->BuildIndex(
-            vectors.data(), kVectorCount, kDimension) ==
-        SPTAG::ErrorCode::Success);
-
     float target[kDimension];
     for (SPTAG::DimensionType col = 0; col < kDimension; ++col) {
         target[col] =
@@ -290,125 +280,170 @@ BOOST_AUTO_TEST_CASE(BKTResultAdmissionFilter)
                 (257 * (col + 5) + col * 29) % 263) /
             263.0f;
     }
-    SPTAG::QueryResult native(target, k, false);
-    SPTAG::QueryResult allAdmitted(target, k, false);
-    BOOST_REQUIRE(
-        index->SearchIndex(native) == SPTAG::ErrorCode::Success);
-    BOOST_REQUIRE(
-        index->SearchIndexWithResultFilter(
-            allAdmitted,
-            [](SPTAG::SizeType) { return true; },
-            4096) == SPTAG::ErrorCode::Success);
-    BOOST_CHECK_EQUAL(native.GetScanned(), allAdmitted.GetScanned());
-    for (int rank = 0; rank < k; ++rank) {
-        BOOST_REQUIRE(native.GetResult(rank) != nullptr);
-        BOOST_REQUIRE(allAdmitted.GetResult(rank) != nullptr);
-        BOOST_CHECK_EQUAL(
-            native.GetResult(rank)->VID,
-            allAdmitted.GetResult(rank)->VID);
-        BOOST_CHECK_EQUAL(
-            native.GetResult(rank)->Dist,
-            allAdmitted.GetResult(rank)->Dist);
-    }
-
-    SPTAG::QueryResult sparse(target, k, false);
-    BOOST_REQUIRE(
-        index->SearchIndexWithResultFilter(
-            sparse,
-            [](SPTAG::SizeType id) { return id % 2 == 0; },
-            4096) == SPTAG::ErrorCode::Success);
-    bool reachedBeyondUnfilteredTopK = false;
-    for (int rank = 0; rank < k; ++rank) {
-        BOOST_REQUIRE(sparse.GetResult(rank) != nullptr);
-        BOOST_CHECK_EQUAL(sparse.GetResult(rank)->VID % 2, 0);
-        reachedBeyondUnfilteredTopK |= sparse.GetResult(rank)->VID >= 8;
-    }
-    BOOST_CHECK(reachedBeyondUnfilteredTopK);
-
-    SPTAG::QueryResult rare(target, k, false);
-    BOOST_REQUIRE(
-        index->SearchIndexWithResultFilter(
-            rare,
-            [](SPTAG::SizeType id) {
-                return id % 32 == 0;
-            },
-            256) == SPTAG::ErrorCode::Success);
-    for (int rank = 0; rank < k; ++rank) {
-        BOOST_REQUIRE(
-            rare.GetResult(rank) != nullptr);
-        BOOST_CHECK_GE(
-            rare.GetResult(rank)->VID, 0);
-        BOOST_CHECK_EQUAL(
-            rare.GetResult(rank)->VID % 32, 0);
-    }
-
-    SPTAG::QueryResult noneAdmitted(target, k, false);
-    BOOST_REQUIRE(
-        index->SearchIndexWithResultFilter(
-            noneAdmitted,
-            [](SPTAG::SizeType) {
-                return false;
-            },
-            32) == SPTAG::ErrorCode::Success);
-    BOOST_CHECK_LT(
-        noneAdmitted.GetScanned(), kVectorCount);
-    for (int rank = 0; rank < k; ++rank) {
-        BOOST_REQUIRE(
-            noneAdmitted.GetResult(rank) !=
-            nullptr);
-        BOOST_CHECK_LT(
-            noneAdmitted.GetResult(rank)->VID,
-            0);
-    }
-
-    for (const char* bfs : {"0", "1"})
+    for (auto algorithm : {SPTAG::IndexAlgoType::BKT, SPTAG::IndexAlgoType::KDT})
     {
-        BOOST_REQUIRE(index->SetParameter("EnableBfs", bfs) == SPTAG::ErrorCode::Success);
-        SPTAG::QueryResult plain(target, k, false), admitted(target, k, false);
-        SPTAG::QueryResult empty(target, k, false), replay(target, k, false);
-        std::vector<int> visits(kVectorCount, 0);
-        BOOST_REQUIRE(index->SearchIndexWithMaxCheck(plain, 128) == SPTAG::ErrorCode::Success);
-        BOOST_REQUIRE(index->SearchIndexWithTraversalFilter(admitted,
-            [&](SPTAG::SizeType id) {
-                BOOST_REQUIRE(id >= 0 && id < kVectorCount);
-                ++visits[static_cast<size_t>(id)];
-                return true;
-            }, 128) == SPTAG::ErrorCode::Success);
-        BOOST_CHECK_EQUAL(plain.GetScanned(), admitted.GetScanned());
-        for (int visitsForID : visits) BOOST_CHECK_LE(visitsForID, 1);
-        BOOST_REQUIRE(index->SearchIndexWithTraversalFilter(empty,
-            [](SPTAG::SizeType) { return false; }, 128) == SPTAG::ErrorCode::Success);
-        BOOST_REQUIRE(index->SearchIndexWithMaxCheck(replay, 128) == SPTAG::ErrorCode::Success);
+        auto index = SPTAG::VectorIndex::CreateInstance(
+            algorithm, SPTAG::VectorValueType::Float);
+        BOOST_REQUIRE(index != nullptr);
+        BOOST_REQUIRE(index->SetParameter("DistCalcMethod", "L2") == SPTAG::ErrorCode::Success);
+        BOOST_REQUIRE(index->SetParameter("NumberOfThreads", "1") == SPTAG::ErrorCode::Success);
+        BOOST_REQUIRE(index->BuildIndex(vectors.data(), kVectorCount, kDimension) ==
+            SPTAG::ErrorCode::Success);
+        for (int bfs : {0, 1})
+        {
+            if (algorithm == SPTAG::IndexAlgoType::KDT && bfs != 0) continue;
+            if (algorithm == SPTAG::IndexAlgoType::BKT)
+                BOOST_REQUIRE(index->SetParameter("EnableBfs", bfs ? "1" : "0") ==
+                    SPTAG::ErrorCode::Success);
+            for (int maxCheck : {1, 32, 128, 4096})
+            {
+                BOOST_TEST_CONTEXT("algorithm=" << static_cast<int>(algorithm) <<
+                    " bfs=" << bfs << " maxCheck=" << maxCheck)
+                {
+                    SPTAG::QueryResult native(target, k, false), admitted(target, k, false);
+                    SPTAG::QueryResult sparse(target, k, false), empty(target, k, false);
+                    SPTAG::QueryResult replay(target, k, false);
+                    std::vector<SPTAG::SizeType> allVisits, sparseVisits, emptyVisits;
+                    BOOST_REQUIRE(index->SearchIndexWithMaxCheck(native, maxCheck) ==
+                        SPTAG::ErrorCode::Success);
+                    BOOST_REQUIRE(index->SearchIndexWithResultFilter(admitted,
+                        [&](SPTAG::SizeType id) { allVisits.push_back(id); return true; },
+                        maxCheck) == SPTAG::ErrorCode::Success);
+                    BOOST_REQUIRE(index->SearchIndexWithResultFilter(sparse,
+                        [&](SPTAG::SizeType id) { sparseVisits.push_back(id); return id % 32 == 0; },
+                        maxCheck) == SPTAG::ErrorCode::Success);
+                    BOOST_REQUIRE(index->SearchIndexWithResultFilter(empty,
+                        [&](SPTAG::SizeType id) { emptyVisits.push_back(id); return false; },
+                        maxCheck) == SPTAG::ErrorCode::Success);
+                    BOOST_REQUIRE(index->SearchIndexWithMaxCheck(replay, maxCheck) ==
+                        SPTAG::ErrorCode::Success);
+                    BOOST_CHECK_LE(native.GetScanned(), maxCheck);
+                    BOOST_CHECK_EQUAL(native.GetScanned(), admitted.GetScanned());
+                    BOOST_CHECK_EQUAL(native.GetScanned(), sparse.GetScanned());
+                    BOOST_CHECK_EQUAL(native.GetScanned(), empty.GetScanned());
+                    BOOST_CHECK_EQUAL(native.GetScanned(), replay.GetScanned());
+                    BOOST_CHECK_EQUAL_COLLECTIONS(allVisits.begin(), allVisits.end(),
+                        sparseVisits.begin(), sparseVisits.end());
+                    BOOST_CHECK_EQUAL_COLLECTIONS(allVisits.begin(), allVisits.end(),
+                        emptyVisits.begin(), emptyVisits.end());
+                    std::vector<int> visits(kVectorCount, 0);
+                    std::vector<std::pair<float, SPTAG::SizeType>> eligible;
+                    for (const auto id : allVisits)
+                    {
+                        BOOST_REQUIRE(id >= 0 && id < kVectorCount);
+                        BOOST_CHECK_EQUAL(++visits[static_cast<size_t>(id)], 1);
+                        if (id % 32 == 0)
+                            eligible.emplace_back(index->ComputeDistance(target,
+                                vectors.data() + static_cast<size_t>(id) * kDimension), id);
+                    }
+                    std::sort(eligible.begin(), eligible.end());
+                    for (int rank = 0; rank < k; ++rank)
+                    {
+                        BOOST_CHECK_EQUAL(admitted.GetResult(rank)->VID, native.GetResult(rank)->VID);
+                        BOOST_CHECK_EQUAL(admitted.GetResult(rank)->Dist, native.GetResult(rank)->Dist);
+                        BOOST_CHECK_EQUAL(replay.GetResult(rank)->VID, native.GetResult(rank)->VID);
+                        BOOST_CHECK_EQUAL(replay.GetResult(rank)->Dist, native.GetResult(rank)->Dist);
+                        BOOST_CHECK_LT(empty.GetResult(rank)->VID, 0);
+                        if (static_cast<size_t>(rank) < eligible.size())
+                        {
+                            BOOST_CHECK_EQUAL(sparse.GetResult(rank)->VID, eligible[rank].second);
+                            BOOST_CHECK_EQUAL(sparse.GetResult(rank)->Dist, eligible[rank].first);
+                        }
+                        else
+                            BOOST_CHECK_LT(sparse.GetResult(rank)->VID, 0);
+                    }
+                }
+            }
+        }
+
+        if (algorithm == SPTAG::IndexAlgoType::BKT)
+            BOOST_REQUIRE(index->SetParameter("EnableBfs", "0") == SPTAG::ErrorCode::Success);
+        BOOST_REQUIRE(index->SetParameter("NumberOfInitialDynamicPivots", "1") == SPTAG::ErrorCode::Success);
+        BOOST_REQUIRE(index->SetParameter("NumberOfOtherDynamicPivots", "1") == SPTAG::ErrorCode::Success);
+        SPTAG::QueryResult native(target, 1, false), bridgePreserved(target, 1, false);
+        std::vector<SPTAG::SizeType> visited;
+        BOOST_REQUIRE(index->SearchIndexWithResultFilter(native,
+            [&](SPTAG::SizeType id) { visited.push_back(id); return true; },
+            128) == SPTAG::ErrorCode::Success);
+        SPTAG::SizeType reachable = -1;
+        for (const auto id : visited)
+            if (id != native.GetResult(0)->VID) reachable = id;
+        BOOST_REQUIRE_GE(reachable, 0);
+        BOOST_REQUIRE(index->SearchIndexWithResultFilter(bridgePreserved,
+            [reachable](SPTAG::SizeType id) { return id == reachable; },
+            128) == SPTAG::ErrorCode::Success);
+        BOOST_CHECK_EQUAL(bridgePreserved.GetScanned(), native.GetScanned());
+        BOOST_CHECK_EQUAL(bridgePreserved.GetResult(0)->VID, reachable);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(BKTMetadataAdmissionWorkspaceReuse)
+{
+    constexpr SPTAG::SizeType count = 64;
+    constexpr SPTAG::DimensionType dimension = 4;
+    constexpr int k = 8;
+    std::vector<float> vectors(static_cast<size_t>(count) * dimension);
+    std::vector<std::uint8_t> metadata(count);
+    std::vector<std::uint64_t> offsets(count + 1);
+    for (SPTAG::SizeType id = 0; id < count; ++id)
+    {
+        for (SPTAG::DimensionType col = 0; col < dimension; ++col)
+            vectors[static_cast<size_t>(id) * dimension + col] = id * (col + 1.0f);
+        metadata[id] = static_cast<std::uint8_t>(id);
+        offsets[id] = id;
+    }
+    offsets.back() = count;
+    std::shared_ptr<SPTAG::VectorSet> vectorSet = std::make_shared<SPTAG::BasicVectorSet>(
+        SPTAG::ByteArray(reinterpret_cast<std::uint8_t*>(vectors.data()),
+            vectors.size() * sizeof(float), false), SPTAG::VectorValueType::Float, dimension, count);
+    std::shared_ptr<SPTAG::MetadataSet> metadataSet = std::make_shared<SPTAG::MemMetadataSet>(
+        SPTAG::ByteArray(metadata.data(), metadata.size(), false),
+        SPTAG::ByteArray(reinterpret_cast<std::uint8_t*>(offsets.data()),
+            offsets.size() * sizeof(std::uint64_t), false), count);
+    std::shared_ptr<SPTAG::VectorIndex> index = std::make_shared<SPTAG::BKT::Index<float>>();
+    BOOST_REQUIRE(index->SetParameter("DistCalcMethod", "L2") == SPTAG::ErrorCode::Success);
+    BOOST_REQUIRE(index->SetParameter("NumberOfThreads", "1") == SPTAG::ErrorCode::Success);
+    BOOST_REQUIRE(index->BuildIndex(vectorSet, metadataSet) == SPTAG::ErrorCode::Success);
+    const float* target = vectors.data() + 17 * dimension;
+    SPTAG::QueryResult native(target, k, false), idFiltered(target, k, false);
+    BOOST_REQUIRE(index->SearchIndexWithMaxCheck(native, 32) == SPTAG::ErrorCode::Success);
+    BOOST_REQUIRE(index->SearchIndexWithResultFilter(idFiltered,
+        [](SPTAG::SizeType id) { return id % 2 == 0; }, 32) == SPTAG::ErrorCode::Success);
+    for (int repeat = 0; repeat < 3; ++repeat)
+    {
+        SPTAG::QueryResult all(target, k, true), sparse(target, k, true), empty(target, k, false);
+        int admissionCalls = 0;
+        BOOST_REQUIRE(index->SearchIndexWithFilter(all,
+            [&](const SPTAG::ByteArray&) { ++admissionCalls; return true; },
+            32) == SPTAG::ErrorCode::Success);
+        BOOST_CHECK_GT(admissionCalls, 0);
+        BOOST_REQUIRE(index->SearchIndexWithFilter(sparse,
+            [](const SPTAG::ByteArray& value) { return value.Data()[0] % 2 == 0; },
+            32) == SPTAG::ErrorCode::Success);
+        BOOST_REQUIRE(index->SearchIndexWithFilter(empty,
+            [](const SPTAG::ByteArray&) { return false; }, 32) == SPTAG::ErrorCode::Success);
+        BOOST_CHECK_EQUAL(native.GetScanned(), all.GetScanned());
+        BOOST_CHECK_EQUAL(native.GetScanned(), sparse.GetScanned());
+        BOOST_CHECK_EQUAL(native.GetScanned(), empty.GetScanned());
         for (int rank = 0; rank < k; ++rank)
         {
-            BOOST_CHECK_EQUAL(admitted.GetResult(rank)->VID, plain.GetResult(rank)->VID);
-            BOOST_CHECK_EQUAL(admitted.GetResult(rank)->Dist, plain.GetResult(rank)->Dist);
+            BOOST_CHECK_EQUAL(all.GetResult(rank)->VID, native.GetResult(rank)->VID);
+            BOOST_CHECK_EQUAL(all.GetResult(rank)->Dist, native.GetResult(rank)->Dist);
+            BOOST_CHECK_EQUAL(sparse.GetResult(rank)->VID, idFiltered.GetResult(rank)->VID);
+            BOOST_CHECK_EQUAL(sparse.GetResult(rank)->Dist, idFiltered.GetResult(rank)->Dist);
             BOOST_CHECK_LT(empty.GetResult(rank)->VID, 0);
-            BOOST_CHECK_EQUAL(replay.GetResult(rank)->VID, plain.GetResult(rank)->VID);
-            BOOST_CHECK_EQUAL(replay.GetResult(rank)->Dist, plain.GetResult(rank)->Dist);
+            if (all.GetResult(rank)->VID >= 0)
+            {
+                BOOST_REQUIRE_EQUAL(all.GetMetadata(rank).Length(), 1U);
+                BOOST_CHECK_EQUAL(all.GetMetadata(rank).Data()[0], all.GetResult(rank)->VID);
+            }
         }
     }
+}
 
-    BOOST_REQUIRE(index->SetParameter("EnableBfs", "0") == SPTAG::ErrorCode::Success);
-    BOOST_REQUIRE(index->SetParameter("NumberOfInitialDynamicPivots", "1") == SPTAG::ErrorCode::Success);
-    BOOST_REQUIRE(index->SetParameter("NumberOfOtherDynamicPivots", "1") == SPTAG::ErrorCode::Success);
-    std::unordered_set<SPTAG::SizeType> initialSeeds;
-    SPTAG::QueryResult rejectedSeeds(target, 1, false);
-    BOOST_REQUIRE(index->SearchIndexWithTraversalFilter(rejectedSeeds,
-        [&](SPTAG::SizeType id) { initialSeeds.insert(id); return false; },
-        4096) == SPTAG::ErrorCode::Success);
-    SPTAG::SizeType reachable = kVectorCount - 1;
-    while (reachable >= 0 && initialSeeds.count(reachable) != 0) --reachable;
-    BOOST_REQUIRE_GE(reachable, 0);
-    const auto onlyReachable = [reachable](SPTAG::SizeType id) { return id == reachable; };
-    SPTAG::QueryResult bridgePreserved(target, 1, false), bridgePruned(target, 1, false);
-    BOOST_REQUIRE(index->SearchIndexWithResultFilter(bridgePreserved,
-        onlyReachable, 4096) == SPTAG::ErrorCode::Success);
-    BOOST_REQUIRE(index->SearchIndexWithTraversalFilter(bridgePruned,
-        onlyReachable, 4096) == SPTAG::ErrorCode::Success);
-    BOOST_CHECK_EQUAL(bridgePreserved.GetResult(0)->VID, reachable);
-    BOOST_CHECK_LT(bridgePruned.GetResult(0)->VID, 0);
-
+BOOST_AUTO_TEST_CASE(BKTResultAdmissionCollapsedAliases)
+{
+    constexpr SPTAG::DimensionType kDimension = 4;
     constexpr SPTAG::SizeType duplicateCount = 1024;
     std::vector<float> duplicateVectors((duplicateCount + 1) * kDimension, 0.0f);
     for (int col = 0; col < kDimension; ++col)
@@ -428,7 +463,7 @@ BOOST_AUTO_TEST_CASE(BKTResultAdmissionFilter)
     SPTAG::QueryResult duplicatePlain(duplicateVectors.data(), 16, false);
     SPTAG::QueryResult duplicateAdmitted(duplicateVectors.data(), 16, false);
     BOOST_REQUIRE(duplicates->SearchIndexWithMaxCheck(duplicatePlain, 64) == SPTAG::ErrorCode::Success);
-    BOOST_REQUIRE(duplicates->SearchIndexWithTraversalFilter(duplicateAdmitted,
+    BOOST_REQUIRE(duplicates->SearchIndexWithResultFilter(duplicateAdmitted,
         [](SPTAG::SizeType) { return true; }, 64) == SPTAG::ErrorCode::Success);
     BOOST_CHECK_EQUAL(duplicatePlain.GetScanned(), duplicateAdmitted.GetScanned());
     for (int rank = 0; rank < 16; ++rank)
@@ -443,11 +478,14 @@ BOOST_AUTO_TEST_CASE(BKTResultAdmissionFilter)
         ? duplicateCount - 2 : duplicateCount - 1;
     BOOST_REQUIRE(duplicates->DeleteIndex(center) == SPTAG::ErrorCode::Success);
     SPTAG::QueryResult alias(duplicateVectors.data(), 1, false);
-    BOOST_REQUIRE(duplicates->SearchIndexWithTraversalFilter(alias,
+    SPTAG::QueryResult aliasPlain(duplicateVectors.data(), 1, false);
+    BOOST_REQUIRE(duplicates->SearchIndexWithMaxCheck(aliasPlain, 64) == SPTAG::ErrorCode::Success);
+    BOOST_REQUIRE(duplicates->SearchIndexWithResultFilter(alias,
         [center, survivingAlias](SPTAG::SizeType id) {
             return id == center || id == survivingAlias;
         }, 64) == SPTAG::ErrorCode::Success);
     BOOST_CHECK_EQUAL(alias.GetResult(0)->VID, survivingAlias);
+    BOOST_CHECK_EQUAL(alias.GetScanned(), aliasPlain.GetScanned());
 }
 
 BOOST_AUTO_TEST_CASE(SPANNTest)

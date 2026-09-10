@@ -103,8 +103,6 @@ make_overlay() {
     set_ini_value "$tenant/indexloader.ini" SearchSSDIndex HashTableExponent 4
     set_ini_value "$tenant/indexloader.ini" SearchSSDIndex MaxDistRatio 8.0
     set_ini_value "$tenant/indexloader.ini" SearchSSDIndex SearchPostingPageLimit 3
-    set_ini_value "$tenant/indexloader.ini" SearchSSDIndex EnableAdaptiveFilteredNprobe false
-    set_ini_value "$tenant/indexloader.ini" SearchSSDIndex ForceDenseTagSearch true
     set_ini_value "$tenant/indexloader.ini" SearchSSDIndex LogPhaseTime true
 
     python3 - "$tenant/indexloader.ini" "$tenant" "$batch_size" "$TOPK" "$RERANK_L" "$NPROBE" <<'PY'

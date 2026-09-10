@@ -105,19 +105,13 @@ DefineSSDParameter(m_limitedTagMinHeadCount, int, 8, "LimitedTagMinHeadCount")
 DefineSSDParameter(m_enableLimitedTagSupportExpansion, bool, false, "EnableLimitedTagSupportExpansion")
 DefineSSDParameter(m_secondLevelInitialProbeRatio, double, 1.0, "HierarchyInitialProbeRatio") // Mutable
 DefineSSDParameter(m_secondLevelMaxCheck, int, 112, "HierarchyMaxCheck") // Mutable
-DefineSSDParameter(m_secondLevelGraphSignaturePruning, bool, false, "HierarchyGraphSignaturePruning") // Mutable
 DefineSSDParameter(m_secondLevelPrefetchMode, std::string, std::string("Rolling16"), "HierarchyPrefetchMode")
-DefineSSDParameter(m_headNavigationMode, std::string, std::string("Auto"), "HeadNavigationMode") // Mutable
 DefineSSDParameter(m_hybridVectorWeight, float, 1.0f, "HybridVectorWeight")
 DefineSSDParameter(m_hybridCategoricalCols, std::string, std::string(""), "HybridCategoricalCols")
 DefineSSDParameter(m_hybridCategoricalWeights, std::string, std::string(""), "HybridCategoricalWeights")
 DefineSSDParameter(m_hybridNumericCols, std::string, std::string(""), "HybridNumericCols")
 DefineSSDParameter(m_hybridNumericWeights, std::string, std::string(""), "HybridNumericWeights")
 DefineSSDParameter(m_hybridCandidateCount, int, 128, "HybridCandidateCount")
-DefineSSDParameter(m_hybridRouteSampleCount, int, 64, "HybridRouteSampleCount")
-DefineSSDParameter(m_hybridRouteSelectivityThreshold, float, 0.02f, "HybridRouteSelectivityThreshold")
-DefineSSDParameter(m_hybridRouteDeformationThreshold, float, 1.0f, "HybridRouteDeformationThreshold")
-DefineSSDParameter(m_logHybridRoute, bool, false, "LogHybridRoute")
 DefineSSDParameter(m_enableDataCompression, bool, false, "EnableDataCompression")
 DefineSSDParameter(m_enableDictTraining, bool, true, "EnableDictTraining")
 DefineSSDParameter(m_minDictTraingBufferSize, int, 10240000, "MinDictTrainingBufferSize")
@@ -188,27 +182,11 @@ DefineSSDParameter(m_ioThreads, int, 4, "IOThreadsPerHandler") // Mutable
 DefineSSDParameter(m_searchInternalResultNum, int, 64, "SearchInternalResultNum") // Mutable; [SearchSSDIndex] InternalResultNum aliases here
 DefineSSDParameter(m_searchPostingPageLimit, int, 3, "SearchPostingPageLimit") // Mutable H/O read budget; STATIC buffers use posting metadata
 DefineSSDParameter(m_collectPostingContributionStats, bool, false, "CollectPostingContributionStats") // Mutable; diagnostic only
-DefineSSDParameter(m_forceDenseTagSearch, bool, false, "ForceDenseTagSearch") // Mutable
-DefineSSDParameter(m_directSparseMaxPostings, int, 320, "DirectSparseMaxPostings") // Sparse-tag sidecar threshold
-DefineSSDParameter(m_filteredSearchNprobeSafety, float, 1.0f, "FilteredSearchNprobeSafety") // Mutable
-DefineSSDParameter(m_filteredSearchTargetRecall, float, 1.0f, "FilteredSearchTargetRecall") // Mutable
-DefineSSDParameter(m_filteredSearchCoverageExponent, float, 0.0f, "FilteredSearchCoverageExponent") // Mutable; 0 disables coverage-driven over-probing
-DefineSSDParameter(m_enableAdaptiveFilteredNprobe, bool, false, "EnableAdaptiveFilteredNprobe") // Mutable; opt-in override of SearchInternalResultNum
-DefineSSDParameter(m_logAdaptiveNprobe, bool, false, "LogAdaptiveNprobe") // Mutable; per-query observability
 DefineSSDParameter(m_logPhaseTime, bool, false, "LogPhaseTime") // Mutable; diagnostic timing only
 DefineSSDParameter(m_disableCrossEdges, bool, false, "DisableCrossEdges") // Mutable
 DefineSSDParameter(m_logCrossStats, bool, false, "LogCrossStats") // Mutable
 DefineSSDParameter(m_logPathStats, bool, false, "LogPathStats") // Mutable
 DefineSSDParameter(m_dumpHeads, int, 0, "DumpHeads") // Mutable; number of queries to dump
-DefineSSDParameter(m_filterKeepUExtra, bool, false, "FilterKeepUExtra") // Mutable
-DefineSSDParameter(m_enableUnfilterTail, bool, true, "EnableUnfilterTail") // Mutable
-DefineSSDParameter(m_ablateUExtra, bool, false, "AblateUExtra") // Mutable
-DefineSSDParameter(m_ablateTail, bool, false, "AblateTail") // Mutable
-DefineSSDParameter(m_unfilterPurePages, bool, false, "UnfilterPurePages") // Mutable
-DefineSSDParameter(m_unfilterExtraTailPages, int, 0, "UnfilterExtraTailPages") // Mutable
-// STATIC distance-order diagnostic: scan the nearest pure prefix while retaining
-// the complete tail suffix. 100 preserves normal full-posting behavior.
-DefineSSDParameter(m_unfilterPureDistanceScanPercent, int, 100, "UnfilterPureDistanceScanPercent") // Mutable
 DefineSSDParameter(m_rerank, int, 0, "Rerank")
 DefineSSDParameter(m_enableADC, bool, false, "EnableADC")
 DefineSSDParameter(m_recall_analysis, bool, false, "RecallAnalysis")
@@ -303,13 +281,6 @@ DefineSSDParameter(m_centeringToZero, bool, false, "CenteringToZero")
 DefineSSDParameter(m_headBatch, int, 32, "IterativeSearchHeadBatch") // Mutable
 
 DefineSSDParameter(m_shareDB, bool, false, "ShareDB")
-
-// Primary-head CSR bypass. The build emits one exact primary owner per vector;
-// project-filtered searches can expand graph heads from RAM without posting IO.
-DefineSSDParameter(m_buildPrimaryHeadCSR, bool, false, "BuildPrimaryHeadCSR")
-DefineSSDParameter(m_primaryHeadCSRFile, std::string, std::string("primary_head_csr.bin"), "PrimaryHeadCSRFile")
-DefineSSDParameter(m_enablePrimaryHeadBypass, bool, false, "EnablePrimaryHeadBypass")
-DefineSSDParameter(m_primaryHeadBypassRerankL, int, 0, "PrimaryHeadBypassRerankL")
 
 // In-posting quantization (unified): postings store a compact code [meta|code] in
 // place of the full ValueType vector; the full vectors stay on disk for cold rerank.

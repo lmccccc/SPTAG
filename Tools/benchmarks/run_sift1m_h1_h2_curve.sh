@@ -9,10 +9,6 @@ QUERY="$DATA/query"
 OUT="$DATA/h2_curve_h1_graphless"
 BENCH="$ROOT/Release/spannaclbench"
 NPROBES=(16 24 32 48 62 80 96 128 192 256 384)
-MODES=("$@")
-if [[ ${#MODES[@]} -eq 0 ]]; then
-    MODES=(H2Only)
-fi
 
 [[ -x "$BENCH" ]] || { echo "Missing benchmark binary: $BENCH" >&2; exit 1; }
 [[ -d "$INDEX/tenant_0" ]] || { echo "Missing index: $INDEX" >&2; exit 1; }
@@ -23,14 +19,12 @@ mkdir -p "$OUT/ini" "$OUT/log"
 export LD_LIBRARY_PATH="$ROOT/Release:${LD_LIBRARY_PATH:-}"
 
 write_overlay() {
-    local mode=$1
-    local nprobe=$2
-    local path="$OUT/ini/${mode}_n${nprobe}.ini"
+    local nprobe=$1
+    local path="$OUT/ini/unified_n${nprobe}.ini"
     printf '%s\n' \
         '[SearchSSDIndex]' \
         'isExecute=true' \
         'BuildSsdIndex=false' \
-        "HeadNavigationMode=${mode}" \
         "InternalResultNum=${nprobe}" \
         'ResultNum=10' \
         'NumberOfThreads=1' \
@@ -43,14 +37,13 @@ write_overlay() {
 }
 
 run_case() {
-    local mode=$1
-    local nprobe=$2
-    local workload=$3
-    local truth=$4
-    shift 4
+    local nprobe=$1
+    local workload=$2
+    local truth=$3
+    shift 3
     local overlay
-    overlay=$(write_overlay "$mode" "$nprobe")
-    local log="$OUT/log/${mode}_n${nprobe}_${workload}.log"
+    overlay=$(write_overlay "$nprobe")
+    local log="$OUT/log/unified_n${nprobe}_${workload}.log"
     "$BENCH" \
         --index "$INDEX" \
         --queries "$QUERY/query_vectors.npy" \
@@ -69,29 +62,25 @@ run_case() {
         tail -40 "$log" >&2
         exit 1
     }
-    sed "s/^{/{\"workload\":\"${workload}\",\"mode\":\"${mode}\",\"nprobe\":${nprobe},/" \
+    sed "s/^{/{\"workload\":\"${workload}\",\"mode\":\"unified\",\"nprobe\":${nprobe},/" \
         "$log" | grep '^{' >> "$OUT/results.jsonl"
 }
 
-for mode in "${MODES[@]}"; do
-    [[ "$mode" == H2Only ]] ||
-        { echo "Unsupported navigation mode: $mode" >&2; exit 2; }
-    for nprobe in "${NPROBES[@]}"; do
-        run_case "$mode" "$nprobe" unfilter \
-            "$QUERY/groundtruth_unfilter_local_ids.npy"
-        run_case "$mode" "$nprobe" broad_tag \
-            "$QUERY/groundtruth_broad_tag_local_ids.npy" \
-            --query-tags "$QUERY/query_tags_broad.npy" --tag-column 0
-        run_case "$mode" "$nprobe" medium_tag \
-            "$QUERY/groundtruth_medium_tag_local_ids.npy" \
-            --query-tags "$QUERY/query_tags_medium.npy" --tag-column 0
-        run_case "$mode" "$nprobe" sparse_tag \
-            "$QUERY/groundtruth_extreme_tag_local_ids.npy" \
-            --query-tags "$QUERY/query_tags_extreme.npy" --tag-column 0
-        run_case "$mode" "$nprobe" mixed_dnf \
-            "$QUERY/groundtruth_mixed_dnf_local_ids.npy" \
-            --query-dnf "$QUERY/query_dnf_mixed.npy"
-    done
+for nprobe in "${NPROBES[@]}"; do
+    run_case "$nprobe" unfilter \
+        "$QUERY/groundtruth_unfilter_local_ids.npy"
+    run_case "$nprobe" broad_tag \
+        "$QUERY/groundtruth_broad_tag_local_ids.npy" \
+        --query-tags "$QUERY/query_tags_broad.npy" --tag-column 0
+    run_case "$nprobe" medium_tag \
+        "$QUERY/groundtruth_medium_tag_local_ids.npy" \
+        --query-tags "$QUERY/query_tags_medium.npy" --tag-column 0
+    run_case "$nprobe" sparse_tag \
+        "$QUERY/groundtruth_extreme_tag_local_ids.npy" \
+        --query-tags "$QUERY/query_tags_extreme.npy" --tag-column 0
+    run_case "$nprobe" mixed_dnf \
+        "$QUERY/groundtruth_mixed_dnf_local_ids.npy" \
+        --query-dnf "$QUERY/query_dnf_mixed.npy"
 done
 
 Rscript Tools/benchmarks/plot_sift1m_h1_h2_curve.R \

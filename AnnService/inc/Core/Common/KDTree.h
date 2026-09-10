@@ -237,11 +237,10 @@ break;
             }
 
             template <typename T, typename Q>
-            void InitSearchTrees(const Dataset<T>& p_data, std::function<float(const T*, const T*, DimensionType)> fComputeDistance, COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_space,
-                bool p_bounded = false) const
+            void InitSearchTrees(const Dataset<T>& p_data, std::function<float(const T*, const T*, DimensionType)> fComputeDistance, COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_space) const
             {
                 for (int i = 0; i < m_iTreeNumber; i++) {
-                    if (p_bounded && p_space.m_iNumberOfCheckedLeaves >= p_space.m_iMaxCheck) break;
+                    if (p_space.m_iNumberOfCheckedLeaves >= p_space.m_iMaxCheck) break;
                     KDTSearch<T, Q>(p_data, fComputeDistance, p_query, p_space, m_pTreeStart[i], 0);
                 }
             }

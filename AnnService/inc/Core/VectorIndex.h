@@ -77,23 +77,12 @@ public:
 
     virtual ErrorCode SearchIndexWithFilter(QueryResult& p_query, std::function<bool(const ByteArray&)> filterFunc, int maxCheck = 0, bool p_searchDeleted = false) const = 0;
 
-    // The predicate controls result admission only. Graph/tree traversal remains
-    // unconstrained so sparse admissible sets can still be reached.
+    // Predicates admit already visited results without changing spatial
+    // traversal or its stopping thresholds. Sparse results may underfill.
     virtual ErrorCode SearchIndexWithResultFilter(
         QueryResult& p_query,
         std::function<bool(SizeType)> p_resultFilter,
         int p_maxCheck = 0,
-        bool p_searchDeleted = false) const
-    {
-        return ErrorCode::Undefined;
-    }
-
-    // Unlike result-only filtering, this can remove graph bridges. Tree
-    // partitions remain searchable; only graph seeds and edges are filtered.
-    virtual ErrorCode SearchIndexWithTraversalFilter(
-        QueryResult& p_query,
-        const std::function<bool(SizeType)>& p_filter,
-        int p_maxCheck,
         bool p_searchDeleted = false) const
     {
         return ErrorCode::Undefined;
@@ -396,15 +385,11 @@ public:
 
         int16_t GetHeadNodeBundleNodeId(SizeType p_sampleId) const;
 
-        // p_routedNodeMask: per-bundle-node allow-list (size = nodeCount, 1=allowed).
-        // Pass an empty vector to disable bundle-node routing (scan all nodes).
-        // Replaces the previous uint32_t bitmask (which silently dropped nodes >= 32).
-        bool HeadNodeMatchesQuery(SizeType p_sampleId, const Cache::HierarchicalPostingMask& p_queryMask, const std::vector<uint8_t>& p_routedNodeMask) const;
+        bool HeadNodeMatchesQuery(SizeType p_sampleId, const Cache::HierarchicalPostingMask& p_queryMask) const;
 
         bool HeadNodeMatchesQuery(
             SizeType p_sampleId,
             const Cache::HierarchicalPostingMask& p_queryMask,
-            const std::vector<uint8_t>& p_routedNodeMask,
             const Cache::HierWidthTable& p_hierWidths) const;
 
         // Lightweight tag-content gate for heads using the head's OWN-tag mask
@@ -442,7 +427,6 @@ public:
             uint64_t m_dedupSkippedVectors = 0;
             uint64_t m_uniqueMatchedPostings = 0;
             uint64_t m_uniqueMatchedVectors = 0;
-            uint64_t m_primaryHeadCandidates = 0;
             uint64_t m_postingPageReads = 0;
             uint64_t m_postingLogicalBytes = 0;
             uint64_t m_postingPhysicalBytes = 0;
@@ -464,16 +448,6 @@ public:
             std::function<bool(int)> m_postingFilter;
             std::function<bool(int)> m_tailPostingFilter;
             std::vector<uint32_t> m_queryTags;
-            float m_filterSelectivity = 1.0f;
-            // Unmodified predicate selectivity for pre-search route selection.
-            // m_filterSelectivity may include adaptive-nprobe safety scaling.
-            float m_routeSelectivity = 1.0f;
-            std::vector<SizeType> m_directPostingIDs;
-            // Optional local head IDs whose centroid vectors must be merged with
-            // a direct posting scan. Kept separate so generic sparse-tag callers
-            // that supply arbitrary posting IDs retain their existing behavior.
-            std::vector<SizeType> m_directHeadLocalIDs;
-            std::vector<int> m_searchHeadBundleNodes;
             // Per-level minimum tag value (ascending, disjoint ranges) persisted at
             // build time as tag_level_offsets.bin. Used to map a raw tag value to its
             // hierarchical level (org/dept/team/project) for HierarchicalPostingMask
@@ -484,10 +458,10 @@ public:
             // authoritative filter and supersedes the flat OR/IN m_queryTags list.
             SPTAG::Cache::DNFPredicate m_dnf;
 
-            // A limited-tag pure prefix is safe only when every satisfiable DNF
-            // clause is anchored by equality on the configured key column (or
-            // when a legacy flat query has exactly that one categorical column).
-            bool m_limitedTagRouteEligible = false;
+            // The H region is eligible only when every satisfiable DNF clause
+            // has equality on the configured key column (or a legacy flat
+            // query has exactly that one categorical column).
+            bool m_limitedTagMembershipEligible = false;
             std::vector<uint32_t> m_limitedTagQueryValues;
 
             void Reset()
@@ -496,14 +470,9 @@ public:
                 m_postingFilter = nullptr;
                 m_tailPostingFilter = nullptr;
                 m_queryTags.clear();
-                m_filterSelectivity = 1.0f;
-                m_routeSelectivity = 1.0f;
-                m_directPostingIDs.clear();
-                m_directHeadLocalIDs.clear();
-                m_searchHeadBundleNodes.clear();
                 m_tagLevelOffsets.clear();
                 m_dnf.Clear();
-                m_limitedTagRouteEligible = false;
+                m_limitedTagMembershipEligible = false;
                 m_limitedTagQueryValues.clear();
             }
 
@@ -542,7 +511,6 @@ public:
                                                    uint64_t p_prePSPostings = 0,
                                                    uint64_t p_scannedVectors = 0,
                                                    uint64_t p_matchedVectors = 0,
-                                                   uint64_t p_primaryHeadCandidates = 0,
                                                    uint64_t p_postingPageReads = 0,
                                                    uint64_t p_postingLogicalBytes = 0,
                                                    uint64_t p_postingPhysicalBytes = 0,
