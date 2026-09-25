@@ -1,5 +1,6 @@
 """Preflight and launcher contracts; all build processes use a fixture stub."""
 
+import configparser
 import importlib.util
 import json
 import os
@@ -30,6 +31,36 @@ class NativePreflightContractTest(unittest.TestCase):
         VALIDATOR.validate(VALIDATOR.read_config(
             BENCHMARKS / "build_spann_attr_sift1b_zipf200_limited_tag_h5.ini"
         ))
+
+    def test_portable_adaptive_gettingstart_config(self):
+        config = VALIDATOR.read_config(ROOT / "docs/AdaptiveSpann.ini")
+        VALIDATOR.validate(config)
+        self.assertEqual(config["base"]["indexalgotype"], "BKT")
+        self.assertEqual(config["buildssdindex"]["storage"], "STATIC")
+        self.assertEqual(config["tags"]["columntypes"], "categorical,numeric")
+        self.assertEqual(config["selecthead"]["hierarchyenabled"], "true")
+        self.assertEqual(config["build"]["buildsignatures"], "true")
+        search = config["searchssdindex"]
+        self.assertEqual(search["enablepostingnavigation"], "true")
+        self.assertEqual(search["maxcheck"], "2048")
+        self.assertEqual(search["postingadditionalmaxcheck"], "2048")
+        self.assertEqual(search["postinganchorcount"], "8")
+        self.assertEqual(search["disablecrossedges"], "true")
+
+        removed_body = self.options.split("static bool IsRemovedParameter(", 1)[1].split(
+            "static bool IsRemovedSectionAlias(", 1
+        )[0]
+        removed = {name.lower() for name in re.findall(r'"([A-Za-z0-9_]+)"', removed_body)}
+        for section, values in config.items():
+            with self.subTest(section=section):
+                self.assertFalse(removed.intersection(values))
+
+        text = (ROOT / "docs/GettingStart.md").read_text()
+        match = re.search(r"```ini\n(\[SearchSSDIndex\]\n.*?)\n```", text, re.DOTALL)
+        self.assertIsNotNone(match)
+        documented = configparser.ConfigParser(interpolation=None, comment_prefixes=(";",))
+        documented.read_string(match.group(1))
+        self.assertEqual(dict(documented["SearchSSDIndex"]), search)
 
     def test_every_native_removed_parameter_rejects_explicit_defaults(self):
         body = self.options.split("static bool IsRemovedParameter(", 1)[1].split(

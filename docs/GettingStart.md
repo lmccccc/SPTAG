@@ -1,5 +1,264 @@
 ## **Quick start**
 
+### **Current adaptive SPANN: portable configuration**
+
+For the current attribute-filtered implementation, start with the complete
+[native INI template](AdaptiveSpann.ini), not a historical SIFT experiment.
+It builds **one BKT H1 navigation graph** plus upper posting catalogs and enables
+the final adaptive, controlled-ascent supplementation. H2 and above are not
+separate query ANN graphs. The same index serves unfiltered, categorical,
+numeric and mixed-DNF queries; do not select another graph or multiply nprobe
+according to predicate selectivity.
+
+The template is a **starting configuration, not a universal performance optimum**:
+Float128/L2, two attribute columns, three hierarchy levels, eight build threads
+and one query thread are editable examples. Its `2048 + 2048` query budgets come
+from the current SIFT1B adaptive measurements, whose actual index used UInt8
+and five levels. Changing a dataset still requires recall/latency evaluation.
+All data/model/search settings belong in the native INI, not environment
+overrides or hard-coded client defaults.
+
+#### **Adapt the input and construction settings**
+
+Copy `docs/AdaptiveSpann.ini` to a run-local INI and replace every
+`/absolute/path/to/...` value. Use new, absent index/work paths for a fresh build.
+Absolute paths avoid working-directory ambiguity: paths are not automatically
+relative to the INI's directory. Native INI comments start with `;` on their own
+line; do not use `#`, inline comments, shell variables or `~` in values.
+
+| Section / setting | What another dataset or application must supply |
+| --- | --- |
+| `[Base] VectorPath`, `ValueType`, `VectorType`, `Dim` | The actual base file, element type, container and dimension. Native bulk IO supports `Float`, `Int8`, `UInt8`, `Int16`; `DEFAULT`, `TXT`, `XVEC` name containers, not element types. |
+| `[Base] DistCalcMethod` | The index metric (`L2` or `Cosine`), also used for queries and truth. For Cosine, `Normalized` describes the actual input; native normalization must not modify a mapped source file. |
+| `[Base] QueryPath`, `QueryType`, `TruthPath`, `TruthType` | Inputs for the querying/evaluation program. Queries must match the built vector type and dimension. The bulk builder does not run a query campaign merely because these paths are present. |
+| `[Base] IndexDirectory`, `[BuildSSDIndex] TmpDir` | A new output root and a run-specific work directory. The bulk build uses tenant `0`; the root contains `manifest.txt` and `tenant_0/`. |
+| `[Tags] TagFile`, `ColumnTypes` | Row-aligned, headerless attributes and the type of **every original column**. Example: `numeric,categorical,numeric,categorical` preserves that order. |
+| `[BuildSSDIndex] LimitedTagColumn` | The zero-based **original** categorical key column; use `3` for the preceding example if the fourth column is the key. It is not the ordinal among categorical columns. |
+| `[SelectHead] Ratio`, `HierarchyLevels`, `HierarchyReplicaCount` | Spatial construction choices to size for the dataset and memory budget. `0 < Ratio < 1` applies at every level; `HierarchyLevels >= 2` includes H1. Three levels are an example, not a requirement. |
+| `[SelectHead]`, `[BuildHead]`, `[BuildSSDIndex] NumberOfThreads` | Construction parallelism for the target host. Query threads are a separate `[SearchSSDIndex]` setting. |
+
+For `VectorType=DEFAULT`, vectors are an `int32 N, int32 D` header followed by
+exactly `N * D * sizeof(ValueType)` row-major bytes. The file does **not** encode
+the element type. `Dim` can be omitted for this container; if present it must
+match the header. TXT/XVEC require an explicit dimension. `VectorSize` optionally
+limits a prefix; omit it or use `-1` for all rows. Headerless vectors, NumPy files
+and renamed `.fvecs` files are not DEFAULT input; use the correct native reader
+or explicitly convert to a new file. `VectorOffset` and `VectorCount` are removed.
+
+Attributes start at byte zero and contain `N * C` native `uint32` values, with
+`C` derived from `ColumnTypes`. Numeric columns hold unsigned, order-preserving
+values, **not float/int32 bit patterns**. With a vector prefix, the attribute file
+may describe either that exact prefix or the full validated vector source.
+Do not add a header, offsets or padding, reorder columns, or derive row IDs from
+tag values. Optional `[Tags] NumTagsPerVec` must equal `C`; do not repeat it in
+the build SSD section. Schema/version/fingerprint metadata is persisted.
+This limited-tag template requires a categorical key, but queries need not
+constrain it: pure numeric and unanchored OR predicates use the original O
+region. An untagged index can instead use the classic SPANN examples below;
+do not manufacture categorical labels just to load a different dataset.
+
+Construction and query controls are **not interchangeable**. In particular,
+`[BuildHead] MaxCheck`, `[BuildSSDIndex] MaxCheck` and build `InternalResultNum`
+control graph construction/assignment, not a query's budget or nprobe.
+`[Base] IndexAlgoType=BKT` selects the head algorithm; the overall index and
+`TenantIndexManager` algorithm are still `SPANN`.
+`Ratio`, hierarchy depth, metric, schema and posting layout require a new build;
+they are not search overlays. For raw STATIC postings the record width is
+`sizeof(int32) + D * sizeof(ValueType) + C * sizeof(uint32)`. The native build
+can raise `PostingPageLimit` to accommodate `PostingVectorLimit` (118 in the
+template), independently for H and O. Thus a page/record budget copied from
+UInt8 SIFT has a different byte cost for a higher-dimensional Float dataset.
+
+#### **Build once, with the native INI**
+
+After the normal [repository build setup](../README.md), build the native
+attribute builder and launch from the repository root:
+
+```bash
+cmake --build build --target spannbuilder --parallel 8
+python3 Tools/benchmarks/validate_spann_hierarchy_config.py /absolute/path/to/my-dataset.ini
+bash Tools/benchmarks/run_spann_attr_build.sh /absolute/path/to/my-dataset.ini
+```
+
+The preflight reads configuration only; it does not open the dataset or start
+a build. The launcher invokes `Release/spannbuilder -c <ini>`, stages construction
+sections before building, and applies `[SearchSSDIndex]` only afterward.
+With `BuildSignatures=true`, it defers the signature pass to a separate process
+and preserves the primary-build INI. Keep that INI and the original run INI.
+`InPlaceBuild=true` avoids a final index copy; `PersistSelectHead=true` keeps
+a selection checkpoint. Neither authorizes overwriting an existing index.
+The launcher refuses an existing fresh-build `IndexDirectory`; use
+`ResumeBuild=true` only for a compatible checkpoint, never to change the model.
+
+The adaptive path requires a native BKT H1 graph, compatible loaded hierarchy
+CSR and `Storage=STATIC`, without hybrid distance or a quantized H1 geometry.
+The template uses raw vectors and leaves these alternate modes disabled.
+Do not add `BuildH1Graph` or `CompactHierarchyVectors`: new builds already persist
+the required native H1 graph and upper catalogs. Unsupported old graphless
+layouts need explicit migration into a new directory, not a query-time rebuild.
+Retired `HierarchyInitialProbeRatio`, `HierarchyMaxCheck`,
+`HierarchyPrefetchMode`, `HeadNavigationMode` and `PostingMinCandidates` are
+also invalid fresh settings, even when supplied as false or zero.
+
+#### **Query settings and adaptive budgets**
+
+Only three settings extend ordinary native SPANN search:
+`EnablePostingNavigation`, `PostingAnchorCount`, `PostingAdditionalMaxCheck`.
+The complete template's search section is deliberately small:
+
+```ini
+[SearchSSDIndex]
+isExecute=true
+BuildSsdIndex=false
+InternalResultNum=96
+NumberOfThreads=1
+ResultNum=10
+MaxCheck=2048
+MaxDistRatio=8
+SearchPostingPageLimit=3
+DisableCrossEdges=true
+EnablePostingNavigation=true
+PostingAnchorCount=8
+PostingAdditionalMaxCheck=2048
+```
+
+| Search setting | Native library default | Template | Meaning |
+| --- | --- | --- | --- |
+| `InternalResultNum` | 64 | 96 | nprobe: requested H1 head-result capacity, not final top-k or an exact SSD read count. Effective capacity is at least the requested final top-k. |
+| `ResultNum` | 5 | 10 | Final top-k; an API client must pass this value to its search call. |
+| `MaxCheck` | 4096 | 2048 | Original H1 checked-leaf budget. It is not a count of every distance computation or all upper-catalog work. |
+| `EnablePostingNavigation` | false | true | Enable one supplementary phase **after** filtered H1 search, only when valid heads underfill the head-result capacity. |
+| `PostingAnchorCount` | 8 | 8 | Maximum nearest already-scored H1 anchors, including predicate negatives. Must be positive. |
+| `PostingAdditionalMaxCheck` | 0 | 2048 | Nonnegative extra checked-leaf allowance for supplementation only; does not enlarge the graph phase. |
+| `SearchPostingPageLimit` | 3 | 3 | Physical-page cap on each selected H/O posting region. Zero means uncapped, not "no reads". |
+| `MaxDistRatio` | 10000 | 8 | Native distance-ratio cutoff for selected posting candidates; not a filter-selectivity controller. |
+| `NumberOfThreads` | 2 | 1 | Aliases native `SearchThreadNum`; separate from client concurrency and build threads (whose SSD thread default is 16). |
+
+`DisableCrossEdges=true` keeps the current single-H1 query profile explicit.
+Phase/path logging, head dumps, hybrid distance and quantization are not
+needed by this recipe; their disabled defaults need no extra search entries.
+
+**Enabling the flag alone is insufficient:** if graph work has reached
+`MaxCheck` and `PostingAdditionalMaxCheck=0`, supplementation does not start.
+Its ceiling is `MaxCheck + PostingAdditionalMaxCheck`; the sum must fit a
+signed native integer. A selected CSR row completes before the budget is
+checked again, so full-row overshoot is possible.
+
+The current sequence is: finish native H1 result-only post-filter search;
+protect its admitted heads; use already-scored anchors to explore one global
+signature-pruned H2+ representative frontier; fill or replace only the
+originally missing slots. A failed signature skips representative/member
+access. Within an admitted H2 row, fresh predicate-negative H1 members become
+terminal visited rejects without vector prefetch, distance or checked-leaf cost.
+Ordinary H1 graph negatives still serve as scored navigation bridges.
+Rejected downward children do not expose all their other owners; explicit
+entry/owner promotion may still ascend once. No graph restart follows.
+
+Adaptive convergence derives, rather than configures, an H2 representative
+pool width `W = max(effective graph MaxCheck / 16, head-result capacity)`.
+For `MaxCheck=2048`, top-k 10 and nprobe 96, `W=128`; for nprobe 384, `W=384`.
+H3+ share expansion priority without occupying H2 pool slots. Once this pool
+is populated, a nearest pending representative worse than its boundary ends
+the supplementary phase. Filling the result heap alone does not stop it.
+Convergence can also stop **underfilled**: representative distance is an ANN
+heuristic, not a lower bound on all unseen members. There is no separate H2
+nprobe, convergence-window knob, selectivity multiplier or recall controller.
+
+Unfiltered BKT preserves native adaptive/soft stopping and can overshoot nominal
+`MaxCheck`; nonempty predicates use the separate hard graph cap and guarded
+tree refill. See [search budget boundaries](SearchBudgetBoundaries.md).
+Tune nprobe first on a fixed index, then examine graph work, supplementary work
+and SSD page limits separately. Do not rewrite construction settings or expand
+parameters by predicate selectivity in the client. Preserve sparse/empty results
+in recall accounting instead of silently dropping those queries.
+
+#### **Load and search from another program**
+
+Use the actual [wrapper API](../Wrappers/inc/CoreInterface.h) and native
+`Helper::IniReader`; do not translate this recipe into environment variables.
+For a built bulk index, load the **root** `IndexDirectory` with `LoadAll`, not
+its `tenant_0` subdirectory. Read persisted dimension/type from
+`tenant_0/indexloader.ini`; the saved index, not a guessed dataset name, determines
+query-buffer layout. Use native vector IO for the application's query file,
+with that type/dimension, and keep the buffer alive through the call.
+
+The following C++ integration sketch assumes `configPath` names the run/search
+INI and `queryBytes` / `predicateBytes` are validated `ByteArray` inputs.
+Include `Wrappers/inc/CoreInterface.h`, `inc/Helper/SimpleIniReader.h` and
+`<stdexcept>`. Match the [native builder's CMake target](../AnnService/CMakeLists.txt):
+compile the wrapper implementation `Wrappers/src/CoreInterface.cpp`, link
+`SPTAGLibStatic` and its dependencies, and use the same include paths and
+compile definitions (`TBB`/`NUMA` in the Linux build). This is not a header-only
+API. Initialize/load once outside the timed query loop; only repeat the final
+search call for each query.
+
+```cpp
+SPTAG::Helper::IniReader config, saved;
+if (config.LoadIniFile(configPath) != SPTAG::ErrorCode::Success)
+    throw std::runtime_error("Cannot read search INI");
+const auto root = config.GetParameter<std::string>("Base", "IndexDirectory", "");
+if (root.empty() || saved.LoadIniFile(root + "/tenant_0/indexloader.ini") != SPTAG::ErrorCode::Success)
+    throw std::runtime_error("Cannot read saved index configuration");
+const int dimension = saved.GetParameter<int>("Base", "Dim", 0);
+const auto valueType = saved.GetParameter<std::string>("Base", "ValueType", "");
+SPTAG::VectorValueType valueEnum;
+if (dimension <= 0 || !SPTAG::Helper::Convert::ConvertStringTo(valueType.c_str(), valueEnum))
+    throw std::runtime_error("Invalid saved vector layout");
+const int topK = config.GetParameter<int>("SearchSSDIndex", "ResultNum", 0);
+if (topK <= 0)
+    throw std::runtime_error("A positive SearchSSDIndex.ResultNum is required");
+
+auto parameterCheck = SPTAG::VectorIndex::CreateInstance(SPTAG::IndexAlgoType::SPANN, valueEnum);
+if (!parameterCheck)
+    throw std::runtime_error("Unsupported vector type");
+TenantIndexManager manager(dimension, "SPANN", valueType.c_str());
+for (const auto& item : config.GetParameters("SearchSSDIndex")) {
+    if (parameterCheck->SetParameter(item.first.c_str(), item.second.c_str(), "SearchSSDIndex")
+        != SPTAG::ErrorCode::Success)
+        throw std::runtime_error("Invalid SearchSSDIndex parameter: " + item.first);
+    manager.SetSearchParam(item.first.c_str(), item.second.c_str(), "SearchSSDIndex");
+}
+if (!manager.LoadAll(root.c_str()))
+    throw std::runtime_error("Cannot load index");
+
+auto results = manager.SearchWithPredicate(queryBytes, 0, topK, predicateBytes, -1);
+if (!results)
+    throw std::runtime_error("Filtered search failed; inspect native diagnostics");
+```
+
+The native `VectorIndex::SetParameter` validation is intentional:
+`TenantIndexManager::SetSearchParam` returns `void`, not an acceptance status.
+Keep `[Base]`, construction sections and application-only orchestration out of
+that search-parameter loop. For unfiltered requests, call
+`manager.SearchWithPredicate(queryBytes, 0, topK, ByteArray(), 0)`.
+The query buffer is **one vector without a file header**, of
+`dimension * sizeof(ValueType)` bytes; do not always cast it to Float.
+
+For explicit column-aware filtering, use DNF3 `uint32` words:
+`[0x444E4633, clause_count, {literal_count, {kind, column, op, value}...}...]`.
+Clauses are ORed and literals within a clause are ANDed. `kind=0` is categorical
+equality; `kind=1` is numeric. Columns are original schema indices, and operators
+are `EQ=0`, `LT=1`, `LE=2`, `GT=3`, `GE=4`. With the template's schema,
+`[0x444E4633, 1, 2, 0, 0, 0, 17, 1, 1, 4, 500]` means
+`column0 == 17 AND column1 >= 500`. Pass `-1` as the last API argument for DNF,
+not the number of words. Invalid kinds, columns or buffers fail explicitly;
+do not substitute a legacy flat tag list for numeric/DNF predicates.
+
+For evaluation, truth must use the same base-row IDs, metric, query cohort
+and **exact per-query predicate**; unfiltered truth is not filtered truth.
+The specialized `native_postfilter/nativeBench` campaign client restricts its
+workload to Float/UInt8 and 128 dimensions, but these are **client restrictions,
+not native-library dataset limits**. Its `[Validation]`, `[CounterProbe]` and
+`[Runtime.*]` sections are orchestration, not SPANN parameters. The preserved
+[controlled-ascent benchmark profile](../Tools/benchmarks/configs/posting_frontier_repair/sift1b_controlled_ascent.ini)
+explicitly pins additional diagnostic/default values for reproducibility;
+do not replace it with this lean template or remove its required keys.
+
+### **Other native entry points**
+
+The memory-index and classic SSDServing examples below describe separate tools;
+they are not substitutes for the current adaptive attribute-build recipe above.
+
 ### **Memory SPTAG Index Build**
  ```bash
  Usage:
@@ -119,11 +378,11 @@ IndexAlgoType=BKT
 Dim=128
 VectorPath=sift1b/base.1B.u8bin
 VectorType=DEFAULT
-QueryPath==sift1b/query.public.10K.u8bin
+QueryPath=sift1b/query.public.10K.u8bin
 QueryType=DEFAULT
-WarmupPath==sift1b/query.public.10K.u8bin
+WarmupPath=sift1b/query.public.10K.u8bin
 WarmupType=DEFAULT
-TruthPath==sift1b/public_query_gt100.bin
+TruthPath=sift1b/public_query_gt100.bin
 TruthType=DEFAULT
 IndexDirectory=sift1b
 
@@ -175,7 +434,16 @@ SearchPostingPageLimit=3
 
 ```
 
-#### **SIFT1B with categorical and numeric attributes**
+<a id="sift1b-with-categorical-and-numeric-attributes"></a>
+
+#### **SIFT1B construction details (dataset-specific)**
+
+This section records the local SIFT1B construction recipe. For another dataset,
+use [the portable template](AdaptiveSpann.ini) and the configuration contract
+above. The local `_h5` build INI retains its earlier search settings
+(`MaxCheck=1024`, no explicit additional budget); it is **not** the final adaptive
+query profile. In a new writable run INI, replace its entire `[SearchSSDIndex]`
+section with the current search section above. Do not edit frozen run copies.
 
 The current SIFT1B recipe uses two row-major `uint32` columns:
 `[categorical tag, numeric]`. Column types are explicit schema, not navigation
@@ -195,9 +463,10 @@ The generator writes both the headerless SPTAG input
 `sift1b_zipf200_sparse399_numeric_attrs.u32` and a shape-preserving NumPy copy,
 plus exact counts, the policy inputs, and a hash-bound manifest.
 The prep script and tracked INI use
-`/mnt/nvme/baotonglu/mocheng/datasets/sift1b` by default; when the dataset is
-elsewhere, set `SIFT1B_ROOT` for generation and update the native INI paths to
-the same root. The native builder consumes the files as a tenant-0 bulk view,
+`/mnt/nvme/baotonglu/mocheng/datasets/sift1b` by default. This is a local
+synthetic-attribute fixture generator, not a required preparation step for
+other datasets; declare their actual vector/attribute files in their own INI.
+The native builder consumes the files as a tenant-0 bulk view,
 so it does not synthesize per-vector metadata/routing objects or copy the
 mapped two-column attribute table before STATIC construction. Limited-tag
 STATIC placement also retains only emitted RNG edges for both `H` and `O`
@@ -229,8 +498,6 @@ Ratio=0.12
 HierarchyEnabled=true
 HierarchyLevels=5
 HierarchyReplicaCount=8
-BuildH1Graph=false
-CompactHierarchyVectors=false
 MinHeadsPerTag=0
 ParallelBKTBuild=true
 
@@ -251,6 +518,11 @@ TailReplicaCount=0
 UnfilterTailBufferLength=0
 
 [SearchSSDIndex]
+InternalResultNum=96
+MaxCheck=2048
+EnablePostingNavigation=true
+PostingAnchorCount=8
+PostingAdditionalMaxCheck=2048
 SearchPostingPageLimit=3
 
 ```
@@ -297,16 +569,18 @@ ordinary native graph phase first, preserving its native result collector.
 Only afterward may bounded signed-posting completion use anchors from that
 phase. There is no in-row density trigger or fresh-candidate floor.
 `PostingAnchorCount=8` is a positive integer and
-`PostingAdditionalMaxCheck=0` is a nonnegative integer. The latter permits
-additional checked work beyond `MaxCheck`; zero shares only the remaining
-native budget and can honestly underfill. `MaxCheck` plus the additional
+`PostingAdditionalMaxCheck` is a nonnegative integer, defaulting to zero.
+The current query example explicitly uses `2048` additional checked leaves.
+Zero shares only the remaining native budget; an exhausted H1 graph budget
+then prevents supplementation entirely. `MaxCheck` plus the additional
 budget must fit a native signed integer. Invalid values are rejected even
 when posting navigation is disabled.
 `PostingMinCandidates` is retired and rejected in build, search and saved
 INIs, including explicit zero and OFF configurations. Remove that key from
 a writable configuration and use the new controls; never edit frozen
-historical snapshots. The older row-density, candidate-floor and whole-row
-overshoot experiments remain historical evidence, not active policies.
+historical snapshots. Older row-density and candidate-floor policies are
+historical evidence, not active policies. Complete-row budget overshoot remains
+part of the current supplementary phase.
 This is not a second upper ANN search, an additional own-result
 heap, a graph restart or a global tag scan. Sparse results can still underfill.
 `HeadNavigationMode`, `HierarchyGraphSignaturePruning`, `SparseFallbackMaxHeads`,
@@ -335,7 +609,7 @@ as a legacy profile, not the five-level launch configuration.
 The complete INI names `sift1b_spann_zipf200_limited_tag_h5` and
 `sift1b_spann_zipf200_limited_tag_h5_tmp`; these may already contain a stopped
 experiment. **Do not launch a fresh build against existing output paths:**
-the launcher clears `IndexDirectory` when `ResumeBuild=0`.
+the launcher refuses an existing `IndexDirectory` when `ResumeBuild=0`.
 For a restart after model changes, copy the current repository INI into a new
 run directory and set only `Base.IndexDirectory` and `BuildSSDIndex.TmpDir`
 to new, absent paths. Preserve previous run INIs, executables, logs and partial
@@ -398,14 +672,16 @@ routing: both paths use the same spatial traversal and fixed budgets.
 Limited-tag mode sets `TailReplicaCount=0` because
 it does not append supplemental unfilter-tail replicas.
 
-Filtered BKT/KDT searches maintain an independent unfiltered distance heap for
-native stopping. Exact result admission cannot extend that stopping condition;
-filtered and unfiltered calls obey the same initial-pivot and neighbor
-`MaxCheck` caps. An underfilled result set does not continue a tree frontier,
-widen the hierarchy beam, restart traversal, or trigger direct tag-to-head
-completion. Sparse or budget-limited queries may return fewer than top-k,
-including zero. These are valid ANN results, not failures to repair; keep them
-in recall accounting.
+Ordinary unfiltered BKT retains native adaptive/soft stopping: initial pivots,
+adjacency expansion and tree refill may overshoot nominal `MaxCheck`. Nonempty
+predicates instead use a hard graph checked-leaf cap, with bounded seed/refill
+calls; filtered underfilled queries may resume pending tree cells while budget
+remains. After graph completion, the current adaptive policy may supplement
+missing heads once, without restarting the graph or scanning all tag heads.
+Its representative convergence is not a recall guarantee. Sparse or
+budget-limited queries may return fewer than top-k, including zero; retain these
+queries in recall accounting. See [SearchBudgetBoundaries.md](SearchBudgetBoundaries.md)
+for the exact distinction between graph and supplementary budgets.
 
 `SearchPostingPageLimit` actively caps physical reads in the selected region.
 In constrained `H | O` snapshots, eligible anchored predicates read H, while
@@ -433,10 +709,21 @@ jump to predicate-selected pages. Native OPQ/PipePQ load their configured
 codec; `SPTAG_OPQ_PREFILTER`, `SPTAG_PAGE_SELECT` and
 `SPTAG_RBQ_EXHAUSTIVE` are rejected rather than enabling alternate paths.
 
-#### **Current SIFT1M limited-tag comparison**
+<details>
+<summary>Archived SIFT1M experiments and superseded search policies (not current configuration)</summary>
+
+The following records preserve historical measurements, executable identities
+and parameter names. They are **not copyable settings for the current engine**:
+some named knobs were subsequently removed, and pending/acceptance statements
+refer to those campaigns only. Use the portable adaptive configuration above
+for new applications; preserve historical INIs and artifacts unchanged.
+
+<a id="current-sift1m-limited-tag-comparison"></a>
+
+#### **Historical SIFT1M limited-tag comparison**
 
 Use `Tools/benchmarks/build_spann_attr_sift1m_zipf200_limited_tag.ini` for the
-current three-level Float128 experiment, rather than the generic SSDServing
+historical three-level Float128 experiment, rather than the generic SSDServing
 example below. It uses native DEFAULT input, `ColumnTypes=categorical,numeric`,
 key column 0, shared `Ratio=0.16`, 24 build threads, retained-O support
 expansion with a source-capped floor of 16, and no global extra-support budget.
@@ -1465,13 +1752,14 @@ process protocol. Do not splice the two protocols into one current sweep;
 mixed or partial execution declarations are rejected. This metadata describes
 the benchmark evidence, not an instruction to load or search an index.
 
-The native `spannaclbench` accepts an array in the same search INI:
+</details>
+
+#### **Optional native benchmark nprobe sweeps**
+
+The native `spannaclbench` accepts an array in the same search INI.
+Keep the complete current `[SearchSSDIndex]` section above and add:
 
 ```ini
-[SearchSSDIndex]
-InternalResultNum=24
-MaxCheck=2048
-
 [SearchSweep]
 NProbe=[16,24,32,48,62,80,96,128,192,256,384]
 ```
