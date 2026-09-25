@@ -2082,7 +2082,39 @@ Process samples also retain `/proc/PID/io` counters, and final usage includes
 filesystem input/output block counts. These include loading and warmup, not
 query-only I/O. Native requested posting bytes are not device-read bytes.
 
-The SIFT1B generator replaces the old four-level ACL hierarchy with exactly
+### Fresh attributes and complete predicate groundtruth
+
+Use the repository-owned [portable native INI](../../docs/AdaptiveSpann.ini)
+and the [complete GettingStart preparation contract](../../docs/GettingStart.md#generate-attributes-and-predicate-groundtruth-from-scratch).
+Copy the INI, set its original native input files, raw attribute path and new
+output directories, and edit its predicate definitions for the actual schema.
+No precomputed workload, old GT, local scenario JSON or temporary script is
+needed:
+
+```bash
+python3 -m pip install -r Tools/benchmarks/requirements-predicate-inputs.txt
+python3 Tools/benchmarks/generate_spann_attributes.py --config /absolute/path/to/new-run/build.ini
+python3 Tools/benchmarks/generate_spann_predicate_groundtruth.py --config /absolute/path/to/new-run/build.ini
+```
+
+Skip synthetic attribute generation for existing real `TagFile` inputs.
+`generate_spann_predicate_groundtruth.py` computes every configured unfiltered,
+categorical, numeric and mixed-DNF truth in bounded base/query tiles, not just
+the new 0.1% scenario. It reads DEFAULT vectors and raw uint32 attributes,
+uses explicit column types and top-k from the same INI, emits native/DNF3
+predicates plus NPY/native truth, and refuses existing output directories.
+The seven example scenarios can be selected independently; actual selectivity
+is measured, never forced by a scenario's name. L2 and all four native element
+types are supported; the offline generator is not restricted to 128 dimensions.
+The source inputs are read-only, and successful output includes hashes,
+source identities and `completion.json`.
+
+The old four-level SIFT1B ACL generator is removed. The historical
+`native_postfilter/prepare_selectivity.py` still authenticates previously
+generated inputs for frozen comparisons, but is not a bootstrap dependency.
+Generated datasets, attribute arrays and GT remain outside git.
+
+The synthetic attribute generator replaces the old four-level ACL hierarchy with exactly
 two attributes: one Zipf-200 categorical tag and one deterministic numeric
 value. It writes the final row-major `uint32 [N,2]` SPTAG input directly in
 bounded-memory chunks; no `tags5` merge or per-vector routing-key text file is
@@ -2096,16 +2128,14 @@ Both original and constrained placement retain only emitted RNG edges rather
 than initializing `N * ReplicaCount` slots.
 
 ```bash
-Tools/benchmarks/prep_sift1b_inputs.sh
-CFG=Tools/benchmarks/build_spann_attr_sift1b_zipf200_limited_tag.ini
-Tools/benchmarks/run_spann_attr_build.sh "$CFG"
+Tools/benchmarks/run_spann_attr_build.sh /absolute/path/to/new-run/build.ini
 ```
 
 The canonical build uses one global spatial hierarchy,
 `[Tags] ColumnTypes=categorical,numeric`, and explicit `LimitedTagColumn=0`. Categorical mask layout is internal filter metadata, not
 an attribute hierarchy or a partition plan. Signed support and hierarchy
-artifacts retain generation checks; upper-layer signatures are compatibility
-metadata and do not participate in query traversal. Historical four-category SIFT1B recipes explicitly retain the archived
+artifacts retain generation checks; upper-layer signatures prune supplementary
+posting discovery, not ordinary H1 graph edges. Historical four-category SIFT1B recipes explicitly retain the archived
 `sift1b_tags5.u32` schema; old `4node` filenames do not authorize schema reinterpretation.
 These inputs are not produced by the current generator.
 

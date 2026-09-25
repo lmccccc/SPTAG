@@ -69,6 +69,59 @@ def permutation_multiplier(vector_count: int, seed: int) -> int:
     return candidate
 
 
+def categorical_counts(
+    vector_count: int,
+    cardinality: int,
+    exponent: float,
+    extreme_tag_count: int,
+) -> np.ndarray:
+    """Allocate the historical exact Zipf counts and final rare-label count."""
+    categorical_values = cardinality + int(extreme_tag_count > 0)
+    if categorical_values > MAX_CATEGORICAL_VALUES:
+        raise ValueError(
+            f"at most {MAX_CATEGORICAL_VALUES} categorical values are "
+            "supported by posting signatures"
+        )
+    counts = zipf_counts(cardinality, vector_count - extreme_tag_count, exponent)
+    if extreme_tag_count:
+        counts = np.concatenate(
+            (counts, np.asarray([extreme_tag_count], dtype=np.int64))
+        )
+    if int(counts.sum()) != vector_count or np.any(counts <= 0):
+        raise RuntimeError(
+            "Zipf rounding did not produce positive counts summing "
+            "to the requested vector count"
+        )
+    return counts
+
+
+def attribute_chunks(
+    vector_count: int,
+    counts: np.ndarray,
+    seed: int,
+    numeric_seed: int,
+    chunk_rows: int,
+):
+    """Yield (start, uint32 block) using the original chunk-independent recipe."""
+    if chunk_rows <= 0:
+        raise ValueError("chunk rows must be positive")
+    multiplier = permutation_multiplier(vector_count, seed)
+    offset = seed % vector_count
+    cumulative = np.cumsum(counts, dtype=np.int64)
+    for start in range(0, vector_count, chunk_rows):
+        end = min(start + chunk_rows, vector_count)
+        vector_ids = np.arange(start, end, dtype=np.uint64)
+        ranks = (
+            vector_ids * np.uint64(multiplier) + np.uint64(offset)
+        ) % np.uint64(vector_count)
+        block = np.empty((end - start, 2), dtype="<u4")
+        block[:, 0] = np.searchsorted(cumulative, ranks, side="right")
+        block[:, 1] = (
+            vector_ids * np.uint64(NUMERIC_MULTIPLIER) + np.uint64(numeric_seed)
+        ).astype(np.uint32)
+        yield start, block
+
+
 def prepare_output_paths(
     final_paths: list[Path],
     temporary_paths: list[Path],
@@ -215,29 +268,12 @@ def main() -> None:
     extreme_tag_count = coverage_boundary_count(
         vector_count, policy
     )
-    categorical_values = (
-        args.attribute_cardinality + int(extreme_tag_count > 0)
-    )
-    if categorical_values > MAX_CATEGORICAL_VALUES:
-        raise ValueError(
-            f"at most {MAX_CATEGORICAL_VALUES} categorical values are "
-            "supported by posting signatures"
-        )
-    regular_count = vector_count - extreme_tag_count
-    counts = zipf_counts(
+    counts = categorical_counts(
+        vector_count,
         args.attribute_cardinality,
-        regular_count,
         args.zipf_exponent,
+        extreme_tag_count,
     )
-    if extreme_tag_count:
-        counts = np.concatenate(
-            (counts, np.asarray([extreme_tag_count], dtype=np.int64))
-        )
-    if int(counts.sum()) != vector_count or np.any(counts <= 0):
-        raise RuntimeError(
-            "Zipf rounding did not produce positive counts summing "
-            "to the requested vector count"
-        )
 
     expected_prefix = (
         f"sift1b_zipf{args.attribute_cardinality}"
@@ -289,7 +325,6 @@ def main() -> None:
 
     multiplier = permutation_multiplier(vector_count, args.seed)
     offset = args.seed % vector_count
-    cumulative = np.cumsum(counts, dtype=np.int64)
     observed = np.zeros(counts.size, dtype=np.int64)
     numeric_min = np.iinfo(np.uint32).max
     numeric_max = 0
@@ -309,24 +344,13 @@ def main() -> None:
             dtype="<u4",
             shape=(vector_count, 2),
         )
-        for start in range(0, vector_count, args.chunk_size):
-            end = min(start + args.chunk_size, vector_count)
-            vector_ids = np.arange(start, end, dtype=np.uint64)
-            ranks = (
-                vector_ids * np.uint64(multiplier) + np.uint64(offset)
-            ) % np.uint64(vector_count)
-            tags = np.searchsorted(
-                cumulative, ranks, side="right"
-            ).astype(np.uint32)
-            numeric = (
-                vector_ids * np.uint64(NUMERIC_MULTIPLIER)
-                + np.uint64(args.numeric_seed)
-            ).astype(np.uint32)
-
-            raw[start:end, 0] = tags
-            raw[start:end, 1] = numeric
-            attributes[start:end, 0] = tags
-            attributes[start:end, 1] = numeric
+        for start, block in attribute_chunks(
+            vector_count, counts, args.seed, args.numeric_seed, args.chunk_size
+        ):
+            end = start + len(block)
+            tags, numeric = block[:, 0], block[:, 1]
+            raw[start:end] = block
+            attributes[start:end] = block
             observed += np.bincount(
                 tags, minlength=counts.size
             ).astype(np.int64)

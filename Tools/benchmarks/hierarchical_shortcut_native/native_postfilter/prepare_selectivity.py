@@ -181,7 +181,7 @@ def prepare(path):
     save(output / "status.json", dict(state="preparing", stage="exact_categorical_truth",
                                      candidates=len(candidate_ids)))
     import faiss
-    from generate_sift1b_acl_groundtruth import knn_l2
+    from predicate_groundtruth import knn_l2
     threads = settings.getint("TruthThreads")
     require(threads > 0, "TruthThreads must be positive")
     faiss.omp_set_num_threads(threads)

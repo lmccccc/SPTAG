@@ -387,6 +387,23 @@ comments are NOT stripped, so a value line must contain only the value; sections
 and keys are lowercased (case-insensitive). An explicit CLI flag still overrides
 any ini value (later `SetSSDBuildParam` push wins).
 
+## Reproducible offline predicate inputs
+
+`Tools/benchmarks/generate_spann_attributes.py --config <native.ini>` is the
+INI-only synthetic categorical/numeric recipe; existing real attributes can
+skip it. `generate_spann_predicate_groundtruth.py --config <native.ini>` builds
+all configured unfiltered/categorical/numeric/DNF truths directly from native
+DEFAULT vectors and raw uint32 attributes, without a previous workload or GT.
+Shared native file/schema readers live in `native_input_io.py`; predicate
+validation, DNF3 encoding and stable top-k helpers live in `predicate_groundtruth.py`.
+The offline GT tool currently supports L2 and the four native element types,
+with bounded streamed base/query distance tiles and source inputs kept read-only.
+Its preparation sections are in `docs/AdaptiveSpann.ini`, not core search knobs.
+Keep top-k sourced from `SearchSSDIndex.ResultNum`, original column indices,
+explicit `-1`/infinity underfill and fresh-output refusal. Do not restore the
+removed four-level SIFT1B ACL generator or make fresh preparation depend on
+`native_postfilter/prepare_selectivity.py`'s authenticated historical inputs.
+
 ## Compact storage reconstruction
 
 Explicit-schema head metadata uses authenticated V9 records with one index-owned

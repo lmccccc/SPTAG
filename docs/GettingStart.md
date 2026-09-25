@@ -30,7 +30,7 @@ line; do not use `#`, inline comments, shell variables or `~` in values.
 | --- | --- |
 | `[Base] VectorPath`, `ValueType`, `VectorType`, `Dim` | The actual base file, element type, container and dimension. Native bulk IO supports `Float`, `Int8`, `UInt8`, `Int16`; `DEFAULT`, `TXT`, `XVEC` name containers, not element types. |
 | `[Base] DistCalcMethod` | The index metric (`L2` or `Cosine`), also used for queries and truth. For Cosine, `Normalized` describes the actual input; native normalization must not modify a mapped source file. |
-| `[Base] QueryPath`, `QueryType`, `TruthPath`, `TruthType` | Inputs for the querying/evaluation program. Queries must match the built vector type and dimension. The bulk builder does not run a query campaign merely because these paths are present. |
+| `[Base] QueryPath`, `QueryType`, `QuerySize`, `TruthPath`, `TruthType` | Inputs for the querying/evaluation program. Queries must match the built vector type and dimension; `QuerySize` optionally bounds the native query prefix (1000 in the template). The bulk builder does not run a query campaign merely because these paths are present. |
 | `[Base] IndexDirectory`, `[BuildSSDIndex] TmpDir` | A new output root and a run-specific work directory. The bulk build uses tenant `0`; the root contains `manifest.txt` and `tenant_0/`. |
 | `[Tags] TagFile`, `ColumnTypes` | Row-aligned, headerless attributes and the type of **every original column**. Example: `numeric,categorical,numeric,categorical` preserves that order. |
 | `[BuildSSDIndex] LimitedTagColumn` | The zero-based **original** categorical key column; use `3` for the preceding example if the fourth column is the key. It is not the ordinal among categorical columns. |
@@ -68,6 +68,101 @@ they are not search overlays. For raw STATIC postings the record width is
 can raise `PostingPageLimit` to accommodate `PostingVectorLimit` (118 in the
 template), independently for H and O. Thus a page/record budget copied from
 UInt8 SIFT has a different byte cost for a higher-dimensional Float dataset.
+
+#### **Generate attributes and predicate groundtruth from scratch**
+
+The template also includes optional `[AttributeGeneration]`, `[GroundTruth]`
+and `[Predicate.<name>]` preparation sections. They are not SPANN search
+parameters. The following repository-owned tools need only the original base
+and query vectors plus this INI; they do **not** require a built index, an old
+`workloads.json`, precomputed truth, a local scenario file or a temporary script.
+Install the dependencies in your Python environment, then run from the repository
+root with the same edited INI used for building:
+
+```bash
+python3 -m pip install -r Tools/benchmarks/requirements-predicate-inputs.txt
+python3 Tools/benchmarks/generate_spann_attributes.py --config /absolute/path/to/my-dataset.ini
+python3 Tools/benchmarks/generate_spann_predicate_groundtruth.py --config /absolute/path/to/my-dataset.ini
+```
+
+**Skip the first generator when you already have real attributes.** It is an
+optional deterministic synthetic recipe for exactly
+`ColumnTypes=categorical,numeric`, not a replacement for a dataset's real labels.
+It derives the vector count from the native input and writes raw `uint32`
+attributes exactly to `[Tags] TagFile`, plus sibling `.npy`, `.counts.tsv` and
+`.manifest.json` files. The basename need not encode SIFT or a label count.
+The INI declares the regular-label cardinality, Zipf exponent, seeds and chunk
+size. The rare-label count retains the native coverage recipe based on
+`SelectHead.Ratio`, `LimitedTagSlotsPerHead` and search `InternalResultNum`;
+the standard `.12`, two slots and 96 heads produce 399 rare-label rows.
+The rare label is the regular-label cardinality (200 in the example).
+Very small smoke datasets need smaller cardinality and compatible coverage
+settings; invalid recipes fail rather than silently changing them.
+
+The **groundtruth generator reads the raw TagFile**, supports all declared
+categorical/numeric columns in their original order, and computes every requested
+scenario from source vectors. Its current input contract is native `DEFAULT`
+base/query files with `Float`, `Int8`, `UInt8` or `Int16` elements and **L2**.
+Dimensions are not fixed to 128. Cosine and TXT/XVEC input are rejected by this
+offline tool rather than reinterpreted; this does not restrict the native
+index library's separate input/metric capabilities.
+
+| Preparation setting | Meaning |
+| --- | --- |
+| `[SearchSSDIndex] ResultNum` | The single top-k source for both truth and search; there is no separate GT top-k override. |
+| `[GroundTruth] QueryCount` | First N query rows, or `all`; cannot exceed the native query prefix. The template uses `all` of `[Base] QuerySize`, avoiding two independently specified cohort sizes. |
+| `[GroundTruth] ChunkRows`, `QueryBatch` | Bound base-vector chunks and distance tiles; no full 1B Float corpus or corpus-by-query matrix is allocated. Query/result storage still scales with the query cohort, scenario count and top-k. |
+| `[GroundTruth] Threads` | Explicit FAISS and BLAS thread limit for offline truth generation. |
+| `[GroundTruth] Scenarios` | Ordered scenario names, each with one `[Predicate.<name>]` definition. |
+| `[Predicate.<name>] Expression` | JSON predicate shared by that scenario's query cohort; `null` is unfiltered, `categorical_eq` is equality, and `numeric_eq/lt/le/gt/ge` compare unsigned numeric values. Nonempty `and`/`or` lists compose DNF. |
+| `[GroundTruth] OutputDirectory` | A new, absent output directory. Existing directories, files, symlinks and partial runs are never overwritten. |
+
+Each literal is `[original_column, uint32_value]` and must match `ColumnTypes`.
+Categorical range operations, malformed expressions and incompatible column
+kinds fail before generation. The preparation encoder bounds expanded DNF
+to 64 clauses and 64 literals per clause. These are generator resource limits,
+not new native ANN parameters.
+
+The template covers unfiltered, broad/medium/rare categorical, tag169, numeric,
+and mixed-DNF cases. Labels and thresholds are explicit examples, not adaptive
+selection rules. `sel_01pct` is only a name: the manifest reports its **actual**
+eligible count and selectivity on your data. For the final five-scenario
+comparison, request exactly
+`unfilter,broad_tag,medium_tag,sel_01pct,mixed_dnf`; fixed campaign clients still
+enforce their own cohort/dimension/scenario contracts.
+
+Truth uses exhaustive FAISS float32 squared-L2 distance tiles, reused across
+the predicates, with ties ordered by original vector ID. This is not ANN
+search or sampled truth. UInt8 SIFT128 squared distances are integer-exact;
+Float data retains normal float32 distance arithmetic. The generator checks
+finite inputs/results and records the FAISS version and settings. Chunking
+bounds working memory, **not total work**: an unfiltered 1B truth scan can still
+be expensive.
+
+The new output contains `workloads.json`, `completion.json`, the source INI,
+typed `query_vectors.native.npy`, Float32 `query_vectors.npy` for compatibility,
+and a streamed `attributes.npy` copy for workload consumers. That copy needs
+an additional `N * C * 4` bytes of disk space, not a full in-memory attribute
+table. Each scenario gets `groundtruth_<name>_local_ids.npy`,
+`groundtruth_<name>_dists.npy` and native `groundtruth_<name>.ibin`
+(`int32 query_count, int32 topk`, then row-major int32 IDs). Native predicate
+files are recorded under `native_predicates` in the manifest; column-sensitive
+filters use the same length-prefixed DNF3 format as the native benchmark.
+Fewer than top-k matches are padded with `-1` IDs and positive-infinity distances,
+including zero-match cases.
+
+Input identities, selected-attribute hashes, output hashes, predicates and
+candidate counts are recorded. A reported error retains `failure.json` and partial
+files; an interruption may leave only `started.json` and partial output.
+Only a complete `completion.json` with a matching workload hash marks success.
+Source vectors and
+attributes are never modified. The template's `TruthPath` points to the newly
+generated **unfiltered** native truth; filtered evaluations must select their
+matching per-scenario truth, not that unfiltered file.
+
+The obsolete four-level SIFT1B ACL generator has been removed.
+`native_postfilter/prepare_selectivity.py` remains only for authenticated reuse
+of older campaigns; it is **not required** for this fresh-input workflow.
 
 #### **Build once, with the native INI**
 
@@ -448,10 +543,13 @@ section with the current search section above. Do not edit frozen run copies.
 The current SIFT1B recipe uses two row-major `uint32` columns:
 `[categorical tag, numeric]`. Column types are explicit schema, not navigation
 partitions; there is no attribute hierarchy or PerTagBKT routing-key file.
-If these inputs do not already exist, generate them in bounded-memory chunks with:
+If these inputs do not already exist, use a new run INI with the preparation
+sections from [the portable template](AdaptiveSpann.ini), the actual SIFT1B
+UInt8/128 input paths and fresh attribute/GT destinations:
 
 ```bash
-Tools/benchmarks/prep_sift1b_inputs.sh
+python3 Tools/benchmarks/generate_spann_attributes.py --config /absolute/path/to/new-run/build.ini
+python3 Tools/benchmarks/generate_spann_predicate_groundtruth.py --config /absolute/path/to/new-run/build.ini
 ```
 
 The categorical column contains 200 Zipf-distributed regular values and one
@@ -462,10 +560,11 @@ rare-label dataset count as
 The generator writes both the headerless SPTAG input
 `sift1b_zipf200_sparse399_numeric_attrs.u32` and a shape-preserving NumPy copy,
 plus exact counts, the policy inputs, and a hash-bound manifest.
-The prep script and tracked INI use
-`/mnt/nvme/baotonglu/mocheng/datasets/sift1b` by default. This is a local
-synthetic-attribute fixture generator, not a required preparation step for
-other datasets; declare their actual vector/attribute files in their own INI.
+The older `prep_sift1b_inputs.sh` and tracked SIFT1B build recipes retain local
+paths for historical reproductions. New preparation reads all paths from the
+provided INI; it does not use those machine defaults. Synthetic attributes are
+not a required preparation step for other datasets; declare their actual
+vector/attribute files in their own INI.
 The native builder consumes the files as a tenant-0 bulk view,
 so it does not synthesize per-vector metadata/routing objects or copy the
 mapped two-column attribute table before STATIC construction. Limited-tag
