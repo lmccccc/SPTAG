@@ -21,6 +21,10 @@ if(NOT WIN32)
 endif()
 
 option(USE_ASAN "Enable AddressSanitizer (ASAN) for memory debugging" OFF)
+option(SPTAG_QUERY_WORK_DIAGNOSTICS "Compile query work counters for separate untimed replay" OFF)
+if(SPTAG_QUERY_WORK_DIAGNOSTICS)
+    add_definitions(-DSPTAG_QUERY_WORK_DIAGNOSTICS)
+endif()
 
 if(${CMAKE_CXX_COMPILER_ID} STREQUAL "GNU")
     # require at least gcc 5.0
@@ -98,8 +102,10 @@ if (WIN32)
     set (LIBRARY_OUTPUT_PATH ${CMAKE_BINARY_DIR}/${CMAKE_CFG_INTDIR})
     set (EXECUTABLE_OUTPUT_PATH ${CMAKE_BINARY_DIR}/${CMAKE_CFG_INTDIR})
 else()
-    set (LIBRARY_OUTPUT_PATH "${PROJECT_SOURCE_DIR}/${CMAKE_BUILD_TYPE}/")
-    set (EXECUTABLE_OUTPUT_PATH "${PROJECT_SOURCE_DIR}/${CMAKE_BUILD_TYPE}/")
+    set(SPTAG_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/${CMAKE_BUILD_TYPE}" CACHE PATH
+        "Native library and executable output directory")
+    set (LIBRARY_OUTPUT_PATH "${SPTAG_OUTPUT_DIRECTORY}/")
+    set (EXECUTABLE_OUTPUT_PATH "${SPTAG_OUTPUT_DIRECTORY}/")
 endif()
 
 set (CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR})

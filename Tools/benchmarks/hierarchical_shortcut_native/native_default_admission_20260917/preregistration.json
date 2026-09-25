@@ -1,0 +1,39 @@
+{
+  "phase": "bounded_native_default_admission",
+  "ordinary_order": [
+    [
+      "h1",
+      "supplier"
+    ],
+    [
+      "supplier",
+      "h1"
+    ]
+  ],
+  "ordinary_processes": 4,
+  "ordinary_queries": 1000,
+  "warmup": 1000,
+  "profile_processes": 2,
+  "fixtures": "h1/supplier forward/reverse16,24,384; four filtered8-query fixtures",
+  "nprobe": [
+    24
+  ],
+  "threads": 1,
+  "numa": 2,
+  "O_DIRECT": true,
+  "page_limit": 15,
+  "configs": {
+    "supplier_asc.ini": "398e196ff971d2f5536b2e758c3e375829a3c3704261611bf80232436f56e050",
+    "supplier_desc.ini": "14fbbb06faf97c088e450566811b02e257881116a45cee2bbeab161977706358",
+    "supplier_profile.ini": "7d1ac57036dfe4c8871d6d0e7e53e4c60ad8bb66d1a9399f568648f8bbcf1180",
+    "h1_profile.ini": "b7377939f76c088590d5da353196974bb849700b3d6c95a1e07ac86f2959287d",
+    "h1_asc.ini": "3435747b32f7386fea21af7d042089f217c9e7fdc0b3c8fa6af979cdf4073258",
+    "supplier_plain.ini": "3baa00d1159e1a7b4e8a389c2479c6d3b46542170fb4a2efad94708152ba9981",
+    "h1_plain.ini": "cec50decc47f86899dc509c5c668eaccdda7ab6561dac2b011996b393ec3fe23",
+    "h1_desc.ini": "345bde2365996b2b0f18ceabaa68a73d0da3052b2277bb27ab4d1a826bb5dd13"
+  },
+  "no_full_sweep": true,
+  "reason": "Restore native predicate-free selected-head/own admission only when e=d is proven.",
+  "expected_unfilter": "Exact original H1 heads/final IDs/distances/native core work, including q915.",
+  "filtered_reference": "Native-reuse v2 unchanged interfaces and policy."
+}

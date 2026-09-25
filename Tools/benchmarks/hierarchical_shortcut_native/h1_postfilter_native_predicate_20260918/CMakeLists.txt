@@ -1,0 +1,41 @@
+cmake_minimum_required(VERSION 3.16)
+project(PostfilterPosting LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+enable_testing()
+find_package(OpenMP REQUIRED)
+find_package(Boost REQUIRED COMPONENTS system thread filesystem regex serialization wserialization)
+find_package(TBB REQUIRED)
+add_executable(postfilter-bench MatchedBench.cpp "${SPANN_ROOT}/Wrappers/src/CoreInterface.cpp")
+target_compile_definitions(postfilter-bench PRIVATE MATCHED_CURRENT)
+add_executable(native-tests NativeTests.cpp)
+add_executable(own-only-tests OwnOnlyTest.cpp "${SPANN_ROOT}/Wrappers/src/CoreInterface.cpp")
+target_compile_definitions(own-only-tests PRIVATE MATCHED_CURRENT)
+add_executable(storage-boundary-tests StorageBoundaryTests.cpp)
+target_compile_options(storage-boundary-tests PRIVATE -fsanitize=undefined -fno-sanitize-recover=all)
+target_link_options(storage-boundary-tests PRIVATE -fsanitize=undefined)
+foreach(target postfilter-bench native-tests storage-boundary-tests own-only-tests)
+    target_compile_definitions(${target} PRIVATE TBB NUMA)
+    target_compile_options(${target} PRIVATE -fno-omit-frame-pointer)
+    target_include_directories(${target} PRIVATE "${SPANN_ROOT}/AnnService" "${SPANN_ROOT}/Wrappers")
+    target_link_libraries(${target} PRIVATE "${SPANN_ROOT}/Release/libSPTAGLibStatic.a"
+        "${SPANN_ROOT}/Release/libDistanceUtils.a" "${SPANN_ROOT}/Release/libRaBitQ2Lib.a"
+        "${SPANN_ROOT}/Release/libzstd.a" ${Boost_LIBRARIES} TBB::tbb OpenMP::OpenMP_CXX numa dl rt)
+endforeach()
+add_test(NAME native-postfilter-posting COMMAND native-tests)
+add_test(NAME storage-boundary-ubsan COMMAND storage-boundary-tests)
+add_test(NAME native-empty-posting-own COMMAND numactl --cpunodebind=2 --membind=2
+    $<TARGET_FILE:own-only-tests>
+    "${CMAKE_CURRENT_SOURCE_DIR}/diagnostic_configs/extreme_tag_visited_posting_ratio_0.01.ini")
+get_filename_component(TOOLCHAINS "${SPANN_ROOT}/../.." ABSOLUTE)
+set(ORIGINAL "${TOOLCHAINS}/matched_baseline_20260917/original")
+add_executable(original-reference MatchedBench.cpp
+    "${ORIGINAL}/build/AnnService/CMakeFiles/spannaclbench.dir/__/Wrappers/src/CoreInterface.cpp.o")
+add_executable(head-reference HeadReference.cpp
+    "${ORIGINAL}/build/AnnService/CMakeFiles/spannaclbench.dir/__/Wrappers/src/CoreInterface.cpp.o")
+foreach(target original-reference head-reference)
+target_compile_definitions(${target} PRIVATE TBB NUMA)
+target_include_directories(${target} PRIVATE "${ORIGINAL}/source/AnnService" "${ORIGINAL}/source/Wrappers")
+target_link_libraries(${target} PRIVATE "${ORIGINAL}/source/Release/libSPTAGLibStatic.a"
+    "${ORIGINAL}/source/Release/libDistanceUtils.a" "${ORIGINAL}/source/Release/libRaBitQ2Lib.a"
+    "${ORIGINAL}/source/Release/libzstd.a" ${Boost_LIBRARIES} TBB::tbb OpenMP::OpenMP_CXX numa dl rt)
+endforeach()

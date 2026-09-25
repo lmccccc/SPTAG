@@ -7,6 +7,7 @@
 #include "inc/Helper/AtomicFile.h"
 #include "inc/Core/SPANN/Index.h"
 #include "inc/Core/SPANN/HeadNodeMetadata.h"
+#include "inc/Core/SPANN/NumericMetadata.h"
 #include "inc/Core/Common/QueryResultSet.h"
 #ifdef ROCKSDB
 #include "inc/Core/SPANN/ExtraRocksDBController.h"
@@ -70,282 +71,10 @@ constexpr std::uint32_t kTagRoutingStatsMagic = 0x53525454U; // TTRS
 constexpr std::uint32_t kTagRoutingStatsVersion = 4;
 constexpr std::uint32_t kLegacyRoutingColumn =
     (std::numeric_limits<std::uint32_t>::max)();
-constexpr std::uint32_t kLegacyNumericMetaMagic =
-    0x54454D4EU; // NMET
-constexpr std::uint32_t kNumericMetaMagic =
-    0x324D554EU; // NUM2
-constexpr std::uint32_t kNumericMetaVersion = 2;
-
-struct NumericMetaFileHeader {
-    std::uint32_t magic = kNumericMetaMagic;
-    std::uint32_t version = kNumericMetaVersion;
-    std::int32_t numBaseColumns = 0;
-    std::int32_t numNumericColumns = 0;
-    std::int32_t vectorCount = 0;
-    std::int32_t tagColumnCount = 0;
-    std::uint64_t generationFingerprint = 0;
-    std::uint64_t contentFingerprint = 0;
-};
-
-static_assert(sizeof(NumericMetaFileHeader) == 40,
-              "Unexpected NumericMetaFileHeader layout");
-
-struct NumericMetaDiskData {
-    int numBaseColumns = 0;
-    int vectorCount = 0;
-    int tagColumnCount = 0;
-    std::uint64_t generationFingerprint = 0;
-    std::uint64_t contentFingerprint = 0;
-    bool generationBound = false;
-    std::vector<SPTAG::Cache::NumQuantParam> params;
-};
-
-std::uint64_t NumericMetaFingerprint(
-    const NumericMetaFileHeader& header,
-    const std::vector<SPTAG::Cache::NumQuantParam>& params)
-{
-    constexpr std::uint64_t offset =
-        1469598103934665603ULL;
-    constexpr std::uint64_t prime =
-        1099511628211ULL;
-    std::uint64_t hash = offset;
-    const auto append =
-        [&](const void* data, size_t bytes) {
-            const auto* begin =
-                static_cast<const std::uint8_t*>(data);
-            for (size_t i = 0; i < bytes; ++i) {
-                hash ^= begin[i];
-                hash *= prime;
-            }
-        };
-    append(&header.numBaseColumns,
-           sizeof(header.numBaseColumns));
-    append(&header.numNumericColumns,
-           sizeof(header.numNumericColumns));
-    append(&header.vectorCount,
-           sizeof(header.vectorCount));
-    append(&header.tagColumnCount,
-           sizeof(header.tagColumnCount));
-    append(&header.generationFingerprint,
-           sizeof(header.generationFingerprint));
-    if (!params.empty()) {
-        append(params.data(),
-               params.size() * sizeof(params[0]));
-    }
-    return hash;
-}
-
-std::uint64_t ComputeNumericMetaContentFingerprint(
-    int numBaseColumns,
-    int vectorCount,
-    int tagColumnCount,
-    std::uint64_t generationFingerprint,
-    const std::vector<SPTAG::Cache::NumQuantParam>&
-        params)
-{
-    NumericMetaFileHeader header;
-    header.numBaseColumns = numBaseColumns;
-    header.numNumericColumns =
-        static_cast<std::int32_t>(params.size());
-    header.vectorCount = vectorCount;
-    header.tagColumnCount = tagColumnCount;
-    header.generationFingerprint =
-        generationFingerprint;
-    return NumericMetaFingerprint(header, params);
-}
-
-bool SaveNumericMetaFile(
-    const std::string& path,
-    int numBaseColumns,
-    int vectorCount,
-    int tagColumnCount,
-    std::uint64_t generationFingerprint,
-    const std::vector<SPTAG::Cache::NumQuantParam>&
-        params,
-    std::uint64_t* contentFingerprint = nullptr)
-{
-    const std::int64_t totalColumns =
-        static_cast<std::int64_t>(numBaseColumns) +
-        static_cast<std::int64_t>(params.size());
-    if (numBaseColumns < 0 ||
-        params.empty() ||
-        params.size() >
-            static_cast<size_t>(
-                (std::numeric_limits<std::int32_t>::max)()) ||
-        vectorCount <= 0 ||
-        tagColumnCount <= numBaseColumns ||
-        totalColumns !=
-            tagColumnCount) {
-        return false;
-    }
-    for (const auto& param : params) {
-        if (param.lo > param.hi) return false;
-    }
-
-    NumericMetaFileHeader header;
-    header.numBaseColumns = numBaseColumns;
-    header.numNumericColumns =
-        static_cast<std::int32_t>(params.size());
-    header.vectorCount = vectorCount;
-    header.tagColumnCount = tagColumnCount;
-    header.generationFingerprint =
-        generationFingerprint;
-    header.contentFingerprint =
-        ComputeNumericMetaContentFingerprint(
-            numBaseColumns, vectorCount,
-            tagColumnCount, generationFingerprint,
-            params);
-    if (contentFingerprint != nullptr) {
-        *contentFingerprint =
-            header.contentFingerprint;
-    }
-
-    const std::string temporary = path + ".tmp";
-    FILE* file = std::fopen(temporary.c_str(), "wb");
-    if (file == nullptr) return false;
-    bool ok =
-        std::fwrite(&header, sizeof(header), 1, file) ==
-            1 &&
-        std::fwrite(
-            params.data(), sizeof(params[0]),
-            params.size(), file) == params.size();
-    if (std::fclose(file) != 0) ok = false;
-    if (!ok ||
-        !SPTAG::Helper::AtomicReplaceFile(
-            temporary, path)) {
-        std::remove(temporary.c_str());
-        return false;
-    }
-    return true;
-}
-
-bool LoadNumericMetaFile(
-    const std::string& path,
-    NumericMetaDiskData& metadata)
-{
-    metadata = NumericMetaDiskData();
-    std::ifstream input(path, std::ios::binary);
-    if (!input.good()) return false;
-    input.seekg(0, std::ios::end);
-    const std::streamoff fileBytes = input.tellg();
-    input.seekg(0, std::ios::beg);
-    std::uint32_t magic = 0;
-    input.read(
-        reinterpret_cast<char*>(&magic), sizeof(magic));
-    if (!input.good()) return false;
-    input.seekg(0, std::ios::beg);
-
-    if (magic == kNumericMetaMagic) {
-        NumericMetaFileHeader header;
-        input.read(
-            reinterpret_cast<char*>(&header),
-            sizeof(header));
-        const std::int64_t totalColumns =
-            static_cast<std::int64_t>(
-                header.numBaseColumns) +
-            static_cast<std::int64_t>(
-                header.numNumericColumns);
-        if (!input.good() ||
-            header.version != kNumericMetaVersion ||
-            header.numBaseColumns < 0 ||
-            header.numNumericColumns <= 0 ||
-            header.vectorCount <= 0 ||
-            header.tagColumnCount <=
-                header.numBaseColumns ||
-            totalColumns !=
-                header.tagColumnCount) {
-            return false;
-        }
-        const std::uint64_t expectedBytes =
-            sizeof(header) +
-            static_cast<std::uint64_t>(
-                header.numNumericColumns) *
-                sizeof(
-                    SPTAG::Cache::NumQuantParam);
-        if (fileBytes < 0 ||
-            static_cast<std::uint64_t>(fileBytes) !=
-                expectedBytes) {
-            return false;
-        }
-        metadata.params.resize(
-            static_cast<size_t>(
-                header.numNumericColumns));
-        input.read(
-            reinterpret_cast<char*>(
-                metadata.params.data()),
-            static_cast<std::streamsize>(
-                metadata.params.size() *
-                sizeof(metadata.params[0])));
-        if (!input.good() ||
-            header.contentFingerprint !=
-                NumericMetaFingerprint(
-                    header, metadata.params)) {
-            return false;
-        }
-        for (const auto& param : metadata.params) {
-            if (param.lo > param.hi) return false;
-        }
-        metadata.numBaseColumns =
-            header.numBaseColumns;
-        metadata.vectorCount = header.vectorCount;
-        metadata.tagColumnCount =
-            header.tagColumnCount;
-        metadata.generationFingerprint =
-            header.generationFingerprint;
-        metadata.contentFingerprint =
-            header.contentFingerprint;
-        metadata.generationBound = true;
-        return true;
-    }
-
-    if (magic != kLegacyNumericMetaMagic) {
-        return false;
-    }
-    std::array<std::int32_t, 3> legacyHeader{};
-    input.read(
-        reinterpret_cast<char*>(legacyHeader.data()),
-        static_cast<std::streamsize>(
-            sizeof(legacyHeader)));
-    if (!input.good() ||
-        legacyHeader[1] < 0 ||
-        legacyHeader[2] <= 0) {
-        return false;
-    }
-    const std::uint64_t expectedBytes =
-        sizeof(legacyHeader) +
-        static_cast<std::uint64_t>(legacyHeader[2]) *
-            sizeof(SPTAG::Cache::NumQuantParam);
-    if (fileBytes < 0 ||
-        static_cast<std::uint64_t>(fileBytes) !=
-            expectedBytes) {
-        return false;
-    }
-    const std::int64_t legacyTagColumns =
-        static_cast<std::int64_t>(
-            legacyHeader[1]) +
-        static_cast<std::int64_t>(
-            legacyHeader[2]);
-    if (legacyTagColumns >
-        (std::numeric_limits<int>::max)()) {
-        return false;
-    }
-    metadata.params.resize(
-        static_cast<size_t>(legacyHeader[2]));
-    input.read(
-        reinterpret_cast<char*>(
-            metadata.params.data()),
-        static_cast<std::streamsize>(
-            metadata.params.size() *
-            sizeof(metadata.params[0])));
-    if (!input.good()) return false;
-    for (const auto& param : metadata.params) {
-        if (param.lo > param.hi) return false;
-    }
-    metadata.numBaseColumns = legacyHeader[1];
-    metadata.tagColumnCount =
-        static_cast<int>(legacyTagColumns);
-    return true;
-}
+using SPTAG::SPANN::NumericMetaDiskData;
+using SPTAG::SPANN::ComputeNumericMetaContentFingerprint;
+using SPTAG::SPANN::SaveNumericMetaFile;
+using SPTAG::SPANN::LoadNumericMetaFile;
 
 std::uint64_t MakeTagRoutingKey(
     std::uint32_t column,
@@ -1355,6 +1084,63 @@ std::string HeadNodeMetaPath(const std::string& workDir)
     return workDir + "/HeadIndex/head_node_meta.bin";
 }
 
+bool ValidatePostingParameters(const char* name, const char* value)
+{
+    if (!name) return false;
+    if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(name, "PostingMinCandidates")) {
+        fprintf(stderr, "[ERROR] PostingMinCandidates was removed even with posting navigation OFF. "
+            "Remove it from build/search/saved INIs; migrate to PostingAnchorCount=8 and "
+            "PostingAdditionalMaxCheck=0. No candidate-floor policy is retained.\n");
+        return false;
+    }
+    const bool anchor = SPTAG::Helper::StrUtils::StrEqualIgnoreCase(name, "PostingAnchorCount");
+    const bool additional = SPTAG::Helper::StrUtils::StrEqualIgnoreCase(name, "PostingAdditionalMaxCheck");
+    int parsed = 0;
+    if ((anchor || additional) &&
+        !SPTAG::SPANN::Options::ParsePostingInteger(value, additional ? 0 : 1, parsed)) {
+        fprintf(stderr, "[ERROR] %s requires a %s integer within int range; rejected value %s.\n",
+            name, additional ? "nonnegative" : "positive",
+            value ? value : "(null)");
+        return false;
+    }
+    return true;
+}
+
+bool ValidateStagedPostingBudget(const char* name, const char* value, const char* section,
+    const std::vector<std::pair<std::string, std::string>>& extraBuild,
+    const std::vector<std::tuple<std::string, std::string, std::string>>& build,
+    const std::vector<std::tuple<std::string, std::string, std::string>>& search)
+{
+    const auto isSSD = [](const char* s) {
+        return SPTAG::Helper::StrUtils::StrEqualIgnoreCase(s, "BuildSSDIndex") ||
+            SPTAG::Helper::StrUtils::StrEqualIgnoreCase(s, "SearchSSDIndex");
+    };
+    if (!isSSD(section) ||
+        (!SPTAG::Helper::StrUtils::StrEqualIgnoreCase(name, "MaxCheck") &&
+         !SPTAG::Helper::StrUtils::StrEqualIgnoreCase(name, "PostingAdditionalMaxCheck"))) return true;
+    SPTAG::SPANN::Options defaults;
+    int maxCheck = defaults.m_maxCheck, additional = defaults.m_postingAdditionalMaxCheck;
+    const auto collect = [&](const char* key, const char* text) {
+        if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(key, "MaxCheck"))
+            return SPTAG::SPANN::Options::ParsePostingInteger(text, 1, maxCheck);
+        if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(key, "PostingAdditionalMaxCheck"))
+            return SPTAG::SPANN::Options::ParsePostingInteger(text, 0, additional);
+        return true;
+    };
+    for (const auto& parameter : extraBuild)
+        if (!collect(parameter.first.c_str(), parameter.second.c_str())) return false;
+    for (const auto* parameters : {&build, &search})
+        for (const auto& parameter : *parameters)
+            if (isSSD(std::get<2>(parameter).c_str()) &&
+                !collect(std::get<0>(parameter).c_str(), std::get<1>(parameter).c_str())) return false;
+    if (!collect(name, value) || maxCheck > (std::numeric_limits<int>::max)() - additional) {
+        fprintf(stderr, "[ERROR] Invalid MaxCheck + PostingAdditionalMaxCheck: "
+            "strict nonnegative integer budgets must fit int (MaxCheck must be positive).\n");
+        return false;
+    }
+    return true;
+}
+
 std::shared_ptr<SPTAG::VectorIndex> GetMemoryIndexForInternal(const std::shared_ptr<SPTAG::VectorIndex>& internalIndex)
 {
     auto* spannInternalIdx = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(internalIndex.get());
@@ -1399,7 +1185,7 @@ bool SaveHeadNodeMetaFile(
     const std::shared_ptr<SPTAG::VectorIndex>& headIndex,
     std::uint64_t generationFingerprint)
 {
-    return SPTAG::SPANN::SaveHeadNodeMetadataV8(
+    return SPTAG::SPANN::SaveHeadNodeMetadata(
         HeadNodeMetaPath(workDir), headIndex, generationFingerprint);
 }
 
@@ -1438,14 +1224,24 @@ bool LoadHeadNodeMetaFile(
         fclose(f);
         return false;
     }
-    if (header.version == kHeadNodeMetaVersionV8 &&
-        spannInternalIdx->HasRoutingOnlyHierarchy()) {
+    if (header.version == 9 ||
+        (header.version == kHeadNodeMetaVersionV8 &&
+         spannInternalIdx->HasRoutingOnlyHierarchy())) {
         fclose(f);
-        return SPTAG::SPANN::LoadHeadNodeMetadataV8(
+        const auto* options = spannInternalIdx->GetOptions();
+        const auto schema = options->Schema();
+        if (!spannInternalIdx->HasRoutingOnlyHierarchy())
+            return SPTAG::SPANN::LoadHeadNodeMetadata(
+                metaPath, headIndex, header.numSamples, expectedGeneration, {},
+                &schema,
+                [spannInternalIdx]() {
+                    return spannInternalIdx->PopulateHeadNodeGlobalVIDsFromBundles(true);
+                });
+        return SPTAG::SPANN::LoadHeadNodeMetadata(
             metaPath, headIndex, headIndex->GetNumSamples(), expectedGeneration,
             [spannInternalIdx](SPTAG::SizeType head) {
                 return spannInternalIdx->GetGlobalVID(head);
-            });
+            }, header.version == 9 || !options->m_columnTypes.empty() ? &schema : nullptr);
     }
 
     // V3-V7 remain readable for unconstrained legacy indexes, but only V8 is
@@ -1904,6 +1700,7 @@ bool AnnIndex::BuildWithMetaData(ByteArray p_data, ByteArray p_meta, SizeType p_
 
 void AnnIndex::SetBuildParam(const char *p_name, const char *p_value, const char *p_section)
 {
+    if (!ValidatePostingParameters(p_name, p_value)) return;
     if (nullptr == m_index)
     {
         if (SPTAG::IndexAlgoType::Undefined == m_algoType || SPTAG::VectorValueType::Undefined == m_inputValueType)
@@ -1917,6 +1714,7 @@ void AnnIndex::SetBuildParam(const char *p_name, const char *p_value, const char
 
 void AnnIndex::SetSearchParam(const char *p_name, const char *p_value, const char *p_section)
 {
+    if (!ValidatePostingParameters(p_name, p_value)) return;
     if (nullptr != m_index)
         m_index->SetParameter(p_name, p_value, p_section);
 }
@@ -2544,6 +2342,8 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
              SPTAG::Helper::StrUtils::StrEqualIgnoreCase(value, "PerTagBKT"));
     };
     for (const auto& parameter : m_pendingBuildParams) {
+        if (!ValidatePostingParameters(std::get<0>(parameter).c_str(), std::get<1>(parameter).c_str()))
+            return false;
         if (removedSetting(std::get<0>(parameter).c_str(), std::get<1>(parameter).c_str(),
                            std::get<2>(parameter).c_str())) {
             fprintf(stderr, "[ERROR] %s was removed; use canonical native options.\n",
@@ -2552,6 +2352,9 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
         }
     }
     for (const auto& parameter : m_extraSSDBuildParams) {
+        if (!ValidatePostingParameters(parameter.first.c_str(), parameter.second.c_str()) ||
+            !ValidateStagedPostingBudget(parameter.first.c_str(), parameter.second.c_str(), "BuildSSDIndex",
+                m_extraSSDBuildParams, m_pendingBuildParams, m_pendingSearchParams)) return false;
         if (removedSetting(parameter.first.c_str(), parameter.second.c_str(), "BuildSSDIndex")) {
             fprintf(stderr, "[ERROR] %s was removed; use canonical native options.\n",
                     parameter.first.c_str());
@@ -4006,6 +3809,9 @@ void TenantIndexManager::SetBuildParam(const char* p_name, const char* p_value, 
         return;
     }
     p_name = SPTAG::SPANN::Options::CanonicalParameter(p_section, p_name);
+    if (!ValidatePostingParameters(p_name, p_value) ||
+        !ValidateStagedPostingBudget(p_name, p_value, p_section,
+            m_extraSSDBuildParams, m_pendingBuildParams, m_pendingSearchParams)) return;
 
     bool updated = false;
     for (auto& pendingParam : m_pendingBuildParams)
@@ -4035,7 +3841,10 @@ void TenantIndexManager::SetSearchParam(const char* p_name, const char* p_value,
     }
     p_name = SPTAG::SPANN::Options::CanonicalParameter(p_section, p_name);
 
+    if (!ValidatePostingParameters(p_name, p_value)) return;
     std::unique_lock<std::shared_mutex> wlock(m_tenantIndicesMutex);
+    if (!ValidateStagedPostingBudget(p_name, p_value, p_section,
+        m_extraSSDBuildParams, m_pendingBuildParams, m_pendingSearchParams)) return;
     bool updated = false;
     for (auto& pendingParam : m_pendingSearchParams)
     {
@@ -4219,7 +4028,9 @@ bool TenantIndexManager::EnsureTenantLoaded(int p_tenantId)
     m_lruMap[p_tenantId] = std::prev(m_lruList.end());
 
     EnsureHeadNodeMetaLoaded(loadPath, indexPtr->GetInternalIndex());
-
+    auto* routingIndex = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(indexPtr->GetInternalIndex().get());
+    if (routingIndex && routingIndex->RefreshRoutingSignatures() != SPTAG::ErrorCode::Success)
+        return false;
     return true;
 }
 
@@ -4661,12 +4472,14 @@ bool TenantIndexManager::BuildSignatures(
                 !staticStorage;
             std::shared_ptr<SPTAG::VectorIndex>
                 loadedMemoryIndex;
+            std::shared_ptr<SPTAG::VectorIndex> loadedInternalIndex;
             {
                 std::shared_lock<std::shared_mutex> rlock(m_tenantIndicesMutex);
                 auto it = m_tenantIndices.find(p_tenantId);
                 if (it != m_tenantIndices.end()) {
                     const auto internalIndex =
                         it->second->GetInternalIndex();
+                    loadedInternalIndex = internalIndex;
                     if (staticStorage) {
                         loadedMemoryIndex =
                             GetMemoryIndexForInternal(
@@ -4720,7 +4533,8 @@ bool TenantIndexManager::BuildSignatures(
                         "(static=%d headmeta=%d sig=%d routeStats=%d on disk)\n",
                         p_tenantId, (int)staticStorage, (int)headMetaOk,
                         (int)sigOk, (int)routeStatsOk);
-                return true;
+                auto* routing = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(loadedInternalIndex.get());
+                return routing && routing->RefreshRoutingSignatures() == SPTAG::ErrorCode::Success;
             }
             fprintf(stderr,
                     "[INFO] Tenant %d: rebuilding signatures because persisted "
@@ -4820,9 +4634,8 @@ bool TenantIndexManager::BuildSignatures(
                 }
             }
 
-            memoryIndex->InitializeHeadNodeMeta(
-                numHeadSamples, numNumericCols,
-                hierWidths,
+            memoryIndex->InitializeCompactHeadNodeMeta(
+                numHeadSamples, tagSchema, hierWidths,
                 hybridDistanceEnabled ||
                     limitedTagEnabled);
             if (!spannInternalIdx->PopulateHeadNodeGlobalVIDsFromBundles()) {
@@ -5155,7 +4968,7 @@ bool TenantIndexManager::BuildSignatures(
             fprintf(stderr, "[INFO] Tenant %d: head_node_meta generated for %d heads "
                     "(%d resolved) [non-FILEIO].\n",
                     p_tenantId, (int)numHeadSamples, resolved);
-            return true;
+            return spannInternalIdx->RefreshRoutingSignatures() == SPTAG::ErrorCode::Success;
         }
     }
 
@@ -5574,9 +5387,8 @@ bool TenantIndexManager::BuildSignatures(
         auto* spannInternalIdx = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(internalIdx.get());
         if (memoryIndex != nullptr && spannInternalIdx != nullptr) {
             const SizeType numHeadSamples = memoryIndex->GetNumSamples();
-            memoryIndex->InitializeHeadNodeMeta(
-                numHeadSamples, numNumericCols,
-                hierWidths,
+            memoryIndex->InitializeCompactHeadNodeMeta(
+                numHeadSamples, tagSchema, hierWidths,
                 hasSelfContainedGlobalTail);
             for (SizeType hid = 0; hid < numHeadSamples; ++hid) {
                 SizeType globalVID = spannInternalIdx->GetGlobalVID(hid);
@@ -5718,7 +5530,12 @@ bool TenantIndexManager::BuildSignatures(
     fprintf(stderr, "[INFO] Tenant %d: built posting membership metadata + %d head tags (%d postings, %llu assignments)\n",
             p_tenantId, headTagCount, numHeads,
             static_cast<unsigned long long>(totalAssignments));
-    return true;
+    std::shared_lock<std::shared_mutex> routingLock(m_tenantIndicesMutex);
+    const auto routingTenant = m_tenantIndices.find(p_tenantId);
+    if (routingTenant == m_tenantIndices.end()) return false;
+    auto* routing = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(
+        routingTenant->second->GetInternalIndex().get());
+    return routing && routing->RefreshRoutingSignatures() == SPTAG::ErrorCode::Success;
 }
 
 std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
@@ -6082,7 +5899,7 @@ std::shared_ptr<QueryResult> TenantIndexManager::SearchWithPredicate(
                             const auto* mask = memIdx->GetHeadNodePS(localHid);
                             return mask == nullptr || mask->MayIntersect(queryMask);
                         }
-                        const auto* hierMask = memIdx->GetHeadNodePostingHierMask(localHid);
+                        const auto hierMask = memIdx->GetHeadNodePostingHierMask(localHid);
                         if (hierMask == nullptr) return true;  // fail open
                         if (dnfHasNum && quantCols > 0 && qp != nullptr) {
                             const std::uint64_t* quant = memIdx->GetHeadNodeNumQuant(localHid);

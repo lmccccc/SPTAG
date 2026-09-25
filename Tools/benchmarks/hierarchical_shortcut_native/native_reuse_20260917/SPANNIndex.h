@@ -1,0 +1,1022 @@
+#include "PostingSupplier.h"
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#ifndef _SPTAG_SPANN_INDEX_H_
+#define _SPTAG_SPANN_INDEX_H_
+
+#include "inc/Core/Common.h"
+#include "inc/Core/VectorIndex.h"
+
+#include "inc/Core/Common/CommonUtils.h"
+#include "inc/Core/Common/DistanceUtils.h"
+#include "inc/Core/Common/SIMDUtils.h"
+#include "inc/Core/Common/QueryResultSet.h"
+#include "inc/Core/Common/BKTree.h"
+#include "inc/Core/Common/WorkSpacePool.h"
+#include "inc/Core/Common/FineGrainedLock.h"
+#include "inc/Core/Common/VersionLabel.h"
+#include "inc/Core/Common/PostingSizeRecord.h"
+
+#include "inc/Core/Common/LabelSet.h"
+#include "inc/Helper/SimpleIniReader.h"
+#include "inc/Helper/StringConvert.h"
+#include "inc/Helper/ThreadPool.h"
+#include "inc/Helper/ConcurrentSet.h"
+#include "inc/Helper/AtomicFile.h"
+#include "inc/Helper/VectorSetReader.h"
+#include "inc/Core/Common/IQuantizer.h"
+
+#include "IExtraSearcher.h"
+#include "HybridHeadGraph.h"
+#include "HybridRoutingStats.h"
+#include "LimitedTagSupport.h"
+#include "SecondLevelHeadPostings.h"
+#include "Options.h"
+
+#include <functional>
+#include <shared_mutex>
+#include <atomic>
+#include <algorithm>
+#include <cstdint>
+#include <utility>
+
+namespace SPTAG
+{
+
+    namespace Helper
+    {
+        class IniReader;
+    }
+
+
+    namespace SPANN
+    {
+        struct HeadBundleNodeInfo
+        {
+            int nodeId = 0;
+            std::string headIndexRelativePath;
+            SizeType headOffset = 0;
+            SizeType headCount = 0;
+            SizeType postingOffset = 0;
+            SizeType postingCount = 0;
+            SizeType assignmentCount = 0;
+        };
+
+        template<typename T>
+	    class SPANNResultIterator;
+
+        // Non-templated accessor interface for SPANN::Index<T>. The multi-tenant
+        // wrapper (CoreInterface) needs to reach SPANN-specific accessors without
+        // knowing the vector value type T. All methods here return value-type-
+        // agnostic types, so a single dynamic_cast<ISPANNIndex*> works for every
+        // instantiation (float / uint8 / int8 / ...). This replaces the previous
+        // hardcoded dynamic_cast<SPANN::Index<float>*>, which silently failed for
+        // any non-float index.
+        class ISPANNIndex
+        {
+        public:
+            virtual ~ISPANNIndex() = default;
+            virtual std::shared_ptr<VectorIndex> GetMemoryIndex() = 0;
+            virtual std::shared_ptr<IExtraSearcher> GetDiskIndex() = 0;
+            virtual Options* GetOptions() = 0;
+            virtual bool HasLimitedTagLayout() const = 0;
+            virtual SizeType GetGlobalVID(SizeType vid) = 0;
+            virtual bool PopulateHeadNodeGlobalVIDsFromBundles() = 0;
+            virtual ErrorCode CompactHierarchyVectors() { return ErrorCode::Undefined; }
+            // Output-only offline migration; destination must not exist or overlap the source.
+            virtual ErrorCode MaterializeHierarchyVectors(const std::string&) { return ErrorCode::Undefined; }
+            // Called only on private export/build staging directories before validation.
+            virtual ErrorCode PrepareHierarchyExport(const std::string&) { return ErrorCode::Success; }
+            virtual bool HasRoutingOnlyHierarchy() const { return false; }
+            virtual void SetVectorTags(const uint32_t* tags, int numVecs, int numTagsPerVec) = 0;
+            // The caller keeps this view alive until BuildIndex returns.
+            virtual void SetVectorTagsView(const uint32_t* tags, int numVecs, int numTagsPerVec) = 0;
+            virtual void SetNodeVectorAssignments(const std::vector<std::vector<SizeType>>& nodeVectorAssignments) = 0;
+            virtual void SetPrimaryNodeVectorAssignments(const std::vector<std::vector<SizeType>>& primaryNodeVectorAssignments) = 0;
+            virtual void SetSharedDB(std::shared_ptr<Helper::KeyValueIO> p_db) = 0;
+            virtual bool BuildPrimaryHeadCSRBackfill(const void* vectors, SizeType vectorCount,
+                                                     const uint32_t* tags, int numTagsPerVec) = 0;
+            virtual ErrorCode AddIndexWithTags(const void* data, SizeType vectorNum,
+                                                DimensionType dimension, const uint32_t* tags,
+                                                int numTagsPerVec, bool normalized) = 0;
+        };
+
+        template<typename T>
+        class Index : public VectorIndex, public ISPANNIndex
+        {
+        private:
+            std::shared_ptr<VectorIndex> m_index;
+	        std::vector<HeadBundleNodeInfo> m_headBundleNodes;
+            mutable std::vector<std::shared_ptr<VectorIndex>> m_loadedHeadBundleIndexes;
+            mutable std::vector<std::vector<SizeType>> m_headBundleLocalToGlobalHIDs;
+            mutable std::unordered_map<SizeType, SizeType> m_globalHeadVIDToLocalHID;
+            mutable std::mutex m_globalHeadVIDToLocalHIDMutex;
+            mutable std::mutex m_headBundleLoadLock;
+            // Runtime cross-edge suffix appended directly after each bundle RNG
+            // row. In hybrid mode the same head_cross_edges.bin interface stores
+            // degree-16 hybrid edges for the single global BKT head graph.
+            mutable DimensionType m_headInlineCrossEdgeSize = 0;
+            mutable size_t m_headInlineCrossEdgeTotal = 0;
+            mutable bool m_headInlineEdgesHybrid = false;
+            mutable std::uint64_t m_headInlineCrossEdgeGeneration = 0;
+            mutable std::uint64_t m_headInlineCrossEdgeContent = 0;
+            mutable std::uint64_t m_headInlineCrossEdgeBodyFingerprint = 0;
+            mutable DimensionType m_headLocatorLocalBits = 0;
+            mutable SizeType m_headLocatorLocalMask = 0;
+            mutable std::vector<std::int16_t> m_headBundleNodeByB;        // -1 if unresolved
+            mutable std::vector<SizeType> m_headBundleLocalByB;           // local id inside bundle
+            mutable std::atomic<bool> m_headBundleDenseMapsReady{false};
+            mutable std::mutex m_headBundleDenseMapsMutex;
+            mutable std::atomic<bool> m_headCrossEdgesLoaded{false};
+            mutable std::mutex m_headCrossEdgesMutex;
+            mutable std::atomic<bool> m_headCrossEdgesDirty{false};
+            mutable HybridHeadGraph m_hybridHeadGraph;
+            mutable HybridDistanceConfig m_hybridDistance;
+            mutable HybridRoutingStats m_hybridRoutingStats;
+            mutable LimitedTagSupport m_limitedTagSupport;
+            // One slot per configured hierarchy layer. Lower-layer indexes are
+            // build-time-only; the highest slot retains the persisted graph.
+            std::vector<std::shared_ptr<VectorIndex>> m_secondLevelIndexes;
+            std::vector<std::shared_ptr<VectorSet>> m_secondLevelCatalogs;
+            std::vector<SecondLevelHeadPostings> m_secondLevelPostings;
+            mutable std::atomic<bool> m_headHybridGraphLoaded{false};
+            mutable std::mutex m_headHybridGraphMutex;
+            mutable std::shared_timed_mutex m_headTopologyLock;
+            // globalVID -> (bundleNodeId, localHidWithinBundle) reverse map, populated
+            // on each EnsureHeadBundleNodeLoaded for the loaded node only.
+            mutable std::unordered_map<SizeType, std::pair<int, SizeType>> m_globalVIDToBundleLoc;
+            mutable std::mutex m_globalVIDToBundleLocMutex;
+            std::string m_headBundleBaseDir;
+	        COMMON::Dataset<std::uint64_t> m_vectorTranslateMap;
+            // Dual-pool slim head store: when true, the root head index physically holds
+            // only the U_extra head vectors; H1 head GetSample lookups are resolved into
+            // the per-bundle subgraph stores. Detected at load via HeadIndex/head_metaonly.bin.
+            mutable bool m_metadataOnlyHeadStore = false;
+            // head_metaonly.bin: V1 legacy flat/bundle, V2 disjoint, V3 routing-only.
+            std::int32_t m_hierarchyCatalogVersion = 0;
+            std::uint64_t m_hierarchyCatalogFingerprint = 0;
+            // Graphless H1 mode retains this catalog for hierarchy expansion/rerank.
+            // It is deliberately separate from the metadata-only root's one
+            // physical compatibility vector.
+            mutable std::shared_ptr<VectorSet> m_h1CatalogVectors;
+            // Build-time hierarchy CSR used only while creating graphless-H1
+            // postings. Persisted signatures are added after support is learned.
+            std::vector<std::vector<std::uint64_t>> m_graphlessHierarchyOffsets;
+            std::vector<std::vector<SecondLevelHeadPostings::Member>>
+                m_graphlessHierarchyMembers;
+            // Precomputed H1 head-id -> resolved bundle sample pointer table. Built once at
+            // load (SetupMetadataOnlyHeadStore) after every bundle is eager-loaded and
+            // immutable, so the external sample resolver is a lock-free O(1) array lookup
+            // on the search hot path (the unordered_map + mutex path was a 4x unfilter
+            // regression).
+            mutable std::vector<const void*> m_metaOnlyHeadVectorPtrs;
+            std::unordered_map<std::string, std::string> m_headParameters;
+            // Construction values must survive a subsequent runtime overlay when
+            // serializing the distinct [BuildSSDIndex] section.
+            std::vector<std::pair<std::string, std::string>> m_buildSSDParameters;
+            // Explicit runtime settings supplied through [SearchSSDIndex]. Keep
+            // them separate from the construction options so SaveConfig preserves
+            // the native build/search section boundary.
+            std::vector<std::pair<std::string, std::string>> m_searchSSDParameters;
+
+            std::unique_ptr<NativeReuse::PostingModel> m_nativePostingModel;
+            COMMON::VersionLabel m_versionMap;
+            std::shared_ptr<IExtraSearcher> m_extraSearcher;
+            std::unique_ptr<SPTAG::COMMON::IWorkSpaceFactory<ExtraWorkSpace>> m_workSpaceFactory;
+
+            Options m_options;
+            bool m_recoveredLimitedTagReadOnly = false;
+            bool m_mutableLimitedTagLayout = false;
+            bool m_mutableLimitedTagRecovery = false;
+            std::string m_mutableLimitedTagIndexDirectory;
+
+            std::function<float(const T*, const T*, DimensionType)> m_fComputeDistance;
+            int m_iBaseSquare;
+
+            std::recursive_mutex m_dataAddLock;
+            std::shared_timed_mutex m_dataDeleteLock;
+            std::shared_timed_mutex m_checkPointLock;
+
+            // Pre-set vector tags for embedding in postings during build
+            std::vector<uint32_t> m_pendingVectorTags;
+            const uint32_t* m_pendingVectorTagsView = nullptr;
+            size_t m_pendingVectorTagCount = 0;
+            int m_pendingNumTagsPerVec = 0;
+            std::vector<std::vector<SizeType>> m_pendingNodeVectorAssignments;
+            std::vector<std::vector<SizeType>> m_pendingPrimaryNodeVectorAssignments;
+            std::vector<std::vector<SizeType>> m_pendingNodeHeadSelections;
+            std::unordered_map<SizeType, int> m_pendingHeadVectorOwners;
+
+            // Dual-pool v3: per-bundle U_extra VID lists and head role vector
+            std::vector<std::vector<SizeType>> m_pendingNodeUExtraSelections;
+            std::vector<uint8_t> m_pendingHeadRoles;
+
+            ErrorCode InitializeHeadBundleNodesFromSelections();
+            ErrorCode LoadTopLevelHeadIDMap(SizeType p_expectedHeadCount);
+            ErrorCode ActivateMetadataOnlyBundleRoot();
+            ErrorCode TryResumeCompletedBundleHeads(bool& p_resumed);
+
+        public:
+            Index()
+            {
+                m_workSpaceFactory = std::make_unique<SPTAG::COMMON::ThreadLocalWorkSpaceFactory<ExtraWorkSpace>>();
+                //m_workSpaceFactory = std::make_unique<SPTAG::COMMON::SharedPoolWorkSpaceFactory<ExtraWorkSpace>>();
+                m_fComputeDistance = std::function<float(const T*, const T*, DimensionType)>(COMMON::DistanceCalcSelector<T>(m_options.m_distCalcMethod));
+                m_iBaseSquare = (m_options.m_distCalcMethod == DistCalcMethod::Cosine) ? COMMON::Utils::GetBase<T>() * COMMON::Utils::GetBase<T>() : 1;
+            }
+
+            ~Index() {}
+
+            inline std::shared_ptr<VectorIndex> GetMemoryIndex() { return m_index; }
+            inline std::shared_ptr<IExtraSearcher> GetDiskIndex() { return m_extraSearcher; }
+            // Offline maintenance: the caller must quiesce searches before compaction.
+            ErrorCode CompactHierarchyVectors() override;
+            ErrorCode MaterializeHierarchyVectors(const std::string& p_directory) override;
+            ErrorCode PrepareHierarchyExport(const std::string& p_directory) override;
+            bool HasRoutingOnlyHierarchy() const override { return m_hierarchyCatalogVersion == 3; }
+            inline Options* GetOptions() { return &m_options; }
+            inline const std::vector<HeadBundleNodeInfo>& GetHeadBundleNodes() const { return m_headBundleNodes; }
+            inline bool HasHeadBundleNodes() const { return !m_headBundleNodes.empty(); }
+            inline DimensionType GetInlineHeadCrossEdgeSize() const { return m_headInlineCrossEdgeSize; }
+            inline size_t GetInlineHeadCrossEdgeTotal() const { return m_headInlineCrossEdgeTotal; }
+            inline bool InlineHeadEdgesAreHybrid() const { return m_headInlineEdgesHybrid; }
+            inline DimensionType GetInlineHeadLocatorLocalBits() const { return m_headLocatorLocalBits; }
+
+            // v5: Σ bundle.headCount — canonical "total head count" after cross-edges unified
+            // the per-bundle subgraphs into one logical graph. Replaces m_index->GetNumSamples()
+            // at sites where the value means "how many heads exist", not "navigate via m_index".
+            inline SizeType TotalHeadSampleCount() const {
+                SizeType n = 0;
+                for (const auto& bn : m_headBundleNodes) n += bn.headCount;
+                return n;
+            }
+
+            // Dual-pool v3: role-based head classification using loaded head_role.bin sidecar.
+            inline bool HasHeadRoles() const {
+                return m_extraSearcher && m_extraSearcher->HasHeadRoles();
+            }
+            inline bool IsHeadRoleUnfilterOnly(SizeType globalHeadVID) const {
+                if (!m_extraSearcher) return false;
+                std::lock_guard<std::mutex> lock(m_globalHeadVIDToLocalHIDMutex);
+                auto bIt = m_globalHeadVIDToLocalHID.find(globalHeadVID);
+                if (bIt == m_globalHeadVIDToLocalHID.end()) return false;
+                return m_extraSearcher->IsUnfilterOnlyHead(static_cast<int>(bIt->second));
+            }
+
+            // Set per-vector tags to be embedded in posting metadata during build
+            void SetVectorTags(const uint32_t* tags, int numVecs, int numTagsPerVec) {
+                m_pendingNumTagsPerVec = numTagsPerVec;
+                m_options.m_numTagsPerVec = numTagsPerVec;
+                m_pendingVectorTags.assign(tags, tags + (size_t)numVecs * numTagsPerVec);
+                m_pendingVectorTagsView = nullptr;
+                m_pendingVectorTagCount = 0;
+            }
+
+            void SetVectorTagsView(const uint32_t* tags, int numVecs, int numTagsPerVec) {
+                m_pendingNumTagsPerVec = numTagsPerVec;
+                m_options.m_numTagsPerVec = numTagsPerVec;
+                m_pendingVectorTags.clear();
+                m_pendingVectorTagsView = tags;
+                m_pendingVectorTagCount =
+                    static_cast<size_t>(numVecs) *
+                    static_cast<size_t>(numTagsPerVec);
+            }
+
+            void SetNodeVectorAssignments(const std::vector<std::vector<SizeType>>& nodeVectorAssignments)
+            {
+                m_pendingNodeVectorAssignments = nodeVectorAssignments;
+            }
+
+            void SetPrimaryNodeVectorAssignments(const std::vector<std::vector<SizeType>>& primaryNodeVectorAssignments)
+            {
+                m_pendingPrimaryNodeVectorAssignments = primaryNodeVectorAssignments;
+            }
+
+            bool BuildPrimaryHeadCSRBackfill(const void* vectors, SizeType vectorCount,
+                                             const uint32_t* tags, int numTagsPerVec) override;
+
+            // Shared-DB hook: when set BEFORE BuildIndex / LoadIndex, the
+            // ExtraDynamicSearcher will reuse this KeyValueIO instead of opening
+            // its own RocksDB. Wrap with Helper::TenantPrefixedKeyValueIO when
+            // multiplexing several tenants over a single physical store.
+            void SetSharedDB(std::shared_ptr<Helper::KeyValueIO> p_db) { m_options.m_externalDB = std::move(p_db); }
+            std::shared_ptr<Helper::KeyValueIO> GetSharedDB() const { return m_options.m_externalDB; }
+
+            inline SizeType GetNumSamples() const { return m_versionMap.Count(); }
+            inline DimensionType GetFeatureDim() const { return m_index->GetFeatureDim(); }
+            inline SizeType GetValueSize() const { return m_options.m_dim * sizeof(T); }
+
+            inline int GetCurrMaxCheck() const { return m_options.m_maxCheck; }
+            inline int GetNumThreads() const { return m_options.m_iSSDNumberOfThreads; }
+            inline DistCalcMethod GetDistCalcMethod() const { return m_options.m_distCalcMethod; }
+            inline IndexAlgoType GetIndexAlgoType() const { return IndexAlgoType::SPANN; }
+            inline VectorValueType GetVectorValueType() const { return GetEnumValueType<T>(); }
+
+            void SetQuantizer(std::shared_ptr<SPTAG::COMMON::IQuantizer> quantizer);
+
+            inline float AccurateDistance(const void* pX, const void* pY) const { 
+                if (m_options.m_distCalcMethod == DistCalcMethod::L2) return m_fComputeDistance((const T*)pX, (const T*)pY, m_options.m_dim);
+
+                float xy = m_iBaseSquare - m_fComputeDistance((const T*)pX, (const T*)pY, m_options.m_dim);
+                float xx = m_iBaseSquare - m_fComputeDistance((const T*)pX, (const T*)pX, m_options.m_dim);
+                float yy = m_iBaseSquare - m_fComputeDistance((const T*)pY, (const T*)pY, m_options.m_dim);
+                return 1.0f - xy / (sqrt(xx) * sqrt(yy));
+            }
+            inline float ComputeDistance(const void* pX, const void* pY) const { return m_fComputeDistance((const T*)pX, (const T*)pY, m_options.m_dim); }
+            inline float GetDistance(const void* target, const SizeType idx) const {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "GetDistance NOT SUPPORT FOR SPANN");
+                return -1;
+            }
+            inline bool ContainSample(const SizeType idx) const { return idx >= 0 && idx < m_versionMap.Count() && !m_versionMap.Deleted(idx); }
+
+            std::shared_ptr<std::vector<std::uint64_t>> BufferSize() const
+            {
+                std::shared_ptr<std::vector<std::uint64_t>> buffersize(new std::vector<std::uint64_t>);
+                auto headIndexBufferSize = m_index->BufferSize();
+                buffersize->insert(buffersize->end(), headIndexBufferSize->begin(), headIndexBufferSize->end());
+                buffersize->push_back(sizeof(long long) * m_index->GetNumSamples());
+                return std::move(buffersize);
+            }
+
+            std::shared_ptr<std::vector<std::string>> GetIndexFiles() const
+            {
+                std::shared_ptr<std::vector<std::string>> files(new std::vector<std::string>);
+                auto headfiles = m_index->GetIndexFiles();
+                for (auto file : *headfiles) {
+                    files->push_back(m_options.m_headIndexFolder + FolderSep + file);
+                }
+                files->push_back(m_options.m_headIDFile);
+                return std::move(files);
+            }
+
+            ErrorCode SaveConfig(std::shared_ptr<Helper::DiskIO> p_configout);
+            ErrorCode PrepareIndexSave(
+                const std::string& p_folderPath) override
+            {
+                if (IsRecoveredLimitedTagReadOnly()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Recovered limited-tag H/O generations are read-only.\n");
+                    return ErrorCode::Undefined;
+                }
+                if (!MutableLimitedTagConfigurationIntact()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Mutable limited-tag H/O layout identity cannot be changed at runtime.\n");
+                    return ErrorCode::Undefined;
+                }
+                if (HasMutableLimitedTagLayout() &&
+                    !IsCurrentIndexDirectory(
+                        p_folderPath)) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Mutable limited-tag H/O indexes do not support cross-directory SaveIndex.\n");
+                    return ErrorCode::Undefined;
+                }
+                return m_extraSearcher == nullptr
+                    ? ErrorCode::Success
+                    : m_extraSearcher
+                          ->BeginLimitedTagCheckpoint(
+                              p_folderPath);
+            }
+
+            ErrorCode AcquireIndexSaveLock(
+                const std::string& p_folderPath) override
+            {
+                if (HasMutableLimitedTagLayout()) {
+                    if (!IsCurrentIndexDirectory(
+                            p_folderPath)) {
+                        return ErrorCode::Undefined;
+                    }
+                    m_checkPointLock.lock();
+                    m_dataAddLock.lock();
+                    m_dataDeleteLock.lock();
+                }
+                return ErrorCode::Success;
+            }
+
+            void ReleaseIndexSaveLock(
+                const std::string&) override
+            {
+                if (HasMutableLimitedTagLayout()) {
+                    m_dataDeleteLock.unlock();
+                    m_dataAddLock.unlock();
+                    m_checkPointLock.unlock();
+                }
+            }
+
+            bool SupportsNonDirectorySave()
+                const override
+            {
+                return
+                    !HasMutableLimitedTagLayout() &&
+                    !IsLimitedTagMutationReadOnly();
+            }
+
+            ErrorCode CompleteIndexSave(
+                const std::string& p_folderPath) override
+            {
+                if (HasMutableLimitedTagLayout() &&
+                    !Helper::SyncDirectoryTree(
+                        p_folderPath)) {
+                    return ErrorCode::DiskIOFail;
+                }
+                return m_extraSearcher == nullptr
+                    ? ErrorCode::Success
+                    : m_extraSearcher
+                          ->CommitLimitedTagReadiness(
+                              p_folderPath);
+            }
+            ErrorCode SaveIndexData(const std::vector<std::shared_ptr<Helper::DiskIO>>& p_indexStreams);
+
+            ErrorCode LoadConfig(Helper::IniReader& p_reader);
+            ErrorCode LoadIndexData(const std::vector<std::shared_ptr<Helper::DiskIO>>& p_indexStreams);
+            ErrorCode LoadIndexDataFromMemory(const std::vector<ByteArray>& p_indexBlobs);
+
+            ErrorCode BuildIndex(const void* p_data, SizeType p_vectorNum, DimensionType p_dimension, bool p_normalized = false, bool p_shareOwnership = false);
+            ErrorCode BuildIndex(bool p_normalized = false);
+            ErrorCode SearchIndex(QueryResult &p_query, bool p_searchDeleted = false) const;
+
+            std::shared_ptr<ResultIterator> GetIterator(const void* p_target, bool p_searchDeleted = false, std::function<bool(const ByteArray&)> p_filterFunc = nullptr, int p_maxCheck = 0) const;
+            ErrorCode SearchIndexIterativeNext(QueryResult& p_results, COMMON::WorkSpace* workSpace, int batch, int& resultCount, bool p_isFirst, bool p_searchDeleted = false) const;
+            ErrorCode SearchIndexIterativeEnd(std::unique_ptr<COMMON::WorkSpace> workSpace) const;
+            ErrorCode SearchIndexIterativeEnd(std::unique_ptr<SPANN::ExtraWorkSpace> extraWorkspace) const;
+            bool SearchIndexIterativeFromNeareast(QueryResult& p_query, COMMON::WorkSpace* p_space, bool p_isFirst, bool p_searchDeleted = false) const;
+            std::unique_ptr<COMMON::WorkSpace> RentWorkSpace(int batch, std::function<bool(const ByteArray&)> p_filterFunc = nullptr, int p_maxCheck = 0) const;
+            ErrorCode SearchIndexIterative(QueryResult& p_headQuery, QueryResult& p_query, COMMON::WorkSpace* p_indexWorkspace, ExtraWorkSpace* p_extraWorkspace, int p_batch, int& resultCount, bool first) const;
+
+            ErrorCode SearchIndexWithFilter(QueryResult& p_query, std::function<bool(const ByteArray&)> filterFunc, int maxCheck = 0, bool p_searchDeleted = false) const;
+
+            ErrorCode SearchDiskIndex(QueryResult& p_query, SearchStats* p_stats = nullptr) const;
+	        ErrorCode SearchDiskIndexIterative(QueryResult& p_headQuery, QueryResult& p_query, ExtraWorkSpace* extraWorkspace) const;
+            ErrorCode DebugSearchDiskIndex(QueryResult& p_query, int p_subInternalResultNum, int p_internalResultNum,
+                SearchStats* p_stats = nullptr, std::set<int>* truth = nullptr, std::map<int, std::set<int>>* found = nullptr) const;
+            ErrorCode UpdateIndex();
+
+            void InitializeDefaultHeadBundle();
+            ErrorCode SaveHeadBundleManifest(const std::string& p_baseDir) const;
+            ErrorCode LoadHeadBundleManifest(const std::string& p_baseDir);
+
+            // SelectHead resume checkpoint: persist / reload the spatial head-selection
+            // build state so a failed BuildHead/BuildSSDIndex can restart without
+            // re-running the head-selection BKT. Gated by SPTAG_PERSIST_SELECTHEAD
+            // (+ SPTAG_RESUME_BUILD to actually resume).
+            ErrorCode SaveHeadSelectState(const std::string& p_path) const;
+            ErrorCode LoadHeadSelectState(const std::string& p_path);
+            ErrorCode InitializeHeadBundleRuntime(const std::string& p_baseDir);
+            ErrorCode SetupMetadataOnlyHeadStore(const std::string& p_baseDir);
+            ErrorCode EnsureHeadBundleNodeLoaded(int p_nodeId) const;
+            ErrorCode EnsureHeadBundleDenseMaps() const;
+            ErrorCode ResizeInlineHeadCrossEdges(
+                DimensionType p_crossEdgeCount) const;
+            ErrorCode LoadHeadHybridGraph() const;
+            ErrorCode LoadHybridRoutingStats();
+            ErrorCode LoadLimitedTagSupport(
+                const std::string& p_baseDir);
+            ErrorCode BuildSecondLevelHeadPostings();
+            ErrorCode ValidateSecondLevelSampleIDs(
+                const std::vector<std::vector<std::uint64_t>>& p_levelToLower);
+            ErrorCode LoadSecondLevelIndex(
+                const std::string& p_baseDir);
+            ErrorCode LoadOwnedHierarchyCatalogs(
+                const std::string& p_baseDir,
+                const std::vector<std::vector<std::uint64_t>>& p_levelToLower,
+                const std::shared_ptr<VectorIndex>& p_topIndex,
+                std::vector<std::shared_ptr<VectorSet>>& p_catalogs) const;
+            ErrorCode FingerprintHierarchyCatalog(
+                const std::shared_ptr<VectorSet>& p_heads,
+                std::uint64_t& p_fingerprint) const;
+            ErrorCode FinalizeRoutingHierarchyStorage();
+            ErrorCode EnsureHierarchyHeadMetadata(const std::string& p_baseDir, bool p_build);
+            ErrorCode RefreshHierarchySignatures(
+                const std::vector<std::vector<std::uint64_t>>& p_levelToLower,
+                bool p_validateOnly);
+            ErrorCode SearchSecondLevelHeads(
+                COMMON::QueryResultSet<T>* p_queryResults,
+                int p_graphResultNum,
+                const Cache::PostingBitmask&
+                    p_querySignature,
+                const std::function<bool(SizeType)>&
+                    p_headAdmission,
+                const LimitedTagSupport* p_headSupport,
+                int& p_scannedOut,
+                ExtraWorkSpace* p_workspace = nullptr,
+                const std::function<bool(SizeType, const float*)>& p_headPointCandidate = nullptr) const;
+            ErrorCode LoadHeadCrossEdges() const;
+            ErrorCode EnsureHeadHybridGraph();
+            ErrorCode EnsureStaticTailCrossEdges();
+            bool SearchStaticTailCrossGraph(
+                const T* p_target,
+                int p_ownerNode,
+                int p_candidateCount,
+                std::vector<std::pair<SizeType, float>>& p_candidates) const;
+            ErrorCode SearchHeadBundleCrossEdgesNative(
+                COMMON::QueryResultSet<T>* p_queryResults,
+                int p_entryNode,
+                int p_graphResultNum,
+                int& p_scannedOut,
+                bool p_useHybrid,
+                const std::uint32_t* p_queryTags,
+                int p_numQueryTags,
+                const Cache::DNFPredicate* p_queryDNF) const;
+            ErrorCode SearchHeadBundlesNative(
+                COMMON::QueryResultSet<T>* p_queryResults,
+                const std::vector<int>& p_candidateNodes,
+                int p_graphResultNum,
+                int& p_scannedOut,
+                const std::function<bool(SizeType)>&
+                    p_globalResultFilter = {},
+                int p_resultFilterMaxCheck = 0) const;
+
+            ErrorCode SetParameter(const char* p_param, const char* p_value, const char* p_section = nullptr);
+            std::string GetParameter(const char* p_param, const char* p_section = nullptr) const;
+
+            inline const void* GetSample(const SizeType idx) const { return nullptr; }
+            inline SizeType GetNumDeleted() const { return m_versionMap.GetDeleteCount(); }
+            inline bool NeedRefine() const
+            {
+                // Limited H/O head and posting IDs are append-only; legacy
+                // compaction cannot preserve their support-row identity.
+                if (m_limitedTagSupport.HasExpansion()) return false;
+                if (IsRecoveredLimitedTagReadOnly()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Recovered limited-tag H/O generations are read-only.\n");
+                    return false;
+                }
+                if (HasMutableLimitedTagLayout()) {
+                    return false;
+                }
+                return m_versionMap.GetDeleteCount() > (size_t)(GetNumSamples() * m_options.m_fDeletePercentageForRefine);
+            }
+            ErrorCode RefineSearchIndex(QueryResult &p_query, bool p_searchDeleted = false) const { return ErrorCode::Undefined; }
+            ErrorCode SearchTree(QueryResult& p_query) const { return ErrorCode::Undefined; }
+            ErrorCode AddIndex(const void* p_data, SizeType p_vectorNum, DimensionType p_dimension, std::shared_ptr<MetadataSet> p_metadataSet, bool p_withMetaIndex = false, bool p_normalized = false);
+            ErrorCode AddIndexWithTags(const void* p_data, SizeType p_vectorNum,
+                                       DimensionType p_dimension, const uint32_t* p_tags,
+                                       int p_numTagsPerVec, bool p_normalized) override;
+            ErrorCode DeleteIndex(const SizeType& p_id);
+
+            ErrorCode DeleteIndex(const void* p_vectors, SizeType p_vectorNum);
+            ErrorCode RefineIndex(const std::vector<std::shared_ptr<Helper::DiskIO>> &p_indexStreams,
+                                  IAbortOperation *p_abort, std::vector<SizeType> *p_mapping);
+            ErrorCode RefineIndex(std::shared_ptr<VectorIndex>& p_newIndex) { return ErrorCode::Undefined; }
+
+            ErrorCode Check() override;
+
+            ErrorCode SetWorkSpaceFactory(std::unique_ptr<SPTAG::COMMON::IWorkSpaceFactory<SPTAG::COMMON::IWorkSpace>> up_workSpaceFactory)
+            {
+                SPTAG::COMMON::IWorkSpaceFactory<SPTAG::COMMON::IWorkSpace>* raw_generic_ptr = up_workSpaceFactory.release();
+                if (!raw_generic_ptr) return ErrorCode::Fail;
+
+
+                SPTAG::COMMON::IWorkSpaceFactory<ExtraWorkSpace>* raw_specialized_ptr = dynamic_cast<SPTAG::COMMON::IWorkSpaceFactory<ExtraWorkSpace>*>(raw_generic_ptr);
+                if (!raw_specialized_ptr)
+                {
+                    // If it is of type SPTAG::COMMON::WorkSpace, we should pass on to child index
+                    if (!m_index) 
+                    {
+                        delete raw_generic_ptr;
+                        return ErrorCode::Fail;
+                    }
+                    else
+                    {
+                        return m_index->SetWorkSpaceFactory(std::unique_ptr<SPTAG::COMMON::IWorkSpaceFactory<SPTAG::COMMON::IWorkSpace>>(raw_generic_ptr));
+                    }
+                    
+                }
+                else
+                {
+                    m_workSpaceFactory = std::unique_ptr<SPTAG::COMMON::IWorkSpaceFactory<ExtraWorkSpace>>(raw_specialized_ptr);
+                    return ErrorCode::Success;
+                }
+            }
+
+            SizeType GetGlobalVID(SizeType vid)
+            {
+                if (vid < 0 || vid >= m_vectorTranslateMap.R() || m_vectorTranslateMap.C() != 1)
+                    return MaxSize;
+                const std::uint64_t global = *m_vectorTranslateMap[vid];
+                return global < static_cast<std::uint64_t>(MaxSize)
+                    ? static_cast<SizeType>(global) : MaxSize;
+            }
+
+            // Monolithic and graphless catalogs share the existing head-ID map.
+            // Only legacy bundle-backed slim roots resolve IDs from bundles.
+            // Caller must InitializeHeadNodeMeta first.
+            bool PopulateHeadNodeGlobalVIDsFromBundles()
+            {
+                if (m_index == nullptr || !m_index->HasHeadNodeMeta()) return false;
+                const SizeType metaCount = m_index->GetHeadNodeMetaSampleCount();
+                const bool requireResolvedVIDs =
+                    m_options.m_enableLimitedTagPosting ||
+                    m_options.m_enableHybridDistance;
+                if ((!m_metadataOnlyHeadStore || !m_options.m_buildH1Graph) &&
+                    static_cast<SizeType>(m_vectorTranslateMap.R()) >= metaCount) {
+                    if (requireResolvedVIDs) {
+                        for (SizeType head = 0; head < metaCount; ++head) {
+                            if (*(m_vectorTranslateMap[head]) >=
+                                static_cast<std::uint64_t>(MaxSize)) {
+                                SPTAGLIB_LOG(
+                                    Helper::LogLevel::LL_Error,
+                                    "Cannot populate head metadata: head %d has an invalid canonical VID.\n",
+                                    static_cast<int>(head));
+                                return false;
+                            }
+                        }
+                    }
+                    for (SizeType localHeadId = 0; localHeadId < metaCount; ++localHeadId) {
+                        m_index->SetHeadNodeGlobalVID(
+                            localHeadId,
+                            static_cast<SizeType>(*(m_vectorTranslateMap[localHeadId])));
+                        m_index->SetHeadNodeBundleNodeId(localHeadId, 0);
+                    }
+                    for (size_t slot = 0; slot < m_headBundleNodes.size() &&
+                                          slot < m_headBundleLocalToGlobalHIDs.size(); ++slot) {
+                        for (SizeType head : m_headBundleLocalToGlobalHIDs[slot]) {
+                            if (head >= 0 && head < metaCount)
+                                m_index->SetHeadNodeBundleNodeId(head, m_headBundleNodes[slot].nodeId);
+                        }
+                    }
+                    return true;
+                }
+                if (!m_options.m_buildH1Graph) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Cannot populate graphless head metadata: the canonical head-ID map is incomplete.\n");
+                    return false;
+                }
+
+                std::lock_guard<std::mutex> lock(m_globalVIDToBundleLocMutex);
+                if (m_globalVIDToBundleLoc.empty() || m_headBundleLocalToGlobalHIDs.empty()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Cannot populate head metadata: bundle ID mappings are unavailable.\n");
+                    return false;
+                }
+                for (const auto& kv : m_globalVIDToBundleLoc)
+                {
+                    SizeType globalVID = kv.first;
+                    int nodeId = kv.second.first;
+                    SizeType local = kv.second.second;
+                    if (nodeId < 0 || nodeId >= (int)m_headBundleLocalToGlobalHIDs.size() ||
+                        nodeId >= (int)m_headBundleNodes.size()) continue;
+                    const auto& l2g = m_headBundleLocalToGlobalHIDs[(size_t)nodeId];
+                    if (local < 0 || (size_t)local >= l2g.size()) continue;
+                    SizeType globalHeadId = l2g[(size_t)local];
+                    if (globalHeadId < 0 || globalHeadId >= metaCount) continue;
+                    m_index->SetHeadNodeGlobalVID(globalHeadId, globalVID);
+                    m_index->SetHeadNodeBundleNodeId(
+                        globalHeadId, m_headBundleNodes[static_cast<size_t>(nodeId)].nodeId);
+                }
+                if (requireResolvedVIDs) {
+                    for (SizeType head = 0; head < metaCount; ++head) {
+                        const SizeType vid = m_index->GetHeadNodeGlobalVID(head);
+                        if (vid < 0 || vid == MaxSize) {
+                            SPTAGLIB_LOG(
+                                Helper::LogLevel::LL_Error,
+                                "Cannot populate head metadata: bundle head %d has no resolved VID.\n",
+                                static_cast<int>(head));
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            }
+
+            ErrorCode GetPostingDebug(SizeType vid, std::vector<SizeType>& VIDs, std::shared_ptr<VectorSet>& vecs);
+
+        private:
+            struct TaggedHeadLocation
+            {
+                int m_bundleSlot = -1;
+                SizeType m_localHeadID = -1;
+            };
+            struct LimitedPostingRecord
+            {
+                SizeType m_vid = -1;
+                std::uint32_t m_keyTag =
+                    LimitedTagSupport::EmptyTag;
+                std::vector<std::uint32_t> m_attributes;
+                std::string m_record;
+            };
+
+            bool IsCurrentIndexDirectory(
+                const std::string& p_path) const
+            {
+                const std::string& currentDirectory =
+                    m_mutableLimitedTagLayout &&
+                            !m_mutableLimitedTagIndexDirectory
+                                 .empty()
+                        ? m_mutableLimitedTagIndexDirectory
+                        : m_options.m_indexDirectory;
+                std::error_code error;
+                if (std::filesystem::equivalent(
+                        p_path,
+                        currentDirectory,
+                        error)) {
+                    return true;
+                }
+                error.clear();
+                const auto target =
+                    std::filesystem::weakly_canonical(
+                        p_path, error);
+                if (error) return false;
+                const auto current =
+                    std::filesystem::weakly_canonical(
+                        currentDirectory,
+                        error);
+                return !error && target == current;
+            }
+
+            void LatchMutableLimitedTagLayout()
+            {
+                if (!m_options
+                         .m_enableLimitedTagPosting ||
+                    m_options.m_storage !=
+                        Storage::FILEIO) {
+                    return;
+                }
+                if (!m_mutableLimitedTagLayout) {
+                    m_mutableLimitedTagRecovery =
+                        m_options.m_recovery;
+                    m_mutableLimitedTagIndexDirectory =
+                        m_options.m_indexDirectory;
+                }
+                m_mutableLimitedTagLayout = true;
+            }
+
+            bool HasMutableLimitedTagLayout() const
+            {
+                return m_mutableLimitedTagLayout ||
+                    (m_options
+                         .m_enableLimitedTagPosting &&
+                     m_options.m_storage ==
+                         Storage::FILEIO);
+            }
+
+            bool HasLimitedTagLayout()
+                const override
+            {
+                return m_mutableLimitedTagLayout ||
+                    m_options
+                        .m_enableLimitedTagPosting;
+            }
+
+            bool MutableLimitedTagConfigurationIntact()
+                const
+            {
+                return !m_mutableLimitedTagLayout ||
+                    (m_options
+                         .m_enableLimitedTagPosting &&
+                     m_options.m_storage ==
+                         Storage::FILEIO &&
+                     m_options.m_recovery ==
+                         m_mutableLimitedTagRecovery &&
+                     IsCurrentIndexDirectory(
+                         m_options.m_indexDirectory));
+            }
+
+            bool IsRecoveredLimitedTagReadOnly() const
+            {
+                return m_recoveredLimitedTagReadOnly;
+            }
+
+            bool IsLimitedTagMutationReadOnly() const
+            {
+                return IsRecoveredLimitedTagReadOnly() ||
+                    m_limitedTagSupport.HasExpansion();
+            }
+
+            bool CheckHeadIndexType();
+            void SelectHeadAdjustOptions(Options& p_options, int p_vectorCount);
+            int SelectHeadDynamicallyInternal(const std::shared_ptr<COMMON::BKTree> p_tree, int p_nodeID, const Options& p_opts, std::vector<SizeType>& p_selected);
+            void SelectHeadDynamically(const std::shared_ptr<COMMON::BKTree> p_tree, int p_vectorCount,
+                                       const Options& p_options, std::vector<SizeType>& p_selected,
+                                       const std::vector<SizeType>* p_candidateIndices = nullptr);
+
+            template <typename InternalDataType>
+            bool SelectHeadsFromData(COMMON::Dataset<InternalDataType>& p_data,
+                                     Options& p_options,
+                                     std::vector<SizeType>& p_selected,
+                                     const char* p_stage,
+                                     bool p_fallbackToFirst,
+                                     const std::vector<SizeType>* p_candidateIndices = nullptr);
+
+            template <typename InternalDataType>
+            bool SelectHeadInternal(std::shared_ptr<Helper::VectorSetReader>& p_reader);
+
+            ErrorCode BuildIndexInternal(std::shared_ptr<Helper::VectorSetReader>& p_reader);
+            ErrorCode GetTaggedHeadLocation(SizeType p_headID, TaggedHeadLocation& p_location) const;
+            ErrorCode AddTaggedHeadToBundle(int p_bundleSlot, const T* p_center, SizeType p_anchorVID,
+                                            SizeType p_templateHeadID, SizeType& p_headID);
+            ErrorCode SplitTaggedPosting(ExtraWorkSpace* p_workspace, SizeType p_headID,
+                                         const T* p_preferredCenter, SizeType p_preferredVID);
+            ErrorCode MergeTaggedPosting(ExtraWorkSpace* p_workspace, SizeType p_headID);
+            ErrorCode DecodeLimitedPosting(
+                const TaggedPostingSnapshot& p_snapshot,
+                std::vector<LimitedPostingRecord>& p_hRecords,
+                std::vector<LimitedPostingRecord>& p_oRecords);
+            ErrorCode SplitLimitedTagPosting(
+                ExtraWorkSpace* p_workspace,
+                SizeType p_headID,
+                int p_pendingCount,
+                bool& p_topologyChanged);
+            ErrorCode SelectLimitedMaintenanceHeads(
+                const T* p_vector,
+                std::uint32_t p_tag,
+                const LimitedTagSupport& p_support,
+                SizeType p_excludedHead,
+                SizeType p_replacementHead,
+                const std::vector<std::uint32_t>*
+                    p_replacementTags,
+                std::vector<SizeType>& p_heads);
+            ErrorCode MergeLimitedTagPosting(
+                ExtraWorkSpace* p_workspace,
+                SizeType p_headID);
+            ErrorCode EnsureLimitedTagCapacity(
+                ExtraWorkSpace* p_workspace,
+                const PostingUpdateTargets& p_targets,
+                bool& p_topologyChanged,
+                bool& p_checkpointStarted,
+                const std::string& p_checkpointBaseDir);
+            void TombstoneTaggedHeads(ExtraWorkSpace* p_workspace,
+                                      const std::vector<SizeType>& p_headIDs,
+                                      const TaggedPostingSnapshot* p_restorePosting = nullptr);
+            ErrorCode EnsureTaggedPureCapacity(ExtraWorkSpace* p_workspace,
+                                               std::shared_ptr<VectorSet>& p_vectors,
+                                               SizeType p_begin,
+                                               PostingUpdateTargets& p_targets,
+                                               bool& p_topologyChanged);
+            ErrorCode DrainTaggedMergeMaintenance();
+            ErrorCode SaveLoadedHeadBundles(const std::string& p_baseDir);
+            ErrorCode MarkCrossEdgesDirty(const std::string& p_baseDir = std::string());
+
+        public:
+            bool AllFinished() { if (m_options.m_storage != Storage::STATIC) return m_extraSearcher->AllFinished(); return true; }
+
+            void GetDBStat() { 
+                if (m_options.m_storage != Storage::STATIC) m_extraSearcher->GetDBStats();
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Current Vector Num: %d, Deleted: %d .\n", GetNumSamples(), GetNumDeleted());
+            }
+
+            void GetIndexStat(int finishedInsert, bool cost, bool reset) { if (m_options.m_storage != Storage::STATIC) m_extraSearcher->GetIndexStats(finishedInsert, cost, reset); }
+            
+            void ForceCompaction() { if (m_options.m_storage == Storage::ROCKSDBIO) m_extraSearcher->ForceCompaction(); }
+
+            void StopMerge() { m_options.m_inPlace = true; }
+
+            void OpenMerge() { m_options.m_inPlace = false; }
+
+            void ForceGC() { 
+                if (IsLimitedTagMutationReadOnly()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Recovered or O-expanded limited-tag H/O generations are immutable.\n");
+                    return;
+                }
+                if (HasMutableLimitedTagLayout()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Dynamic limited-tag H/O postings do not support legacy ForceGC.\n");
+                    return;
+                }
+                auto workSpace = m_workSpaceFactory->GetWorkSpace();
+                if (!workSpace) {
+                    workSpace.reset(new ExtraWorkSpace());
+                    m_extraSearcher->InitWorkSpace(workSpace.get(), false);
+                }
+                else {
+                    m_extraSearcher->InitWorkSpace(workSpace.get(), true);
+                }
+                workSpace->m_deduper.clear();
+                workSpace->m_postingIDs.clear();
+                m_extraSearcher->ForceGC(workSpace.get(), m_index.get()); 
+            }
+            
+            ErrorCode Checkpoint() {
+                if (IsLimitedTagMutationReadOnly()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Recovered or O-expanded limited-tag H/O generations cannot be mutated by checkpointing.\n");
+                    return ErrorCode::Undefined;
+                }
+                if (!MutableLimitedTagConfigurationIntact()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Mutable limited-tag H/O layout identity cannot be changed at runtime.\n");
+                    return ErrorCode::Undefined;
+                }
+                /** Lock & wait until all jobs done **/
+                while (!AllFinished())
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                }
+
+                /** Lock **/
+                if (m_options.m_persistentBufferPath == "") return ErrorCode::FailedCreateFile;
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Locking Index\n");
+                std::unique_lock<std::shared_timed_mutex> lock(m_checkPointLock);
+                std::unique_lock<std::recursive_mutex> dataLock(m_dataAddLock);
+                std::unique_lock<std::shared_timed_mutex> deleteLock(m_dataDeleteLock);
+
+                // Flush block pool states & block mapping states
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Saving storage states\n");
+                ErrorCode ret;
+                if ((ret = m_extraSearcher
+                               ->BeginLimitedTagCheckpoint(
+                                   m_options
+                                       .m_persistentBufferPath)) !=
+                    ErrorCode::Success)
+                    return ret;
+                if ((ret = DrainTaggedMergeMaintenance()) != ErrorCode::Success)
+                    return ret;
+                if ((ret = m_extraSearcher->Checkpoint(m_options.m_persistentBufferPath)) != ErrorCode::Success)
+                    return ret;
+
+                /** Flush the checkpoint file: SPTAG states, block pool states, block mapping states **/
+                std::string filename = m_options.m_persistentBufferPath + FolderSep + m_options.m_headIndexFolder;
+                // Flush SPTAG
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Saving in-memory index to %s\n", filename.c_str());
+                if ((ret = m_index->SaveIndex(filename)) != ErrorCode::Success)
+                    return ret;
+                if ((ret = SaveLoadedHeadBundles(m_options.m_persistentBufferPath)) != ErrorCode::Success)
+                    return ret;
+                if ((ret = CompleteIndexSave(
+                         m_options
+                             .m_persistentBufferPath)) != ErrorCode::Success)
+                    return ret;
+                return ErrorCode::Success;
+            }
+
+            ErrorCode AddIndexSPFresh(const void *p_data, SizeType p_vectorNum, DimensionType p_dimension, SizeType* VID) {
+                if (m_options.m_storage == Storage::STATIC || m_extraSearcher == nullptr) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Only Support KV Extra Update\n");
+                    return ErrorCode::Fail;
+                }
+                if (IsLimitedTagMutationReadOnly()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Recovered or O-expanded limited-tag H/O generations are immutable.\n");
+                    return ErrorCode::Undefined;
+                }
+                if (HasMutableLimitedTagLayout()) {
+                    SPTAGLIB_LOG(
+                        Helper::LogLevel::LL_Error,
+                        "Dynamic limited-tag H/O postings require AddIndexWithTags; legacy AddIndexSPFresh is unsupported.\n");
+                    return ErrorCode::Fail;
+                }
+
+                if (p_data == nullptr || p_vectorNum == 0 || p_dimension == 0) return ErrorCode::EmptyData;
+                if (p_dimension != GetFeatureDim()) return ErrorCode::DimensionSizeMismatch;
+
+                std::shared_lock<std::shared_timed_mutex> lock(m_checkPointLock);
+
+                SizeType begin;
+                {
+                    std::lock_guard<std::recursive_mutex> lock(m_dataAddLock);
+
+                    begin = m_versionMap.GetVectorNum();
+
+                    if (begin == 0) { return ErrorCode::EmptyIndex; }
+
+                    if (m_versionMap.AddBatch(p_vectorNum) != ErrorCode::Success) {
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "MemoryOverFlow: VID: %d, Map Size:%d\n", begin, m_versionMap.BufferSize());
+                        return ErrorCode::MemoryOverFlow;
+                    }
+                }
+                for (int i = 0; i < p_vectorNum; i++) VID[i] = begin + i;
+
+                std::shared_ptr<VectorSet> vectorSet;
+                if (m_options.m_distCalcMethod == DistCalcMethod::Cosine) {
+                    ByteArray arr = ByteArray::Alloc(sizeof(T) * p_vectorNum * p_dimension);
+                    memcpy(arr.Data(), p_data, sizeof(T) * p_vectorNum * p_dimension);
+                    vectorSet.reset(new BasicVectorSet(arr, GetEnumValueType<T>(), p_dimension, p_vectorNum));
+                    int base = COMMON::Utils::GetBase<T>();
+                    for (SizeType i = 0; i < p_vectorNum; i++) {
+                        COMMON::Utils::Normalize((T*)(vectorSet->GetVector(i)), p_dimension, base);
+                    }
+                }
+                else {
+                    vectorSet.reset(new BasicVectorSet(ByteArray((std::uint8_t*)p_data, sizeof(T) * p_vectorNum * p_dimension, false),
+                        GetEnumValueType<T>(), p_dimension, p_vectorNum));
+                }
+
+                auto workSpace = m_workSpaceFactory->GetWorkSpace();
+                if (!workSpace) {
+                    workSpace.reset(new ExtraWorkSpace());
+                    m_extraSearcher->InitWorkSpace(workSpace.get(), false);
+                }
+                else {
+                    m_extraSearcher->InitWorkSpace(workSpace.get(), true);
+                }
+                workSpace->m_deduper.clear();
+                workSpace->m_postingIDs.clear();
+                return m_extraSearcher->AddIndex(workSpace.get(), vectorSet, m_index, begin);
+            }
+        };
+    } // namespace SPANN
+} // namespace SPTAG
+
+#endif // _SPTAG_SPANN_INDEX_H_

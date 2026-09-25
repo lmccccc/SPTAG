@@ -606,15 +606,16 @@ int Run(int argc, char** argv) {
     const char* vecPath  = sVecPath.empty()  ? nullptr : sVecPath.c_str();
     const char* tagPath  = sTagPath.empty()  ? nullptr : sTagPath.c_str();
     const char* indexDir = sIndexDir.empty() ? nullptr : sIndexDir.c_str();
-    const bool compactHierarchy = ArgFlag(argc, argv, "--compact-hierarchy");
+    if (ArgFlag(argc, argv, "--compact-hierarchy")) {
+        fprintf(stderr, "[spannbuilder] --compact-hierarchy is retired; use --materialize-hierarchy with a NEW output root.\n");
+        return 2;
+    }
     const bool materializeHierarchy = ArgFlag(argc, argv, "--materialize-hierarchy");
-    if (compactHierarchy || materializeHierarchy) {
+    if (materializeHierarchy) {
         const char* outputRoot = ArgVal(argc, argv, "--output-index-dir", nullptr);
         if (!indexDir || ArgFlag(argc, argv, "--build-signatures-only") ||
             ArgFlag(argc, argv, "--backfill-primary-head-csr") ||
-            (compactHierarchy && materializeHierarchy) ||
-            (materializeHierarchy && (outputRoot == nullptr || *outputRoot == '\0')) ||
-            (compactHierarchy && outputRoot != nullptr)) {
+            outputRoot == nullptr || *outputRoot == '\0') {
             fprintf(stderr, "[spannbuilder] Hierarchy maintenance requires IndexDirectory "
                 "and exactly one maintenance command. --materialize-hierarchy also requires "
                 "--output-index-dir pointing to a NEW output root.\n");
@@ -640,16 +641,6 @@ int Run(int argc, char** argv) {
         }
         auto* spann = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(index.get());
         if (spann == nullptr) return 1;
-        if (compactHierarchy) {
-            fprintf(stderr, "[spannbuilder] LEGACY V2 compatibility compaction requested. "
-                "New builds use independent routing catalogs; reverse with --materialize-hierarchy.\n");
-            if (spann->CompactHierarchyVectors() != SPTAG::ErrorCode::Success) {
-                fprintf(stderr, "[spannbuilder] COMPACT-HIERARCHY FAILED\n");
-                return 1;
-            }
-            fprintf(stderr, "[spannbuilder] COMPACT-HIERARCHY done.\n");
-            return 0;
-        }
         namespace fs = std::filesystem;
         struct StagedOutput {
             fs::path path;

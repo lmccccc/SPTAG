@@ -1,5 +1,736 @@
 # Benchmark Scripts
 
+## Main posting Recall-QPS figures
+
+`plot_posting_min_sweep.R` renders registered native measurements with R.
+Historical modes retain the fixed six-panel layout: unfiltered, broad, medium,
+extreme, numeric and mixed DNF; `--selectivity` plots only registered scenarios.
+It reads `registration.json` and `plain-results.json`, requires
+1,000 queries per run, and writes PNG/PDF, plotted CSVs and a
+source-data snapshot to a new output directory.
+Posting-policy comparison modes require two repetitions.
+
+```bash
+Rscript Tools/benchmarks/plot_posting_min_sweep.R CAMPAIGN NEW_OUTPUT
+Rscript Tools/benchmarks/plot_posting_min_sweep.R CAMPAIGN NEW_OUTPUT --partial
+Rscript Tools/benchmarks/plot_posting_min_sweep.R CAMPAIGN NEW_OUTPUT --member-postfilter
+Rscript Tools/benchmarks/plot_posting_min_sweep.R CAMPAIGN NEW_OUTPUT --postgraph
+Rscript Tools/benchmarks/plot_posting_min_sweep.R CAMPAIGN NEW_OUTPUT --selectivity
+Rscript Tools/benchmarks/plot_posting_min_sweep.R CAMPAIGN NEW_OUTPUT --compact-storage
+```
+
+The default compares `graph`, `min1`, `min3`, `min5` and `min10` across all six
+scenarios. `--member-postfilter` compares `graph`, the frozen `row_min1`
+member-filter policy, and `all_members_min1`/`all_members_min10`. The latter
+mode permits a registered scenario subset containing `medium_tag`; other
+panels explicitly say **not measured**, with no historical timings substituted.
+That historical member policy scores unvisited nonmatches too; its minimum counts
+only fresh matching H1 candidates. Keep its entry rule and native search budget
+unchanged when isolating that policy change.
+
+`--postgraph` compares `graph`, `postgraph_shared`, `postgraph_extra` and
+`graph_total` across all six registered scenarios. The registration must include
+`posting_anchor_count` and a `budgets` object keyed by those four variant IDs.
+Each budget declares integer `graph_maxcheck` and
+`posting_additional_maxcheck`. The shared variant has no extra budget; the extra
+variant retains the base graph budget and declares a positive supplement; the
+H1-only `graph_total` control uses their combined nominal ceiling. Labels are
+derived from these declarations, not guessed from variant names. They describe
+configured checked-leaf budgets, not a hard limit on all distance evaluations.
+The restored unfiltered path retains upstream adaptive stopping, including
+soft-cap overshoot and the `max(MaxCheck / 16, resultNum)` navigation distance
+pool. Changing MaxCheck can therefore change navigation breadth before the
+nominal limit is reached. Filtered H1 needs an independent hard checked-leaf
+guard because its matching-result heap can remain underfilled. Complete
+auxiliary rows may cross the remaining-budget boundary; equal nominal ceilings
+do not imply equal actual work.
+
+H1-only means posting supplementation is disabled in the same project runtime;
+it is not a pristine Microsoft SPTAG binary. Record the search-runtime revision
+and stopping policy with each campaign. After a search-policy correction, rerun
+every method against the same unchanged index, query cohort and runtime on the
+same CPU/NUMA placement. Do not splice historical H1-only timings into new
+postgraph curves. Search-only corrections do not require index reconstruction.
+
+`--selectivity` reuses the four `--postgraph` variants, fixed styles, per-variant
+`budgets` and positive `posting_anchor_count`, but accepts an arbitrary nonempty,
+duplicate-free ordered `scenarios` array. It requires
+`nprobe: [16, 24, 48, 96, 192, 384]` in that order, `query_count: 1000` and
+`repetitions: 2`. For the requested no-filter-through-approximately-0.1%
+categorical comparison, plus mixed DNF as a separate workload, register:
+
+```json
+["unfilter", "broad_tag", "medium_tag", "sel_01pct", "mixed_dnf"]
+```
+
+Reuse the authentic SIFT1B `broad_tag` and `medium_tag` predicates and exact
+truth: their actual fractions are `0.170124930` (17.012493%) and `0.017012493`
+(1.7012493%), not fabricated 10%/1% targets. Measure the new categorical
+`sel_01pct` fraction from its exact truth rather than assuming exactly `0.001`.
+The separate `mixed_dnf` fraction is `0.000425710` (0.042571%); give it an
+explicit mixed-DNF title and its own actual-density label, not a categorical
+0.1% label. These scenario IDs are registration choices, not renderer constants.
+
+There are no automatic numeric-only, extreme-sparse or historical placeholder
+panels in this mode. Layout follows the registered order. Add
+`scenario_metadata`, an object with exactly those registered scenario keys.
+Each value must contain a nonempty scalar string `title` and a finite scalar
+`selectivity` fraction in `[0, 1]`. Supply **measured actual density**, not the
+nominal percentage suggested by an ID. Titles visibly include
+**Actual selectivity**; `unfilter` must declare `1` and is labeled
+**100% (no filter)**. Scalar metadata describes a static predicate per scenario;
+query-varying densities must not be disguised as one nominal fraction.
+
+Optional `eligible_count` and `corpus_count` must be supplied together as exact
+JSON integers (`0 <= eligible_count <= corpus_count`, `corpus_count > 0`,
+both at most `2^53 - 1`). Their ratio must match `selectivity` within `1e-12`.
+For example, this **synthetic schema illustration is not SIFT1B evidence**:
+
+```json
+{
+  "broad_tag": {
+    "title": "Synthetic categorical predicate",
+    "selectivity": 0.1234,
+    "eligible_count": 1234,
+    "corpus_count": 10000
+  }
+}
+```
+
+The real `scenario_metadata` must also include every other registered scenario.
+The ordinary `plain-results.json` array retains fields `scenario`, `variant`,
+`nprobe`, `repetition`, `queries`, `recall` and `qps`; optional `diagnostic` must
+be boolean false for every record. No historical timings or interpolated
+recall points are inserted. Keep the registration frozen: this mode rejects
+registration changes during rendering and records its hash and full-precision
+scenario metadata in `plot_metadata.json`. It emits the same `recall_qps.png`,
+`recall_qps.pdf`, `plotted_points.csv`, `nprobe24.csv` and `source_points.json`
+as the historical modes. Never write synthetic test fixtures to actual campaign
+output directories.
+
+`--compact-storage` compares `original_layout` and `compact_layout` across all
+six registered scenarios. Register an even number of repetitions, at least
+two, and balance method execution order in the benchmark runner. The renderer
+checks complete grids and repetition counts, not execution order. Additional
+runs may be combined only when the protocol and frozen runtime/index for each
+variant are unchanged; retain every run, including slow outliers. Do not pool
+different compact implementations under one variant.
+Use the original runtime and original index for the
+first variant, not a legacy file converted to compact RAM by the new loader.
+The registration declares one common `search_settings` object, for example:
+
+```json
+{
+  "graph_maxcheck": 2048,
+  "posting_additional_maxcheck": 2048,
+  "posting_anchor_count": 8
+}
+```
+
+These fields must be valid native integer settings, with a combined budget
+within the native integer limit. Variant-specific `budgets` are rejected; if
+individual measurement records also contain these settings, they must agree
+with the common declaration. Native result names `max_check` and
+`posting_additional_max_check` are checked against the same declared values.
+Keep all other search INI settings, the query
+cohort and index memberships unchanged. Exact result/head/work parity and
+persisted/resident/peak storage measurements are separate acceptance evidence;
+Recall-QPS curves alone cannot prove a lossless layout change or 1B scalability.
+
+`--partial` uses only complete method-by-nprobe grids within each repetition
+and can be combined with any comparison mode. In `--selectivity`, registered
+scenarios with no complete repetition remain visibly pending; unregistered
+scenarios never acquire panels. The four explicit comparison flags are mutually
+exclusive. Diagnostic timings, duplicate
+points, unregistered records and incomplete final grids are rejected. QPS is
+the arithmetic mean of complete repetitions; bars show their range, not a
+confidence interval. Lines connect measured points, without recall interpolation.
+
+## Bounded H1 graph shortcuts from the complete H2/H3 hierarchy
+
+The isolated native prototype in
+[`hierarchical_shortcut_native/README.md`](hierarchical_shortcut_native/README.md)
+has been implemented and executed on the first 1,000 SIFT1M queries. It keeps
+the original H1 BKT/RNG32 graph, builds at most eight deterministic H1 shortcut
+candidates from **both** original adjacent-layer CSRs, and shares the native
+graph frontier, visited set and a hard total-distance-call budget. Plain,
+added-edge and degree-preserving rewired searches use the same implementation.
+No production algorithm, original index, posting, binary or `_SPTAG.so` is changed.
+
+The corrected, fully validated results are in dataset comparisons
+`h1_hierarchy_shortcut_20260915_v2/`; the first run is explicitly superseded.
+At a 2,000-call cap, plain/added/rewired exact-H1 top24 recall was
+98.9542%/98.9167%/98.9167%, with ordinary navigation
+329.10/360.50/358.16 µs. At a 1,200-call cap, rewiring improved exact-head
+recall by 0.2375 percentage points but cost 15.1% more time. This initial
+shortcut policy did **not** demonstrate an advantage over widening H1 search
+at near-equal high exact-head recall.
+
+**Native full-query integration is now separately complete**, under
+`hierarchical_shortcut_native/full/`, with results in
+`h1_hierarchy_shortcut_full_20260915/`. An authenticated reconstruction of the
+frozen runtime keeps ordinary H1 navigation plus its actual own-head/H/O/dedup
+and SSD stages; it does not call the incompatible generic disk-search helper.
+Frozen baseline H1 IDs/distances and recall/work match on all1,000 queries.
+Final Recall@10 is natural/plain2000/add2000/rewire2000:
+**90.73%/90.68%/90.71%/90.69%**. Ordinary full latency over three rotated paired
+repetitions is **0.9656/0.9628/0.9905/0.9884 ms**. Add/rewire are 2.88%/2.67%
+slower than capped plain, despite similar SSD work (~23.83 postings,
+~143.7 pages/query). No full-query advantage is demonstrated.
+
+The dedicated README documents reconstruction, native integration boundaries,
+actual distance work, per-query counted/uncounted final-result parity, 2/2 native
+fixtures, provenance and exact commands. This remains an offline H2/H3-derived
+shortcut overlay, not a runtime hierarchical frontier or billion-scale result.
+Do not mix preserved standalone timings with the fresh native full-query runs.
+
+**Clarified joint acceptance has now been evaluated**, not just unfiltered:
+`hierarchical_shortcut_native/full_scenarios/` runs original H1, original H3
+and both existing hybrids on all six authentic SIFT1M workloads (unfilter,
+broad/medium/extreme categorical, numeric, mixed DNF). Results are in
+`h1_hierarchy_shortcut_scenarios_20260915/`: 168 native processes, three rotated
+paired repetitions, frozen H1/H3 baseline parity, exact-filter/result/work
+validation, and 535 protected files unchanged.
+
+Unfiltered hybrid latency is 1.037×/1.029× H1 with near-equal final recall.
+**Filtering does not meet the H3-like quality/cost goal**: hybrid versus H3
+Recall@10 is approximately broad72.2% vs87.7%, medium19.8% vs86.3%,
+extreme0.28% vs90.1%, numeric30.4% vs42.2%, and mixed1.04% vs76.1%.
+Extreme/mixed hybrid queries underfill99.7% of the time. Lower latency or fewer
+SSD reads at that quality is not a speedup claim. All scenario inputs exist;
+the remaining limitation is the flattened policy's candidate/own-head admission
+gap, not source availability. The dedicated README has per-scenario H1/H3
+ratios, underfill and graph/CSR/SSD work tables. No weighted mixture, adaptive
+predicate-dependent hybrid budget, fallback or broader tuning was introduced.
+
+**Policy interpretation:** these results evaluate the existing **offline
+flattened H1 overlay**, not the subsequently clarified online upward fallback.
+That intended rule would take the current item's eight direct parent postings,
+rank their representatives by **current-query-to-parent** distance, and expand
+nearest first; the chosen upper item has its own eight parents at the next
+layer. The prototype instead uses offline H1-item-to-owner distances and fixed
+H1 edges. Online nearest-of-eight navigation was not implemented or benchmarked
+**in that fixed-overlay matrix**, which must not be cited as evidence
+about its effectiveness.
+
+**A subsequent online parent-queue implementation is preserved**:
+[`online_native/README.md`](hierarchical_shortcut_native/online_native/README.md)
+defines its query-ranked eight-parent fallback, predicate-independent spatial
+stall trigger, lazy16-member CSR cursors and unified2000/3200 distance budgets.
+It offers every evaluated H1 to the original H3 own-point/posting admission
+callbacks, with separate matched graph-only admission controls. Original H1/H3
+baselines are unchanged. Results are in
+`comparisons/online_owners_admission_20260915/`: 216 certified native processes,
+six scenarios, two paired repetitions, full-path fixtures and1,749 unchanged
+protected files.
+
+The later architectural correction, **H1-only native traversal with synchronous
+posting-derived neighbor supply**, is documented separately in
+[`supplier_native/README.md`](hierarchical_shortcut_native/supplier_native/README.md).
+It returns to the same native H1 frontier after each bounded helper call; no
+upper navigation queue survives. Its new matched graph-only control and
+six-scenario comparison do not rename or overwrite the parent-queue results.
+
+Admission correction, **not online parents**, explains most gains: at budget2000
+medium Recall@10 is original H1 19.77%, matched control94.03%, online92.63%.
+Numeric is30.44%/49.08%/47.87%, with verified native own points from outside the
+selected posting heads. Online2000 unfiltered recall90.69% is near H1's90.73%,
+but latency is1.117×. Extreme/mixed online recall remains14.75%/31.54% versus
+H3's90.07%/76.10%; budget3200 helps but still misses the joint goal and costs more.
+Full tables, own-point proof, counters and the preserved launcher-race retry are
+documented. This is now a measured result for an actual online policy, not a
+reinterpretation of the failed fixed overlay.
+
+## Same-posting H1/H3 navigation ablation on SIFT1M
+
+`configs/sift1m_same_posting/` isolates navigation quality, rather than comparing
+independently constructed SPANN posting stores. The native upstream builder
+builds only a flat BKT on the preserved H3's **ordered 160,091 H1 vectors**.
+Its saved `vectors.bin` must hash-identically to `SPTAGHeadVectors.bin`.
+There is no head reselection, posting assignment, replica change, or SSD build.
+
+```bash
+python3 Tools/benchmarks/build_same_posting_head.py \
+  --config Tools/benchmarks/configs/sift1m_same_posting/head_build.ini
+python3 Tools/benchmarks/run_same_posting_head.py \
+  --config Tools/benchmarks/configs/sift1m_same_posting/experiment.ini
+python3 Tools/benchmarks/run_same_posting_head.py \
+  --config Tools/benchmarks/configs/sift1m_same_posting/recall90.ini
+```
+
+Both modes use the **same frozen H3 executable and same search view**.
+Equal-budget native INIs differ only in the historical `HeadNavigationMode`:
+`H1Only` versus `H2Only` (the latter selects the complete preserved H3).
+This is an offline historical ablation; it does not restore those retired
+switches in production. H1 IDs, H/O regions, support metadata, hierarchy CSR,
+top graph, 524-byte records and every SSD posting byte stay unchanged.
+The complete original file inventory, including the posting payload hash,
+is checked before and after execution.
+
+The isolated view enables `BuildH1Graph`, replaces the dummy metadata-only
+KDT with the real BKT, and omits its two graphless-root sidecars. The graphful
+loader requires an explicit H3 catalog path; that path is only a symlink to
+the existing top graph's `vectors.bin`. It adds no vector data or new samples.
+The original graphless H3 and H3 in this graphful view must produce identical
+recall, scans, distances and requested I/O counters. Their execution/storage
+plumbing differs, so use the two modes **within the new view** for timing.
+
+The first attempt without the top-catalog filename alias failed loading and
+was stopped; its logs remain in `same_posting_head_20260915`. The successful
+run is `same_posting_head_20260915_catalog_alias`; the near-equal-recall run
+is `same_posting_head_20260915_recall90`. One-query preflights now reject
+native load failures before launching the full warmup/cohort.
+
+Ordinary runs alternate modes and reverse order on the second repetition.
+They use 1,000 warmup + 1,000 measured queries, one query thread, NUMA2,
+direct IO and search page15, matching the earlier comparison. Separate
+`DumpHeads=2000` diagnostic runs capture the selected local H1 IDs before
+posting selection; their logging-heavy QPS must not replace ordinary QPS.
+`quality.ini` describes a separate offline exact-H1-neighbor audit of these
+logs. Exact enumeration is diagnostic only and never a query fallback.
+
+The standalone exact-head analyzer uses native `VectorSetReader` and native
+Float squared-L2 distance functions. It computes all H1 distances once per
+query and validates each logged distance before comparing the two selected
+head sets. Run it separately from timed search:
+
+```bash
+prefix=/mnt/nvme/baotonglu/mocheng/datasets/sift1m_zipf200_sparse193_numeric/toolchains/spann_upstream_2ac3ebc
+cmake -S Tools/benchmarks/head_quality_native -B "$prefix/head-quality-build" \
+  -DSPANN_UPSTREAM_BUILD="$prefix/build" -DCMAKE_BUILD_TYPE=Release
+cmake --build "$prefix/head-quality-build" --parallel 1
+ctest --test-dir "$prefix/head-quality-build" --output-on-failure
+numactl --cpunodebind=2 --membind=2 "$prefix/bin/headqualitybench" \
+  --config Tools/benchmarks/configs/sift1m_same_posting/quality.ini
+```
+
+`HEAD_QUALITY_QUERY` records include exact ranks, boundary ties and cross-mode
+overlap. `HEAD_QUALITY_SUMMARY` is emitted only after all queries validate;
+discard partial output on a nonzero exit. Exact head recall is **not** final
+dataset Recall@10. Deterministic ranks use distance then local H1 ID; the
+tie-adjusted recall separately caps boundary credit so extra tied heads
+cannot hide omitted strictly nearer heads.
+
+The completed same-posting L24 audit selected 24 heads for every query.
+Flat H1 recovered 99.3333% of exact nearest24 H1 IDs, versus H3's 88.1417%;
+tie-adjusted values were identical. Mean missing nearest24 heads were
+0.160 versus 2.846 per query. These measurements establish selection loss
+before disk scanning, but do not attribute it to an individual hierarchy
+stage. Results and per-query ranks are preserved in the successful
+comparison directory's `quality/` subdirectory.
+
+### Offline H3 routing and parent-coverage audit
+
+Build the `headroutingbench` target in a separate build directory and use
+`configs/sift1m_same_posting/routing_quality.ini`. The optional `[Hierarchy]`
+section specifies the ordered H2/H3 native catalogs, the two preserved V3
+CSRs and the fixed parent beam. The tool neither loads a graph nor scans SSD
+postings: it replaces upper query selection with exhaustive distance oracles,
+then follows the saved CSR rows. It also measures exact-KNN parent coverage
+for oracle target heads, without constructing or saving replacement CSRs.
+All these exhaustive operations are diagnostics, never production fallbacks.
+
+```bash
+cmake -S Tools/benchmarks/head_quality_native -B "$prefix/head-routing-build" \
+  -DSPANN_UPSTREAM_BUILD="$prefix/build" -DCMAKE_BUILD_TYPE=Release
+cmake --build "$prefix/head-routing-build" --target headroutingbench --parallel 1
+python3 Tools/benchmarks/head_quality_native/test_head_quality.py \
+  "$prefix/head-routing-build/bin/headroutingbench"
+ctest --test-dir "$prefix/head-routing-build" -R head_routing_fixtures --output-on-failure
+numactl --cpunodebind=2 --membind=2 "$prefix/head-routing-build/bin/headroutingbench" \
+  --config Tools/benchmarks/configs/sift1m_same_posting/routing_quality.ini
+```
+
+The measured L24 search uses a routing beam of 16 at both H3 and H2, not 24.
+The authenticated frozen construction source selects diversified parents with
+RNGFactor=1 from 64 approximate candidates, then nearest-fills to exactly eight
+replicas. This affects both H1-to-H2 and H2-to-H3 assignment; it is distinct
+from RNG pruning of the top graph's lateral edges.
+
+Completed results are in `same_posting_head_20260915_catalog_alias/routing_quality/`.
+Exact-top replay matches all 24 logged H3-selected IDs for 998/1000 queries
+and 23998/24000 selected IDs overall. Exact-H1 top24 coverage is 21156/24000
+(88.1500%), versus logged H3's 21154/24000 (88.1417%). Bypassing H3 and directly
+selecting the globally nearest 16 H2 nodes raises saved-CSR coverage only to
+21270/24000 (88.6250%). These are oracle head-coverage metrics, not final data
+recall or timed searches; differences between oracle modes are net changes,
+not a disjoint per-stage accounting of the original misses.
+
+With these same exact query-parent sets, replacing saved eight-parent
+assignments by exact nearest-eight parents reduces H1 target coverage from
+21270 to 20835 out of 24000: 877 targets are rescued but 1312 regress.
+For the exact top16 H2 targets, H3-parent coverage falls from 15451 to 15209
+out of 16000: 232 rescues versus 474 regressions. Thus this experiment does
+not support removing diversity outright. The KNN comparison also removes
+construction ANN approximation, so it is not an isolated RNG-on/off ablation
+over identical historical candidate lists. The principal observed limitation
+is coverage through a small fixed parent beam, especially the final H2-to-H1
+transition; an individual parent's proximity is not a lower bound on all
+of its children's query distances.
+
+### H2-only ratio and replica experiments
+
+`build_h2_only.py` runs the pinned native SPANN selector and head-graph builder
+on the preserved ordered H1 catalog, with both SSD execution/build flags off.
+It checks every selected H2 vector against its recorded H1 ordinal, verifies
+that graph-vector bytes equal the selected catalog, and rejects source-vector
+deletion or BKT side effects. No dataset or original posting file is rebuilt.
+
+```bash
+python3 Tools/benchmarks/build_h2_only.py \
+  --config Tools/benchmarks/configs/sift1m_h2_sweep/build_r08.ini
+python3 Tools/benchmarks/build_h2_only.py \
+  --config Tools/benchmarks/configs/sift1m_h2_sweep/build_r16.ini
+python3 Tools/benchmarks/build_h2_only.py \
+  --config Tools/benchmarks/configs/sift1m_h2_sweep/build_r32.ini
+```
+
+The 0.16 case reuses the exact historical H2 selection and builds only its
+independent BKT graph. The 0.08 and 0.32 cases make new native selections.
+The upstream dynamic selector does not guarantee the requested count: these
+builds produced 12813, 25607 and 44475 H2 nodes respectively, over 160091 H1
+nodes. Report the actual ratio (the requested 0.32 case is about 0.2778).
+Each ratio has one selection/graph build; this exploratory comparison does
+not estimate construction-seed variability.
+
+For head-only builds, generic upstream SPANN `SaveIndex` would overwrite the
+selected ordinal map with its still-unloaded translation map if saved into
+the same directory. Fixed `Execution.ExportDirectory` therefore keeps that
+final generic export separate from `Base.IndexDirectory`; only the latter's
+verified `HeadIndex` and selected vector/ordinal files are experiment inputs.
+Successful builds are under `build_runs/h2_ratio_sweep_20260915_fixedsave/`.
+The stopped first attempt under `h2_ratio_sweep_20260915/r08/` is preserved
+as failed-run provenance and must not be consumed as a completed index.
+
+The fixed sweep uses replicas 2/4/8/16 and H2 beams
+4/8/12/16/24/32/48/64/96/128, while keeping the final H1 result count at 24:
+
+```bash
+python3 Tools/benchmarks/run_h2_sweep.py \
+  --config Tools/benchmarks/configs/sift1m_h2_sweep/experiment.ini
+python3 Tools/benchmarks/analyze_h2_sweep.py \
+  --config Tools/benchmarks/configs/sift1m_h2_sweep/experiment.ini
+```
+
+See `h2_sweep_native/INTERFACE.md` for the independent native build and strict
+schema. An isolated copy of upstream BKT wraps the native distance callback,
+counting tree-center and graph distances, including repeated evaluations.
+Counted and ordinary ordered IDs/distances must match; ordinary timing restores
+the original callback. The pristine-library binary is also fixture-compared.
+Original upstream sources, libraries and existing binaries are never changed.
+The runner fingerprints all input graphs, H1 vectors, queries and the untouched
+disk posting store before and after the run.
+
+Completed results: `comparisons/h2_ratio_replica_20260915/`. All 120 points and
+three flat references completed; 123000 query recalls were recomputed from
+saved selected IDs and the shared exact-H1 oracle. The rebuilt 0.16/R8
+assignments share 1280721/1280728 edges with the preserved CSR, with identical
+owner sets for 160084/160091 H1 nodes.
+
+The flat reference recovers 99.3333% of exact H1 top24 with 2232.031 mean
+native distance calls (p95 2531). Best measured points not exceeding that
+**mean** work:
+
+| Actual H2 ratio | Replicas | Beam | Mean total distances | H1 recall |
+| --- | ---: | ---: | ---: | ---: |
+| 0.08004 | 4 | 32 | 2130.164 | 92.6208% |
+| 0.15995 | 8 | 32 | 2156.467 | 95.4042% |
+| 0.27781 | 8 | 48 | 2157.337 | 96.5458% |
+
+The last point has p95 work 2763, above the flat reference. Capping both mean
+and p95 instead yields best recall 95.6708% at ratio 0.27781/R16/beam24.
+The cheapest observed point recovering flat recall is ratio 0.27781/R16/beam64:
+99.3875%, mean 3674.756 distances, p95 4920. This is 1.646x flat mean work.
+Its ordinary navigation mean is 386.504 microseconds versus its same-run flat
+reference's 132.122 microseconds (2.925x). These are standalone H2-graph-plus-CSR
+navigation measurements, **not** full-H3 production timings or dataset recall.
+There is no interpolation between tested points and no global-optimum claim.
+
+Owner-rank diagnostics explain the persistent misses: at ratio 0.16/R8, the
+nearest assigned parent's query rank is at most 16 for only 88.625% of exact
+H1 targets; the p95/p99 ranks are 29/67 and the maximum is 404. For query 0,
+the second-nearest H1 (116651) has parent ranks
+18/173/554/81/197/1014/291/2031, so the nearest 16 H2 postings cannot contain
+it. R16 moves the p99 nearest-owner rank down to 38, but also doubles total
+assignment entries and mean posting length. More replicas do not supply
+cost-free query coverage.
+
+#### Replica32 continuation
+
+`configs/sift1m_h2_sweep/replica32.ini` runs replicas 8/16/32 over the same
+three H2 graphs and ten beams using a new isolated `h2-replica32-build` binary.
+The old executable/results are preserved. AssignmentCandidates remains 64;
+only the allowed replica range and the explicit new replica list change.
+
+```bash
+python3 Tools/benchmarks/run_h2_sweep.py \
+  --config Tools/benchmarks/configs/sift1m_h2_sweep/replica32.ini
+python3 Tools/benchmarks/analyze_h2_sweep.py \
+  --config Tools/benchmarks/configs/sift1m_h2_sweep/replica32.ini
+python3 Tools/benchmarks/validate_h2_extension.py \
+  --config Tools/benchmarks/configs/sift1m_h2_sweep/replica32.ini \
+  --baseline Tools/benchmarks/configs/sift1m_h2_sweep/experiment.ini
+```
+
+All 90 points completed under `comparisons/h2_replica32_20260915/`.
+The 93000 selected-ID recalls were checked; all 63000 repeated flat/R8/R16
+query records match the previous experiment exactly except timing. Assignment
+candidate banks, exact-H1 oracle files and repeated R8/R16 CSR bytes also match.
+
+At actual ratio 0.15995 and beam16:
+
+| Replicas | Exact-H2 oracle coverage | Actual head recall | Mean H1 distances | Mean total distances |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 88.6250% | 88.2458% | 777.604 | 1503.889 |
+| 16 | 94.8417% | 94.4833% | 1386.572 | 2112.857 |
+| 32 | 97.7917% | 97.4750% | 2428.022 | 3154.307 |
+
+R32 lowers the p99 nearest-owner query rank from R8's 67 to 23. At beam32,
+R32's exact-parent coverage reaches 99.4958%, while actual head recall is
+99.3042%, with 4723.192 mean distance calls and 540.666 microseconds.
+This is near flat recall (99.3333%) but about 2.12x its mean distance work.
+
+Under the strict flat mean-work cap (2232.031), the best tested R32 point is
+actual ratio0.27781/beam12: 94.5583% recall and 1978.410 calls. The nearby beam16
+point uses 2279.395 calls (+2.12%) and yields 96.2417%, still below R8/beam48
+at the same ratio (96.5458%, 2157.337 calls). This comparison explicitly
+reports the grid gap rather than implying an interpolated exact work match.
+The lowest-work tested R32 point exceeding flat recall is ratio0.27781/beam48:
+99.5542%, 4338.011 calls, versus R16/beam64's 99.3875% and 3674.756 calls.
+Thus R32 substantially improves fixed-beam coverage, but this grid does not
+show an equal-work advantage over the smaller replica counts.
+
+#### Half-density H2 with replica32
+
+`build_r50.ini` requests Ratio=0.5 and native automatic SplitFactor=0, which
+the upstream builder resolves to 2. This is an explicit additional construction
+change: the earlier fixed SplitFactor=6 restricted attainable selection density.
+The new native BKT selection contains 81539 of 160091 H1 vectors, an actual
+ratio of 0.509329. All selected ordinals and vector copies are verified.
+
+```bash
+python3 Tools/benchmarks/build_h2_only.py \
+  --config Tools/benchmarks/configs/sift1m_h2_sweep/build_r50.ini
+python3 Tools/benchmarks/run_h2_sweep.py \
+  --config Tools/benchmarks/configs/sift1m_h2_sweep/ratio50.ini
+python3 Tools/benchmarks/analyze_h2_sweep.py \
+  --config Tools/benchmarks/configs/sift1m_h2_sweep/ratio50.ini
+python3 Tools/benchmarks/run_h2_sweep.py \
+  --config Tools/benchmarks/configs/sift1m_h2_sweep/ratio50_fine.ini
+python3 Tools/benchmarks/analyze_h2_sweep.py \
+  --config Tools/benchmarks/configs/sift1m_h2_sweep/ratio50_fine.ini
+python3 Tools/benchmarks/validate_h2_extension.py \
+  --config Tools/benchmarks/configs/sift1m_h2_sweep/ratio50_fine.ini \
+  --baseline Tools/benchmarks/configs/sift1m_h2_sweep/ratio50.ini
+```
+
+The initial and refined grids cover 30 distinct beams. Fine points refine both
+the equal-work boundary and the flat-recall crossing; four shared points and
+the flat reference match exactly except timing. The single-ratio analyzer
+reports the optional r16/R8/beam16 baseline as null when absent, but still
+measures and compares the flat H1 reference.
+
+The combined result is preserved in
+`comparisons/h2_ratio50_replica32_fine_20260915/combined_comparison.json`.
+Fine-run timing replaces coarse-run timing for shared points deterministically;
+all non-timing fields must match. Both runs retain their original raw evidence.
+
+| Navigation | H2 beam | Mean total distances | Head recall | Ordinary navigation mean |
+| --- | ---: | ---: | ---: | ---: |
+| Flat H1 | - | 2232.031 | 99.3333% | 131.993 us |
+| H2 ratio0.509329/R32 | 29 | 2231.827 | 97.1958% | 216.119 us |
+| H2 ratio0.509329/R32 | 54 | 3356.561 | 99.3042% | 345.766 us |
+| H2 ratio0.509329/R32 | 56 | 3441.369 | 99.3792% | 355.513 us |
+
+Thus near-identical mean distance work still loses about 2.14 recall percentage
+points. At beam29, p95 work is 3155 versus flat's 2531; capping both mean and
+p95 instead selects beam20 with 95.3125% recall. The cheapest tested point
+exceeding flat recall uses 54.18% more mean distance calls and 2.693x ordinary
+navigation time. It is not a claim of an untested global minimum.
+
+At beam29 the exact-H2 oracle covers 98.5542% of exact H1 targets, versus the
+actual route's 97.1958%. Both upper graph approximation and parent coverage
+remain relevant; giving the route exact H2 neighbors alone still does not
+match flat recall. These remain H2-graph-plus-one-CSR navigation measurements,
+not full H3 execution or final dataset recall. Original H1 and disk postings
+remain unchanged.
+
+## Same-runtime full-query phase attribution on SIFT1M
+
+`run_full_phase_ab.py` and `configs/sift1m_full_phase/experiment.ini` compare
+flat24, H3_24 and H3_29 using the same frozen executable, ordered H1 catalog,
+flat graph loader view and unchanged SSD postings described above. These are
+the original three-level ratio0.16/replica8 routes, not the new H2-only/R32
+sweep. The full-query metric is dataset Recall@10, not exact-head recall.
+
+```bash
+python3 Tools/benchmarks/run_full_phase_ab.py \
+  --config Tools/benchmarks/configs/sift1m_full_phase/experiment.ini
+```
+
+The completed output is
+`comparisons/full_phase_cost_20260915/` under the SIFT1M data root. An existing
+output directory is never overwritten. Five rotating case rounds alternate
+ordinary/profile order, with 1000 warmup and 1000 measured queries per process,
+one query thread and verified O_DIRECT descriptors. All six native INIs disable
+head dumps and path logging; each pair differs only in `LogPhaseTime`.
+`runs.json`, `summary.json`, native logs, IO/resource evidence, configuration
+snapshots and full input hashes preserve the evidence. Recall and native work
+match across repetitions, profiling modes and the prior full-QPS experiment.
+
+| Full-query metric | Flat24 | H3_24 | H3_29 |
+| --- | ---: | ---: | ---: |
+| Dataset Recall@10 | 90.73% | 88.60% | 90.78% |
+| Ordinary mean latency, ms | 0.929780 | 0.778303 | 0.892789 |
+| Ordinary median QPS | 1074.89 | 1286.68 | 1125.84 |
+| Profile navigation, ms | 0.348450 | 0.233101 | 0.270430 |
+| Profile posting retrieval/non-scan, ms | 0.507169 | 0.493322 | 0.548451 |
+| Profile posting scan, ms | 0.063936 | 0.063499 | 0.076535 |
+| Profile other posting work, ms | 0.014983 | 0.005195 | 0.006231 |
+| Profile core total, ms | 0.934531 | 0.795121 | 0.901637 |
+| Profile outside-core residual, ms | 0.034055 | 0.032110 | 0.034238 |
+| Profile outer mean latency, ms | 0.968586 | 0.827231 | 0.935875 |
+
+At near-equal data recall, H3_29 saves 78.020 us of navigation, adds 41.282 us
+of retrieval/non-scan and 12.598 us of posting scan, and saves 8.752 us of other
+posting work. This closes to a 32.894 us profiled core saving (rounding aside).
+Ordinary end-to-end latency independently improves by 36.991 us, or 3.978%.
+All five matched ordinary rounds favor H3_29: flat run means span
+0.923985--0.934469 ms and H3_29 spans 0.878154--0.912538 ms. Median QPS is
+aggregated separately and is not the reciprocal of mean latency.
+
+H3_29's 270.430 us navigation includes 77.803 us of top-graph search,
+140.856 us of CSR vector work, 32.214 us of merge, 4.078 us of tag handling,
+5.456 us of sorting and 10.024 us of remaining navigation. These are nested
+components, not extra charges to add to navigation. Native work counters such
+as `headScanned`/`h2Upper` are not exact total graph distance-callback counts;
+they cannot establish that full H3 does fewer or more distance calculations.
+
+Timer interpretation follows the authenticated frozen source, not today's
+production implementation. Navigation is `bkt + pq + graphOther`; flat BKT
+search is inside `graphOther` despite zero `bkt`/`pq` fields. `io` subtracts
+scan callback time from the asynchronous retrieval interval: it includes
+scheduling, waiting and handling, and is not pure device latency. `scan`
+includes record processing, deduplication, distance evaluation and heap work.
+`postOther` includes posting preparation and final result handling. The
+outside-core residual includes wrapper work and phase-log emission, not just
+logging. Per-query phase sums are checked with 0.001 ms print rounding allowed;
+profile sums must not be forced to equal ordinary latency.
+
+The standalone pristine-upstream flat timer (~132 us) and H2-only/R32 timer
+(~216 us at ratio0.509329/beam29) are a different experiment from these frozen
+full-runtime navigation measurements. The full flat load log confirms
+MaxCheck=2048 and HashTableExponent=4; the standalone tool retains the saved
+flat graph's HashTableExponent=2. These observations do not isolate the cause
+of the ~216 us full-versus-standalone flat timing gap. Do not attribute that
+gap to hash configuration, count it entirely as wrapper overhead, splice the
+two timers into one cost balance, or claim a general hierarchy speed advantage
+over pristine BKT from this full-runtime comparison.
+
+## Original SPANN versus preserved H3 on SIFT1M
+
+`configs/sift1m_vanilla_spann/` pins a clean Microsoft/SPTAG checkout at
+`2ac3ebcab562bc81cdb8c7c98b35ea72f2703c3b`. It uses the original
+`docs/GettingStart.md` SIFT1M recipe, with 24 rather than 64 build threads.
+Source, static libraries, executables, index/staging data, and comparison
+outputs are isolated from this fork and the historical H3 artifacts. Only
+existing local SIFT files are used; no dataset checkout or download is needed.
+
+Build with the original `indexbuilder` using the fixed native INI:
+
+```bash
+python3 Tools/benchmarks/run_vanilla_spann_build.py \
+  --config Tools/benchmarks/configs/sift1m_vanilla_spann/build.ini
+```
+
+The launcher derives its native arguments from the INI and deliberately omits
+`-i`: at this revision a literal `-i FromFile` tries to open a file named
+`FromFile`. `IndexBuilder` does not consume `[SearchSSDIndex]`; the benchmark
+applies the separate fixed search controls and forwards their MaxCheck/hash
+settings to the memory index. The upstream `UpdateIndex()` alone does not
+forward those two settings.
+
+Two original-reader details matter for this comparison. STATIC hard-codes
+`O_DIRECT`, even when the default `UseDirectIO` option says false. Also, the
+default `PostingVectorLimit=118` raises the example's page12 build/search
+limit to page15 for 516-byte Float+VID records. The saved original index
+therefore reports page15. The comparison search INIs explicitly use page15
+for **both** engines rather than pretending that a late page12 setter
+re-truncates the original reader's cached list metadata. Page-aligned physical
+requests can include an additional boundary page.
+
+The H3 preparation makes a separate loader/view; its only loader changes are
+`IndexDirectory` and `UseDirectIO=true`. Every payload remains a symlink to
+the unchanged frozen H3 index. Its build cap16, 524-byte attribute-bearing
+records, representatives and memberships are retained. The fresh original
+and preserved H3 do **not** share their H1 representative sets, so the result
+is a comparison of the two concrete indices, not a pure structural ablation.
+
+```bash
+python3 Tools/benchmarks/run_vanilla_spann_comparison.py \
+  --config Tools/benchmarks/configs/sift1m_vanilla_spann/h3.ini
+python3 Tools/benchmarks/run_vanilla_spann_comparison.py \
+  --config Tools/benchmarks/configs/sift1m_vanilla_spann/benchmark.ini
+```
+
+Run these serially, after the build and adapter compilation have finished.
+Both use the same first 1,000 queries/top10 truth, full 1,000-query warmup
+before each measurement, one query thread, CPU/memory NUMA node2, and three
+ordinary/profile pairs. The original and H3 input containers differ, but
+their query vectors and groundtruth IDs were compared exactly. Do not mix in
+the old 100-warmup/900-query buffered-IO curve. The launcher records actual
+posting descriptor flags, resource/I/O samples, commands, native logs and
+immutable input identities; it never drops system caches or changes THP.
+
+The original adapter calls the untouched public `SearchIndex` for ordinary
+timing and the official memory-index/`SearchDiskIndex` split for phase timing.
+Original STATIC does not populate separate scan/read latency fields:
+posting access and scanning must be reported **together**, not as zero
+scan cost or pure device latency. H3's old `h2` timing denotes the entire
+three-level navigation; it does not expose separate H2/H1 timers.
+
+The adapter is built separately against the original static libraries and
+copies their generated compiler flags and ordered link dependencies:
+
+```bash
+prefix=/mnt/nvme/baotonglu/mocheng/datasets/sift1m_zipf200_sparse193_numeric/toolchains/spann_upstream_2ac3ebc
+cmake -S Tools/benchmarks/vanilla_native -B "$prefix/adapter-build" \
+  -DSPANN_UPSTREAM_BUILD="$prefix/build" \
+  -DCMAKE_CXX_COMPILER=/usr/bin/c++ -DCMAKE_BUILD_TYPE=Release
+cmake --build "$prefix/adapter-build" --target vanillaspannbench --parallel 1
+```
+
+`h3_recall90.ini` adds one fixed L29 measurement after the coarse curve,
+bringing its recall close to original SPANN L24. Its outputs remain separate.
+The read-only analysis and R rendering commands are:
+
+```bash
+python3 Tools/benchmarks/run_vanilla_spann_comparison.py \
+  --config Tools/benchmarks/configs/sift1m_vanilla_spann/h3_recall90.ini
+python3 Tools/benchmarks/analyze_vanilla_spann_comparison.py \
+  --config Tools/benchmarks/configs/sift1m_vanilla_spann/analysis.ini
+Rscript Tools/benchmarks/plot_vanilla_spann_comparison.R \
+  /path/to/comparison/curve.csv /path/to/comparison/figures
+```
+
+The comparison uses H3's complete `post` phase, not just its `io+scan`
+subphases. Ordinary vanilla timing surrounds `SearchIndex`; H3's historical
+outer timer also includes its manager wrapper, native counter collection and
+returned-ID copies. Both exclude recall calculation. Percent-level total
+differences therefore should not be called isolated structural gains/losses.
+
+H3 `contributing_postings_per_query` counts first-visit ownership after
+cross-posting deduplication, so asynchronous completion order can change
+that attribution while total reads, scans, distances, and recall remain
+unchanged. Only that attribution field is excluded from the strict core-work
+comparison; its observed range is retained. `--resume` reuses successful
+native H3 logs only when the binary, inputs, payloads, commands, and fixed
+search controls still match. Failed/incomplete native logs are never
+overwritten. Old raw logs and the original analysis source remain intact.
+
+`plot_vanilla_spann_comparison.R` renders a new `curve.csv` using R/ggplot2
+and refuses to overwrite an existing comparison figure.
+
 ## Native vector input migration
 
 `spannbuilder` now uses the original `VectorSetReader` dispatch and core DiskIO:
@@ -229,7 +960,8 @@ For local SIFT1B, use
 extends this spatial hierarchy to five total levels. Its raw UInt8 records
 are 140 bytes, and it uses the existing two-column single-label/numeric
 attributes, O-derived floor-16 support, and new `_h5` output directories.
-Only H5 retains a graph; every level uses the same `.12` selection ratio,
+H1 retains the query graph; upper levels retain representative vectors and
+signed CSR, not query ANN graphs. Every level uses the same `.12` selection ratio,
 configured solely by native `[SelectHead] Ratio=.12`, `HierarchyEnabled=true`,
 and `HierarchyLevels=5`.
 The CSR replica count remains `8`. This profile does not overwrite the older H1/H2 index.
@@ -241,28 +973,33 @@ round up to at least one head without changing the saved ratio. The remaining
 selection keys are `HierarchyReplicaCount`, `HierarchyHeadVectors`,
 `HierarchyHeadVectorIDs`, `HierarchyHeadIndexFolder`, `HierarchyPostingFile`,
 and the generated `HierarchyGenerationFingerprint`.
-Runtime hierarchy keys are `HierarchyInitialProbeRatio`, `HierarchyMaxCheck`,
-and `HierarchyPrefetchMode`. The initial probe ratio is one fixed CSR beam
-fraction, not a head-selection ratio or the first step of a widening loop.
-`BuildH1Graph=false` retains just the top graph and uses CSR descent below it.
-When a hierarchy is enabled, every sparse, dense, numeric-only, and unfiltered
-request uses it. Without a hierarchy, requests use the native H1 graph.
-Hierarchy queries never enumerate the global tag-to-H1 support map.
+Runtime navigation uses native H1 `MaxCheck` and `InternalResultNum`.
+`EnablePostingNavigation` defaults to false; current hierarchy recipes enable
+it explicitly to add signed CSR neighbors after sparse ordinary rows.
+H1 result-only post-filter remains the filtered baseline when it is disabled.
+`HierarchyInitialProbeRatio`, `HierarchyMaxCheck`, `HierarchyPrefetchMode`,
+`BuildH1Graph` and `CompactHierarchyVectors` are retired fresh settings.
+There is no independent upper ANN query or global tag-to-H1 support scan.
+Native temporary upper ANN indexes remain only during construction to preserve
+the original candidate/RNG replica assignment; they are not persisted.
 
 `HierarchyRouteSelectivityThreshold` and its `SecondLevelRouteSelectivityThreshold`
 alias are removed and rejected, including zero, empty and old-default values.
 There is no replacement dispatch knob. `HeadNavigationMode` and
 `HierarchyGraphSignaturePruning` are also removed and rejected. Persisted
-legacy signatures and their authenticated domains are compatibility metadata
-only; queries do not use them for result admission or traversal pruning.
-Hierarchy traversal does not require wrapper selectivity estimates or
+legacy signature domains remain authenticated compatibility metadata.
+Signatures themselves conservatively reject auxiliary posting regions before
+representative/member access, never ordinary H1 graph neighbors.
+Posting navigation does not require wrapper selectivity estimates or
 `tag_routing_stats.bin`. The tag-statistics sidecar may still be produced for
 diagnostics and public statistics consumers, but it never controls search and
 its absence does not disable filtered queries.
 
-Except for the removed route threshold and signature-domain pair, legacy `SelectSecondLevel` and `SecondLevel*` names remain explicit read/set
-aliases, with canonical keys taking precedence in INI files. Saving emits only
-canonical keys. Old artifact filenames and binary formats are unchanged.
+Use canonical hierarchy catalog/CSR names in new INIs. Required saved legacy
+layout/provenance fields are decoded explicitly with warnings; retired upper
+search controls do not regain setter or query semantics. Saving emits
+canonical keys. Existing artifact filenames and binary formats remain readable
+where their data is needed, without loading an upper ANN graph.
 `SecondLevelRatio` is **not** a selection option: it is accepted only as a
 compatibility constraint and is omitted on save. An enabled legacy hierarchy
 whose ratio differs from `Ratio` fails build/load/save explicitly; use the
@@ -729,9 +1466,10 @@ At load, the validated support sidecar builds the metadata used for H-region
 membership and exact result admission. Graph traversal remains distance-only.
 It never retries or raises `MaxCheck` to fill a predicate-specific posting
 quota, and it never enumerates a tag-to-H1 list. Empty physical postings do not
-count as results. The same configured graph and posting budgets apply whether
-the request is filtered or unfiltered. `HeadNavigationMode` is retired; an
-enabled hierarchy is always used, while a disabled hierarchy uses native H1.
+count as SSD results, but a selected matching head can still contribute its
+own record through native handling. `HeadNavigationMode` is retired. Every
+query uses native H1 navigation; optional signed posting adjacency does not
+create an independent upper ANN search.
 
 Static posting scans and iterators mark each VID in the existing workspace
 deduper before evaluating its predicate, so rejected replicas are skipped too.
@@ -744,65 +1482,73 @@ use first-visited records, while `scanned_occurrence_to_unique_ratio` measures
 all scanned replicas. The legacy `FalsePositivePostings()` counter now includes
 postings containing only already-visited matches.
 
-`[SelectHead] HierarchyLevels` counts H1: `3` means H3 -> H2 -> H1,
-with only H3 retaining a search graph. Every layer uses the same
-`[SearchSSDIndex] InternalResultNum` nprobe ceiling. One native,
-distance-only top-graph search uses the fixed `HierarchyMaxCheck` budget.
-`HierarchyInitialProbeRatio` then selects one fixed downward beam at every CSR
-layer. There is exactly one hierarchy iteration: no saved-frontier widening,
-underfill continuation, second graph pass, retry, or global scan.
+`[SelectHead] HierarchyLevels` counts H1. H1 is the sole query graph;
+H2 and higher levels are representative/CSR/signature catalogs. Filtered H1
+results use native result-only admission: nonmatching graph nodes still
+participate in distance navigation. The query retains native `MaxCheck`,
+`InternalResultNum`, tree continuation and final exact-record filtering.
+Upper representatives do not enter final top-k.
 
-H3/H2 are spatial routing-only indexes: their vectors do not enter the final
-top-k. Only nodes returned by the top search become downward parents. At H1,
-every unique reached child is distance-scored before support and exact-predicate
-membership decides whether its posting or own vector may contribute. A matching
-head outside the reached fixed beam remains unvisited, so sparse predicates may
-return fewer than k. The global tag-to-H1 map remains for construction,
-maintenance, and audit only.
+`[SearchSSDIndex] EnablePostingNavigation=true` adds the sparse adjacency
+supplier; false is the library default. The native H1 graph completes first.
+Only an underfilled head result set with remaining
+`MaxCheck + PostingAdditionalMaxCheck` budget starts one supplemental phase.
+`PostingAnchorCount` bounds nearest already-scored anchors, including negatives;
+their owners are merged and signature-qualified H2+ postings compete in one
+representative-distance frontier. Each selected posting exposes its owners
+once; complete upper rows add children to that same frontier. Rejected rows
+may expose owners without representative or CSR access. The phase preserves
+original heads and refines a bounded heap for the missing slots, replacing
+worse supplementary heads even after it fills. Only checked-leaf budget or
+reachable-posting exhaustion are hard work limits. Native-style frontier
+convergence may stop earlier: the H2 representative-distance pool has capacity
+`max(effective MaxCheck / 16, head-result capacity)`, and the nearest pending
+representative must remain within that pool. Coarse H3+ nodes share expansion
+priority without consuming H2 convergence slots. This approximate ANN criterion
+also handles predicates with fewer eligible heads than nprobe. It is not a
+proof that representative distances lower-bound all members or guarantee recall.
+The old in-row percentage and `PostingMinCandidates` policies are retired.
 
-`HierarchyMaxCheck` retains the native checked-work meaning. BKT counts checked
-leaves/graph-neighbor evaluations, not every internal tree-pivot distance, so
-it is not an exact total-distance ceiling. The same value is used regardless of
-predicate presence or density. Existing saved top graph/tree settings still
-apply; no signature or predicate state is passed into graph traversal.
+Signature rejection precedes representative/member access. Within an admitted
+H2 row, the compact visited/match lookup checks predicates before vector work.
+Fresh rejected members are marked visited and skipped without prefetch, distance
+or checked-leaf cost; replicas reuse that rejection. A rejected collapsed
+representative still checks aliases, scoring its shared vector once only when
+a live matching alias needs admission. Ordinary graph negatives remain scored
+bridges. The post-graph phase does not enqueue candidates or restart the graph;
+its terminal rejection visits must never be used for further graph traversal.
+Frozen all-scored experiments keep their original results and source snapshots.
 
-Each layer owns its local visited state. Native BKT navigation uses its original
-workspace without borrowed state or distance callbacks. CSR layers use separate
-touched-word bitmaps and retain their allocated capacity across queries.
-Distances and predicate state are not shared across layers; the query does not
-translate upper local IDs into canonical H1 IDs.
+The entire selected auxiliary CSR row completes, even across the remaining
+H1 budget. Native checked leaves do not count all tree pivots, upper distances
+or CSR/owner references: report those separately, not as a hard total-distance
+bound. Upper query state contains only touched IDs, and discovered candidates
+use a distance-ordered cache rather than repeatedly scanning the whole list.
+This avoids catalog-sized per-query allocation/clearing; it does not bound
+owner fanout or the maximum CSR row length.
 
-Only H1 real heads and SSD records enter the final result set. They share the
-existing global-VID deduper, including exact-predicate rejections. Each reached
-H1 head is scored geometrically before its own-vector membership check; rejecting
-that own vector cannot suppress a posting containing matching records. Exact
-VID/deletion/predicate checks remain authoritative for both H1 points and SSD
-records.
-The compact H1 point heap is pooled with the query workspace. Only H1 children
-reached through CSR descent are offered to it, including reachable heads with
-empty postings. SSD retains `visited -> predicate -> decode/distance`.
-Legacy H1 conversion, repeated admission, and compaction are skipped when the
-H1 point heap is active. Empty/partial hierarchy results do not silently switch
-to H1 graph navigation.
+H1 selected heads and SSD records retain native global-VID translation,
+liveness, exact predicates and deduplication. Matching heads with empty SSD
+postings still use the native selected-head record path. There is no
+supplementary H1 own-point heap or eager own/alias qualification for the bit.
+Attribute support and signatures are may-match summaries; final numeric/DNF
+checks remain exact. Numeric and unanchored DNF requests now use authenticated
+O-region signatures for the same H1 result-admission/match bit. H/O selection
+does not depend on whether auxiliary navigation is enabled. Own values are
+merged once; upper H/O unions are refreshed at build/load or explicit metadata
+replacement, never by a catalog-wide query scan. Missing or stale metadata is
+logged as conservative unknown. See `native_postfilter/README.md` under
+`hierarchical_shortcut_native` for the lifecycle and shared-memory costs.
 
-Persisted upper-layer signatures remain load/save compatibility metadata only.
-They do not admit results, reject seeds or neighbors, or prune CSR children.
-`HierarchyPrefetchMode=Rolling16` and `Batch64` prefetch layer-local vector
-rows only and have identical distance-ordering, admission, and budget semantics.
-Candidates use a reusable distance/ID-only bounded heap with local-ID
-tie-breaking.
+Fresh builds persist H1 navigation and upper catalogs. Temporary per-layer
+native ANN construction, using `[BuildHead]`, preserves the original
+candidate-search/RNG replica assignment and is released after assignment;
+it is not an upper query graph. Old graphless H1 indexes require explicit
+materialization into a new destination before search, without a silent upper
+ANN fallback. Materialization does not repair historical posting-assignment
+defects; those require a separately authorized rebuild.
 
-Graphless construction follows the same merge/deduplicate, score, then retain
-ordering. Its shared placement helper serves both support voting and filtered
-H-prefix assignment. The existing `max(InternalResultNum, 64)` placement beam
-limits retained intermediate heads, never the raw CSR child prefix; every child
-of the selected parents competes by query distance before truncation. The helper
-reuses layer-local touched-word bitmaps and buffers across calls. H1 filtering,
-the top graph's build-search budget, and query-time navigation remain unchanged.
-Indexes built with the earlier prefix truncation must be rebuilt to repair their
-posting assignments; reloading or materializing their vectors cannot do that.
-
-The canonical SIFT1M Zipf200 index now uses
+The previous graphless SIFT1M Zipf200 index is
 `datasets/sift1m_zipf200_sparse193_numeric/index_limited_tag_h3_placement_fixed`.
 The full native rebuild changed only the output and temporary locations in the
 build INI; the old `index_limited_tag_h3_independent` index is retained. Pure-H
@@ -815,20 +1561,20 @@ architecture-only control.
 Historical placement and graph-signature A/B measurements remain under the
 dataset's `hierarchy_audit_checks/` directory as frozen provenance. They were
 produced by retired query semantics and must not be replayed or interpreted as
-current routing modes. Current comparisons vary only native fixed budgets such
-as `InternalResultNum`, `MaxCheck`, `HierarchyInitialProbeRatio`, and
-`HierarchyMaxCheck`.
+current routing modes. Current comparisons use main H1 post-filter with
+`EnablePostingNavigation` disabled/enabled, matching native `InternalResultNum`,
+`MaxCheck`, SSD page limits, inputs, IO and query windows.
 
 ### Independent hierarchy-layer storage
 
-New unquantized STATIC graphless hierarchies use `head_metaonly.bin` version 3.
+Legacy unquantized STATIC graphless hierarchies use `head_metaonly.bin` version 3.
 H1 and every intermediate layer own complete, contiguous native vector
-catalogs, including sampled/promoted rows. The top layer keeps only the vectors
-inside its native BKT index, not an additional selection-catalog copy. H1 alone owns canonical result VIDs and V8 attributes; upper layers retain
-spatial CSR structures and compatibility signatures, with obsolete upper
-attribute artifacts removed.
-The canonical build sets `[SelectHead] CompactHierarchyVectors=false`;
-requesting legacy compaction during a fresh build is rejected explicitly.
+catalogs, including sampled/promoted rows. Legacy top-layer vectors may be read from their old native-index vector file,
+but its graph/tree is not loaded. H1 alone owns canonical result VIDs and V8
+attributes; upper layers retain spatial CSR and signatures, with obsolete
+upper attribute artifacts removed. Fresh main builds always retain H1
+navigation and independent upper catalogs. Fresh `BuildH1Graph` and
+`CompactHierarchyVectors` settings are rejected.
 
 The V3 descriptor keeps the 28-byte prefix and 8-byte canonical-H1 fingerprint.
 Loading checks exact catalog sizes, H1 V8 generation/content/VID integrity,
@@ -861,22 +1607,22 @@ In-process callers can use
 searches are quiesced.
 
 V1/V2 reading and explicit `--compact-hierarchy` remain legacy compatibility
-operations. They do not change the unified spatial query policy. Legacy
-signature fields remain authenticated compatibility data; they do not alter
-current traversal. V3 still requires complete generation-bound metadata.
+operations; they do not restore an upper ANN query path. Signature domains
+remain authenticated provenance, while signature masks can conservatively
+prune auxiliary postings. V3 still requires complete generation-bound metadata.
 
-Graphless STATIC directory exports copy the persisted artifacts into a private
+Legacy graphless STATIC directory exports copy the persisted artifacts into a private
 staging directory and use native loading to validate them before publication;
 they do not recursively serialize the dummy KDT or logical views over the source.
 In-place saves validate a hard-linked staging view and replace only the INI.
 The loader resolves the physical root descriptor against the directory actually
 being loaded, not an obsolete build/export directory embedded in the INI.
 
-`LogPhaseTime=true` separates top-graph search, CSR gathering/deduplication,
-admission, vector scoring, and sorting; the legacy `h2*` field names also apply
-to deeper hierarchies. The same diagnostic lines report per-layer graph, merge,
-admission, vector-scoring, and sorting times without enabling a separate
-adaptive-search mode.
+The full main-code campaign records H1/upper distances, signature/owner/member
+work and allocations using a separate `SPTAG_QUERY_WORK_DIAGNOSTICS` build.
+Those counters are compiled out of ordinary throughput measurements, and the
+diagnostic replay must match normal outputs and SSD work. Old `h2*` top-graph
+phase measurements are historical evidence, not current query stages.
 
 The retired EST4 sidecar and its split/merge serving route have been removed.
 Rare labels use regular H/O support and the ordinary exact-filter path.
@@ -886,9 +1632,13 @@ complete categorical domain `(0,1]` for artifact compatibility and audit.
 Legacy V3 domain endpoints remain authenticated fields in the unchanged
 binary format (V2 implies full coverage). Load/repair/save preserve those
 fields; old INI endpoints are read-only provenance, not overrides. Query
-traversal ignores both new and legacy upper-layer signatures. Numeric-only and
-unanchored predicates use the same hierarchy and fixed budgets as every other
-request, selecting O when H-region membership is not valid.
+navigation uses signature masks for H1 result admission and auxiliary posting
+regions, never to block ordinary H1 neighbors. Numeric-only and unanchored
+predicates use authenticated region summaries and native budgets, with exact
+final filtering. Unknown legacy numeric domains conservatively skip numeric
+pruning with a warning.
+They do not select an alternative upper-graph query path. Native H/O membership
+continues to select O when H-region membership is not valid.
 The dataset generators derive their rare-label recipe from active native budgets;
 this is not a separate serving policy. Before
 heads exist they use `expectedHeadCount = native input count * SelectHead.Ratio`; the
@@ -910,6 +1660,427 @@ Release/spannbuilder \
 ```
 
 ## SIFT1B Limited-Tag Recommendation
+
+### Five-scenario adaptive SPTAG / PipeANN Recall-QPS figures
+
+The explicit `--selectivity` mode of `plot_sift1b_official.R` consumes completed
+ordinary measurements only. It neither runs benchmarks nor regenerates truth.
+The historical one-argument invocation remains unchanged: six scenarios,
+`SPANN`/`PipeANN`, and separate figures under the run directory's `plots/`.
+For the current five-scenario comparison, use a **new, nonexistent output
+directory**:
+
+```bash
+Rscript Tools/benchmarks/plot_sift1b_official.R RUN_DIRECTORY NEW_OUTPUT --selectivity
+```
+
+`RUN_DIRECTORY` must contain `summary.csv` and `plot_registration.json`.
+The required CSV header is:
+
+```csv
+scenario,engine,L,queries,repeats,threads,cpu_nodes,recall,recall_min,recall_max,qps,qps_min,qps_max,candidate_count,selectivity,predicate
+```
+
+There is one summary row per `(scenario, engine, L)`. Every registered point
+must contain all of that engine's declared repetitions. No partial mode,
+missing curves, duplicated points, warmups or diagnostic timings are accepted.
+`recall` and its range are fractions in `[0,1]`; all QPS/range values must be
+positive and the reported point must lie within its range. A one-repetition
+point must have collapsed ranges. The renderer uses the supplied statistics
+verbatim: it does not average already summarized points or interpolate recall.
+The native producer remains responsible for authentic per-repetition evidence;
+the renderer checks the CSV's repetition counts against the frozen declaration.
+
+The registered scenario order is exactly `unfilter`, `broad_tag`, `medium_tag`,
+`sel_01pct`, `mixed_dnf`. Their current actual fractions are `1`,
+`0.170124930`, `0.017012493`, `0.001000735`, `0.000425710`, respectively.
+Mixed DNF is a separate workload, not the categorical 0.1% endpoint.
+Numeric-only and extreme-sparse records are rejected, not silently discarded.
+Every panel displays its registered actual density and eligible count;
+`unfilter` explicitly says **100% (no filter)**.
+
+`plot_registration.json` has the following contract:
+
+| Field | Requirement |
+| --- | --- |
+| `schema_version`, `dataset`, `corpus_count` | `1`, `"SIFT1B"`, `1000000000` |
+| `comparison` | `"fresh_paired"`, `"reused_pipeann_baseline"`, or `"historical"`; never inferred |
+| `series` | Optional legacy-compatible declaration: `"adaptive_only"` requires exactly adaptive/PipeANN; `"with_h1_control"` requires all three engines |
+| `scenarios` | The five ordered IDs above |
+| `scenario_metadata` | Exactly those IDs, each with scalar `title`, `predicate`, integer `candidate_count`, and fractional `selectivity` |
+| `engines` | Objects keyed by `SPTAG_adaptive` and `PipeANN`, optionally `SPTAG_H1`; no implicit or absent legend entries |
+| `caption_note` | Optional nonempty caption text; synthetic tests visibly identify themselves here |
+
+Each scenario's predicate, count and fraction must match every CSV row in that
+panel. Its fraction must equal `candidate_count / corpus_count` within `1e-12`.
+Do not round actual densities to nominal 10%, 1% or 0.1% labels.
+
+Each engine object declares the fields below. The following is a **schema
+example, not a campaign registration or performance result**; use the actual
+frozen grid, controls and authenticated identities rather than copying them
+into an existing campaign:
+
+```json
+{
+  "native_control": "nprobe",
+  "L": [16, 24, 48, 96, 192, 384, 768],
+  "repeats": 2,
+  "queries": 1000,
+  "threads": 1,
+  "cpu_nodes": "3",
+  "memory_nodes": "3",
+  "query_cohort_id": "REPLACE_WITH_FROZEN_ORDERED_QUERY_COHORT_ID",
+  "index_id": "REPLACE_WITH_FROZEN_INDEX_ID",
+  "runtime_id": "REPLACE_WITH_FROZEN_RUNTIME_ID",
+  "source_date": "2026-09-24",
+  "io_mode": "buffered",
+  "qps_aggregation": "median",
+  "search_policy": "predicate_first_adaptive_global_posting_frontier",
+  "controls": {
+    "graph_maxcheck": 2048,
+    "posting_additional_maxcheck": 2048,
+    "posting_anchor_count": 8,
+    "search_posting_page_limit": 3,
+    "enable_posting_navigation": true
+  }
+}
+```
+
+The earlier three-series SPTAG campaign uses the same compact SIFT1B index with
+120,040,156 H1 heads and the frozen adaptive runtime identified by `46af429...`;
+record full authenticated index/runtime identities, not just that prefix.
+Its nprobe grid is `[16, 24, 48, 96, 192, 384, 768]`, with two ordinary passes,
+reversed case order on the second pass, and ascending sweeps within each case.
+Each point has 1,000 warmup, measured and replay queries, one query thread,
+and CPU/memory NUMA 3. MaxCheck is 2048, posting extra is 2048, anchors are 8
+and the search posting page limit is 3. The same-index/runtime H1-only control
+uses MaxCheck 2048 with posting disabled. It is this project's baseline,
+**not an unmodified Microsoft SPTAG build**.
+
+These are native measurement protocol facts, not settings inferred or executed
+by the renderer. Preserve the existing runner's case protocol as additional
+per-engine provenance (for example `native_case_protocol`); engine metadata is
+retained verbatim. Warmup/replay counts and reversed execution order cannot be
+proved from aggregated CSV rows alone. The supplied median/min/max coordinates
+are retained without re-aggregation.
+
+`L` contains at least two strictly increasing native integer controls, each at
+least ten. Grids and positive integer repetition counts may differ by engine
+but must be complete in every panel; captions list each engine's grid and
+repetition count. `qps_aggregation` is explicitly `arithmetic_mean` or `median`.
+CPU/memory NUMA and cohort/index/runtime identities are nonempty strings.
+Use frozen content identities for the ordered query cohort, runtime and index,
+not a guessed common label. The common cohort is the same ordered query vectors,
+not the different filtered truth files for each scenario.
+
+For `SPTAG_adaptive`, `native_control` is `nprobe`, I/O is `buffered`, and
+`search_policy` is exactly `predicate_first_adaptive_global_posting_frontier`.
+For optional `SPTAG_H1`, use `nprobe`, `buffered`, `h1_only`, and
+`enable_posting_navigation: false`. Both SPTAG objects declare valid native
+`graph_maxcheck`, `posting_additional_maxcheck` and `posting_anchor_count`.
+The H1 legend derives MaxCheck from its declaration. This prevents the earlier
+full-budget failure policy from being relabeled as the current adaptive method.
+Captions identify H1-only as the project baseline, never a vanilla Microsoft
+build; they claim shared index/runtime only when those identities actually match.
+`PipeANN` uses `native_control: "searchL"`, `io_mode: "direct"`, an explicit
+nonempty `search_policy` (for example `official_search_disk_index`), and a
+nonempty flat `controls` object describing its actual fixed settings, such as
+pipeline and unfiltered/filtered `mem_L`. All fixed controls are retained in
+metadata and printed in captions. **SPTAG nprobe and PipeANN searchL are not
+equal work**, and buffered versus direct I/O is not a matched-I/O algorithm-only
+comparison.
+
+`fresh_paired` requires matching query counts, ordered `query_cohort_id`, query
+threads, CPU NUMA and memory NUMA across engines. The optional H1 control must
+also share SPTAG's frozen index and runtime identities. `historical` permits
+different cohort/execution declarations, but every engine must provide a valid
+`source_date` (`YYYY-MM-DD`) and explicit CPU/memory NUMA strings. Figures then
+say **Historical comparison - not a fresh paired run** and show each source
+date and placement. Predicate/count/density matching still applies.
+`reused_pipeann_baseline` retains the same strict cohort and placement matching,
+requires source dates and explicit per-engine `measurement_reused` flags
+(PipeANN true, SPTAG false), and labels the figures as an SPTAG rerun with a
+preserved PipeANN baseline, not a fresh paired measurement.
+
+Optional CSV provenance columns (`query_cohort_id`, `memory_nodes`, `io_mode`,
+`index_id`, `runtime_id`, `search_policy`, `qps_aggregation`, `native_control`,
+`source_date`, `corpus_count`) are checked against the registration when
+present. Optional `diagnostic` must be false and `stage` must be `measured`.
+No cohort or placement is inferred from QPS or a directory name.
+
+Outputs are combined `recall_qps.png`/`.pdf`, five
+`SCENARIO_recall_qps.png`/`.pdf` pairs, `plotted_points.csv`,
+`plot_metadata.json`, byte-identical `source_summary.csv` and
+`source_registration.json`, plus `hash_manifest.csv`. The coordinate CSV
+preserves every input field, including numeric text precision; only row order
+changes to registered scenario/engine/native-control order. Recall regressions
+remain connected in that order, not sorted by recall. Every figure uses the
+full Recall@10 axis `[0,1]`, log-QPS, common engine styles, and observed recall/QPS
+repetition ranges rather than confidence intervals.
+
+Metadata records engine controls, pairing declarations, axes, and MD5 hashes
+of both input files and generated figures/coordinates/snapshots. The hash
+manifest also hashes `plot_metadata.json`; it excludes only itself. Inputs are
+checked for mutation during rendering, and failed output is removed rather than
+published. Existing output directories are never overwritten.
+
+#### Assembling the completed native campaigns
+
+`assemble_sift1b_selectivity.py` is a bounded, read-only input assembler, not a
+measurement runner. Only the parent should invoke it, **after declaring both
+fresh campaigns complete**:
+
+```bash
+B=/mnt/nvme/baotonglu/mocheng/datasets/sift1b/comparisons/main_posting_adaptive_curves_20260924
+P=/mnt/nvme/baotonglu/mocheng/datasets/sift1b/comparisons/pipeann_adaptive_curves_20260924_v2
+python3 -B Tools/benchmarks/assemble_sift1b_selectivity.py "$B" "$P" --completed
+```
+
+For the final adaptive-only rerun, the producer must explicitly register
+`variants: ["postgraph_extra"]`, ten cases and 70 ordinary measured points.
+The controlled-ascent campaign declares `implementation_revision:
+"controlled_ascent"` and two native processes: its 70-point ordinary process
+plus a separate six-point, first32 counter-only process. The explicit
+`points_by_kind` and `cases_by_kind` separate these grids; counters are never
+publication throughput. Either completed ordinary or subsequent completed
+diagnostic stage status is accepted, but the ordinary log, exit status and
+all 70 measured payloads must independently pass the full checks.
+The final combined `state: "complete"` also requires matching
+`ordinary-completion.json`/`after-normal-status.json` evidence binding the
+70-point report hash and native command. A reported performance regression
+does not suppress valid measured curves or turn a partial run into completion.
+No H1-only performance matrix is required or silently dropped. Reuse the
+authenticated, unchanged PipeANN baseline only with explicit flags and a new
+publication directory outside both source campaigns:
+
+```bash
+python3 -B Tools/benchmarks/assemble_sift1b_selectivity.py \
+  NEW_ADAPTIVE_CAMPAIGN COMPLETED_PIPEANN_BASELINE --completed --adaptive-only \
+  --reuse-pipeann-baseline --output-directory NEW_PUBLICATION/plot_input
+Rscript Tools/benchmarks/plot_sift1b_official.R \
+  NEW_PUBLICATION/plot_input NEW_PUBLICATION/plots_selectivity --selectivity
+```
+
+This produces exactly 100 coordinates from 70 adaptive and 130 PipeANN measured
+repetitions, with only adaptive/PipeANN series in every panel. The baseline's
+original SPTAG campaign association is retained in provenance, while the
+current query payload, predicates, truth, native controls and execution
+placement are independently matched. Existing baseline `plot_input` and
+figures remain untouched. The default assembler still requires the complete
+older 140-point SPTAG matrix and produces its original 135 coordinates.
+
+The original `pipeann_adaptive_curves_20260924` attempt is **failed and not
+plottable**: unfiltered execution reported EBADF errors despite exit zero, and
+broad categorical execution exited 132. Preserve those logs. A partial
+`unfilter/results.json` is not campaign completion. Use only a fresh replacement
+path approved by the parent; the exporter takes both campaign paths through its
+CLI and requires the replacement's registered INI to name that same output
+directory and the existing SPTAG campaign. It does not require a particular
+PipeANN directory or INI basename.
+
+The corrected `_v2` campaign uses `benchmark_v2.ini` and the parent-verified
+`readonly_descriptor_adaptation` registration. **Running is not complete**:
+do not invoke assembly or rendering until all 130 measured points have completed
+successfully and the parent approves them. The adaptation fixes query-only
+`O_RDWR` opens to `O_RDONLY` under `READ_ONLY_TESTS`, with explicit open-failure
+handling. It does not change ANN/search/filter/distance code, PQ, pipeline 32,
+uring, tcmalloc or `NO_MAPPING`; failed original-attempt timings remain excluded.
+
+The exporter authenticates the adaptation manifest against both the registered
+INI and registration hash, binds its two binary identities and original-toolchain
+lineage, and checks its declared file-access-only scope, unchanged flags/backend/
+allocator and completed validation evidence. It records the full manifest in
+`assembly_manifest.json`, retains the registered adaptation record and scope in
+the PipeANN engine metadata, and emits a visible `caption_note` disclosing the
+file-access-only change and unchanged ANN behavior. The existing renderer already
+prints that note on combined and per-scenario figures. The exporter does **not**
+invoke the toolchain verifier, rerun its native fixtures/smokes, or use their
+first-16-query functional timings as curve points.
+
+The completion flag does not bypass validation. SPTAG must report completed
+`after/normal`; PipeANN must report five completed native processes and 130
+measured points. Missing, running, failed, partial or reordered inputs fail
+without producing a usable assembly. The exporter requires exactly 140 SPTAG
+ordinary records and 260 PipeANN native records (130 warmups, 130 measured).
+It reuses existing helpers to check the registered job/control order and
+reparse every PipeANN `RESULT` line, then compares all scenario and campaign
+reports. Only the two registered measured repetitions enter each median/min/max.
+The current controller's native-error guard also rejects error/fatal/bad-file-
+descriptor diagnostics even when valid-looking `RESULT` lines exist. Controller
+and frozen launcher hashes are recorded separately; unrelated controller failure
+handling may change, but the parser/input helpers and registered jobs must match.
+Signalled/nonzero-exit resource reports are rejected, including GNU-time reports
+that also contain a misleading `Exit status: 0`.
+
+SPTAG `graph` maps to `SPTAG_H1`; `postgraph_extra` maps to `SPTAG_adaptive`.
+Both retain the same full authorized runtime hash and a canonical registered
+index-inventory identity. The PipeANN runtime identity combines its two verified
+binary hashes. Query identity hashes the **ordered logical UInt8 payload**:
+the SPTAG `.npy` and PipeANN headered `query.u8bin` must contain identical
+`1000 x 128` bytes despite different container hashes. Each PipeANN truth input
+must be an exact `1000 x 10` IDs-only uint32 matrix with its eight-byte header,
+matching the authenticated SPTAG int64 truth IDs. Predicates, counts and actual
+densities must agree with the authenticated workload and fixed filter profile.
+
+The assembler checks SPTAG's native case boundaries, controls, warmup/measured/
+replay counts, raw payload hashes, GT-ID recall, returned-result/SSD-work
+summaries and deterministic IDs/distances/SSD-work parity between repetitions.
+Unfiltered H1/adaptive payloads must also agree. It preserves whole-window
+native QPS, **not** inverse mean per-query latency: the outer measured window
+includes loop/result-release overhead absent from individual latency samples.
+Latency bounds and native nearest-rank percentiles are checked separately.
+No attribute/base-vector rescanning or new exact-distance computation occurs;
+the completed native campaign remains the source of that semantic evidence.
+
+Source dates come from completed, successful GNU-time resource files bound to
+their registered commands, using UTC file-completion timestamps, not directory
+names or the assembly date. The declared comparison is `fresh_paired`, while
+retaining SPTAG buffered versus PipeANN direct I/O and their different native
+warmup/replay protocols. The native report's legacy `timing_accepted` field is
+preserved as source evidence, not used to mix stages or discard ordinary runs.
+
+The only output directory is fresh `P/plot_input`, containing `summary.csv`
+(135 points), renderer-compatible `plot_registration.json`, and
+`assembly_manifest.json`. The manifest includes source/raw SHA-256 hashes,
+completion evidence, native commands/case/job protocols, all 270 measured
+records, excluded-warmup counts and output hashes. Registered index/base files
+are checked by identity (`stat`) only, with no directory inventory walk or
+large payload hash; other content reads are capped at 128 MiB per file.
+Existing assemblies are never overwritten. Source changes during assembly
+fail and remove only the newly created output files.
+
+The assembler never executes native binaries or invokes R. After separately
+reviewing the completed assembly, the parent may render to the intended new
+directory:
+
+```bash
+Rscript Tools/benchmarks/plot_sift1b_official.R "$P/plot_input" "$P/plots_selectivity" --selectivity
+```
+
+### Fixed PipeANN / SPANN comparison profile
+
+The repository-owned comparison configuration is
+`configs/sift1b_official/benchmark.ini`, with checked-in native SPANN search
+INIs, native PipeANN filter JSON files and `pipeann_readonly.cmake` beside it.
+Use `run_sift1b_official.py`; do not synthesize a new configuration in an
+experiment directory or pass data/search overrides through the environment.
+Run directories contain byte-for-byte configuration snapshots, not rendered
+or patched configurations.
+
+```bash
+python3 Tools/benchmarks/run_sift1b_official.py check-config
+python3 Tools/benchmarks/run_sift1b_official.py build-tools
+python3 Tools/benchmarks/run_sift1b_official.py prepare-inputs
+python3 Tools/benchmarks/run_sift1b_official.py prepare-memory
+python3 Tools/benchmarks/run_sift1b_official.py check-ready
+python3 Tools/benchmarks/run_sift1b_official.py run
+```
+
+The PipeANN profile follows its `docs/cpp-interface.md` and the
+`scripts/tests-pipeann/fig13.sh` / `eval_f.sh` latency recipe: read-only
+`READ_ONLY_TESTS` plus `NO_MAPPING`, `io_uring`, PQ32, pipeline width 32,
+mode 2, top-10 and one query thread. Unfiltered search requires a compatible
+1% memory-entry index (`R=32`, `L=64`, `alpha=1.2`) and `mem_L=10`;
+filtered search keeps native `auto` and `mem_L=0`. Missing memory files are
+an error, never permission to downgrade unfiltered search to zero.
+The official low-budget grid starts at 10 and includes 15 and 20.
+
+The configured NUMA placement is a host policy, not a claim that the whole
+process uses one CPU. Do not confine the query thread, SQPOLL and helper work
+to a single CPU. Build thread counts are adapted to this host and are fixed
+in the same INI. Native toolchain preparation is isolated from the PipeANN
+working tree; memory preparation adds a separate alias prefix and does not
+rebuild or replace the billion-vector SSD graph.
+
+This host lacks the system tcmalloc development package. The fixed CMake
+profile links and locates the unmodified Ubuntu `gperftools` 2.9.1-0ubuntu3
+packages under `datasets/sift1b/toolchains/dependencies/gperftools`, rather
+than disabling the allocator or requiring a global library override.
+The downloaded `.deb` files and their SHA-256 list are retained in `packages/`;
+the toolchain manifest records the actual resolved runtime-library hashes.
+On this host the private prefix was populated with these commands:
+
+```bash
+mkdir -p /mnt/nvme/baotonglu/mocheng/datasets/sift1b/toolchains/dependencies/gperftools/packages
+cd /mnt/nvme/baotonglu/mocheng/datasets/sift1b/toolchains/dependencies/gperftools/packages
+apt-get download libgoogle-perftools-dev=2.9.1-0ubuntu3 libgoogle-perftools4=2.9.1-0ubuntu3 libtcmalloc-minimal4=2.9.1-0ubuntu3
+dpkg-deb --extract libgoogle-perftools-dev_2.9.1-0ubuntu3_amd64.deb ..
+dpkg-deb --extract libgoogle-perftools4_2.9.1-0ubuntu3_amd64.deb ..
+dpkg-deb --extract libtcmalloc-minimal4_2.9.1-0ubuntu3_amd64.deb ..
+```
+
+Query preparation converts the existing matching 1K query/GT suite into
+native data files only. Filter expressions and budgets remain in the
+checked-in files; relative filter bindings resolve in the configured prepared
+data directory. Both engines warm the complete query set before each timed
+pass. The fixed SPANN sweep differs only in `InternalResultNum`; empty and
+underfilled results remain in recall. Existing full saved-index audit evidence
+is reused only when its index file identities still match.
+
+This remains a 1K-query experiment, not the separate formal 10K protocol.
+The figures disclose buffered SPANN versus direct-I/O PipeANN; do not present
+them as a matched-I/O algorithm-only comparison. Historical ad-hoc runs,
+including `pipeann_spann_h5_20260913T080606Z`, are not the recommended PipeANN
+pure-search baseline and must not replace this entrypoint.
+
+For a SPANN placement/page-size regression, the fixed diagnostic entrypoint is
+`python3 Tools/benchmarks/run_spann_memory_diagnostics.py run`, using
+`configs/sift1b_spann_memory/diagnostic.ini`. It reuses the same frozen binary,
+index, query cohort, warmup and repetition count; the native L96 INI adds only
+phase timing. Cases run serially: local NUMA/default THP, the same placement
+with process-local THP disabled, the historical CPU48/interleaved placement,
+then the local/default case again. This is diagnostic data, not replacement
+benchmark curves. The driver records native phase timings and its own child's
+CPU, NUMA page counts, RSS, `AnonHugePages` and faults. It never changes global
+THP settings, drops the host page cache, or changes other users' processes.
+
+For H5..H1 per-layer costs, use the same entrypoint with
+`--config Tools/benchmarks/configs/sift1b_spann_layers/diagnostic_L0064.ini`
+or `diagnostic_L0096.ini` in that directory. Each runs one canonical search
+point, adding only native `LogPhaseTime` and `LogPathStats`. Per-layer means
+exclude every warmup block and retain the native distinction between graph
+checked counts and downward distance evaluations. Vector-row lookups, CSR
+row expansions and visited-bitmap checks are logical access counts, not
+hardware cache misses or physical DRAM transactions.
+
+The `diagnostic_access_L0064.ini` and `diagnostic_access_L0096.ini` plans pin
+a separate instrumented executable. Build it with the checked-in
+`access_profile.cmake`; its output directories are outside the production
+`Release` tree. H5 counters cover all ordinary BKT search distance callbacks,
+including tree-centroid calculations omitted from `graph_checked`, graph
+queue row visits, visited-table calls and BKT root/queue node visits. They
+exclude prefetch-only lookups and are not instruction-level load/store counts.
+The scoped thread-local collector is enabled only around a profiled top-layer
+search with path logging; it never changes admission, traversal or budgets.
+Keep original-binary timing results separate from these counting runs.
+
+For implementation/beam A/B, run
+`python3 Tools/benchmarks/run_spann_latency_ab.py run`. Its fixed
+`configs/sift1b_spann_latency/experiment.ini` runs all variants and repeats
+inside one native process, loading the billion-vector index only once.
+Implementation variants must preserve every returned ID, work counter and
+parent budget. Explicit routing variants report lost and gained groundtruth
+hits separately; an unchanged aggregate recall does not establish identical
+results. The native `--dump-results` flag emits timed-query IDs only after
+the timer stops. `HierarchyDedupMode` selects Bitmap, LocalHash or Auto;
+Auto uses a candidate-sized hash only when its estimated storage is smaller
+than the layer bitmap. `HierarchyRoutingBudgets` is Auto for the original
+ratio-based rule, or a top-to-bottom list of parent beams (H5,H4,H3,H2 for H5).
+It never changes the H1 posting target or depends on a query predicate.
+Do not report a beam-change speedup as a same-work implementation speedup.
+`--config Tools/benchmarks/configs/sift1b_spann_latency/confirm.ini` repeats
+the baseline/Auto comparison and the declared beam variants with Rolling16
+throughout. Preserve failed-run status if only its completed measurements
+are recovered for analysis; confirmation requires a normal native exit.
+
+`--config Tools/benchmarks/configs/sift1b_spann_latency/recall90.ini` fixes
+the canonical L128 point (90.26% recall in the reference cohort). It pairs
+Bitmap/Auto phase profiles with explicit `Kind=throughput` variants whose
+phase/path logging is disabled. All four retain identical search budgets and
+must return identical IDs; throughput variants deliberately have no phase means.
+Process samples also retain `/proc/PID/io` counters, and final usage includes
+filesystem input/output block counts. These include loading and warmup, not
+query-only I/O. Native requested posting bytes are not device-read bytes.
 
 The SIFT1B generator replaces the old four-level ACL hierarchy with exactly
 two attributes: one Zipf-200 categorical tag and one deterministic numeric
@@ -956,10 +2127,10 @@ choose their owner by vector distance rather than an attribute pivot.
 
 ### Reduced filtering configuration
 
-The current H5 recipe has **86 explicit entries, down from 138** after the
-attribute-partition cleanup. Most remaining entries are original SPANN
-construction/search settings or input/output configuration, not filtering
-tunables. The filtering/hierarchy-specific overrides are:
+The current H5 recipe uses H1 navigation with upper posting catalogs. Most
+entries are original SPANN construction/search settings or input/output
+configuration, not filtering tunables. The filtering/hierarchy-specific
+overrides are:
 
 ```ini
 [Tags]
@@ -969,7 +2140,6 @@ ColumnTypes=categorical,numeric
 HierarchyEnabled=true
 HierarchyLevels=5
 HierarchyReplicaCount=8
-BuildH1Graph=false
 ParallelBKTBuild=true
 
 [BuildSSDIndex]
@@ -979,8 +2149,7 @@ LimitedTagMinHeadCount=16
 EnableLimitedTagSupportExpansion=true
 
 [SearchSSDIndex]
-HierarchyInitialProbeRatio=0.666666
-HierarchyMaxCheck=192
+EnablePostingNavigation=true
 ```
 
 This is an excerpt, not a standalone build INI: shared native `Ratio=.12`,
@@ -996,9 +2165,10 @@ serial implementation, so launch preflight must verify sufficient RAM.
 | `NumericCols` / `SPTAG_NUMERIC_COLS`, old bulk prefix-count option | Use `[Tags] ColumnTypes` for every original column; width and numeric lane mapping are derived. Legacy stored prefix metadata remains readable. |
 | `HierarchySignatureMinSelectivity`, `HierarchySignatureMaxSelectivity` and `SecondLevel*` aliases | New signatures cover all labels; legacy domain metadata remains authenticated and read-only. |
 | `BKTSeed`, `TPTSeed` | Upstream global/clock RNG behavior; no custom fixed seed or external seed knob. Loaded historical geometry stays unchanged. |
-| `HeadNavigationMode`, `HierarchyGraphSignaturePruning` | One enabled hierarchy is used for every query; graph and CSR traversal are distance-only. |
+| `HeadNavigationMode`, `HierarchyGraphSignaturePruning` | One native H1 query graph; result-only post-filter does not prune ordinary neighbors. |
+| `BuildH1Graph`, `CompactHierarchyVectors`, `HierarchyInitialProbeRatio`, `HierarchyMaxCheck`, `HierarchyPrefetchMode` | Fresh builds retain H1 navigation; no top-graph beam/descent query remains. Required saved layout metadata is decoded explicitly for migration. |
 | `HierarchyRouteSelectivityThreshold`, `SecondLevelRouteSelectivityThreshold` | Predicate selectivity never chooses a graph or budget. |
-| `SparseFallbackMaxHeads`, `SparseFallbackMaxPostingPages` | Direct H1 completion and widening are removed; one fixed top-graph search is followed by one fixed-beam CSR descent. |
+| `SparseFallbackMaxHeads`, `SparseFallbackMaxPostingPages` | No direct/global completion or restart; optional signed posting extends the same H1 frontier. |
 | `ForceDenseTagSearch`, `DirectSparseMaxPostings` | Dense/sparse route selection and direct posting scans are removed. |
 | `FilteredSearchNprobeSafety`, `FilteredSearchTargetRecall`, `FilteredSearchCoverageExponent`, `EnableAdaptiveFilteredNprobe`, `LogAdaptiveNprobe` | Filtered and unfiltered requests share the configured native posting and graph budgets. |
 | `FilterKeepUExtra` | All configured bundle nodes participate independently of predicate presence. |

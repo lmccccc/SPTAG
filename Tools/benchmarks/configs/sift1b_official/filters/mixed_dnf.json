@@ -1,0 +1,12 @@
+{
+  "attr_indexes": [
+    {"name": "tag", "key": 0, "type": "label", "file": "base.label.0"},
+    {"name": "num", "key": 1, "type": "range", "file": "base.label.1"}
+  ],
+  "filter": "tag = $$rare OR (tag = $$regular AND num = $$range)",
+  "bindings": {
+    "rare": "mixed_dnf_rare.spmat",
+    "regular": "mixed_dnf_regular.spmat",
+    "range": "mixed_dnf_range.spmat"
+  }
+}

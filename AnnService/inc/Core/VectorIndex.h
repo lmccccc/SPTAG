@@ -14,6 +14,7 @@
 #include "inc/Helper/SimpleIniReader.h"
 #include "inc/Core/Common/IQuantizer.h"
 #include "inc/Core/Cache/PostingSignature.h"
+#include "inc/Core/HeadMetadataLayout.h"
 
 class ResultIterator;
 
@@ -257,6 +258,10 @@ public:
 
         void ClearHeadNodeMeta();
 
+        void InitializeCompactHeadNodeMeta(SizeType count, const TagSchema& schema,
+            const Cache::HierWidthTable& widths, bool tails);
+        const HeadMetadataLayout& GetHeadMetadataLayout() const { return m_headLayout; }
+
         void InitializeHeadNodeMeta(
             SizeType p_numSamples,
             int p_numQuantCols = 0);
@@ -292,17 +297,18 @@ public:
             bool p_includeTailPS,
             size_t& p_stride);
 
-        bool HasHeadNodeMeta() const { return m_headNodeMetaStride > 0 && !m_headNodeMeta.empty(); }
+        bool HasHeadNodeMeta() const { return m_headLayout.stride > 0 && !m_headNodeMeta.empty(); }
 
         SizeType GetHeadNodeMetaSampleCount() const;
 
-        size_t GetHeadNodeMetaStride() const { return m_headNodeMetaStride; }
+        size_t GetHeadNodeMetaStride() const { return m_headLayout.stride; }
 
         Cache::HierWidthTable GetHeadNodeHierWidths() const;
 
         const std::vector<std::uint8_t>& GetHeadNodeMetaBlob() const { return m_headNodeMeta; }
 
-        std::vector<std::uint8_t>& GetHeadNodeMetaBlob() { return m_headNodeMeta; }
+        std::vector<std::uint8_t>& GetHeadNodeMetaBlob() { ++m_headNodeMetaRevision; return m_headNodeMeta; }
+        std::uint64_t GetHeadNodeMetaRevision() const { return m_headNodeMetaRevision; }
 
         void SetHeadNodeGlobalVID(SizeType p_sampleId, SizeType p_globalVID);
 
@@ -314,7 +320,7 @@ public:
 
         bool HeadNodePSMayIntersect(SizeType p_sampleId, const Cache::PostingBitmask& p_queryMask) const;
 
-        bool HasHeadNodeTailPS() const { return m_headNodeHasTailPS; }
+        bool HasHeadNodeTailPS() const { return m_headLayout.hasTail; }
 
         void SetHeadNodeTailPS(SizeType p_sampleId, const Cache::PostingBitmask& p_ps);
 
@@ -328,7 +334,7 @@ public:
 
         void SetHeadNodeHierMask(SizeType p_sampleId, const Cache::HierarchicalOwnTags& p_mask);
 
-        const Cache::HierarchicalOwnTags* GetHeadNodeHierMask(SizeType p_sampleId) const;
+        HeadOwnTagsView GetHeadNodeHierMask(SizeType p_sampleId) const;
 
         bool HasHeadNodeOwnTags() const
         {
@@ -337,6 +343,7 @@ public:
 
         void SetHeadNodeOwnTagsAvailable(bool p_available)
         {
+            ++m_headNodeMetaRevision;
             m_headNodeOwnTagsAvailable = p_available;
         }
 
@@ -348,7 +355,7 @@ public:
         // matches the query".
         void SetHeadNodePostingHierMask(SizeType p_sampleId, const Cache::HierarchicalPostingMask& p_mask);
 
-        const Cache::HierarchicalPostingMask* GetHeadNodePostingHierMask(SizeType p_sampleId) const;
+        HeadPostingMaskView GetHeadNodePostingHierMask(SizeType p_sampleId) const;
 
         bool HasHeadNodePostingHierMasks() const
         {
@@ -357,6 +364,7 @@ public:
 
         void SetHeadNodePostingHierMasksAvailable(bool p_available)
         {
+            ++m_headNodeMetaRevision;
             m_headNodePostingHierMasksAvailable = p_available;
         }
 
@@ -364,10 +372,11 @@ public:
         // M*NUM_QUANT_WORDS uint64 block = union of member-vector numeric buckets
         // (one 256-bit lane per numeric column). M=0 => no block (V3 layout, byte
         // identical). Used by the posting pre-filter for numeric range predicates.
-        int GetHeadNodeNumQuantCols() const { return m_headNodeNumQuantCols; }
+        int GetHeadNodeNumQuantCols() const { return m_headLayout.numericColumns; }
         void SetHeadNodeNumericDomainFingerprint(
             std::uint64_t p_fingerprint)
         {
+            ++m_headNodeMetaRevision;
             m_headNodeNumericDomainFingerprint =
                 p_fingerprint;
         }
@@ -559,18 +568,8 @@ public:
     // self-contained global tail:
     //   [pure PostingBitmask][tail PostingBitmask][own-tags][posting-content][globalVID][bundleNodeId][headOnly]
     // Aligned to alignof(PostingBitmask)=8 for stride.
-    size_t m_headNodeMetaStride = 0;
-    size_t m_headNodePSOffset = 0;
-    size_t m_headNodeTailPSOffset = 0;
-    bool m_headNodeHasTailPS = false;
-    size_t m_headNodeHierMaskOffset = 0;
-    size_t m_headNodePostingHierMaskOffset = 0;
-    size_t m_headNodeGlobalVIDOffset = 0;
-    size_t m_headNodeBundleNodeIdOffset = 0;
-    size_t m_headNodeHeadOnlyOffset = 0;
-    size_t m_headNodeNumQuantOffset = 0;   // offset of quantized numeric block (V4)
-    size_t m_headNodeTailNumQuantOffset = 0;
-    int m_headNodeNumQuantCols = 0;        // numeric columns in quant block (0 = none)
+    std::uint64_t m_headNodeMetaRevision = 0;
+    HeadMetadataLayout m_headLayout;
     std::uint64_t m_headNodeNumericDomainFingerprint = 0;
     bool m_headNodeOwnTagsAvailable = false;
     bool m_headNodePostingHierMasksAvailable = false;

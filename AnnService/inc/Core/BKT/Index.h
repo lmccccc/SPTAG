@@ -227,8 +227,15 @@ namespace SPTAG
             ErrorCode SearchIndexWithCrossEdges(QueryResult& p_query,
                                                 const CrossGraphSearchContext& p_context,
                                                 int p_maxCheck,
-                                                CrossGraphSearchStats* p_stats = nullptr) const;
+                                                CrossGraphSearchStats* p_stats = nullptr,
+                                                const std::function<bool(SizeType)>* p_resultFilter = nullptr) const;
             ErrorCode SearchIndexWithFilter(QueryResult& p_query, std::function<bool(const ByteArray&)> filterFunc, int maxCheck = 0, bool p_searchDeleted = false) const;
+            ErrorCode SearchIndexWithPostingNavigation(QueryResult& query,
+                const std::function<bool(SizeType)>& predicate,
+                COMMON::PostingNavigation* postingNavigation = nullptr,
+                int maxCheck = 0, bool searchDeleted = false,
+                int anchorCount = 8, int additionalMaxCheck = 0) const;
+
             ErrorCode SearchIndexWithResultFilter(
                 QueryResult& p_query,
                 std::function<bool(SizeType)> p_resultFilter,

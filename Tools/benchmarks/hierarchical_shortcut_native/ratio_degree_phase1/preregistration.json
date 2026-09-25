@@ -1,0 +1,58 @@
+{
+  "phase": "1_only_no_full_sweep",
+  "ordinary_scenario": "unfilter",
+  "ordinary_nprobe": 24,
+  "required_cases": [
+    "h1",
+    "control",
+    "supplier"
+  ],
+  "causal_reference": "One unoptimized implementation of the SAME ratio rule, not another policy.",
+  "ordinary_repetitions": 2,
+  "ordinary_native_processes": 8,
+  "ordinary_order": [
+    [
+      "h1",
+      "control",
+      "supplier",
+      "reference"
+    ],
+    [
+      "reference",
+      "supplier",
+      "control",
+      "h1"
+    ]
+  ],
+  "profile_native_processes": 4,
+  "profile_queries": 1000,
+  "warmup": 1000,
+  "measured_queries": 1000,
+  "query_threads": 1,
+  "numa_cpu_memory_node": 2,
+  "small_fixtures": "h1/control/supplier unfilter [16,24,384] and reverse; supplier medium/extreme/numeric/mixed [24];8 queries and8 warmups.",
+  "supplier_min_base_degree": 16,
+  "supplier_retained_ratio": 0.5,
+  "native_maxcheck": 2048,
+  "hierarchy_maxcheck": 512,
+  "result_num": 10,
+  "page_limit": 15,
+  "profile_attribution": "Nested instrumented nanosecond scopes are not additive and not ordinary latency. Use same-policy reference/optimized ordinary comparison for removed overhead.",
+  "configs": {
+    "control_asc.ini": "7d35b37b5d6097f7412f2be3327b8b1d1403d8025fec678beba37131e27d757c",
+    "control_desc.ini": "a7007fcba4bd7f96b1f74c4856c9821fe0856100f811ee5664d33b693b19dbc7",
+    "control_plain.ini": "5586a0d8ccd8a2d7c294b958925148e889882514fa43f5d8ab5c307f06682c43",
+    "control_profile.ini": "aca6de0af9c3b5b9db2b245c3cb2d5f6e6063992ab0041a36d1c01823cd1dca6",
+    "h1_asc.ini": "acbc3528fb9b017cb6c5a2ca76b7813d45a901ea869e7eb9b6c9065d0bd2fca8",
+    "h1_desc.ini": "ded6914ad0a3ce24164526bbe3370009da0aa34c0e54bfc2c7f1006b79ac6b83",
+    "h1_plain.ini": "7184c59840cd7c3c502f394b252db22d5d30b397965476039b29c8a55bf774ab",
+    "h1_profile.ini": "3334aac25217bef4e59904b8ddc48933834576f754e5aa7a1755ea9b98a55325",
+    "reference_plain.ini": "6bfe2a57319494cdef84eb9f152a999c704a0953cb8b3571541610570e3f8a47",
+    "reference_profile.ini": "21b5d8cfb72950216adbc462002a114dd4fb1bd1cad1a5aa09ef499aa02864fd",
+    "supplier_asc.ini": "6e124977bf42afbadabb271973ee96b90ae148d7ab564367a0f7c5b55649d61e",
+    "supplier_desc.ini": "805e4c9217599a67e417a31346bdc1d06857963cc6c2141630f0b9ac3b0e0de0",
+    "supplier_plain.ini": "916f68c451340c9084c50b3c05acaa67c723c9af07d1b9ae840d2a5d687efe7c",
+    "supplier_profile.ini": "75f26ca64f560f8ceffff5b93c4f33d9770717c134ab1aab0ace96cc473f9ea5"
+  },
+  "stop": "Return after Phase1; do not launch any198-point matrix."
+}

@@ -317,12 +317,45 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                       CrossGraphSearchStats* p_crossStats,
                       std::function<bool(SizeType)> p_resultFilter) const
 {
+    std::function<float(const T*, const T*, DimensionType)> countedDistance;
+    const auto* computeDistance = &m_fComputeDistance;
+    if (auto* accesses = COMMON::g_graphAccessStats)
+    {
+        countedDistance = [this, accesses](const T* query, const T* sample, DimensionType dimension) {
+            ++accesses->m_distanceCalls;
+            return m_fComputeDistance(query, sample, dimension);
+        };
+        computeDistance = &countedDistance;
+    }
     // Keep the native stopping heap independent of result membership.
     const bool hasResultFilter = p_resultFilter || filterFunc;
+    std::vector<std::pair<float, SizeType>> anchors;
+    if (p_space.postingNavigation)
+        anchors.reserve((std::min)(8, p_space.postingAnchorCount));
+    const std::function<void(SizeType, float, bool)> observe = [&](SizeType id, float distance, bool match) {
+#ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
+        if (COMMON::g_graphAccessStats) {
+            ++COMMON::g_graphAccessStats->m_graphUnique;
+            COMMON::g_graphAccessStats->m_graphMatches += match;
+        }
+#endif
+        if (!std::isfinite(distance)) return;
+        const std::pair<float, SizeType> candidate(distance, id);
+        if (anchors.size() < static_cast<std::size_t>(p_space.postingAnchorCount)) {
+            anchors.push_back(candidate);
+            std::push_heap(anchors.begin(), anchors.end());
+        } else if (!anchors.empty() && candidate < anchors.front()) {
+            std::pop_heap(anchors.begin(), anchors.end());
+            anchors.back() = candidate;
+            std::push_heap(anchors.begin(), anchors.end());
+        }
+    };
+    if (p_space.postingNavigation) p_space.scoredCandidate = &observe;
     std::unique_ptr<COMMON::QueryResultSet<T>> unfilteredResults;
     if (hasResultFilter)
     {
-        unfilteredResults = std::make_unique<COMMON::QueryResultSet<T>>(p_query);
+        if (!p_resultFilter)
+            unfilteredResults = std::make_unique<COMMON::QueryResultSet<T>>(p_query);
         p_space.PrepareResultCheckStatus();
     }
     auto& navigationResults = unfilteredResults ? *unfilteredResults : p_query;
@@ -350,9 +383,12 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
     {
         treeStart = std::chrono::high_resolution_clock::now();
     }
-    m_pTrees.InitSearchTrees(m_pSamples, m_fComputeDistance, p_query, p_space);
-    m_pTrees.SearchTrees(m_pSamples, m_fComputeDistance, p_query, p_space,
-        (std::min)(p_space.m_iMaxCheck, m_iNumberOfInitialDynamicPivots));
+    m_pTrees.InitSearchTrees(m_pSamples, *computeDistance, p_query, p_space);
+    if (!hasResultFilter || p_space.m_iNumberOfCheckedLeaves < p_space.m_iMaxCheck)
+        m_pTrees.SearchTrees(m_pSamples, *computeDistance, p_query, p_space,
+            hasResultFilter
+                ? (std::min)(p_space.m_iMaxCheck, m_iNumberOfInitialDynamicPivots)
+                : m_iNumberOfInitialDynamicPivots);
     std::chrono::high_resolution_clock::time_point graphStart;
 
     if constexpr (EnableCrossEdges)
@@ -555,24 +591,39 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                 static_cast<size_t>(p_localId) <
                     nodeContext.m_localToGlobal->size();
         };
+    SizeType knownMatchID = -1;
+    const bool* knownMatch = nullptr;
+    auto* resultSink = &p_query;
+    int supplementFilled = 0;
     const auto admitFilteredResult =
         [&](SizeType p_key,
             const Index<T>* p_index,
             SizeType p_local,
             SizeType p_result,
-            float p_distance) {
+            const auto& p_distance) {
             if (!hasResultFilter || p_result < 0 ||
                 p_space.CheckResultAndSet(p_key)) {
                 return false;
             }
-            return notDeleted(
+#ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
+            if (p_resultFilter && !(knownMatch && p_result == knownMatchID) &&
+                COMMON::g_graphAccessStats)
+                ++COMMON::g_graphAccessStats->m_predicateCalls;
+#endif
+            if ((!p_resultFilter ||
+                    (knownMatch && p_result == knownMatchID ? *knownMatch : p_resultFilter(p_result))) &&
+                notDeleted(
                     p_index->m_deletedID, p_local) &&
-                (!p_resultFilter || p_resultFilter(p_result)) &&
                 checkFilter(
                     p_index->m_pMetadata, p_local,
-                    filterFunc) &&
-                isDup(
-                    p_query, p_result, p_distance);
+                    filterFunc)) {
+                const float distance = p_distance();
+                const bool vacant = resultSink != &p_query && resultSink->worstDist() == MaxDist;
+                const bool stop = isDup(*resultSink, p_result, distance);
+                if (vacant && distance < MaxDist) ++supplementFilled;
+                return stop;
+            }
+            return false;
         };
     const auto admitCollapsedResults =
         [&](int p_nodeID,
@@ -580,7 +631,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
             const std::vector<SizeType>*
                 p_localToGlobal,
             SizeType p_representative,
-            float p_representativeDistance,
+            const auto& p_representativeDistance,
             bool p_updateNavigation) {
             const DimensionType checkPosition =
                 p_index->m_pGraph
@@ -602,7 +653,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                 -treeNode.childStart;
             SizeType collapsedLocal =
                 p_representative;
-            bool navigationDone = !p_updateNavigation;
+            bool navigationDone = !p_updateNavigation || bool(p_resultFilter);
             bool admissionDone = !hasResultFilter;
             do
             {
@@ -624,8 +675,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                                 collapsedLocal)];
                 }
 
-                float collapsedDistance =
-                    p_representativeDistance;
+                float hybridDistance = 0;
                 if constexpr (EnableCrossEdges)
                 {
                     if (p_crossContext
@@ -639,7 +689,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                                     p_index->m_pSamples[
                                         collapsedLocal],
                                     GetFeatureDim());
-                        collapsedDistance =
+                        hybridDistance =
                             p_crossContext
                                 ->m_queryDistance(
                                     p_nodeID,
@@ -647,12 +697,18 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                                     vectorDistance);
                     }
                 }
+                const auto collapsedDistance = [&]() {
+                    if constexpr (EnableCrossEdges) {
+                        if (p_crossContext->m_useHybridDistance) return hybridDistance;
+                    }
+                    return p_representativeDistance();
+                };
 
                 if (!navigationDone && collapsedResult >= 0 &&
                     notDeleted(p_index->m_deletedID, collapsedLocal))
                 {
                     const bool stop = isDup(
-                        navigationResults, collapsedResult, collapsedDistance);
+                        navigationResults, collapsedResult, collapsedDistance());
                     navigationDone = stop && !useHybridCollapsed;
                 }
                 if (!admissionDone)
@@ -702,10 +758,147 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
             }
         }
         p_query.SortResult();
+        p_space.scoredCandidate = nullptr;
+#ifndef SPTAG_QUERY_WORK_DIAGNOSTICS
+        if (!p_space.postingNavigation) return;
+#endif
+        int before = 0;
+        const int target = p_query.GetResultNum();
+        for (int i = 0; i < target; ++i)
+            if (p_query.GetResult(i)->VID >= 0 && p_query.GetResult(i)->Dist < MaxDist) ++before;
+        const int graphLeaves = p_space.m_iNumberOfCheckedLeaves;
+#ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
+        auto* phase = COMMON::g_graphAccessStats;
+        if (phase) {
+            phase->m_headBefore = phase->m_headAfter = phase->m_preservedHeads = before;
+            phase->m_headTarget = target;
+            phase->m_graphLeaves = graphLeaves;
+            phase->m_graphDistances = phase->m_distanceCalls;
+            phase->m_anchorCount = anchors.size();
+            COMMON::ScopedGraphAccessStats excludeObserverAllocations(nullptr);
+            phase->m_graphHeadIds.reserve(before);
+            phase->m_graphHeadDistances.reserve(before);
+            for (int i = 0; i < before; ++i) {
+                phase->m_graphHeadIds.push_back(p_query.GetResult(i)->VID);
+                phase->m_graphHeadDistances.push_back(p_query.GetResult(i)->Dist);
+            }
+        }
+#endif
+        if (!p_space.postingNavigation) return;
+        unsigned reason = 1;
+        const int ceiling = p_space.m_iMaxCheck + p_space.postingAdditionalMaxCheck;
+        if (before < target) {
+            if (graphLeaves >= ceiling) reason = 2;
+            else if (anchors.empty()) reason = 3;
+            else {
+                COMMON::QueryResultSet<T> supplemental(p_query.GetTarget(), target - before);
+                resultSink = &supplemental;
+                std::sort(anchors.begin(), anchors.end());
+                std::vector<int> ids;
+                ids.reserve(anchors.size());
+                for (const auto& anchor : anchors) ids.push_back(anchor.second);
+                p_space.postingNavigation->SetSearchCapacity(
+                    (std::max)(p_space.m_iMaxCheck / 16, target));
+                p_space.postingNavigation->Expand(ids, [&](const std::uint32_t* members, int count) {
+                    COMMON::PostingNavigation::RowResult row;
+                    for (int i = 0; i < count; ++i) {
+                        const SizeType id = static_cast<SizeType>(members[i]);
+                        if (id < 0 || id >= GetNumSamples()) throw std::out_of_range("Invalid postgraph H1 member");
+                        if (COMMON::g_graphAccessStats) ++COMMON::g_graphAccessStats->m_visitedChecks;
+                        // No graph traversal follows this phase; rejected members are terminal visits.
+                        const auto match = p_space.nodeCheckStatus.Match(id, *p_space.matchPredicate);
+                        ++row.degree; row.eligible += match.second;
+                        if (match.first) {
+#ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
+                            if (phase) ++phase->m_auxiliaryVisitedSkips;
+#endif
+                            continue;
+                        }
+                        row.newCandidates += match.second;
+                        bool scored = false;
+                        float distance = 0;
+                        const auto score = [&]() {
+                            if (!scored) {
+                                const char* bytes = reinterpret_cast<const char*>(m_pSamples[id]);
+                                const std::size_t length = std::size_t(m_pSamples.C()) * sizeof(T);
+                                if (length) {
+                                    _mm_prefetch(bytes, _MM_HINT_T0);
+#ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
+                                    if (phase) ++phase->m_auxiliaryPrefetchLines;
+#endif
+                                    for (std::size_t offset = 64 - (reinterpret_cast<std::uintptr_t>(bytes) & 63);
+                                         offset < length; offset += 64) {
+                                        _mm_prefetch(bytes + offset, _MM_HINT_T0);
+#ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
+                                        if (phase) ++phase->m_auxiliaryPrefetchLines;
+#endif
+                                    }
+                                }
+                                distance = (*computeDistance)(p_query.GetQuantizedTarget(), m_pSamples[id], GetFeatureDim());
+                                ++p_space.m_iNumberOfCheckedLeaves;
+                                scored = true;
+#ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
+                                if (phase) {
+                                    ++phase->m_auxiliaryFirstVisits;
+                                    phase->m_auxiliaryNegativeFirstVisits += !match.second;
+                                }
+#endif
+                            }
+                            return distance;
+                        };
+                        if (match.second) score();
+                        knownMatchID = id; knownMatch = &match.second;
+                        if (m_pGraph[id][m_pGraph.m_iNeighborhoodSize - 1] < -1)
+                            // A rejected representative may still have matching collapsed aliases.
+                            admitCollapsedResults(0, this, nullptr, id, score, false);
+                        else if (match.second) admitFilteredResult(id, this, id, id, score);
+                        knownMatch = nullptr;
+#ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
+                        if (phase && !scored) ++phase->m_auxiliaryUnvisitedNegativeSkips;
+#endif
+                    }
+                    row.canContinue = p_space.m_iNumberOfCheckedLeaves < ceiling;
+                    row.targetFilled = supplementFilled >= target - before;
+                    return row;
+                });
+                supplemental.SortResult();
+                for (int i = 0; i < supplementFilled; ++i)
+                    *p_query.GetResult(before + i) = *supplemental.GetResult(i);
+                std::sort(p_query.GetResult(0), p_query.GetResult(0) + target, COMMON::Compare);
+                resultSink = &p_query;
+                reason = p_space.m_iNumberOfCheckedLeaves >= ceiling ? 6 :
+                    (p_space.postingNavigation->Converged() ? 7 : 5);
+            }
+        }
+#ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
+        if (phase) {
+            phase->m_headAfter = before + supplementFilled;
+            phase->m_supplementReason = reason;
+            phase->m_supplementLeaves = p_space.m_iNumberOfCheckedLeaves - graphLeaves;
+            phase->m_supplementDistances = phase->m_distanceCalls - phase->m_graphDistances;
+            phase->m_preservedHeads = 0;
+            for (int i = 0; i < before; ++i)
+                for (int j = 0; j < target; ++j)
+                    if (p_query.GetResult(j)->VID == phase->m_graphHeadIds[i] &&
+                        p_query.GetResult(j)->Dist == phase->m_graphHeadDistances[i]) {
+                        ++phase->m_preservedHeads; break;
+                    }
+        }
+#endif
     };
 
-    while (!p_space.m_NGQueue.empty())
+    while (true)
     {
+        if (p_space.m_NGQueue.empty()) {
+            if (!hasResultFilter || p_query.worstDist() < MaxDist ||
+                p_space.m_iNumberOfCheckedLeaves >= p_space.m_iMaxCheck ||
+                p_space.m_SPTQueue.empty()) break;
+            m_pTrees.SearchTrees(m_pSamples, *computeDistance, p_query, p_space,
+                p_space.m_iNumberOfCheckedLeaves + (std::min)(
+                    p_space.m_iMaxCheck - p_space.m_iNumberOfCheckedLeaves,
+                    (std::max)(1, m_iNumberOfOtherDynamicPivots)));
+            if (p_space.m_NGQueue.empty()) continue;
+        }
         NodeDistPair gnode = p_space.m_NGQueue.pop();
         SizeType currentLocal = gnode.node;
         int currentNode = 0;
@@ -744,6 +937,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
             runtimeCrossEdgeCount;
         const DimensionType checkPos = localEdgeCount - 1;
         const SizeType* node = currentIndex->m_pGraph[currentLocal];
+        if (COMMON::g_graphAccessStats != nullptr) ++COMMON::g_graphAccessStats->m_graphRows;
 
         if constexpr (!EnableCrossEdges)
         {
@@ -765,25 +959,25 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
             gnode.distance <= navigationResults.worstDist() || hybridCollapsed;
         if (checkNode < -1)
         {
-            if (navigationAdmits || hasResultFilter)
+            if (navigationAdmits || (!p_resultFilter && hasResultFilter))
             {
                 admitCollapsedResults(
                     currentNode, currentIndex,
                     currentLocalToGlobal,
                     currentLocal,
-                    gnode.distance, navigationAdmits);
+                    [&]() { return gnode.distance; }, navigationAdmits);
             }
         }
         else
         {
-            if (hasResultFilter)
+            if (hasResultFilter && (navigationAdmits || !p_resultFilter))
             {
                 admitFilteredResult(
                     gnode.node, currentIndex,
                     currentLocal, resultNode,
-                    gnode.distance);
+                    [&]() { return gnode.distance; });
             }
-            if (navigationAdmits && notDeleted(
+            if (!p_resultFilter && navigationAdmits && notDeleted(
                          currentIndex->m_deletedID,
                          currentLocal))
             {
@@ -802,18 +996,19 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
             return;
         }
         const auto expandEdges =
-            [&](const SizeType* p_edges,
+            [&](const auto* p_edges,
                 DimensionType p_begin,
                 DimensionType p_end,
-                bool p_crossEncoded)
+                bool p_crossEncoded, unsigned* degree = nullptr, unsigned* eligible = nullptr,
+                bool auxiliary = false, unsigned* newCandidates = nullptr)
         {
             for (DimensionType edge = p_begin;
                  edge < p_end; ++edge)
             {
-                if (p_space.m_iNumberOfCheckedLeaves >=
+                if (hasResultFilter && !auxiliary && p_space.m_iNumberOfCheckedLeaves >=
                     p_space.m_iMaxCheck)
                 {
-                    break;
+                    return false;
                 }
                 const bool isCross =
                     EnableCrossEdges && p_crossEncoded;
@@ -908,15 +1103,43 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                     }
                 }
 
-                if (targetLocal < 0 ||
-                    targetLocal >=
-                        targetIndex->m_pSamples.R() ||
-                    p_space.CheckAndSet(targetKey))
-                {
+                if (targetLocal < 0 || targetLocal >= targetIndex->m_pSamples.R()) continue;
+                std::pair<bool, bool> match;
+                if (p_space.matchPredicate) {
+                    if (COMMON::g_graphAccessStats != nullptr) ++COMMON::g_graphAccessStats->m_visitedChecks;
+                    match = p_space.nodeCheckStatus.Match(targetKey, [&](SizeType id) {
+                        if (auxiliary) {
+                            // Only a visited miss reaches this callback, before attribute work.
+                            const auto* bytes = reinterpret_cast<const char*>(targetIndex->m_pSamples[targetLocal]);
+                            const std::size_t length = std::size_t(targetIndex->m_pSamples.C()) * sizeof(T);
+                            if (length) {
+                                _mm_prefetch(bytes, _MM_HINT_T0);
+#ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
+                                if (COMMON::g_graphAccessStats) ++COMMON::g_graphAccessStats->m_auxiliaryPrefetchLines;
+#endif
+                                const std::size_t nextLine = 64 - (reinterpret_cast<std::uintptr_t>(bytes) & 63);
+                                for (std::size_t offset = nextLine; offset < length; offset += 64) {
+                                    _mm_prefetch(bytes + offset, _MM_HINT_T0);
+#ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
+                                    if (COMMON::g_graphAccessStats) ++COMMON::g_graphAccessStats->m_auxiliaryPrefetchLines;
+#endif
+                                }
+                            }
+                        }
+                        return (*p_space.matchPredicate)(id);
+                    });
+                    if (degree) { ++*degree; *eligible += match.second; }
+                } else {
+                    match = {p_space.CheckAndSet(targetKey), false};
+                }
+                if (match.first) {
+#ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
+                    if (auxiliary && COMMON::g_graphAccessStats) ++COMMON::g_graphAccessStats->m_auxiliaryVisitedSkips;
+#endif
                     continue;
                 }
                 const float distance =
-                    m_fComputeDistance(
+                    (*computeDistance)(
                         p_query.GetQuantizedTarget(),
                         targetIndex
                             ->m_pSamples[targetLocal],
@@ -932,6 +1155,19 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                           distance)
                     : distance;
                 ++p_space.m_iNumberOfCheckedLeaves;
+                if (p_space.scoredCandidate)
+                    (*p_space.scoredCandidate)(targetLocal, routeDistance, match.second);
+                if (newCandidates && match.second) ++*newCandidates;
+#ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
+                if (auxiliary && COMMON::g_graphAccessStats) {
+                    ++COMMON::g_graphAccessStats->m_auxiliaryFirstVisits;
+                    if (!match.second) ++COMMON::g_graphAccessStats->m_auxiliaryNegativeFirstVisits;
+                }
+#endif
+                if (p_space.matchPredicate) {
+                    knownMatchID = targetLocal;
+                    knownMatch = &match.second;
+                }
                 if (hasResultFilter)
                 {
                     const DimensionType
@@ -964,7 +1200,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                             targetIndex,
                             targetLocalToGlobal,
                             targetLocal,
-                            routeDistance, false);
+                            [&]() { return routeDistance; }, false);
                     }
                     else
                     {
@@ -992,9 +1228,10 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                             targetIndex,
                             targetLocal,
                             targetResult,
-                            routeDistance);
+                            [&]() { return routeDistance; });
                     }
                 }
+                knownMatch = nullptr;
                 if (p_space.m_Results.insert(
                         routeDistance))
                 {
@@ -1004,8 +1241,16 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                             routeDistance));
                 }
             }
+            return true;
         };
-        expandEdges(node, 0, localEdgeCount, false);
+        if (p_space.matchPredicate) {
+            COMMON::PostingNavigation::RowResult ordinary;
+            const bool complete = expandEdges(node, 0, localEdgeCount, false,
+                &ordinary.degree, &ordinary.eligible);
+            (void)complete;
+        } else {
+            expandEdges(node, 0, localEdgeCount, false);
+        }
         expandEdges(
             node, crossEdgeBegin, edgeCount, true);
         if (hybridCollapsed)
@@ -1039,14 +1284,18 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
         }
         if (!(EnableCrossEdges &&
               p_crossContext->m_useHybridDistance) &&
+            (!hasResultFilter || p_space.m_iNumberOfCheckedLeaves < p_space.m_iMaxCheck) &&
             p_space.m_NGQueue.Top().distance >
                 p_space.m_SPTQueue.Top().distance)
         {
-            m_pTrees.SearchTrees(m_pSamples, m_fComputeDistance, p_query, p_space,
-                                 (std::min)(
-                                     p_space.m_iMaxCheck,
-                                     m_iNumberOfOtherDynamicPivots +
-                                         p_space.m_iNumberOfCheckedLeaves));
+            m_pTrees.SearchTrees(m_pSamples, *computeDistance, p_query, p_space,
+                                 hasResultFilter
+                                     ? (std::min)(
+                                           p_space.m_iMaxCheck,
+                                           m_iNumberOfOtherDynamicPivots +
+                                               p_space.m_iNumberOfCheckedLeaves)
+                                     : m_iNumberOfOtherDynamicPivots +
+                                           p_space.m_iNumberOfCheckedLeaves);
         }
     }
     finishSearch();
@@ -1439,6 +1688,44 @@ ErrorCode Index<T>::SearchIndexWithResultFilter(
 }
 
 template <typename T>
+ErrorCode Index<T>::SearchIndexWithPostingNavigation(QueryResult& query,
+    const std::function<bool(SizeType)>& predicate,
+    COMMON::PostingNavigation* postingNavigation, int maxCheck, bool searchDeleted,
+    int anchorCount, int additionalMaxCheck) const
+{
+    if (anchorCount <= 0 || additionalMaxCheck < 0 ||
+        (maxCheck > 0 ? maxCheck : m_iMaxCheck) > (std::numeric_limits<int>::max)() - additionalMaxCheck) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid postgraph anchor count or additional budget.\n");
+        return ErrorCode::FailedParseValue;
+    }
+    if (!predicate)
+        return maxCheck > 0 ? SearchIndexWithMaxCheck(query, maxCheck, searchDeleted)
+                            : SearchIndex(query, searchDeleted);
+    if (!m_bReady) return ErrorCode::EmptyIndex;
+    auto workspace = RentWorkSpace(query.GetResultNum(), nullptr, maxCheck > 0 ? maxCheck : m_iMaxCheck);
+    workspace->matchPredicate = &predicate;
+    workspace->postingNavigation = postingNavigation;
+    workspace->postingAnchorCount = anchorCount;
+    workspace->postingAdditionalMaxCheck = additionalMaxCheck;
+    struct Clear {
+        COMMON::WorkSpace& workspace;
+        ~Clear() { workspace.matchPredicate = nullptr; workspace.postingNavigation = nullptr; workspace.scoredCandidate = nullptr; }
+    };
+    {
+        Clear clear{*workspace};
+        SearchIndex(*static_cast<COMMON::QueryResultSet<T>*>(&query), *workspace,
+                    searchDeleted, true, nullptr, predicate);
+    }
+    m_workSpaceFactory->ReturnWorkSpace(std::move(workspace));
+    if (query.WithMeta() && m_pMetadata)
+        for (int i = 0; i < query.GetResultNum(); ++i) {
+            const auto id = query.GetResult(i)->VID;
+            query.SetMetadata(i, id < 0 ? ByteArray::c_empty : m_pMetadata->GetMetadataCopy(id));
+        }
+    return ErrorCode::Success;
+}
+
+template <typename T>
 std::shared_ptr<ResultIterator> Index<T>::GetIterator(const void *p_target, bool p_searchDeleted, std::function<bool(const ByteArray&)> p_filterFunc, int p_maxCheck) const
 {
     if (!m_bReady)
@@ -1498,7 +1785,8 @@ ErrorCode Index<T>::SearchIndexWithCrossEdges(
     QueryResult& p_query,
     const CrossGraphSearchContext& p_context,
     int p_maxCheck,
-    CrossGraphSearchStats* p_stats) const
+    CrossGraphSearchStats* p_stats,
+    const std::function<bool(SizeType)>* p_resultFilter) const
 {
     if (!m_bReady)
         return ErrorCode::EmptyIndex;
@@ -1566,7 +1854,7 @@ ErrorCode Index<T>::SearchIndexWithCrossEdges(
            StaticDispatch::CheckDup,
            StaticDispatch::AlwaysTrue>(
         results, *workSpace, nullptr,
-        &p_context, p_stats);
+        &p_context, p_stats, p_resultFilter ? *p_resultFilter : std::function<bool(SizeType)>());
     results.SetScanned(workSpace->m_iNumberOfCheckedLeaves);
     m_workSpaceFactory->ReturnWorkSpace(std::move(workSpace));
     return ErrorCode::Success;

@@ -30,41 +30,6 @@ namespace {
 
 thread_local VectorIndex::PostingScanStats g_threadLocalPostingScanStats{};
 thread_local VectorIndex::ThreadLocalSearchContext g_threadLocalSearchContext{};
-std::mutex g_headNodeHierWidthsMutex;
-std::unordered_map<const VectorIndex*, Cache::HierWidthTable>
-    g_headNodeHierWidths;
-
-void StoreHeadNodeHierWidths(
-    const VectorIndex* p_index,
-    const Cache::HierWidthTable& p_widths)
-{
-    std::lock_guard<std::mutex> lock(
-        g_headNodeHierWidthsMutex);
-    g_headNodeHierWidths[p_index] =
-        p_widths;
-}
-
-Cache::HierWidthTable LoadHeadNodeHierWidths(
-    const VectorIndex* p_index)
-{
-    std::lock_guard<std::mutex> lock(
-        g_headNodeHierWidthsMutex);
-    const auto found =
-        g_headNodeHierWidths.find(p_index);
-    return found !=
-            g_headNodeHierWidths.end()
-        ? found->second
-        : Cache::HierWidthTable();
-}
-
-void EraseHeadNodeHierWidths(
-    const VectorIndex* p_index)
-{
-    std::lock_guard<std::mutex> lock(
-        g_headNodeHierWidthsMutex);
-    g_headNodeHierWidths.erase(p_index);
-}
-
 size_t AlignUp(size_t value, size_t alignment)
 {
     return (value + alignment - 1) / alignment * alignment;
@@ -317,28 +282,45 @@ VectorIndex::VectorIndex()
 
 VectorIndex::~VectorIndex()
 {
-    EraseHeadNodeHierWidths(this);
 }
 
 void VectorIndex::ClearHeadNodeMeta()
 {
-    m_headNodeMetaStride = 0;
-    m_headNodePSOffset = 0;
-    m_headNodeTailPSOffset = 0;
-    m_headNodeHasTailPS = false;
-    m_headNodeHierMaskOffset = 0;
-    m_headNodePostingHierMaskOffset = 0;
-    m_headNodeGlobalVIDOffset = 0;
-    m_headNodeBundleNodeIdOffset = 0;
-    m_headNodeHeadOnlyOffset = 0;
-    m_headNodeNumQuantOffset = 0;
-    m_headNodeTailNumQuantOffset = 0;
-    m_headNodeNumQuantCols = 0;
+    ++m_headNodeMetaRevision;
+    m_headLayout.stride = 0;
+    m_headLayout.pure = 0;
+    m_headLayout.tail = 0;
+    m_headLayout.hasTail = false;
+    m_headLayout.own = 0;
+    m_headLayout.legacyPosting = 0;
+    m_headLayout.vid = 0;
+    m_headLayout.bundle = 0;
+    m_headLayout.flags = 0;
+    m_headLayout.numeric = 0;
+    m_headLayout.tailNumeric = 0;
+    m_headLayout.numericColumns = 0;
     m_headNodeNumericDomainFingerprint = 0;
     m_headNodeOwnTagsAvailable = false;
     m_headNodePostingHierMasksAvailable = false;
-    EraseHeadNodeHierWidths(this);
-    m_headNodeMeta.clear();
+    m_headLayout = HeadMetadataLayout{};
+    std::vector<std::uint8_t>().swap(m_headNodeMeta);
+}
+
+void VectorIndex::InitializeCompactHeadNodeMeta(
+    SizeType count, const TagSchema& schema, const Cache::HierWidthTable& widths, bool tails)
+{
+    const auto layout = HeadMetadataLayout::Compact(schema, widths, tails);
+    if (count <= 0 || static_cast<std::size_t>(count) >
+        (std::numeric_limits<std::size_t>::max)() / layout.stride)
+        throw std::invalid_argument("Invalid compact metadata sample count");
+    ClearHeadNodeMeta();
+    m_headLayout = layout;
+    m_headLayout.count = count;
+    m_headNodeMeta.assign(static_cast<std::size_t>(count) * layout.stride, 0);
+    for (SizeType head = 0; head < count; ++head) {
+        SetHeadNodeGlobalVID(head, MaxSize);
+        SetHeadNodeBundleNodeId(head, -1);
+    }
 }
 
 bool VectorIndex::TryComputeHeadNodeMetaStride(
@@ -501,7 +483,7 @@ void VectorIndex::InitializeHeadNodeMeta(
     if (!InitializeHeadNodeMetaLayout(
             p_numSamples, p_numQuantCols, p_hierWidths, p_includeTailPS))
         return;
-    m_headNodeMeta.assign(static_cast<size_t>(p_numSamples) * m_headNodeMetaStride, 0);
+    m_headNodeMeta.assign(static_cast<size_t>(p_numSamples) * m_headLayout.stride, 0);
     for (SizeType sampleId = 0; sampleId < p_numSamples; ++sampleId) {
         SetHeadNodeGlobalVID(sampleId, MaxSize);
         SetHeadNodeBundleNodeId(sampleId, -1);
@@ -534,8 +516,7 @@ bool VectorIndex::InitializeHeadNodeMetaLayout(
 {
     ClearHeadNodeMeta();
     if (p_numSamples <= 0) return false;
-    StoreHeadNodeHierWidths(
-        this, p_hierWidths);
+    m_headLayout.widths = p_hierWidths;
     const int quantCols =
         p_numQuantCols > 0 ? p_numQuantCols : 0;
     size_t computedStride = 0;
@@ -555,74 +536,81 @@ bool VectorIndex::InitializeHeadNodeMetaLayout(
     // uint64 (one 256-bit lane per numeric column). With M==0 the stride is
     // byte-identical to V3, so V3 indexes load unchanged.
     // V6 inserts a second PostingBitmask for the self-contained global tail.
-    m_headNodePSOffset = 0;
-    m_headNodeHasTailPS = p_includeTailPS;
+    m_headLayout.pure = 0;
+    m_headLayout.hasTail = p_includeTailPS;
     size_t afterPostingPS =
-        m_headNodePSOffset +
+        m_headLayout.pure +
         sizeof(Cache::PostingBitmask);
-    if (m_headNodeHasTailPS) {
-        m_headNodeTailPSOffset = AlignUp(
+    if (m_headLayout.hasTail) {
+        m_headLayout.tail = AlignUp(
             afterPostingPS,
             alignof(Cache::PostingBitmask));
         afterPostingPS =
-            m_headNodeTailPSOffset +
+            m_headLayout.tail +
             sizeof(Cache::PostingBitmask);
     } else {
-        m_headNodeTailPSOffset = 0;
+        m_headLayout.tail = 0;
     }
-    m_headNodeHierMaskOffset = AlignUp(afterPostingPS, alignof(Cache::HierarchicalOwnTags));
-    m_headNodePostingHierMaskOffset = AlignUp(m_headNodeHierMaskOffset + sizeof(Cache::HierarchicalOwnTags), alignof(Cache::HierarchicalPostingMask));
+    m_headLayout.own = AlignUp(afterPostingPS, alignof(Cache::HierarchicalOwnTags));
+    m_headLayout.legacyPosting = AlignUp(m_headLayout.own + sizeof(Cache::HierarchicalOwnTags), alignof(Cache::HierarchicalPostingMask));
     // Posting-content masks use this index's persisted width packing rather
     // than process-global state, so separately loaded tenants cannot alter the
     // record layout.
-    m_headNodeGlobalVIDOffset = AlignUp(
-        m_headNodePostingHierMaskOffset +
+    m_headLayout.vid = AlignUp(
+        m_headLayout.legacyPosting +
             Cache::HierPostingMaskBytes(
                 p_hierWidths),
         alignof(SizeType));
-    m_headNodeBundleNodeIdOffset = AlignUp(m_headNodeGlobalVIDOffset + sizeof(SizeType), alignof(int16_t));
-    m_headNodeHeadOnlyOffset = AlignUp(m_headNodeBundleNodeIdOffset + sizeof(int16_t), alignof(std::uint8_t));
-    m_headNodeNumQuantCols = quantCols;
-    size_t afterHeadOnly = m_headNodeHeadOnlyOffset + sizeof(std::uint8_t);
-    if (m_headNodeNumQuantCols > 0) {
-        m_headNodeNumQuantOffset = AlignUp(afterHeadOnly, alignof(std::uint64_t));
-        afterHeadOnly = m_headNodeNumQuantOffset +
-            (size_t)m_headNodeNumQuantCols * Cache::NUM_QUANT_WORDS * sizeof(std::uint64_t);
-        if (m_headNodeHasTailPS) {
-            m_headNodeTailNumQuantOffset =
+    m_headLayout.bundle = AlignUp(m_headLayout.vid + sizeof(SizeType), alignof(int16_t));
+    m_headLayout.flags = AlignUp(m_headLayout.bundle + sizeof(int16_t), alignof(std::uint8_t));
+    m_headLayout.numericColumns = quantCols;
+    size_t afterHeadOnly = m_headLayout.flags + sizeof(std::uint8_t);
+    if (m_headLayout.numericColumns > 0) {
+        m_headLayout.numeric = AlignUp(afterHeadOnly, alignof(std::uint64_t));
+        afterHeadOnly = m_headLayout.numeric +
+            (size_t)m_headLayout.numericColumns * Cache::NUM_QUANT_WORDS * sizeof(std::uint64_t);
+        if (m_headLayout.hasTail) {
+            m_headLayout.tailNumeric =
                 AlignUp(
                     afterHeadOnly,
                     alignof(std::uint64_t));
             afterHeadOnly =
-                m_headNodeTailNumQuantOffset +
-                (size_t)m_headNodeNumQuantCols *
+                m_headLayout.tailNumeric +
+                (size_t)m_headLayout.numericColumns *
                     Cache::NUM_QUANT_WORDS *
                     sizeof(std::uint64_t);
         } else {
-            m_headNodeTailNumQuantOffset = 0;
+            m_headLayout.tailNumeric = 0;
         }
     } else {
-        m_headNodeNumQuantOffset = 0;
-        m_headNodeTailNumQuantOffset = 0;
+        m_headLayout.numeric = 0;
+        m_headLayout.tailNumeric = 0;
     }
-    m_headNodeMetaStride = computedStride;
+    m_headLayout.stride = computedStride;
+    m_headLayout.count = p_numSamples;
+    for (int column = 0; column < Cache::HIER_LEVELS; ++column)
+        m_headLayout.categorical[column] = m_headLayout.legacyPosting +
+            p_hierWidths.wordOff[column] * sizeof(std::uint64_t);
     return true;
 }
 
 std::uint64_t* VectorIndex::GetHeadNodeNumQuantMutable(SizeType p_sampleId)
 {
-    if (m_headNodeNumQuantCols <= 0 || m_headNodeMetaStride == 0) return nullptr;
-    size_t base = static_cast<size_t>(p_sampleId) * m_headNodeMetaStride + m_headNodeNumQuantOffset;
-    size_t bytes = (size_t)m_headNodeNumQuantCols * Cache::NUM_QUANT_WORDS * sizeof(std::uint64_t);
+    ++m_headNodeMetaRevision;
+    if (p_sampleId < 0 || p_sampleId >= m_headLayout.count) return nullptr;
+    if (m_headLayout.numericColumns <= 0 || m_headLayout.stride == 0) return nullptr;
+    size_t base = static_cast<size_t>(p_sampleId) * m_headLayout.stride + m_headLayout.numeric;
+    size_t bytes = (size_t)m_headLayout.numericColumns * Cache::NUM_QUANT_WORDS * sizeof(std::uint64_t);
     if (base + bytes > m_headNodeMeta.size()) return nullptr;
     return reinterpret_cast<std::uint64_t*>(m_headNodeMeta.data() + base);
 }
 
 const std::uint64_t* VectorIndex::GetHeadNodeNumQuant(SizeType p_sampleId) const
 {
-    if (m_headNodeNumQuantCols <= 0 || m_headNodeMetaStride == 0) return nullptr;
-    size_t base = static_cast<size_t>(p_sampleId) * m_headNodeMetaStride + m_headNodeNumQuantOffset;
-    size_t bytes = (size_t)m_headNodeNumQuantCols * Cache::NUM_QUANT_WORDS * sizeof(std::uint64_t);
+    if (p_sampleId < 0 || p_sampleId >= m_headLayout.count) return nullptr;
+    if (m_headLayout.numericColumns <= 0 || m_headLayout.stride == 0) return nullptr;
+    size_t base = static_cast<size_t>(p_sampleId) * m_headLayout.stride + m_headLayout.numeric;
+    size_t bytes = (size_t)m_headLayout.numericColumns * Cache::NUM_QUANT_WORDS * sizeof(std::uint64_t);
     if (base + bytes > m_headNodeMeta.size()) return nullptr;
     return reinterpret_cast<const std::uint64_t*>(m_headNodeMeta.data() + base);
 }
@@ -631,18 +619,20 @@ std::uint64_t*
 VectorIndex::GetHeadNodeTailNumQuantMutable(
     SizeType p_sampleId)
 {
-    if (!m_headNodeHasTailPS ||
-        m_headNodeNumQuantCols <= 0 ||
-        m_headNodeMetaStride == 0) {
+    ++m_headNodeMetaRevision;
+    if (p_sampleId < 0 || p_sampleId >= m_headLayout.count) return nullptr;
+    if (!m_headLayout.hasTail ||
+        m_headLayout.numericColumns <= 0 ||
+        m_headLayout.stride == 0) {
         return nullptr;
     }
     const size_t base =
         static_cast<size_t>(p_sampleId) *
-            m_headNodeMetaStride +
-        m_headNodeTailNumQuantOffset;
+            m_headLayout.stride +
+        m_headLayout.tailNumeric;
     const size_t bytes =
         static_cast<size_t>(
-            m_headNodeNumQuantCols) *
+            m_headLayout.numericColumns) *
         Cache::NUM_QUANT_WORDS *
         sizeof(std::uint64_t);
     if (base + bytes >
@@ -657,18 +647,19 @@ const std::uint64_t*
 VectorIndex::GetHeadNodeTailNumQuant(
     SizeType p_sampleId) const
 {
-    if (!m_headNodeHasTailPS ||
-        m_headNodeNumQuantCols <= 0 ||
-        m_headNodeMetaStride == 0) {
+    if (p_sampleId < 0 || p_sampleId >= m_headLayout.count) return nullptr;
+    if (!m_headLayout.hasTail ||
+        m_headLayout.numericColumns <= 0 ||
+        m_headLayout.stride == 0) {
         return nullptr;
     }
     const size_t base =
         static_cast<size_t>(p_sampleId) *
-            m_headNodeMetaStride +
-        m_headNodeTailNumQuantOffset;
+            m_headLayout.stride +
+        m_headLayout.tailNumeric;
     const size_t bytes =
         static_cast<size_t>(
-            m_headNodeNumQuantCols) *
+            m_headLayout.numericColumns) *
         Cache::NUM_QUANT_WORDS *
         sizeof(std::uint64_t);
     if (base + bytes >
@@ -682,15 +673,15 @@ VectorIndex::GetHeadNodeTailNumQuant(
 
 SizeType VectorIndex::GetHeadNodeMetaSampleCount() const
 {
-    if (m_headNodeMetaStride == 0) return 0;
-    return static_cast<SizeType>(m_headNodeMeta.size() / m_headNodeMetaStride);
+    if (m_headLayout.stride == 0) return 0;
+    return static_cast<SizeType>(m_headNodeMeta.size() / m_headLayout.stride);
 }
 
 void VectorIndex::SetHeadNodeGlobalVID(SizeType p_sampleId, SizeType p_globalVID)
 {
     auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return;
-    std::memcpy(base + m_headNodeGlobalVIDOffset, &p_globalVID, sizeof(SizeType));
+    std::memcpy(base + m_headLayout.vid, &p_globalVID, sizeof(SizeType));
 }
 
 SizeType VectorIndex::GetHeadNodeGlobalVID(SizeType p_sampleId) const
@@ -698,22 +689,29 @@ SizeType VectorIndex::GetHeadNodeGlobalVID(SizeType p_sampleId) const
     const auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return MaxSize;
     SizeType globalVID = MaxSize;
-    std::memcpy(&globalVID, base + m_headNodeGlobalVIDOffset, sizeof(SizeType));
+    std::memcpy(&globalVID, base + m_headLayout.vid, sizeof(SizeType));
     return globalVID;
 }
 
 void VectorIndex::SetHeadNodePS(SizeType p_sampleId, const Cache::PostingBitmask& p_ps)
 {
+    ++m_headNodeMetaRevision;
     auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return;
-    std::memcpy(base + m_headNodePSOffset, &p_ps, sizeof(Cache::PostingBitmask));
+    if (m_headLayout.pure == HeadMetadataLayout::Absent) {
+        if (p_ps.Popcount() != 0) throw std::invalid_argument("Categorical signature in a numeric-only layout");
+        return;
+    }
+    std::memcpy(base + m_headLayout.pure, &p_ps, sizeof(Cache::PostingBitmask));
 }
 
 const Cache::PostingBitmask* VectorIndex::GetHeadNodePS(SizeType p_sampleId) const
 {
     const auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return nullptr;
-    return reinterpret_cast<const Cache::PostingBitmask*>(base + m_headNodePSOffset);
+    static const Cache::PostingBitmask empty;
+    if (m_headLayout.pure == HeadMetadataLayout::Absent) return &empty;
+    return reinterpret_cast<const Cache::PostingBitmask*>(base + m_headLayout.pure);
 }
 
 bool VectorIndex::HeadNodePSMayIntersect(SizeType p_sampleId, const Cache::PostingBitmask& p_queryMask) const
@@ -726,11 +724,16 @@ void VectorIndex::SetHeadNodeTailPS(
     SizeType p_sampleId,
     const Cache::PostingBitmask& p_ps)
 {
-    if (!m_headNodeHasTailPS) return;
+    ++m_headNodeMetaRevision;
+    if (!m_headLayout.hasTail) return;
     auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return;
+    if (m_headLayout.tail == HeadMetadataLayout::Absent) {
+        if (p_ps.Popcount() != 0) throw std::invalid_argument("Categorical tail signature in a numeric-only layout");
+        return;
+    }
     std::memcpy(
-        base + m_headNodeTailPSOffset,
+        base + m_headLayout.tail,
         &p_ps, sizeof(Cache::PostingBitmask));
 }
 
@@ -738,13 +741,15 @@ const Cache::PostingBitmask*
 VectorIndex::GetHeadNodeTailPS(
     SizeType p_sampleId) const
 {
-    if (!m_headNodeHasTailPS) return nullptr;
+    if (!m_headLayout.hasTail) return nullptr;
     const auto* base = HeadNodeMetaBase(
         this, p_sampleId);
     if (base == nullptr) return nullptr;
+    static const Cache::PostingBitmask empty;
+    if (m_headLayout.tail == HeadMetadataLayout::Absent) return &empty;
     return reinterpret_cast<
         const Cache::PostingBitmask*>(
-            base + m_headNodeTailPSOffset);
+            base + m_headLayout.tail);
 }
 
 bool VectorIndex::HeadNodeTailPSMayIntersect(
@@ -761,56 +766,65 @@ void VectorIndex::SetHeadNodeHeadOnly(SizeType p_sampleId, bool p_isHeadOnly)
 {
     auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return;
-    base[m_headNodeHeadOnlyOffset] = p_isHeadOnly ? 1 : 0;
+    base[m_headLayout.flags] = p_isHeadOnly ? 1 : 0;
 }
 
 bool VectorIndex::IsHeadNodeHeadOnly(SizeType p_sampleId) const
 {
     const auto* base = HeadNodeMetaBase(this, p_sampleId);
-    return base != nullptr && base[m_headNodeHeadOnlyOffset] != 0;
+    return base != nullptr && base[m_headLayout.flags] != 0;
 }
 
 void VectorIndex::SetHeadNodeHierMask(SizeType p_sampleId, const Cache::HierarchicalOwnTags& p_mask)
 {
+    ++m_headNodeMetaRevision;
     auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return;
-    std::memcpy(base + m_headNodeHierMaskOffset, &p_mask, sizeof(Cache::HierarchicalOwnTags));
+    std::memcpy(base + m_headLayout.own, p_mask.tag,
+        m_headLayout.ownColumns * sizeof(std::uint32_t));
     m_headNodeOwnTagsAvailable = true;
 }
 
-const Cache::HierarchicalOwnTags* VectorIndex::GetHeadNodeHierMask(SizeType p_sampleId) const
+HeadOwnTagsView VectorIndex::GetHeadNodeHierMask(SizeType p_sampleId) const
 {
-    if (!m_headNodeOwnTagsAvailable) return nullptr;
+    if (!m_headNodeOwnTagsAvailable) return {};
     const auto* base = HeadNodeMetaBase(this, p_sampleId);
-    if (base == nullptr) return nullptr;
-    return reinterpret_cast<const Cache::HierarchicalOwnTags*>(base + m_headNodeHierMaskOffset);
+    if (base == nullptr) return {};
+    return {reinterpret_cast<const std::uint32_t*>(base + m_headLayout.own),
+        m_headLayout.ownColumns};
 }
 
 void VectorIndex::SetHeadNodePostingHierMask(SizeType p_sampleId, const Cache::HierarchicalPostingMask& p_mask)
 {
+    ++m_headNodeMetaRevision;
     auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return;
-    std::memcpy(
-        base + m_headNodePostingHierMaskOffset,
-        &p_mask,
-        m_headNodeGlobalVIDOffset -
-            m_headNodePostingHierMaskOffset);
+    for (int column = 0; column < Cache::HIER_LEVELS; ++column) {
+        const auto offset = m_headLayout.categorical[column];
+        const auto* words = p_mask.mask + m_headLayout.widths.wordOff[column];
+        const auto bytes = m_headLayout.widths.bits[column] / 8;
+        if (offset != HeadMetadataLayout::Absent)
+            std::memcpy(base + offset, words, bytes);
+        else
+            for (int word = 0; word < bytes / 8; ++word)
+                if (words[word] != 0)
+                    throw std::invalid_argument("Categorical mask in a noncategorical compact column");
+    }
     m_headNodePostingHierMasksAvailable = true;
 }
 
-const Cache::HierarchicalPostingMask* VectorIndex::GetHeadNodePostingHierMask(SizeType p_sampleId) const
+HeadPostingMaskView VectorIndex::GetHeadNodePostingHierMask(SizeType p_sampleId) const
 {
-    if (!m_headNodePostingHierMasksAvailable) return nullptr;
+    if (!m_headNodePostingHierMasksAvailable) return {};
     const auto* base = HeadNodeMetaBase(this, p_sampleId);
-    if (base == nullptr) return nullptr;
-    return reinterpret_cast<const Cache::HierarchicalPostingMask*>(base + m_headNodePostingHierMaskOffset);
+    return {base, &m_headLayout};
 }
 
 void VectorIndex::SetHeadNodeBundleNodeId(SizeType p_sampleId, int16_t p_bundleNodeId)
 {
     auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return;
-    std::memcpy(base + m_headNodeBundleNodeIdOffset, &p_bundleNodeId, sizeof(int16_t));
+    std::memcpy(base + m_headLayout.bundle, &p_bundleNodeId, sizeof(int16_t));
 }
 
 int16_t VectorIndex::GetHeadNodeBundleNodeId(SizeType p_sampleId) const
@@ -818,14 +832,14 @@ int16_t VectorIndex::GetHeadNodeBundleNodeId(SizeType p_sampleId) const
     const auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return -1;
     int16_t bundleNodeId = -1;
-    std::memcpy(&bundleNodeId, base + m_headNodeBundleNodeIdOffset, sizeof(int16_t));
+    std::memcpy(&bundleNodeId, base + m_headLayout.bundle, sizeof(int16_t));
     return bundleNodeId;
 }
 
 Cache::HierWidthTable
 VectorIndex::GetHeadNodeHierWidths() const
 {
-    return LoadHeadNodeHierWidths(this);
+    return m_headLayout.widths;
 }
 
 bool VectorIndex::HeadNodeMatchesQuery(
@@ -846,7 +860,7 @@ bool VectorIndex::HeadNodeMatchesQuery(
     if (!IsHeadNodeHeadOnly(p_sampleId)) return false;
 
     // Check hierarchical mask intersection
-    const auto* hierMask = GetHeadNodeHierMask(p_sampleId);
+    const auto hierMask = GetHeadNodeHierMask(p_sampleId);
     if (hierMask == nullptr) return false;
     return hierMask->MayIntersect(
         p_queryMask, p_hierWidths);
@@ -866,7 +880,7 @@ bool VectorIndex::HeadHierMaskMayIntersect(
     const Cache::HierarchicalPostingMask& p_queryMask,
     const Cache::HierWidthTable& p_hierWidths) const
 {
-    const auto* hierMask = GetHeadNodeHierMask(p_sampleId);
+    const auto hierMask = GetHeadNodeHierMask(p_sampleId);
     if (hierMask == nullptr) return false;
     return hierMask->MayIntersect(
         p_queryMask, p_hierWidths);
@@ -886,7 +900,7 @@ bool VectorIndex::HeadPostingHierMaskMayIntersect(
     const Cache::HierarchicalPostingMask& p_queryMask,
     const Cache::HierWidthTable& p_hierWidths) const
 {
-    const auto* postingMask = GetHeadNodePostingHierMask(p_sampleId);
+    const auto postingMask = GetHeadNodePostingHierMask(p_sampleId);
     // Fail-open: legacy / V2 indexes lack the posting-union mask. Keep head
     // so the caller doesn't drop posting candidates spuriously.
     if (postingMask == nullptr) return true;
@@ -1289,22 +1303,6 @@ ErrorCode VectorIndex::SaveIndex(const std::string &p_folderPath)
                 cleanup();
                 return ErrorCode::FailedOpenFile;
             }
-            // BKT/KDT loaders allow absent deletion labels (and some legacy
-            // missing streams). Export must not silently synthesize those files.
-            const fs::path topDirectory = staging / spann->GetOptions()->m_secondLevelHeadIndexFolder;
-            Helper::IniReader topConfig;
-            ret = topConfig.LoadIniFile((topDirectory / "indexloader.ini").string());
-            auto topIndex = CreateInstance(
-                topConfig.GetParameter("Index", "IndexAlgoType", IndexAlgoType::Undefined),
-                topConfig.GetParameter("Index", "ValueType", VectorValueType::Undefined));
-            if (ret != ErrorCode::Success || topIndex == nullptr ||
-                topIndex->LoadIndexConfig(topConfig) != ErrorCode::Success ||
-                !requireFiles(topDirectory, *topIndex->GetIndexFiles()))
-            {
-                cleanup();
-                return ErrorCode::FailedOpenFile;
-            }
-            topIndex.reset();
             std::shared_ptr<VectorIndex> verified;
             ret = LoadIndex(staging.string(), verified);
             if (ret == ErrorCode::Success &&

@@ -1,0 +1,68 @@
+{
+  "reference": "/mnt/nvme/baotonglu/mocheng/datasets/sift1m_zipf200_sparse193_numeric/toolchains/h1_native_filter_cost_bound_20260917",
+  "fused": "/mnt/nvme/baotonglu/mocheng/datasets/sift1m_zipf200_sparse193_numeric/toolchains/h1_native_fused_eligibility_20260917",
+  "ordinary_order": [
+    [
+      [
+        "reference",
+        "A"
+      ],
+      [
+        "fused",
+        "A"
+      ],
+      [
+        "fused",
+        "B"
+      ],
+      [
+        "reference",
+        "B"
+      ],
+      [
+        "reference",
+        "C"
+      ],
+      [
+        "fused",
+        "C"
+      ]
+    ],
+    [
+      [
+        "fused",
+        "C"
+      ],
+      [
+        "reference",
+        "C"
+      ],
+      [
+        "reference",
+        "A"
+      ],
+      [
+        "fused",
+        "A"
+      ],
+      [
+        "fused",
+        "B"
+      ],
+      [
+        "reference",
+        "B"
+      ]
+    ]
+  ],
+  "nprobe": [
+    24
+  ],
+  "queries": 1000,
+  "warmup": 1000,
+  "repeats": 2,
+  "no_additional_curve_stages": true,
+  "fine_clocks": false,
+  "semantic_parity": "heads, final IDs/distances, own IDs, native navigation and SSD work exact",
+  "diagnostic_changes": "qualification counts and omitted budget-incomplete degree frames only"
+}

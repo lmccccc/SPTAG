@@ -265,8 +265,10 @@ columns are supported without reordering, for example
 The selected key must be categorical. Single-label means one value per vector
 in that key column, not that every input must have only one categorical column.
 Saved schema/version/fingerprint metadata binds the original column layout.
-Hierarchy signatures are not consulted by query traversal; the historical
-signature min/max selectivity pair is removed. CPU BKT/TPT RNG follows upstream `5619bb1`:
+Hierarchy signatures conservatively reject auxiliary posting regions before
+representative/member access; they do not prune ordinary H1 graph neighbors.
+The historical signature min/max selectivity pair is removed.
+CPU BKT/TPT RNG follows upstream `5619bb1`:
 BKT centers and TPT projections use the global C RNG; TPT workers shuffle with
 default `std::mt19937` engines and call `Sleep(i * 100)` then `std::srand(clock())`
 per tree. There is no custom fixed seed or external seed parameter, and even
@@ -274,28 +276,45 @@ single-threaded rebuilds need not match. Historical fixed-seed artifacts remain
 unchanged. `Hierarchy*` describes spatial layers; categorical and numeric
 columns remain exact-filter record fields, not partitions.
 `HierarchyLevels` counts H1, so `5` selects H1 through H5. Do not add a separate
-upper-level ratio. `HierarchyInitialProbeRatio` is a search beam fraction, not
-a head-selection ratio.
+upper-level ratio. The old upper-graph beam and budget controls are retired;
+H1 uses the native search `MaxCheck` and `InternalResultNum`.
 The production SIFT1B recipe enables `ParallelBKTBuild=true` so sibling BKT
 nodes are processed concurrently instead of serializing the long recursive
 H1 selection. This increases temporary memory because each concurrent node
 owns k-means workspace; confirm host headroom before launch.
 The expected layer sizes are approximately 120M / 14.4M / 1.728M / 207.36K / 24.88K;
-BKT selection determines the actual counts. Only H5 retains a navigation
-graph. H4/H3/H2/H1 use CSR descent and independent vector catalogs; intermediate
-graphs are temporary construction aids. This SIFT1B recipe selects categorical
-column 0 as its key, with column 1 used for exact numeric filtering.
-Every filtered and unfiltered request runs the same distance-only highest-layer
-search and one fixed-beam CSR descent. `HierarchyInitialProbeRatio` fixes the
-beam fraction and `HierarchyMaxCheck` fixes the shared graph budget. Every
-reached H1 child is distance-scored before exact membership admission.
-Predicates do not prune graph/CSR traversal, choose another graph, widen the
-beam, retry search, or enumerate tag supports. Consequently a sparse predicate
-may return fewer than top-k. `HeadNavigationMode`,
-`HierarchyGraphSignaturePruning`, `SparseFallbackMaxHeads`,
+BKT selection determines the actual counts. H1 retains the query graph;
+H2..H5 retain representative vectors and signed CSR. Native temporary ANN
+indexes use the original `[BuildHead]` settings for CSR assignment and are
+then released, not saved or loaded as query graphs. This SIFT1B recipe selects
+categorical column 0 as its key, with column 1 used for exact numeric filtering.
+Filtered queries use H1 result-only post-filter: nonmatching ordinary nodes
+remain navigable, while matching heads enter the native result collector.
+Unfiltered queries retain native navigation. The native
+`[SearchSSDIndex] EnablePostingNavigation` flag defaults to `false`; current
+hierarchy recipes explicitly enable it. The current design completes the
+ordinary native graph phase first, preserving its native result collector.
+Only afterward may bounded signed-posting completion use anchors from that
+phase. There is no in-row density trigger or fresh-candidate floor.
+`PostingAnchorCount=8` is a positive integer and
+`PostingAdditionalMaxCheck=0` is a nonnegative integer. The latter permits
+additional checked work beyond `MaxCheck`; zero shares only the remaining
+native budget and can honestly underfill. `MaxCheck` plus the additional
+budget must fit a native signed integer. Invalid values are rejected even
+when posting navigation is disabled.
+`PostingMinCandidates` is retired and rejected in build, search and saved
+INIs, including explicit zero and OFF configurations. Remove that key from
+a writable configuration and use the new controls; never edit frozen
+historical snapshots. The older row-density, candidate-floor and whole-row
+overshoot experiments remain historical evidence, not active policies.
+This is not a second upper ANN search, an additional own-result
+heap, a graph restart or a global tag scan. Sparse results can still underfill.
+`HeadNavigationMode`, `HierarchyGraphSignaturePruning`, `SparseFallbackMaxHeads`,
 `SparseFallbackMaxPostingPages`, and hierarchy route-selectivity settings are
-removed and rejected. Both software prefetch modes remain available through
-`HierarchyPrefetchMode`: `Rolling16` (default) and `Batch64`.
+removed and rejected. Fresh `BuildH1Graph`, `CompactHierarchyVectors`,
+`HierarchyInitialProbeRatio`, `HierarchyMaxCheck` and `HierarchyPrefetchMode`
+settings are also retired. Existing layout metadata is decoded explicitly
+when loading old artifacts, without restoring their query policy.
 O-derived support expansion adds support relationships rather than real heads.
 H and O each independently apply the same native construction parameters
 (`PostingPageLimit`, raised by `PostingVectorLimit`), not a combined H+O limit:
@@ -455,8 +474,8 @@ upper-layer ratio also differs. Do not attribute every difference to rescue
 or claim uniformly unchanged performance. The local run and raw measurements
 are preserved under
 `datasets/sift1m_zipf200_sparse193_numeric/build_runs/20260909T141212Z_lightweight_rescue`.
-The updated local `h1_h2_curve_h2_15pct_r8/sift1m_h1_h2_recall_qps.pdf` keeps
-historical H1/H2/H3 curves and adds both matched old/current H3 curves, with
+The historical-format `h1_h2_curve_h2_15pct_r8/sift1m_h1_h2_recall_qps.pdf` kept
+historical H1/H2/H3 curves and added both matched old/current H3 curves, with
 three-run QPS ranges and explicit budget labels. Reproduce that plot using R:
 
 ```bash
@@ -467,6 +486,1005 @@ Rscript Tools/benchmarks/plot_sift1m_h1_h2_curve.R \
 
 The JSONL/CSV, indexes and datasets are local experiment artifacts, not required
 repository downloads. Back up an existing figure before replacing it.
+
+**This historical overlay is not a controlled supplier-overhead comparison.**
+The historical H1 and rebuilt flat H1 have identical vectors but different
+graph and BKT tree bytes. Historical buffered IO also differs from the later
+direct-IO view, as do search budgets, page limits and query windows. A current
+H1 control that shares modified code with the supplier cannot establish
+parity with the pre-supplier implementation. Use the matched-only renderer
+below for that comparison; do not substitute historical points for missing
+matched measurements.
+
+An optional fourth argument adds the completed full-row H1 neighbor supplier
+and its same-run H1, H3 and predicate-first graph controls:
+
+```bash
+Rscript Tools/benchmarks/plot_sift1m_h1_h2_curve.R \
+  <results_h1_h2_h3_placement_fixed.jsonl> <output-prefix> \
+  <20260909T141212Z_results.summary.csv> \
+  <comparisons/h1_startup_20260916/summary.json>
+```
+
+These are single nprobe24 points, not a new sweep curve. The added numeric
+panel contains only the new measurements. Current QPS is the reciprocal of
+mean ordinary latency across two runs; bars show the per-run QPS range.
+The figure distinguishes the current O_DIRECT/page15/1000-query measurements
+from historical curves with different IO, budgets and query windows.
+`<output-prefix>.plot-data.csv` preserves all plotted coordinates.
+
+For measured curves, pass a sweep `summary.json` containing an explicit
+`nprobe` for each measurement as the fourth argument instead. The plotter
+requires the complete scenario/case/nprobe grid, connects measurements in
+nprobe order without fitting or interpolation, and maps point size to nprobe.
+The same-run H1/H3 references are required; the predicate-first graph control
+is optional. Single-point inputs remain unconnected. No benchmark is run by
+the plotting script.
+
+To replace obsolete overlays with a completed **partial scenario stage**, append
+`--partial-scenarios` as the fifth argument after the measured stage summary.
+Each included scenario must still contain all comparison cases at every measured
+nprobe, with at least two probe values; missing individual points are rejected.
+Unavailable scenarios show historical baselines only, or an explicit empty
+panel when no historical data exists. The figure and provenance identify the
+missing scenarios. This option does not fabricate points or label later
+single-point optimizations as measured curves of the frozen stage.
+The exported current-series identifiers are `H1Reference`, `H3Reference`,
+`GraphControl` and `PostingSupplier`; their actual input identity is in the
+provenance rather than a hardcoded measurement date.
+
+Corrected sweeps must declare
+`"supplier_degree_semantics": "predicate_valid_neighbors"` on every supplier
+row. The plot then labels the degree as independent of query visited state.
+Legacy summaries without this field retain the explicit fresh-degree defect
+warning; missing, mixed or unknown declarations within a declared sweep are
+rejected. Keep corrected and legacy runs in separate summaries and preserve
+the previous figure before publishing a rerun. Degree semantics are recorded
+in `<output-prefix>.plot-provenance.json`.
+
+Proportional-degree sweeps instead declare
+`"supplier_degree_semantics": "retained_eligible_ratio"` together with
+`"retained_ratio": 0.5` and `"minimum_physical_degree": 16` on every supplier
+row. These parameters must be valid and constant across the sweep. The figure
+labels the relative trigger separately from the older absolute-degree policy:
+physical degree below the floor never supplements, and otherwise the eligible
+fraction must be strictly below the ratio. Visited does not reduce eligibility.
+
+**Current main implementation.** The implementation lives in `AnnService`,
+including native BKT/SPANN search, `Common/NavigationVisited.h`,
+`Common/PostingNavigation.h` and `SPANN/PostingNavigation.h`. Normal root CMake
+builds compile it into the main library; there is no generated replacement
+core. `Tools/benchmarks/hierarchical_shortcut_native/native_postfilter/README.md`
+now documents only thin clients linked to that library. H1 result-only
+post-filter is the baseline; `EnablePostingNavigation=true` adds the signed
+posting extension. The experiment history below is preserved provenance,
+not a menu of current implementations. No running production deployment or
+existing dataset index was replaced.
+
+**Frozen degree and cost-arbitration experiments.** These degree-based modes
+are frozen connectivity-deficit experiments, not a
+cost-arbitrated auxiliary-edge policy. Do not relabel their measurements as
+evidence for the latter. The isolated cost-based design preserves ordinary
+graph navigation and filters result admission; a node that fails the result
+predicate can still be an intermediate point on a path to a matching node.
+The native `SearchIndexWithResultFilter` interface separates these concerns,
+whereas `SearchIndexWithTraversalFilter` restricts both.
+
+The two candidate actions are lazy continuation of the native graph search
+(which can reach second-hop nodes) and expansion through signed multilevel
+posting auxiliary edges. Both feed the same native frontier and visited state.
+Compare their incremental work for the same remaining useful-result objective,
+including novelty, predicate acceptance, distance competitiveness, posting
+setup and complete-row costs. Do not charge the graph for eagerly enumerating
+an entire squared-degree neighborhood that its best-first search would not
+necessarily explore. Do not scan both alternatives merely to estimate them.
+An auxiliary member rejection must not mark a point visited in a way that
+prevents later ordinary graph navigation through that point.
+
+Cost estimates are decision inputs, not correctness predicates. Keep final
+exact filtering, conservative signature rejection, native distance/budget
+semantics and full selected-row handling independently enforced. A degree
+ratio was not used to select routes in this historical cost model. The older
+hybrid-distance router and adaptive-nprobe estimator perform different jobs;
+enabling them does not implement this policy. Any operation weights or priors
+belong in the native INI, with their units and calibration assumptions explicit.
+
+Changing the expansion policy can intentionally change visited heads and
+expansion counts. Its acceptance checks therefore cover native bridge
+reachability, no auxiliary visited-state poisoning, both estimator choices,
+result correctness and recall at fixed budgets, rather than requiring the
+old deficit supplier's exact work trace. Use a post-filter graph-only control
+with the same admission semantics as well as authenticated H1/H3 references.
+Diagnostic decision records must remain outside ordinary timings. A focused
+policy experiment does not authorize resuming an operator-stopped full sweep.
+
+The isolated implementation is in
+`Tools/benchmarks/hierarchical_shortcut_native/cost_arbitration_v2_20260917/`.
+`CostModel.h` estimates novelty and useful gain from query-local observations
+and explicit priors; `PostingSupplier.h` selects signed H2/H3 actions;
+`NativeSupplier.h` connects them to native result-only graph search. Native
+representative distance orders economically eligible parents within a level,
+then unpaid cost per expected useful gain selects between level winners and
+graph continuation. H3-discovered H2 adjacency is retained for later decisions,
+not placed in a second navigation frontier. A lack of previous graph success
+does not override an otherwise favorable posting estimate.
+
+The checked-in native INIs expose `ArbitrationDistanceCost`,
+`ArbitrationPredicateCost`, `ArbitrationMemberCost`,
+`ArbitrationSignatureCost`, graph/posting setup costs and the history priors.
+These are **uncalibrated operation units**, normalized to distance cost 1,
+not predicted microseconds. The estimator accounts for full-row overshoot
+against `max(1, unfilled H1 result slots)`; its useful-head proxy is not a
+guarantee of final dataset recall. Removed degree-quota controls are rejected.
+
+The focused milestone is recorded locally under
+`datasets/sift1m_zipf200_sparse193_numeric/comparisons/cost_arbitration_v2_20260917/`.
+Its `report.json` contains the precise formulas, native configuration values,
+decision evidence and reproduction commands; `runtime.json` and
+`milestone_manifest.json` pin the implementation and inputs. This is a
+semantically exercised experimental implementation, **not a claim that the
+Broad performance target has been achieved**. The estimate-only control
+measures observation/estimation overhead on an unchanged graph trace.
+Single-point data must not replace the stopped full curves.
+
+Run its bounded native fixtures with:
+
+```bash
+ctest --test-dir \
+  ../datasets/sift1m_zipf200_sparse193_numeric/toolchains/cost_arbitration_v2_20260917/harness \
+  --output-on-failure
+python3 -m unittest discover \
+  -s Tools/benchmarks/hierarchical_shortcut_native/cost_arbitration_v2_20260917 \
+  -p test_protocol.py
+```
+
+These commands assume the repository root and an existing isolated build.
+For a performance reproduction, use the experiment's native configuration
+with a fresh authorized output location; existing evidence must not be
+overwritten and the stopped sweep must not be resumed implicitly.
+
+**NaviX-derived local routing (replacement policy).** The reference is
+[gaurav8297/faiss-navix](https://github.com/gaurav8297/faiss-navix), pinned to
+commit `192fafbff7ead780185891e6056bbf67cbb19606` (MIT license, copyright
+Facebook, Inc. and its affiliates). Its
+[`faiss/impl/HNSW.cpp`, lines 1421-1469](https://github.com/gaurav8297/faiss-navix/blob/192fafbff7ead780185891e6056bbf67cbb19606/faiss/impl/HNSW.cpp#L1421-L1469)
+selects the local expansion operator using physical neighbor count `d` and
+predicate-valid neighbor count `e`. Visited neighbors still contribute to
+both counts; visited is work deduplication, not predicate failure.
+
+For nonempty rows, the upstream decision is:
+
+| Condition | Expansion |
+| --- | --- |
+| `e / d >= 0.5` | Filtered one-hop |
+| Otherwise, `0.4 * (d * e + e) > 2 * d - e` | Directed two-hop |
+| Otherwise | Complete two-hop |
+
+These are cheap local operation estimates, not calibrated latency predictions.
+Despite the upstream comment "Blind Two Hop", the active call is
+`navix_full_two_hop`; `navix_blind` is commented out. Directed expansion ranks
+fresh first-hop intermediates by ascending query distance and follows
+nonmatching intermediates, stopping between complete neighbor rows once its
+valid-encounter count reaches `d`. That encounter count includes valid visited
+neighbors and repeated encounters; it is not a quota of fresh results.
+Complete two-hop scans every first-hop adjacency, including visited
+intermediates, while deduplicating eligible candidate offers.
+
+The requested extension adds a most-sparse posting route **before** the
+upstream branches. Its separate native INI `NavixPostingThreshold` initially
+specifies `e / d < 0.05`; this is a new design choice, not a NaviX constant or an
+empirically established optimum. Only a selected posting route may enumerate
+upper owners, check signatures or compute representative distances. An
+unusable posting action falls back to the applicable NaviX graph operator.
+The ratio selects an expansion route, never a connectivity deficit to fill.
+An empty ordinary row must be handled explicitly without dividing by zero.
+
+This is an adaptation of local expansion, not a complete Faiss search port.
+Keep native BKT initialization, the shared H1 candidate/result domain,
+alias/deletion handling, own-point admission and row-boundary budgets.
+Do not import upstream's scan for the first ten matching global IDs or its
+fixed 4096-candidate scratch array. Nonmatching intermediates are necessary
+for the two-hop operators; filtered one-hop is not equivalent to native
+result-only post-filter traversal. Compare native post-filter, NaviX-only and
+NaviX-plus-posting controls separately, at fixed settings. The stopped full
+sweep and the already published curves remain unchanged.
+
+The isolated implementation is
+`Tools/benchmarks/hierarchical_shortcut_native/navix_posting_20260917/`.
+`NavixMode=navix` disables only the posting extension for the NaviX-only
+control. Native eligibility means posting-region/support eligibility **or**
+exact own-head eligibility, rather than Faiss's per-vector filter byte.
+The native checked-leaf budget does not bound repeated predicate checks or
+second-hop adjacency scans; completing selected expansions can also cross its
+boundary. These differences matter for both work and performance comparisons.
+
+The bounded milestone is **not promoted: its performance goal failed**.
+At nprobe 24, measured Broad latency/recall were 0.702878 ms/0.9154 for the
+result-only post-filter control, 1.525711 ms/0.9177 for NaviX-only and
+1.522814 ms/0.9176 for NaviX plus posting. Extreme-sparse measurements were
+0.904761 ms/0.2033, 76.179772 ms/0.9783 and 89.857407 ms/0.9985 respectively.
+The post-filter controls were freshly measured after the NaviX runs, not
+interleaved; do not describe these as simultaneous paired-core measurements.
+The initial unfiltered-head-admission controls are retained as diagnostics,
+not mislabeled as result-only post-filter.
+
+In 1,000 extreme-sparse measured queries, 2,581,938 of 2,644,028 posting
+decisions fell back to two-hop expansion. Combined search averaged about
+1.46 million qualification checks and 59,098 second-hop rows per query.
+Removing predecision upper work therefore did not resolve the repeated
+graph-expansion cost. Native unfiltered bypass retained exact original
+results and SSD work with zero hierarchy work.
+
+The measured implementation also has avoidable inner-loop overhead; these
+numbers must not be interpreted as the intrinsic cost of NaviX. Unlike
+upstream's filter-byte reads, every neighbor encounter recomputes native
+support/posting/own eligibility. Broad averages 9,668 qualification calls
+for 1,296 fresh graph candidates per query. Its two-hop loop prefetches
+vectors before eligibility/visited rejection, emits candidates individually
+through the generic admission path with observation bookkeeping even when
+diagnostics are disabled, and allocates new local scratch on each expansion.
+The audit confirms these code paths, not a measured latency share for each.
+
+Hot-path optimization must preserve the routing constants, posting threshold,
+native budgets, exact outputs and search-work trajectory. Cache query-local
+predicate results lazily, keeping posting eligibility distinct from own-only
+eligibility and from result improvement. Reuse scratch without fixed candidate
+caps; prefetch vectors only where distance work is needed. Count qualification
+requests separately from expensive cache misses. A visited valid neighbor
+still contributes to local selectivity, and a full two-hop row must not be
+silently skipped to make the work counters look better. Performance controls
+must use result-only post-filter admission, not the historical unfiltered
+head-admission control; keep ordinary timings separate from diagnostics.
+
+The first isolated repair,
+`Tools/benchmarks/hierarchical_shortcut_native/navix_hotpath_20260918/`,
+preserves recorded outputs and search work but **fails Broad latency
+acceptance**. Fresh reversed-order comparisons measured old/new NaviX at
+1.551611/1.599377 ms and old/new combined at 1.557548/1.635945 ms, against
+0.714231 ms for result-only post-filter. Recall remained unchanged.
+Component-cache hits were approximately 45%; a single qualification can
+request several components, so the 20,669 component requests and 11,388 misses
+per query must not be compared as the same unit as 9,668 qualification calls.
+Reduced evaluation or allocation counts alone do not establish an optimization.
+This variant is frozen and not promoted. Its report is
+`datasets/sift1m_zipf200_sparse193_numeric/comparisons/navix_hotpath_20260918/report.json`.
+Further hot-path changes require CPU attribution rather than assuming that
+any one of the audited code patterns explains the latency gap.
+
+The profiled successor,
+`Tools/benchmarks/hierarchical_shortcut_native/navix_profile_fix_20260918/`,
+starts from the original NaviX variant rather than accumulating the failed
+component-cache changes. It lazily caches separate final posting and exact-own
+qualification bytes; mutable deletion, visited state, own gains and
+competitiveness remain uncached. Recorded outputs and search work are unchanged.
+
+Query-thread CPU sampling of the frozen controls places 44.2% of original
+NaviX samples in selected nonoverlapping qualification/admission functions,
+including support-slot reads, alias qualification and posting validity.
+This represents about 0.682 ms/query of gross diagnostic CPU residence, not
+an exact attribution of the latency difference or proof of memory stalls.
+L2-distance sample counts were similar in absolute terms for NaviX and the
+post-filter control. Sampling was outside ordinary timings, with load,
+warmup and other threads excluded.
+
+This targeted fix **also fails reliable Broad speedup acceptance**. Fresh
+old/successor NaviX means were 1.557223/1.535581 ms, but the second paired
+repetition regressed. Combined means were 1.567943/1.567105 ms, effectively
+unchanged; the proper graph control measured 0.711161 ms. The isolated fix is
+not promoted. Qualification evaluations decreased, but the remaining CPU cost
+has not been attributed for the successor, so further speedup is not established.
+Sparse and unfiltered parity checks cover only 32-query replays, not a fresh
+full timing campaign. Raw profiles, source patches, ordinary measurements,
+limitations and reproduction records are retained under
+`datasets/sift1m_zipf200_sparse193_numeric/comparisons/navix_profile_fix_20260918/`.
+
+The subsequent requested threshold comparison exposes the local two-hop
+trigger as native `NavixTwoHopThreshold`, comparing the upstream 0.5 cutoff
+with fixed candidates 0.1 and 0.05. Unlike the hot-path repairs, this is an
+intentional expansion-policy change: preserve the original trajectory only
+for the 0.5 control, not for the two requested candidates. That historical
+comparison kept the posting threshold at 0.05, nprobe at 24 and every other
+native setting fixed. Retain both thresholds separately in native INIs,
+reports and case identifiers.
+
+At or above the two-hop threshold, use the existing **filtered one-hop**
+operator, not native result-only post-filter. Below it, use the original
+directed/full cost comparison unless the posting branch takes precedence.
+With both thresholds equal to 0.05, combined search has no directly selected
+two-hop interval, but unavailable posting expansion can still fall back to
+two-hop. Report these fallbacks and their adjacency work separately; zero
+direct two-hop decisions does not imply zero two-hop work.
+**This equal-threshold combined point does not satisfy the intended strict
+hierarchy:** posting must require a lower local eligible fraction than
+two-hop (`postingThreshold < twoHopThreshold`). Retain its measurements as
+diagnostic evidence only, not as an acceptable combined-policy candidate.
+The experiment's parser admitted equality and its fixed posting cutoff was
+not lowered with the 0.05 two-hop cutoff. The NaviX-only measurements are
+unaffected by this configuration error.
+Use fresh Broad NaviX-only and combined points at all three thresholds plus
+the proper post-filter control, with two reversed-order repetitions.
+This comparison does not authorize a full sweep, additional threshold search,
+automatic promotion or replacement of published plots.
+
+The completed isolated comparison is
+`Tools/benchmarks/hierarchical_shortcut_native/navix_thresholds_20260918/`.
+All seven Broad points used nprobe 24 and two reversed-order repetitions:
+
+| Mode | Two-hop threshold | Mean ms/query | Recall@10 | Explicit second-hop rows/query |
+| --- | --- | --- | --- | --- |
+| Native result-only post-filter | Not applicable | 0.720401 | 0.9154 | 0 |
+| NaviX-only | 0.5 | 1.543136 | 0.9177 | 393.053 |
+| NaviX-only | 0.1 | 1.222632 | 0.9134 | 55.179 |
+| NaviX-only | 0.05 | 1.133370 | 0.9127 | 10.386 |
+| NaviX plus posting | 0.5 | 1.574572 | 0.9176 | 391.040 |
+| NaviX plus posting | 0.1 | 1.229055 | 0.9134 | 46.389 |
+| NaviX plus posting | 0.05 | 1.113048 | 0.9127 | 1.453 |
+
+At 0.05 the combined variant reduces latency by about 29.3% relative to its
+0.5 control, but loses 0.49 recall percentage points. It remains slower and
+has lower recall than native post-filter. Its remaining second-hop rows come
+from 144 posting fallbacks across 1,000 queries; directly selected two-hop
+decisions are zero. Native graph navigation can naturally reach second-hop
+nodes and is not counted as an explicit two-hop operator in this table.
+The 0.5 controls exactly preserve frozen outputs and recorded work.
+Lower-threshold trajectories intentionally differ, and no additional cutoff
+was selected using recall. Full measurements, repetition ranges, route counts,
+native configurations and provenance are retained under
+`datasets/sift1m_zipf200_sparse193_numeric/comparisons/navix_thresholds_20260918/`.
+No variant was promoted and no published curve was changed.
+
+**Strict posting hierarchy correction.** Active combined search must enforce
+`0 <= NavixPostingThreshold < NavixTwoHopThreshold`; equality and reversed
+thresholds are invalid, not alternative policies. For the correction, the
+posting cutoff is explicitly 0.01 with the requested two-hop cutoffs 0.05
+and 0.1. This is an untuned fixed choice, not a proven optimum. Posting cutoff
+zero disables posting under the strict `r < cutoff` comparison; it must not
+be reinterpreted as a special `r == 0` trigger.
+
+For nonempty rows, select one-hop at or above the two-hop cutoff; below it,
+select posting only below the strictly smaller posting cutoff, otherwise
+apply the original directed/full two-hop comparison. Posting failure can
+still fall back to two-hop within that sparse domain. A Broad workload can
+contain locally sparse rows: no global scenario-name bypass is implied.
+Because `e/d` is discrete, lowering a positive posting cutoff may leave
+zero-valid-neighbor triggers unchanged. Keep this distinct from violating
+the strict threshold hierarchy. Preserve all historical measurements,
+including the invalid equal-threshold diagnostic point.
+
+The corrected isolated implementation is
+`Tools/benchmarks/hierarchical_shortcut_native/navix_strict_thresholds_20260918/`.
+One shared validator enforces the strict relation in native configuration
+parsing, route helpers, supplier setup and injectable hooks. The disabled
+posting extension in NaviX-only mode does not reject irrelevant equal cutoffs.
+The correction passes independently of the still-unmet performance goal.
+Fresh Broad measurements, each with two reversed-order repetitions, are:
+
+| Mode | Two-hop / posting cutoffs | Mean ms/query | Recall@10 |
+| --- | --- | --- | --- |
+| Native result-only post-filter | Not applicable | 0.713467 | 0.9154 |
+| Combined | 0.1 / 0.01 | 1.224404 | 0.9134 |
+| Combined | 0.05 / 0.01 | 1.119857 | 0.9127 |
+
+Across 1,000 queries, the corrected 0.05/0.01 configuration made 99 direct
+full-two-hop decisions, 721 posting decisions and 140 full-two-hop fallbacks;
+the intermediate interval is no longer absent. The 0.1/0.01 configuration
+made 2,746 direct full-two-hop decisions, 720 posting decisions and 164
+fallbacks. Both had zero directed-two-hop decisions, and every observed
+Broad posting decision had local `e=0`. Explicit second-hop rows averaged
+3.583 and 48.689 per query respectively. Older timings are historical
+comparisons only, not fresh paired speedups. Full evidence is retained under
+`datasets/sift1m_zipf200_sparse193_numeric/comparisons/navix_strict_thresholds_20260918/`.
+Production binaries and published curves remain unchanged.
+
+**Post-filter plus two-hop isolation.** The requested isolation suspends
+both filtered one-hop and hierarchical posting. The ordinary operator must
+be native result-only post-filter: predicate-invalid neighbors remain eligible
+for graph navigation and for updating the native search-distance bound.
+Merely reducing auxiliary trigger frequency does not restore this behavior.
+For example, the strict 0.05/0.01 variant expanded 230.612 heads per Broad
+query versus 168.604 for post-filter, even though its explicit second-hop
+work was only 3.583 rows. These counts come from captured expansion decisions,
+not queue offers or distance evaluations.
+
+Use local valid-neighbor ratio only to select native ordinary expansion or
+the existing sparse directed/full two-hop operator, at the fixed 0.05 and
+0.1 cutoffs. Ordinary expansion must retain native per-edge budget handling,
+visited state, result/own admission, candidate heap and termination semantics.
+The sparse two-hop operator still uses predicate eligibility for candidate
+destinations and allows nonmatching intermediates; disabling filtered one-hop
+does not mean unfiltered squared-degree distance evaluation.
+There must be no posting callback, upper signature/distance/CSR work, or
+hierarchy-metadata requirement in this graph-only mode. Verify the
+auxiliary-disabled path against native post-filter, and record outer graph
+expansions, ordinary neighbor entries and qualification requests separately
+before attributing any remaining overhead to convergence or per-step cost.
+
+The completed implementation is
+`Tools/benchmarks/hierarchical_shortcut_native/postfilter_twohop_20260918/`.
+Native `NavixMode=postfilter_graph` provides a same-core result-only control
+without ratio classification; `NavixMode=postfilter_twohop` enables only
+the restored ordinary operator and sparse two-hop. Both modes disable posting
+and its owner/model requirement. The control preserves all 1,000 frozen
+post-filter outputs and recorded native/SSD work exactly.
+
+Fresh Broad results at nprobe 24, with two reversed-order repetitions:
+
+| Mode | Mean ms/query | Recall@10 | Outer expansions/query | Qualification requests/query |
+| --- | --- | --- | --- | --- |
+| Post-filter control | 0.711638 | 0.9154 | 168.604 | 0 |
+| Post-filter plus two-hop, 0.1 | 1.229461 | 0.9164 | 167.241 | 4583.078 |
+| Post-filter plus two-hop, 0.05 | 1.168747 | 0.9156 | 168.406 | 4064.870 |
+
+At 0.05, 99.671% of expansions select ordinary post-filter, with 2,075.922
+H1 distances per query versus 2,070.680 for the control. Navigation work
+returns to graph-like levels, but latency remains 64.2% higher. The hybrid
+still performs 3,939.882 initial classification entries and 6.854 explicit
+second-hop rows per query. These establish remaining additional work, not
+an exact per-phase attribution of latency. Qualification requests in this
+table describe the extra classifier, not all final-result predicate checks.
+All posting/upper work is zero. The semantic isolation passes, but neither
+hybrid meets the speed goal; no production or plotting promotion occurred.
+Full measurements, native configurations and validation evidence are under
+`datasets/sift1m_zipf200_sparse193_numeric/comparisons/postfilter_twohop_20260918/`.
+
+**Replacement: native post-filter with signed posting adjacency.** The
+requested replacement abandons NaviX's explicit two-hop operators and
+standalone filtered one-hop. Preserve native graph navigation, including
+nonmatching intermediates. Collect local physical/eligible neighbor counts
+inside ordinary adjacency processing rather than a separate classification
+scan. Valid visited neighbors still count; visited controls duplicate work,
+not eligibility. Do not reintroduce degree-deficit filling.
+
+The row's observed ratio is available after ordinary processing. At that
+point the next action is either native graph continuation or a signed
+posting expansion anchored at that head, feeding the same native frontier.
+This does not skip the already-completed ordinary row. A budget-truncated
+row must not masquerade as a complete-degree observation or start a new
+posting action after the budget is exhausted. Keep the initial activation
+cutoff fixed at 0.01 in native INI, explicitly untuned.
+
+Only after selecting posting may the implementation inspect its upper
+candidates. Reject signatures before representative distances or CSR member
+access, complete selected rows under native budget rules, and preserve
+result/own admission and auxiliary rejection without visited-state poisoning.
+If no usable posting action exists, continue the original frontier; there
+is no two-hop fallback, graph restart or global support scan.
+
+Use same-core native graph, observe-only and posting controls. Observe-only
+collects exactly the fused statistics but performs no upper work, and must
+preserve graph outputs and navigation work. This isolates statistics overhead;
+posting can change the trajectory, so its latency difference is not a
+same-trace causal decomposition. Record classification prescan and explicit
+second-hop work as zero. A repeated small-row access is not automatically
+a second DRAM access; neither cache behavior nor signature savings should
+be claimed without evidence.
+
+The accepted semantic implementation is
+`Tools/benchmarks/hierarchical_shortcut_native/postfilter_posting_fullrow_20260918/`.
+The earlier `postfilter_posting_20260918` attempt incorrectly truncated four
+selected CSR rows at the ordinary per-edge budget boundary; its evidence
+is preserved but superseded. The corrected runtime completes an already
+selected auxiliary row, retains ordinary per-edge truncation and starts no
+new action after budget exhaustion. Corrected captures contain zero partial
+CSR rows. No activation threshold or search budget changed for this repair.
+
+Fresh same-core measurements, with two reversed-order repetitions:
+
+| Scenario | Mode | Mean ms/query | Recall@10 |
+| --- | --- | --- | --- |
+| Broad | Native graph | 0.730224 | 0.9154 |
+| Broad | Observe-only | 1.049193 | 0.9154 |
+| Broad | Graph plus posting | 1.029568 | 0.9154 |
+| Extreme-sparse | Native graph | 0.950633 | 0.2033 |
+| Extreme-sparse | Graph plus posting | 2.261953 | 0.9929 |
+
+Graph and observe preserve identical outputs, head/own results, distance,
+queue, checked and SSD work. Observe therefore exposes 0.318968 ms/query
+(43.7%) of added qualification/cache/observation-path cost on the same
+navigation trajectory. This is not an attribution to predicate comparisons
+alone or to DRAM misses. Broad ordinary neighbor entries remain 3,196.670
+per query in both controls; observe adds one qualification request per
+entry, without an extra classification traversal. Explicit second-hop and
+classification prescan counts are zero in all three modes.
+
+Broad posting checks 3.196 signatures per query and rejects none, so this
+scenario establishes no signature-pruning savings. Sparse posting checks
+4,064.623 signatures and rejects 3,698.608 per query, while adding 17.403
+fresh eligible auxiliary neighbors. These operation counts are not elapsed
+time savings, and the sparse latency comparison has very different recalls.
+The native-speed goal remains unmet and the runtime is not promoted.
+The final report, corrected captures and reproduction commands are retained
+under
+`datasets/sift1m_zipf200_sparse193_numeric/comparisons/postfilter_posting_fullrow_20260918/`.
+
+**User-confirmed simplification: reuse native filter outcomes.** The requested
+successor removes the extra eligibility-query, cache and observe path.
+Switching may use only predicate pass/fail results that native head
+post-filter admission already evaluated during the ordinary expansion.
+Do not invoke support, posting validity, attributes, deletion or alias checks
+merely to obtain a switching input. Keep ordinary navigation and all its
+existing checks intact.
+
+This deliberately replaces the earlier full-physical-neighbor `e/d`
+requirement. The signal is the observed native head-filter acceptance rate,
+not the eligible fraction of all neighbors, not result-heap improvement and
+not the number of fresh vertices. Skipped or previously visited neighbors
+without a native predicate evaluation are unknown, not failures. An
+expansion with no observed filter result continues ordinary graph search.
+Do not synthesize a zero hit rate or perform extra work to fill the sample.
+
+After a completed ordinary row, a simple comparison of naturally observed
+passes/checks may select a signed posting action, within the existing budget.
+Use the fixed initial 0.01 cutoff under an explicitly named native
+filter-hit-ratio control; the number has a different meaning from the old
+full-neighbor cutoff and is not an established optimum. Auxiliary predicate
+evaluations must not feed their own activation decision. Only native graph
+and graph-plus-posting modes belong in this successor, with no observe mode,
+classification prescan, per-H1 qualification cache or two-hop operator.
+Verify predicate call order/count parity as well as navigation parity when
+the auxiliary action is disabled; fewer auxiliary branches alone are not
+proof that the extra eligibility path has disappeared.
+
+This simplification is implemented in
+`Tools/benchmarks/hierarchical_shortcut_native/postfilter_native_switch_20260918/`,
+with native `NativePostfilterMode=graph|posting` and
+`PostingFilterHitRatio=0.01`. The original predicate evaluation updates two
+local counters while ordinary expansion is active. Auxiliary checks do not
+update those counters. Only a complete ordinary row with remaining budget,
+at least one observed check and `passes < ratio * checks` can request a
+posting action. There is no extra ordinary eligibility query or qualification
+cache. Fixtures verify predicate/support/posting-validity/own callback order
+and count parity, as well as navigation parity, when posting is disabled or
+does not trigger.
+
+Fresh same-core results, with two reversed-order repetitions:
+
+| Scenario | Mode | Mean ms/query | Recall@10 |
+| --- | --- | --- | --- |
+| Broad | Native graph | 0.727615 | 0.9154 |
+| Broad | Native switch plus posting | 0.934268 | 0.9170 |
+| Extreme-sparse | Native graph | 0.962601 | 0.2033 |
+| Extreme-sparse | Native switch plus posting | 2.129577 | 0.9932 |
+
+Broad requests posting 17.104 times per query; its trajectory changes, so
+the 28.4% latency difference is not a same-trace observation tax. It checks
+102.352 signatures and rejects only 0.003 per query, establishing no
+substantial Broad signature-pruning benefit. The switch input intentionally
+differs from full-neighbor eligibility, and its fixed cutoff remains untuned.
+Native-level Broad speed is still unmet. All selected CSR rows are complete,
+unfiltered requests retain the native bypass, and production/plots remain
+unchanged. Final source/config/runtime identities, measurements and
+reproduction evidence are retained under
+`datasets/sift1m_zipf200_sparse193_numeric/comparisons/postfilter_native_switch_20260918/`.
+
+**Visited-entry match bit (isolated successor).** The per-expansion
+native-outcome signal has insufficient evidence in many Broad rows: of
+17,104 posting activations in 1,000 captured queries, 11,644 followed just
+one failed predicate check and 14,832 followed at most two. Every activation
+had zero observed passes. Native result-admission short-circuits mean that
+these samples do not describe the entire physical neighborhood.
+
+The requested successor restores full local neighbor eligibility by storing
+a query-specific match bit in the native visited entry itself. The same
+lookup must return both previously-visited status and match. First insertion
+must initialize match; later encounters, including visited neighbors, reuse
+it when collecting local degree in ordinary adjacency processing. Do not add
+another qualification table, whole-index mask or row prescan. Match-false
+nodes must still participate in ordinary post-filter navigation.
+
+One bit is sufficient only with the invariant that every occupied
+navigation entry has initialized match state. Cover tree initialization,
+tree continuation, graph edges and auxiliary insertions, and preserve the
+state through collision handling and rehash. Clear it with query reset.
+Do not sacrifice valid node-ID bits or silently treat unknown as false.
+An auxiliary rejection must not create a navigation-visited entry just to
+cache the rejection. The match definition must remain distinct from result
+competitiveness and own-heap gain; a combined posting-or-own bit cannot stand
+in for its individual components during result admission. Mutable deletion
+checks must retain their native semantics.
+
+This design pays for first predicate evaluation rather than waiting for
+distance-competitive result admission, but avoids repeated evaluations for
+visited entries. Measure that cost against a native graph control, verify
+full local ratios against an independent untimed oracle, and report reused
+match reads separately from first evaluations. Do not assume co-location
+alone proves a speedup.
+
+The first isolated implementation,
+`Tools/benchmarks/hierarchical_shortcut_native/postfilter_visited_match_20260918/`,
+initializes match on every navigation insertion and validates complete local
+ratios, including visited neighbors, against an untimed oracle. Broad bit-only
+preserves the graph trajectory and averages 1,943.817 first match evaluations
+and 1,345.058 reused bit reads per query. It has no separate eligibility array.
+
+However, this first version uses 8-byte match slots versus 4-byte native
+slots and reallocates when switching compact/extended storage; workspace
+reset selects compact before enabling match again. Its Broad graph/bit-only/
+posting means are 0.733459/1.055550/1.061783 ms, so it does not establish a
+successful speed optimization. The measured 43.9% same-trace bit-only tax
+includes storage width, transitions, dispatch, first predicate evaluation
+and row bookkeeping, not just predicate cost. Preserve this version's
+evidence while eliminating introduced storage-transition overhead and
+checking whether compact packing can preserve the actual valid ID domain.
+Never narrow IDs merely to make a match flag fit.
+
+This first implementation explicitly supports only the isolated read-only,
+query-consistent index snapshot. Native result/own liveness checks remain,
+but match-enabled concurrent maintenance is not supported or silently
+declared safe. Its report and capability limits are retained under
+`datasets/sift1m_zipf200_sparse193_numeric/comparisons/postfilter_visited_match_20260918/`.
+
+**Storage correction, same algorithm.** The isolated successor
+`Tools/benchmarks/hierarchical_shortcut_native/postfilter_visited_storage_20260918/`
+keeps native navigation entries at 4 bytes. Since the native sample count is
+signed 32-bit and valid IDs are strictly below that count, unsigned `id+1`
+fits in 31 bits; bit 31 holds match. Comparisons and rehash mask the flag.
+The generic hash-table interface still accepts `INT_MAX`, promoting to
+8-byte storage only when that ID actually requires it. Reset retains the
+allocated backend rather than switching compact/wide each query. There is
+one active array, no separate match array, and result dedup stays 4-byte.
+
+Outside timing, 6,000 warmed real Broad queries recorded zero navigation
+backend allocations or conversions; mixed-mode and cross-index workspace
+reuse also retained stable allocations. This is not a claim that whole
+queries allocate nothing. Each native navigation table has 131,072 slots
+(512 KiB) in all three modes.
+
+| Broad mode | Mean ms, two reversed-order repetitions | Recall@10 |
+| --- | ---: | ---: |
+| Native graph | 0.733207 | 0.9154 |
+| Match bit, posting disabled | 1.023004 | 0.9154 |
+| Match bit plus posting | 1.049887 | 0.9154 |
+
+Graph and bit-only retain identical native results and trajectory. The
+remaining same-trace tax is 0.289797 ms (39.5%); its CPU causes had not yet
+been separated at this milestone. First match evaluations remain 1,943.817/query,
+with 1,345.058 reused reads and unchanged native result-admission calls.
+Co-location removes repeated switch-predicate evaluation for occupied
+entries, not the first evaluation or distinct posting/own admission.
+Do not claim a native-speed result or a fresh paired speedup over the
+historical 8-byte version. The full-neighbor oracle and storage/UBSan
+fixtures pass; sparse and unfiltered checks are only 32-query functional
+replays in this successor. The read-only snapshot limitation remains.
+No production promotion, curve update or stopped-sweep restart occurred.
+The corrected report and provenance are under
+`datasets/sift1m_zipf200_sparse193_numeric/comparisons/postfilter_visited_storage_20260918/`.
+
+**Posting-disabled CPU attribution.** The subsequent
+`postfilter_visited_profile_20260918` investigation profiles the frozen
+storage-corrected executable, without search changes or an ablation. Two
+reversed-order query-thread sampling windows per mode give mean thread CPU
+times of 0.7373 ms/query (graph) and 1.0267 ms/query (bit-only). Auxiliary
+H2/H3 posting calls, signatures, representative distances and CSR members
+are all zero; normal final SSD postings still execute identically.
+
+| Mutually exclusive sampled residence, ms/query | Graph | Bit-only |
+| --- | ---: | ---: |
+| First-match-only callback, own/liveness and physical-node checks | 0.0000 | 0.1770 |
+| Shared support, posting-validity, predicate and liveness functions | 0.0350 | 0.1910 |
+| Visited/result-dedup probe, hash, flag and dispatch | 0.0815 | 0.0845 |
+| Ordinary adjacency, prefetch, row statistics and state | 0.0315 | 0.0460 |
+
+The added hotspot is first-match qualification, not repeated allocation or
+auxiliary posting expansion. Its path includes physical-head/deletion
+checks, posting-support OR live-own eligibility, then an alias-marker check
+when necessary. Samples land in support-tag comparisons, own VID/version/
+deletion access and the alias-marker read. No additional alias candidate
+evaluations occur in this workload. Posting qualification also repeats
+`CheckValidPosting`; that reads metadata, not a CSR traversal.
+
+These are sampled residence estimates, not independently removable costs:
+the qualification categories grow by about 0.3331 ms while total CPU grows
+by 0.2894 ms and other categories decrease. Shared leaf functions cannot
+identify their caller, and PC sampling does not establish cache misses or
+DRAM stalls. There are 3,528 retained samples, no recorded buffer drops or
+wrong-thread samples, and roughly 1 ms actual sampling intervals despite
+a requested 200 us. Only two windows per mode were run; periodic aliasing
+and process drift remain limitations. Full categories, raw PCs, symbol
+mapping, control timings and source references are preserved in
+`datasets/sift1m_zipf200_sparse193_numeric/comparisons/postfilter_visited_profile_20260918/`.
+No optimization or production promotion accompanies this diagnosis.
+
+**Over-restored native lifecycle (superseded diagnostic).** The isolated successor
+`Tools/benchmarks/hierarchical_shortcut_native/postfilter_native_predicate_20260918/`
+removes the added H1 own-result heap, H1 result-admission filter and eager
+own/VID/version/deletion/alias qualification. It restores the authenticated,
+index-compatible pre-supplier SPANN/BKT path, not the preceding experimental
+graph control. The baseline is revision
+`3552194536cb01dd70099e955a29e235a0cf4d2e` plus its authenticated build snapshot;
+upstream `5619bb1` independently establishes the native result/alias lifecycle.
+This is not pristine upstream: existing hard per-edge budgets, bounded tree
+continuation, H/O storage and exact final attribute filters remain.
+
+Only signature gates, attribute routing checks and fixed `.01` sparse
+posting adjacency are added to that lifecycle. The retained 4-byte visited
+bit caches native anchor-support membership, with no posting-validity,
+own-record or alias checks to initialize it. All 160,091 actual H1 own tags
+are present in support; hierarchy signatures also explicitly insert the
+head's own attribute. Native alias processing, liveness, head translation
+and final exact filtering remain in their original places. Bit-only and
+graph have identical native trajectories; warmed visited backends still
+perform no allocations or conversions.
+
+Support membership is exact for the support summary, not exact record
+selectivity or live-result eligibility. Anchored DNF routing remains a
+necessary may-match condition. Numeric-only/unanchored requests retain
+unrestricted routing and exact final filtering; their mapping is
+source-reviewed, not measured by this categorical/unfiltered input set.
+This historical snapshot predates main numeric-signature routing; current
+numeric/unanchored queries use O-region may-match admission, not unrestricted
+admission when authenticated metadata is available.
+
+| Scene / mode | Mean ms, two reversed-order repetitions | Recall@10 |
+| --- | ---: | ---: |
+| Broad native graph | 0.444646 | 0.7225 |
+| Broad predicate bit only | 0.516506 | 0.7225 |
+| Broad bit plus posting | 0.532721 | 0.7225 |
+| Sparse native graph | 0.412776 | 0.0028 |
+| Sparse bit plus posting | 1.102340 | 0.0028 |
+
+The Broad same-trajectory bit tax is 0.071860 ms (16.2%). Do not compare
+these latencies to the earlier 0.9154-recall experimental graph as an
+equal-recall improvement. Native selection retains the nearest 24 heads
+before final filtering, yielding only 7.333 matching SSD postings/query
+in Broad, rather than selecting 24 matching heads and supplementing own
+results. Auxiliary posting provided no recall improvement in this bounded
+restored-native experiment; no new collector, underfill continuation or
+threshold tuning was added to recover that loss. The original reference
+matches selected-head IDs/distances for 32 queries and final IDs/distances/
+SSD work for Broad, sparse and unfiltered 32-query cases. Full raw visited
+traces are unavailable from the original executable, so broader raw-trace
+equivalence is not claimed. This remains a read-only static experiment,
+without production promotion or changes to old evidence, plots or the
+stopped sweep. Reports and baseline authentication are under
+`datasets/sift1m_zipf200_sparse193_numeric/comparisons/postfilter_native_predicate_20260918/`.
+
+The user subsequently clarified that the intended conservative baseline is
+**H1 post-filter**: ordinary navigation remains unpruned, while H1 result
+admission accepts matching heads. Removing the H1 result predicate above
+went too far. The nearest-24-then-filter experiment is therefore not the
+accepted correction, and its lower latency is not a successful replacement.
+The corrective successor below restores H1 result-level filtering without
+reintroducing the supplementary own heap or eager own/liveness/alias
+qualification. Its clean graph, predicate-bit and posting controls all
+share the same H1 admission predicate; final exact filtering stays native.
+
+**Clean H1 post-filter correction.**
+`Tools/benchmarks/hierarchical_shortcut_native/h1_postfilter_native_predicate_20260918/`
+restores authenticated `SearchIndexWithResultFilter` output semantics:
+matching heads enter the H1 result collector, while ordinary nonmatching
+nodes remain traversable under the native distance frontier and budget.
+There is no supplementary own heap. All three modes use native support
+membership for H1 admission, including a matching head with an empty SSD
+posting; native selected-head translation and exact final filtering handle
+its own record. This differs deliberately from the earlier `evaluatePosting`
+predicate, which required a nonempty posting. No own OR, alias-marker,
+version-map or posting-validity work is added to initialize the bit.
+
+| Scene / mode | Mean ms | QPS at mean | Recall@10 |
+| --- | ---: | ---: | ---: |
+| Broad clean H1 post-filter | 0.769049 | 1300 | 0.9153 |
+| Broad plus predicate bit | 0.877312 | 1140 | 0.9153 |
+| Broad plus bit and signed posting | 0.918764 | 1088 | 0.9153 |
+| Sparse clean H1 post-filter | 0.771574 | 1296 | 0.2033 |
+| Sparse plus bit and signed posting | 1.692806 | 591 | 0.9929 |
+
+These are fresh same-core `nprobe=24` measurements, each with 1,000 warmup
+and 1,000 measured queries and two reversed-order repetitions. Broad
+graph/bit-only outputs, navigation and SSD traces are identical; the
+remaining bit tax is 0.108262 ms (14.08%), not a speed improvement.
+Broad returns 24 matching H1 heads and reads 23.979 SSD postings/query.
+Sparse matching heads and SSD postings rise from 0.750 to 17.423/query
+with auxiliary navigation, still subject to the native budget. This is a
+higher-latency, higher-recall result, not an equal-recall speedup; sparse
+timings vary substantially between the two repetitions.
+
+The nearest-24-unmatched regression returns farther matching heads,
+preventing another post-hoc-filter restoration. An actual empty-posting
+head returns its own exact record through the native selected-head path
+in all three modes without a supplemental heap. Original result-filter
+H1 IDs/distances match Broad and sparse 32-query references; unfiltered
+output/SSD behavior matches the original 32-query reference. Same-core
+fixtures additionally check navigation, visited, bit reuse, full CSR and
+zero warmed backend allocations. The bit remains support-summary
+may-match, not exact record selectivity. The scope is static read-only;
+numeric/DNF behavior is source-reviewed rather than measured here.
+No production promotion, old-evidence rewrite, plot update or sweep
+restart occurred. Reports and manifests are under
+`datasets/sift1m_zipf200_sparse193_numeric/comparisons/h1_postfilter_native_predicate_20260918/`.
+
+**Predicate-order discrepancy found after this comparison.** Although the
+restored H1 outputs match, the experimental `admitFilteredResult` still
+contains a distance-to-output-worst early return before the predicate.
+The authenticated pre-supplier helper at
+`matched_baseline_20260917/original/source/AnnService/src/Core/BKT/BKTIndex.cpp:552-570`
+has no such shortcut: after result dedup it calls the predicate directly.
+Its ordinary fresh-neighbor path calls that helper before frontier insertion.
+Output parity therefore did not establish original predicate-work parity.
+
+The recorded 221.616 actual result-predicate evaluations/query describe
+the experimental distance-shortcut control, not the authenticated original
+H1 post-filter. The bit variant performs 1,943.817 first evaluations plus
+23.640 remaining result evaluations, and reuses the bit for 197.976 result
+checks. These counts are valid but cannot justify attributing the 0.108262 ms
+difference to bit storage or to an inherent eightfold increase over the
+original algorithm. The canonical cleanup below removes the residual
+shortcut consistently from both controls and compares actual predicate
+order/counts against the unmodified reference. Tree seeds and ordinary
+neighbors are accounted separately; not every visited insertion can
+be assumed to reach native result admission. Preserve the earlier times
+as measurements of their actual shortcut baseline, not as a native-faithful
+cost comparison or evidence of an equal-work bit penalty.
+
+**Historical isolated cleanup, superseded by main integration.** This
+milestone used `Tools/benchmarks/hierarchical_shortcut_native/native_postfilter/`.
+At that time, `generate.py` applied the authoritative transformation directly
+to authenticated original source; generated core copies were not edited.
+Only five original core files change, plus the two native helpers `Visited.h`
+and `Posting.h`. The complete original BKTree and prefetch code, collapsed
+alias admission, CRUD methods and final record handling are retained.
+The common hash backend and result-dedup path remain original apart from
+unsigned ID encoding that avoids signed overflow; match probing/flagged
+rehash are confined to navigation visited storage.
+
+Normal query code no longer contains the distance shortcut, old observation/
+Outcome/Decision accounting, duplicate liveness accounting, extra erased
+predicate wrapper, tree in-filtering changes or process-global CRUD guards.
+Independent proof instrumentation is generated separately and is not linked
+into the timed library. The read-only STATIC/BKT scope is enforced by the
+benchmark entrypoint, not by disabling unrelated native APIs.
+
+| Broad control, nprobe24 | Mean ms/query | Recall@10 |
+| --- | ---: | ---: |
+| Original-order H1 post-filter | 0.709805 | 0.9153 |
+| Same plus predicate bit and d/e | 0.694566 | 0.9153 |
+| Same plus signed posting | 0.700786 | 0.9153 |
+
+Two reversed pairs show no positive bit penalty in this run; they do not
+prove zero cost or a general speedup. Graph/bit results, distances and SSD
+work agree exactly, with 23.979 SSD postings/query. Original-order predicate
+calls are 1,892.887/query, not 221.616. Bit performs 1,967.457: all 1,869.247
+ordinary values are reused, while tree initialization adds 74.570 calls,
+including 23.640 whose native popped-head predicate later runs again.
+These counts are not a CPU attribution.
+
+Source allowlist witnesses, independent original predicate-order comparisons,
+native alias/deletion and empty-posting own-head cases, packed storage/UBSan,
+full-CSR boundaries and numeric/DNF/unfiltered functional checks are sealed in
+`datasets/sift1m_zipf200_sparse193_numeric/comparisons/native_postfilter/20260918_cleanup/`.
+The normal library contains the required predicate/signature/supplier work
+inside query timing. Historical variants, plots, production files and the
+operator-stopped sweep remain untouched and are not active build inputs.
+
+**Main integration and current acceptance campaign.** The independent
+generator, duplicate helpers and CMake recipe were subsequently removed
+after their exact bytes and paths were archived. The old
+`SecondLevelHierarchy.h` upper-query implementation was removed; main
+`HierarchyPostingBuilder.h` retains native construction assignment only.
+Upper ANN graphs are neither persisted nor loaded for query. H1 and upper
+vector/CSR/signature catalogs are built and saved by the main engine.
+Legacy graphless H1 layouts must be explicitly materialized into a new
+output directory before search; loading never silently rebuilds them or
+falls back to an upper graph.
+
+The main static/shared libraries, service, builder and Python binding are
+built in a separate output directory to preserve existing `Release` files.
+Main integration evidence and archived deleted sources are in
+`datasets/sift1m_zipf200_sparse193_numeric/comparisons/main_postfilter_integration_20260919/`.
+
+The full campaign is registered separately in
+`datasets/sift1m_zipf200_sparse193_numeric/comparisons/main_postfilter_full_20260919/`.
+It uses all 10,000 held-out queries for unfilter, Broad/medium/extreme
+categorical, numeric and mixed-DNF cases; 11 native nprobe values and two
+reversed repetitions compare the same main binary with auxiliary posting
+disabled/enabled. Separate compiled diagnostics are not used for throughput.
+The complete curve and per-scenario acceptance remain pending until that
+campaign finishes; 32-query functional replays do not establish performance.
+
+One-billion projections distinguish UInt8 production configuration from the
+Float SIFT1M campaign. Query-local upper state now scales with touched nodes,
+not whole catalog size, but recursive owner fanout and full CSR row lengths
+remain relevant work bounds. Removing dense query-state initialization alone
+does not prove acceptable 1B latency or recall. The quantitative assumptions,
+payload lower bounds and unresolved limits are recorded in
+`parent-one-billion-projection.json` beside the campaign registration.
+
+Frozen original NaviX measurements and provenance are
+`datasets/sift1m_zipf200_sparse193_numeric/comparisons/navix_posting_20260917/completion_report.json`
+and `summary_with_postfilter_controls.json`; `report.json` records source
+identities, implementation details and reproduction commands. Run only the
+bounded fixtures, from the repository root with its existing isolated build:
+
+```bash
+../datasets/sift1m_zipf200_sparse193_numeric/toolchains/navix_posting_20260917/harness/native-tests
+python3 -m unittest discover \
+  -s Tools/benchmarks/hierarchical_shortcut_native/navix_posting_20260917 \
+  -p test_protocol.py
+```
+
+For a controlled comparison, use a separate matched summary and protocol:
+
+```bash
+Rscript Tools/benchmarks/plot_sift1m_matched_curve.R \
+  <matched-summary.json> <protocol.json> <output-prefix>
+```
+
+This renderer accepts no historical input. It requires four separately labeled
+cases: `h1_original` (authenticated pre-supplier core), `h1` (current core with
+supplier off), `h3` (native hierarchy), and `supplier`. Original and current
+cores must have distinct verified fingerprints and share the ordinary timed
+benchmark body. Each row must match the protocol's index, harness and protocol
+identities and use its expected core identity. The common protocol covers the
+input/workload definitions, buffered IO, native search budgets, query window,
+warmup, thread/NUMA settings, repetitions and declared nprobe array. Index
+views may change private loader paths but must share actual index-data bytes.
+Neither an implementation change nor a different I/O policy may be hidden
+inside a same-run reference.
+
+Every included scenario must have all four cases at every declared nprobe,
+with all declared ordinary repetitions. QPS is `1000 / mean latency_ms`, not
+the arithmetic mean of QPS; error bars are observed min/max, not confidence
+intervals. Curves follow nprobe order without fitting. An explicit final
+`--partial-scenarios` permits completed scenario subsets only; missing panels
+say pending and never contain historical substitutes. Single-point diagnostics
+are not accepted as curve inputs. PNG/PDF, exact plotted coordinates and protocol
+provenance are emitted together. Preserve earlier figures in an archive and
+publish only successfully rendered, complete artifacts.
+
+To overlay existing cost-arbitration measurements without running a new sweep:
+
+```bash
+Rscript Tools/benchmarks/plot_sift1m_matched_curve.R \
+  <matched-summary.json> <protocol.json> <output-prefix> \
+  --partial-scenarios --points <cost-points.json>
+```
+
+The optional points file has `label`, `common`, `provenance` and `rows`.
+`common` records the index fingerprint, ordinary timed-body fingerprint and
+native IO/search/query-window/thread/repetition settings; these must match the
+curve evidence. `rows` contains the measured scenario, case, nprobe, recall,
+latency, latency repetitions and QPS. Cases are `auto`, `graph`, `estimate_only`,
+`original` and `h3`; each included scenario requires auto and graph controls.
+`provenance` retains the original report/summary/runtime/config identities.
+Use only source-hash-verified measured rows, with nprobe taken from the active
+native array rather than its scalar default.
+
+These are independent scatter points and repetition ranges, never joined to
+each other or to the frozen curves. Fresh H1/H3 controls remain separate from
+older curve points. CSV exports distinguish `measurement_kind`, `source_case`
+and `source_file`; point runtime identities live in the overlay provenance,
+not the old curve's core-fingerprint columns. Missing measurements are not
+filled, and the base curve completeness checks remain enforced. The existing
+v2 overlay input is preserved in the local experiment's
+`plot_overlay/points.json`.
+
+Single-load native sweeps declare
+`"sweep_execution": "single_load_nprobe_array"` on every summary row.
+The figure and provenance distinguish these runs from the older per-point
+process protocol. Do not splice the two protocols into one current sweep;
+mixed or partial execution declarations are rejected. This metadata describes
+the benchmark evidence, not an instruction to load or search an index.
+
+The native `spannaclbench` accepts an array in the same search INI:
+
+```ini
+[SearchSSDIndex]
+InternalResultNum=24
+MaxCheck=2048
+
+[SearchSweep]
+NProbe=[16,24,32,48,62,80,96,128,192,256,384]
+```
+
+Pass this file with `--search-ini` (or as an active `--search-sweep-ini`).
+`LoadAll` runs once, then the native loop sets `InternalResultNum` for each
+array entry in order. Every entry has separate warmup, result buffers, counters
+and timed queries, and emits a JSON row with `nprobe`, `index_load_count` and
+`sweep_execution`. Brackets are optional. Values must be distinct positive
+integers at least `--topk`; malformed and empty arrays fail before index loading.
+Without `[SearchSweep]`, existing scalar INIs retain their behavior. When both
+INI command-line options are used, the array belongs to the active sweep INI,
+not the base INI. This benchmark section is not a new core search parameter.
 
 For sift1m dataset, use the default configuration below (buildconfig.ini) and run .\SSDServing.exe buildconfig.ini:
 ```

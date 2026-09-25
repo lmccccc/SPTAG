@@ -970,6 +970,7 @@ break;
                 };
                 for (char i = 0; i < m_iTreeNumber; i++) {
                     const BKTNode& node = m_pTreeRoots[m_pTreeStart[i]];
+                    if (g_graphAccessStats != nullptr) ++g_graphAccessStats->m_treeNodeVisits;
                     if (node.childStart < 0) {
                         p_space.m_SPTQueue.insert(NodeDistPair(m_pTreeStart[i], distanceToSample(node.centerid)));
                     } else if (m_bfs) {
@@ -999,6 +1000,7 @@ break;
                             while (!p_curr->empty()) {
                                 NodeDistPair tmp = p_curr->pop();
                                 const BKTNode& tnode = m_pTreeRoots[tmp.node];
+                                if (g_graphAccessStats != nullptr) ++g_graphAccessStats->m_treeNodeVisits;
                                 if (tnode.childStart < 0) {
                                     p_space.m_SPTQueue.insert(tmp);
                                 }
@@ -1008,6 +1010,7 @@ break;
                                     }
                                     if (!p_space.CheckAndSet(tnode.centerid)) {
                                         p_space.m_NGQueue.insert(NodeDistPair(tnode.centerid, tmp.distance));
+                                        p_space.ObserveScored(tnode.centerid, tmp.distance);
                                     }
                                     for (SizeType begin = tnode.childStart; begin < tnode.childEnd; begin++) {
                                         SizeType index = m_pTreeRoots[begin].centerid;
@@ -1051,16 +1054,14 @@ break;
                 {
                     NodeDistPair bcell = p_space.m_SPTQueue.pop();
                     const BKTNode& tnode = m_pTreeRoots[bcell.node];
+                    if (g_graphAccessStats != nullptr) ++g_graphAccessStats->m_treeNodeVisits;
                     if (tnode.childStart < 0) {
-                        if (p_space.m_iNumberOfCheckedLeaves >=
-                            p_limits)
-                        {
-                            break;
-                        }
                         if (!p_space.CheckAndSet(tnode.centerid)) {
                             p_space.m_iNumberOfCheckedLeaves++;
                             p_space.m_NGQueue.insert(NodeDistPair(tnode.centerid, bcell.distance));
+                            p_space.ObserveScored(tnode.centerid, bcell.distance);
                         }
+                        if (p_space.m_iNumberOfCheckedLeaves >= p_limits) break;
                     }
                     else {
                         for (SizeType begin = tnode.childStart; begin < tnode.childEnd; begin++) {
@@ -1068,6 +1069,7 @@ break;
                         }
                         if (!p_space.CheckAndSet(tnode.centerid)) {
                             p_space.m_NGQueue.insert(NodeDistPair(tnode.centerid, bcell.distance));
+                            p_space.ObserveScored(tnode.centerid, bcell.distance);
                         }
                         for (SizeType begin = tnode.childStart; begin < tnode.childEnd; begin++) {
                             SizeType index = m_pTreeRoots[begin].centerid;

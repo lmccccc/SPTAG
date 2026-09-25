@@ -52,12 +52,12 @@ if (Python_FOUND)
     set(PY_CORE_I ${PROJECT_SOURCE_DIR}/Wrappers/inc/PythonCore.i)
     set(PY_CLIENT_I ${PROJECT_SOURCE_DIR}/Wrappers/inc/PythonClient.i)
     set(PY_COMMON_I ${PROJECT_SOURCE_DIR}/Wrappers/inc/PythonCommon.i)
-    set(CORE_PY_WRAP ${PROJECT_SOURCE_DIR}/Wrappers/inc/CoreInterface_pwrap.cpp)
-    set(CLIENT_PY_WRAP ${PROJECT_SOURCE_DIR}/Wrappers/inc/ClientInterface_pwrap.cpp)
+    set(CORE_PY_WRAP ${CMAKE_CURRENT_BINARY_DIR}/CoreInterface_pwrap.cpp)
+    set(CLIENT_PY_WRAP ${CMAKE_CURRENT_BINARY_DIR}/ClientInterface_pwrap.cpp)
 
     add_custom_command(
         OUTPUT ${CORE_PY_WRAP}
-        COMMAND ${SWIG_EXECUTABLE} -python -c++ -I${PROJECT_SOURCE_DIR}/Wrappers/inc -o ${CORE_PY_WRAP} ${PY_CORE_I}
+        COMMAND ${SWIG_EXECUTABLE} -python -c++ -I${PROJECT_SOURCE_DIR}/Wrappers/inc -outdir ${CMAKE_CURRENT_BINARY_DIR} -o ${CORE_PY_WRAP} ${PY_CORE_I}
         DEPENDS ${PY_CORE_I} ${PY_COMMON_I} ${PROJECT_SOURCE_DIR}/Wrappers/inc/CoreInterface.h
         COMMENT "Generating Python SWIG wrapper: CoreInterface_pwrap.cpp"
         VERBATIM
@@ -65,7 +65,7 @@ if (Python_FOUND)
 
     add_custom_command(
         OUTPUT ${CLIENT_PY_WRAP}
-        COMMAND ${SWIG_EXECUTABLE} -python -c++ -I${PROJECT_SOURCE_DIR}/Wrappers/inc -o ${CLIENT_PY_WRAP} ${PY_CLIENT_I}
+        COMMAND ${SWIG_EXECUTABLE} -python -c++ -I${PROJECT_SOURCE_DIR}/Wrappers/inc -outdir ${CMAKE_CURRENT_BINARY_DIR} -o ${CLIENT_PY_WRAP} ${PY_CLIENT_I}
         DEPENDS ${PY_CLIENT_I} ${PY_COMMON_I} ${PROJECT_SOURCE_DIR}/Wrappers/inc/ClientInterface.h
         COMMENT "Generating Python SWIG wrapper: ClientInterface_pwrap.cpp"
         VERBATIM
@@ -85,21 +85,22 @@ if (Python_FOUND)
     else()
         target_link_libraries(_SPTAG SPTAGLib ${Python_LIBRARIES})
     endif()
-    add_custom_command(TARGET _SPTAG POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy ${PROJECT_SOURCE_DIR}/Wrappers/inc/SPTAG.py ${EXECUTABLE_OUTPUT_PATH})
+    add_custom_command(TARGET _SPTAG POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_BINARY_DIR}/SPTAG.py ${EXECUTABLE_OUTPUT_PATH})
 
     file(GLOB CLIENT_HDR_FILES ${PROJECT_SOURCE_DIR}/Wrappers/inc/ClientInterface.h ${PROJECT_SOURCE_DIR}/AnnService/inc/Socket/*.h ${PROJECT_SOURCE_DIR}/AnnService/inc/Client/*.h)
-    file(GLOB CLIENT_SRC_FILES ${PROJECT_SOURCE_DIR}/Wrappers/src/ClientInterface.cpp ${PROJECT_SOURCE_DIR}/AnnService/src/Socket/*.cpp ${PROJECT_SOURCE_DIR}/AnnService/src/Client/*.cpp ${PROJECT_SOURCE_DIR}/Wrappers/inc/ClientInterface_pwrap.cpp)
+    file(GLOB CLIENT_SRC_FILES ${PROJECT_SOURCE_DIR}/Wrappers/src/ClientInterface.cpp ${PROJECT_SOURCE_DIR}/AnnService/src/Socket/*.cpp ${PROJECT_SOURCE_DIR}/AnnService/src/Client/*.cpp)
+    list(APPEND CLIENT_SRC_FILES ${CLIENT_PY_WRAP})
     add_library (_SPTAGClient SHARED ${CLIENT_SRC_FILES} ${CLIENT_HDR_FILES})
     add_dependencies(_SPTAGClient swig_python_wrappers)
     set_target_properties(_SPTAGClient PROPERTIES PREFIX "" SUFFIX ${PY_SUFFIX})
     target_link_libraries(_SPTAGClient SPTAGLib ${Python_LIBRARIES} ${Boost_LIBRARIES})
-    add_custom_command(TARGET _SPTAGClient POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy ${PROJECT_SOURCE_DIR}/Wrappers/inc/SPTAGClient.py ${EXECUTABLE_OUTPUT_PATH})
+    add_custom_command(TARGET _SPTAGClient POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_BINARY_DIR}/SPTAGClient.py ${EXECUTABLE_OUTPUT_PATH})
 
     install(TARGETS _SPTAG _SPTAGClient
     RUNTIME DESTINATION bin
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib)
-    install(FILES ${PROJECT_SOURCE_DIR}/Wrappers/inc/SPTAG.py ${PROJECT_SOURCE_DIR}/Wrappers/inc/SPTAGClient.py DESTINATION bin)
+    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/SPTAG.py ${CMAKE_CURRENT_BINARY_DIR}/SPTAGClient.py DESTINATION bin)
 else()
     message (STATUS "Could not find Python.")
 endif()
@@ -118,31 +119,34 @@ if (JNI_FOUND)
         set (JAVA_SUFFIX .so)
     endif()
 
-    execute_process(COMMAND swig -java -c++ -I${PROJECT_SOURCE_DIR}/Wrappers/inc -o ${PROJECT_SOURCE_DIR}/Wrappers/inc/CoreInterface_jwrap.cpp ${PROJECT_SOURCE_DIR}/Wrappers/inc/JavaCore.i)
-    execute_process(COMMAND swig -java -c++ -I${PROJECT_SOURCE_DIR}/Wrappers/inc -o ${PROJECT_SOURCE_DIR}/Wrappers/inc/ClientInterface_jwrap.cpp ${PROJECT_SOURCE_DIR}/Wrappers/inc/JavaClient.i)
-    execute_process(COMMAND swig -java -package site.ycsb.fileiointerface -c++ -I${PROJECT_SOURCE_DIR}/Wrappers/inc -o ${PROJECT_SOURCE_DIR}/Wrappers/inc/FileIOInterface_jwrap.cpp ${PROJECT_SOURCE_DIR}/Wrappers/inc/JavaFileIO.i)
+    set(JAVA_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/java)
+    file(MAKE_DIRECTORY ${JAVA_OUTPUT_DIR})
+    execute_process(COMMAND swig -java -c++ -I${PROJECT_SOURCE_DIR}/Wrappers/inc -outdir ${JAVA_OUTPUT_DIR} -o ${JAVA_OUTPUT_DIR}/CoreInterface_jwrap.cpp ${PROJECT_SOURCE_DIR}/Wrappers/inc/JavaCore.i)
+    execute_process(COMMAND swig -java -c++ -I${PROJECT_SOURCE_DIR}/Wrappers/inc -outdir ${JAVA_OUTPUT_DIR} -o ${JAVA_OUTPUT_DIR}/ClientInterface_jwrap.cpp ${PROJECT_SOURCE_DIR}/Wrappers/inc/JavaClient.i)
+    execute_process(COMMAND swig -java -package site.ycsb.fileiointerface -c++ -I${PROJECT_SOURCE_DIR}/Wrappers/inc -outdir ${JAVA_OUTPUT_DIR} -o ${JAVA_OUTPUT_DIR}/FileIOInterface_jwrap.cpp ${PROJECT_SOURCE_DIR}/Wrappers/inc/JavaFileIO.i)
 
     include_directories(${JNI_INCLUDE_DIRS} ${PROJECT_SOURCE_DIR}/AnnService ${PROJECT_SOURCE_DIR}/Wrappers)
 
     file(GLOB CORE_HDR_FILES ${PROJECT_SOURCE_DIR}/Wrappers/inc/CoreInterface.h)
-    file(GLOB CORE_SRC_FILES ${PROJECT_SOURCE_DIR}/Wrappers/src/CoreInterface.cpp ${PROJECT_SOURCE_DIR}/Wrappers/inc/CoreInterface_jwrap.cpp)
+    set(CORE_SRC_FILES ${PROJECT_SOURCE_DIR}/Wrappers/src/CoreInterface.cpp ${JAVA_OUTPUT_DIR}/CoreInterface_jwrap.cpp)
     add_library (JAVASPTAG SHARED ${CORE_SRC_FILES} ${CORE_HDR_FILES})
     set_target_properties(JAVASPTAG PROPERTIES SUFFIX ${JAVA_SUFFIX})
     target_link_libraries(JAVASPTAG SPTAGLib ${JNI_LIBRARIES})
 
     file(GLOB CLIENT_HDR_FILES ${PROJECT_SOURCE_DIR}/Wrappers/inc/ClientInterface.h ${PROJECT_SOURCE_DIR}/AnnService/inc/Socket/*.h ${PROJECT_SOURCE_DIR}/AnnService/inc/Client/*.h)
-    file(GLOB CLIENT_SRC_FILES ${PROJECT_SOURCE_DIR}/Wrappers/src/ClientInterface.cpp ${PROJECT_SOURCE_DIR}/AnnService/src/Socket/*.cpp ${PROJECT_SOURCE_DIR}/AnnService/src/Client/*.cpp ${PROJECT_SOURCE_DIR}/Wrappers/inc/ClientInterface_jwrap.cpp)
+    file(GLOB CLIENT_SRC_FILES ${PROJECT_SOURCE_DIR}/Wrappers/src/ClientInterface.cpp ${PROJECT_SOURCE_DIR}/AnnService/src/Socket/*.cpp ${PROJECT_SOURCE_DIR}/AnnService/src/Client/*.cpp)
+    list(APPEND CLIENT_SRC_FILES ${JAVA_OUTPUT_DIR}/ClientInterface_jwrap.cpp)
     add_library (JAVASPTAGClient SHARED ${CLIENT_SRC_FILES} ${CLIENT_HDR_FILES})
     set_target_properties(JAVASPTAGClient PROPERTIES SUFFIX ${JAVA_SUFFIX})
     target_link_libraries(JAVASPTAGClient SPTAGLib ${JNI_LIBRARIES} ${Boost_LIBRARIES})
 
     file(GLOB FILEIO_HDR_FILES ${PROJECT_SOURCE_DIR}/Wrappers/inc/FileIOInterface.h)
-    file(GLOB FILEIO_SRC_FILES ${PROJECT_SOURCE_DIR}/Wrappers/inc/FileIOInterface_jwrap.cpp)
+    set(FILEIO_SRC_FILES ${JAVA_OUTPUT_DIR}/FileIOInterface_jwrap.cpp)
     add_library (JAVASPTAGFileIO SHARED ${FILEIO_SRC_FILES} ${FILEIO_HDR_FILES})
     set_target_properties(JAVASPTAGFileIO PROPERTIES SUFFIX ${JAVA_SUFFIX})
     target_link_libraries(JAVASPTAGFileIO SPTAGLib ${JNI_LIBRARIES})
 
-    file(GLOB JAVA_FILES ${PROJECT_SOURCE_DIR}/Wrappers/inc/*.java)
+    file(GLOB JAVA_FILES ${JAVA_OUTPUT_DIR}/*.java)
     foreach(JAVA_FILE ${JAVA_FILES})
         message (STATUS "Add copy post-command for file " ${JAVA_FILE})
         add_custom_command(TARGET JAVASPTAGClient POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy ${JAVA_FILE} ${EXECUTABLE_OUTPUT_PATH})

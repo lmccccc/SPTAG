@@ -1,0 +1,41 @@
+{
+  "scope": "bounded_real_filter_cost_no_curve_stages",
+  "cases": {
+    "A": "native H1 empty predicate",
+    "B": "same filtered admission, no ratio observer",
+    "C": "same real nonempty alltrue predicate plus unchanged ratio supplier"
+  },
+  "ordinary_order": [
+    [
+      "A",
+      "B",
+      "C"
+    ],
+    [
+      "C",
+      "A",
+      "B"
+    ]
+  ],
+  "nprobe": [
+    24
+  ],
+  "warmup": 1000,
+  "queries": 1000,
+  "repeats": 2,
+  "threads": 1,
+  "numa": 2,
+  "O_DIRECT": true,
+  "MaxCheck": 2048,
+  "HierarchyMaxCheck": 512,
+  "page_limit": 15,
+  "retained_ratio": 0.5,
+  "minimum_physical_degree": 16,
+  "configs": {
+    "C.ini": "1650f9c42719aeccc21ff9eb94eb9c65090c37ed55367b352cdd48c5a7c3175f",
+    "B.ini": "8b45a8b1647262402d11d65da1940651211829629fb0cf7f16c4416ca313374d",
+    "A.ini": "a3b49b84724c03b1507a6f229d98d14ba6f0496bc4bc92611350f6ef70fa07cb"
+  },
+  "predicate_sha256": "f4836f6e074c5396693de00b035b7c6fd7b99d5fcb1da1347e03c10b3c0e52db",
+  "one_causal_fix_only_if_measured": true
+}

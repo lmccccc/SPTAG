@@ -1,0 +1,45 @@
+{
+  "phase": "2_only_no_full_sweep",
+  "ordinary_order": [
+    [
+      "h1",
+      "reference",
+      "supplier"
+    ],
+    [
+      "supplier",
+      "reference",
+      "h1"
+    ]
+  ],
+  "ordinary_native_processes": 6,
+  "profile_native_processes": 3,
+  "small_fixture_processes": 6,
+  "warmup": 1000,
+  "measured_queries": 1000,
+  "nprobe": [
+    24
+  ],
+  "query_threads": 1,
+  "numa_cpu_memory_node": 2,
+  "O_DIRECT": true,
+  "page_limit": 15,
+  "reference": "Phase1 optimized ratio implementation, compact cache disabled; no old absolute-degree policy.",
+  "coarse_profile": "Fine Engine clocks disabled; intrinsic preparation, adapter preparation, native search and adapter finalization measured separately. Not ordinary elapsed attribution.",
+  "fixtures": "supplier forward/reverse [16,24,384], medium/extreme/numeric/mixed [24],8 warm+8 measured; exact full native payload/core work against preserved Phase1, excluding new metadata/timing.",
+  "configs": {
+    "h1_asc.ini": "acbc3528fb9b017cb6c5a2ca76b7813d45a901ea869e7eb9b6c9065d0bd2fca8",
+    "h1_desc.ini": "ded6914ad0a3ce24164526bbe3370009da0aa34c0e54bfc2c7f1006b79ac6b83",
+    "h1_plain.ini": "7184c59840cd7c3c502f394b252db22d5d30b397965476039b29c8a55bf774ab",
+    "h1_profile.ini": "3334aac25217bef4e59904b8ddc48933834576f754e5aa7a1755ea9b98a55325",
+    "reference_asc.ini": "13a2826f67f07e28bd8bfa24387eb3ee9829dca39dd885707aa5cf1e4fdc0376",
+    "reference_desc.ini": "019de9d389c70e36a5644e388b9c63e17dbeba9e3827e493d1951ede72e77b3b",
+    "reference_plain.ini": "8952db4a4642b76f21c3a7eadddb09608bea5956e465f38c4f7d322549df75c1",
+    "reference_profile.ini": "6f70baae0d558f7d591bda9f6f86f5e4592ef4a01e3a4c683c8c4f8a80164c10",
+    "supplier_asc.ini": "ad9c1d34d600ee6b0f7738f709484bce18b313f091b30adb9e4c8ae1659d51c5",
+    "supplier_desc.ini": "546c082cef61c148375698ddaf1840e3a211baea076613333a1d3bf6a72a4def",
+    "supplier_plain.ini": "0189ab180d9e06d7f173d65824fb68001c9f11c92c91dffde3afbbc09627f43f",
+    "supplier_profile.ini": "73e0f543f990f9e77b6f05bbe7ee7d5936995e237db27505f5c1c1aada0cd6c0"
+  },
+  "stop": "Bounded Phase2 only; no full sweep."
+}

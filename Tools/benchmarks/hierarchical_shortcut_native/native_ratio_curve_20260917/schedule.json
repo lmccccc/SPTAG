@@ -1,0 +1,686 @@
+[
+  {
+    "stage": "unfilter_broad",
+    "scenario": "unfilter",
+    "case": "h1",
+    "repeat": 1,
+    "probes": [
+      16,
+      24,
+      32,
+      48,
+      62,
+      80,
+      96,
+      128,
+      192,
+      256,
+      384
+    ]
+  },
+  {
+    "stage": "unfilter_broad",
+    "scenario": "unfilter",
+    "case": "h3",
+    "repeat": 1,
+    "probes": [
+      16,
+      24,
+      32,
+      48,
+      62,
+      80,
+      96,
+      128,
+      192,
+      256,
+      384
+    ]
+  },
+  {
+    "stage": "unfilter_broad",
+    "scenario": "unfilter",
+    "case": "supplier",
+    "repeat": 1,
+    "probes": [
+      16,
+      24,
+      32,
+      48,
+      62,
+      80,
+      96,
+      128,
+      192,
+      256,
+      384
+    ]
+  },
+  {
+    "stage": "unfilter_broad",
+    "scenario": "broad_tag",
+    "case": "h3",
+    "repeat": 1,
+    "probes": [
+      16,
+      24,
+      32,
+      48,
+      62,
+      80,
+      96,
+      128,
+      192,
+      256,
+      384
+    ]
+  },
+  {
+    "stage": "unfilter_broad",
+    "scenario": "broad_tag",
+    "case": "supplier",
+    "repeat": 1,
+    "probes": [
+      16,
+      24,
+      32,
+      48,
+      62,
+      80,
+      96,
+      128,
+      192,
+      256,
+      384
+    ]
+  },
+  {
+    "stage": "unfilter_broad",
+    "scenario": "broad_tag",
+    "case": "h1",
+    "repeat": 1,
+    "probes": [
+      16,
+      24,
+      32,
+      48,
+      62,
+      80,
+      96,
+      128,
+      192,
+      256,
+      384
+    ]
+  },
+  {
+    "stage": "unfilter_broad",
+    "scenario": "broad_tag",
+    "case": "supplier",
+    "repeat": 2,
+    "probes": [
+      384,
+      256,
+      192,
+      128,
+      96,
+      80,
+      62,
+      48,
+      32,
+      24,
+      16
+    ]
+  },
+  {
+    "stage": "unfilter_broad",
+    "scenario": "broad_tag",
+    "case": "h1",
+    "repeat": 2,
+    "probes": [
+      384,
+      256,
+      192,
+      128,
+      96,
+      80,
+      62,
+      48,
+      32,
+      24,
+      16
+    ]
+  },
+  {
+    "stage": "unfilter_broad",
+    "scenario": "broad_tag",
+    "case": "h3",
+    "repeat": 2,
+    "probes": [
+      384,
+      256,
+      192,
+      128,
+      96,
+      80,
+      62,
+      48,
+      32,
+      24,
+      16
+    ]
+  },
+  {
+    "stage": "unfilter_broad",
+    "scenario": "unfilter",
+    "case": "h1",
+    "repeat": 2,
+    "probes": [
+      384,
+      256,
+      192,
+      128,
+      96,
+      80,
+      62,
+      48,
+      32,
+      24,
+      16
+    ]
+  },
+  {
+    "stage": "unfilter_broad",
+    "scenario": "unfilter",
+    "case": "h3",
+    "repeat": 2,
+    "probes": [
+      384,
+      256,
+      192,
+      128,
+      96,
+      80,
+      62,
+      48,
+      32,
+      24,
+      16
+    ]
+  },
+  {
+    "stage": "unfilter_broad",
+    "scenario": "unfilter",
+    "case": "supplier",
+    "repeat": 2,
+    "probes": [
+      384,
+      256,
+      192,
+      128,
+      96,
+      80,
+      62,
+      48,
+      32,
+      24,
+      16
+    ]
+  },
+  {
+    "stage": "medium_extreme",
+    "scenario": "medium_tag",
+    "case": "h1",
+    "repeat": 1,
+    "probes": [
+      16,
+      24,
+      32,
+      48,
+      62,
+      80,
+      96,
+      128,
+      192,
+      256,
+      384
+    ]
+  },
+  {
+    "stage": "medium_extreme",
+    "scenario": "medium_tag",
+    "case": "h3",
+    "repeat": 1,
+    "probes": [
+      16,
+      24,
+      32,
+      48,
+      62,
+      80,
+      96,
+      128,
+      192,
+      256,
+      384
+    ]
+  },
+  {
+    "stage": "medium_extreme",
+    "scenario": "medium_tag",
+    "case": "supplier",
+    "repeat": 1,
+    "probes": [
+      16,
+      24,
+      32,
+      48,
+      62,
+      80,
+      96,
+      128,
+      192,
+      256,
+      384
+    ]
+  },
+  {
+    "stage": "medium_extreme",
+    "scenario": "extreme_tag",
+    "case": "h3",
+    "repeat": 1,
+    "probes": [
+      16,
+      24,
+      32,
+      48,
+      62,
+      80,
+      96,
+      128,
+      192,
+      256,
+      384
+    ]
+  },
+  {
+    "stage": "medium_extreme",
+    "scenario": "extreme_tag",
+    "case": "supplier",
+    "repeat": 1,
+    "probes": [
+      16,
+      24,
+      32,
+      48,
+      62,
+      80,
+      96,
+      128,
+      192,
+      256,
+      384
+    ]
+  },
+  {
+    "stage": "medium_extreme",
+    "scenario": "extreme_tag",
+    "case": "h1",
+    "repeat": 1,
+    "probes": [
+      16,
+      24,
+      32,
+      48,
+      62,
+      80,
+      96,
+      128,
+      192,
+      256,
+      384
+    ]
+  },
+  {
+    "stage": "medium_extreme",
+    "scenario": "extreme_tag",
+    "case": "supplier",
+    "repeat": 2,
+    "probes": [
+      384,
+      256,
+      192,
+      128,
+      96,
+      80,
+      62,
+      48,
+      32,
+      24,
+      16
+    ]
+  },
+  {
+    "stage": "medium_extreme",
+    "scenario": "extreme_tag",
+    "case": "h1",
+    "repeat": 2,
+    "probes": [
+      384,
+      256,
+      192,
+      128,
+      96,
+      80,
+      62,
+      48,
+      32,
+      24,
+      16
+    ]
+  },
+  {
+    "stage": "medium_extreme",
+    "scenario": "extreme_tag",
+    "case": "h3",
+    "repeat": 2,
+    "probes": [
+      384,
+      256,
+      192,
+      128,
+      96,
+      80,
+      62,
+      48,
+      32,
+      24,
+      16
+    ]
+  },
+  {
+    "stage": "medium_extreme",
+    "scenario": "medium_tag",
+    "case": "h1",
+    "repeat": 2,
+    "probes": [
+      384,
+      256,
+      192,
+      128,
+      96,
+      80,
+      62,
+      48,
+      32,
+      24,
+      16
+    ]
+  },
+  {
+    "stage": "medium_extreme",
+    "scenario": "medium_tag",
+    "case": "h3",
+    "repeat": 2,
+    "probes": [
+      384,
+      256,
+      192,
+      128,
+      96,
+      80,
+      62,
+      48,
+      32,
+      24,
+      16
+    ]
+  },
+  {
+    "stage": "medium_extreme",
+    "scenario": "medium_tag",
+    "case": "supplier",
+    "repeat": 2,
+    "probes": [
+      384,
+      256,
+      192,
+      128,
+      96,
+      80,
+      62,
+      48,
+      32,
+      24,
+      16
+    ]
+  },
+  {
+    "stage": "numeric_mixed",
+    "scenario": "numeric",
+    "case": "h1",
+    "repeat": 1,
+    "probes": [
+      16,
+      24,
+      32,
+      48,
+      62,
+      80,
+      96,
+      128,
+      192,
+      256,
+      384
+    ]
+  },
+  {
+    "stage": "numeric_mixed",
+    "scenario": "numeric",
+    "case": "h3",
+    "repeat": 1,
+    "probes": [
+      16,
+      24,
+      32,
+      48,
+      62,
+      80,
+      96,
+      128,
+      192,
+      256,
+      384
+    ]
+  },
+  {
+    "stage": "numeric_mixed",
+    "scenario": "numeric",
+    "case": "supplier",
+    "repeat": 1,
+    "probes": [
+      16,
+      24,
+      32,
+      48,
+      62,
+      80,
+      96,
+      128,
+      192,
+      256,
+      384
+    ]
+  },
+  {
+    "stage": "numeric_mixed",
+    "scenario": "mixed_dnf",
+    "case": "h3",
+    "repeat": 1,
+    "probes": [
+      16,
+      24,
+      32,
+      48,
+      62,
+      80,
+      96,
+      128,
+      192,
+      256,
+      384
+    ]
+  },
+  {
+    "stage": "numeric_mixed",
+    "scenario": "mixed_dnf",
+    "case": "supplier",
+    "repeat": 1,
+    "probes": [
+      16,
+      24,
+      32,
+      48,
+      62,
+      80,
+      96,
+      128,
+      192,
+      256,
+      384
+    ]
+  },
+  {
+    "stage": "numeric_mixed",
+    "scenario": "mixed_dnf",
+    "case": "h1",
+    "repeat": 1,
+    "probes": [
+      16,
+      24,
+      32,
+      48,
+      62,
+      80,
+      96,
+      128,
+      192,
+      256,
+      384
+    ]
+  },
+  {
+    "stage": "numeric_mixed",
+    "scenario": "mixed_dnf",
+    "case": "supplier",
+    "repeat": 2,
+    "probes": [
+      384,
+      256,
+      192,
+      128,
+      96,
+      80,
+      62,
+      48,
+      32,
+      24,
+      16
+    ]
+  },
+  {
+    "stage": "numeric_mixed",
+    "scenario": "mixed_dnf",
+    "case": "h1",
+    "repeat": 2,
+    "probes": [
+      384,
+      256,
+      192,
+      128,
+      96,
+      80,
+      62,
+      48,
+      32,
+      24,
+      16
+    ]
+  },
+  {
+    "stage": "numeric_mixed",
+    "scenario": "mixed_dnf",
+    "case": "h3",
+    "repeat": 2,
+    "probes": [
+      384,
+      256,
+      192,
+      128,
+      96,
+      80,
+      62,
+      48,
+      32,
+      24,
+      16
+    ]
+  },
+  {
+    "stage": "numeric_mixed",
+    "scenario": "numeric",
+    "case": "h1",
+    "repeat": 2,
+    "probes": [
+      384,
+      256,
+      192,
+      128,
+      96,
+      80,
+      62,
+      48,
+      32,
+      24,
+      16
+    ]
+  },
+  {
+    "stage": "numeric_mixed",
+    "scenario": "numeric",
+    "case": "h3",
+    "repeat": 2,
+    "probes": [
+      384,
+      256,
+      192,
+      128,
+      96,
+      80,
+      62,
+      48,
+      32,
+      24,
+      16
+    ]
+  },
+  {
+    "stage": "numeric_mixed",
+    "scenario": "numeric",
+    "case": "supplier",
+    "repeat": 2,
+    "probes": [
+      384,
+      256,
+      192,
+      128,
+      96,
+      80,
+      62,
+      48,
+      32,
+      24,
+      16
+    ]
+  }
+]

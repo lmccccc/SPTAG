@@ -72,12 +72,8 @@ DefineSelectHeadParameter(m_secondLevelHierarchyLevels, int, 2, "HierarchyLevels
 DefineSelectHeadParameter(m_secondLevelHeadVectorFile, std::string, std::string("SPTAGSecondLevelHeadVectors.bin"), "HierarchyHeadVectors")
 DefineSelectHeadParameter(m_secondLevelHeadIDFile, std::string, std::string("SPTAGSecondLevelHeadVectorIDs.bin"), "HierarchyHeadVectorIDs")
 DefineSelectHeadParameter(m_secondLevelReplicaCount, int, 4, "HierarchyReplicaCount")
-DefineSelectHeadParameter(m_secondLevelHeadIndexFolder, std::string, std::string("SecondLevelHeadIndex"), "HierarchyHeadIndexFolder")
 DefineSelectHeadParameter(m_secondLevelPostingFile, std::string, std::string("second_level_head_postings.bin"), "HierarchyPostingFile")
 DefineSelectHeadParameter(m_secondLevelGenerationFingerprint, std::string, std::string(), "HierarchyGenerationFingerprint")
-DefineSelectHeadParameter(m_buildH1Graph, bool, true, "BuildH1Graph")
-// Retained for V2 indexloader.ini compatibility; new builds must leave this false.
-DefineSelectHeadParameter(m_compactHierarchyVectors, bool, false, "CompactHierarchyVectors")
 #endif
 
 #ifdef DefineBuildHeadParameter
@@ -87,6 +83,9 @@ DefineBuildHeadParameter(m_buildHead, bool, false, "isExecute")
 #endif
 
 #ifdef DefineSSDParameter
+DefineSSDParameter(m_enablePostingNavigation, bool, false, "EnablePostingNavigation")
+DefineSSDParameter(m_postingAnchorCount, int, 8, "PostingAnchorCount")
+DefineSSDParameter(m_postingAdditionalMaxCheck, int, 0, "PostingAdditionalMaxCheck")
 DefineSSDParameter(m_enableSSD, bool, false, "isExecute")
 DefineSSDParameter(m_buildSsdIndex, bool, false, "BuildSsdIndex")
 DefineSSDParameter(m_iSSDNumberOfThreads, int, 16, "NumberOfThreads") // Mutable
@@ -103,9 +102,6 @@ DefineSSDParameter(m_limitedTagColumn, int, 0, "LimitedTagColumn")
 DefineSSDParameter(m_limitedTagSlotsPerHead, int, 2, "LimitedTagSlotsPerHead")
 DefineSSDParameter(m_limitedTagMinHeadCount, int, 8, "LimitedTagMinHeadCount")
 DefineSSDParameter(m_enableLimitedTagSupportExpansion, bool, false, "EnableLimitedTagSupportExpansion")
-DefineSSDParameter(m_secondLevelInitialProbeRatio, double, 1.0, "HierarchyInitialProbeRatio") // Mutable
-DefineSSDParameter(m_secondLevelMaxCheck, int, 112, "HierarchyMaxCheck") // Mutable
-DefineSSDParameter(m_secondLevelPrefetchMode, std::string, std::string("Rolling16"), "HierarchyPrefetchMode")
 DefineSSDParameter(m_hybridVectorWeight, float, 1.0f, "HybridVectorWeight")
 DefineSSDParameter(m_hybridCategoricalCols, std::string, std::string(""), "HybridCategoricalCols")
 DefineSSDParameter(m_hybridCategoricalWeights, std::string, std::string(""), "HybridCategoricalWeights")

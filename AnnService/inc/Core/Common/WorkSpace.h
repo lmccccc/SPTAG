@@ -6,10 +6,15 @@
 
 #include "inc/Core/SearchResult.h"
 #include "CommonUtils.h"
+#include "GraphAccessStats.h"
 #include "Heap.h"
 
 #include <stdarg.h>
 #include <functional>
+#include <limits>
+#include <stdexcept>
+#include <type_traits>
+#include "inc/Core/Common/PostingNavigation.h"
 
 namespace SPTAG
 {
@@ -101,6 +106,8 @@ namespace SPTAG
 
         public:
             OptHashPosVector(): m_secondHash(false), m_exp(2), m_poolSize(8191) {}
+            OptHashPosVector(OptHashPosVector&&) noexcept = default;
+            OptHashPosVector& operator=(OptHashPosVector&&) noexcept = default;
 
             ~OptHashPosVector() { m_hashTable.reset(); }
 
@@ -121,6 +128,11 @@ namespace SPTAG
 
             void clear()
             {
+#ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
+                if (g_graphAccessStats)
+                    g_graphAccessStats->m_nativeHashClearedBytes +=
+                        (m_secondHash ? 2 : 1) * sizeof(SizeType) * (m_poolSize + 1);
+#endif
                 if (!m_secondHash)
                 {
                     // Clear first block.
@@ -141,14 +153,15 @@ namespace SPTAG
             inline bool CheckAndSet(SizeType idx)
             {
                 // Inner Index is begin from 1
-                return _CheckAndSet(m_hashTable.get(), m_poolSize, true, idx + 1) == 0;
+                return _CheckAndSet(m_hashTable.get(), m_poolSize, true,
+                    static_cast<SizeType>(static_cast<std::uint32_t>(idx) + 1U)) == 0;
             }
 
             inline bool Contains(SizeType idx) const
             {
                 if (!m_hashTable) return false;
 
-                const SizeType key = idx + 1;
+                const SizeType key = static_cast<SizeType>(static_cast<std::uint32_t>(idx) + 1U);
                 if (_Contains(m_hashTable.get(), m_poolSize, key)) return true;
                 return m_secondHash &&
                     _Contains(m_hashTable.get() + m_poolSize + 1, m_poolSize, key);
@@ -213,6 +226,8 @@ namespace SPTAG
                 return false;
             }
         };
+
+#include "inc/Core/Common/NavigationVisited.h"
 
         class DistPriorityQueue {
             int m_size;
@@ -357,6 +372,12 @@ namespace SPTAG
 
             inline bool CheckAndSet(SizeType idx)
             {
+                if (g_graphAccessStats != nullptr) ++g_graphAccessStats->m_visitedChecks;
+                if (matchPredicate) {
+                    const auto match = nodeCheckStatus.Match(idx, *matchPredicate);
+                    lastNavigationMatch = match.second;
+                    return match.first;
+                }
                 return nodeCheckStatus.CheckAndSet(idx);
             }
 
@@ -371,6 +392,7 @@ namespace SPTAG
 
             inline bool Contains(SizeType idx) const
             {
+                if (matchPredicate) return nodeCheckStatus.ContainsMatch(idx);
                 return nodeCheckStatus.Contains(idx);
             }
 
@@ -381,7 +403,16 @@ namespace SPTAG
 
             static void Reset() {}
 
-            OptHashPosVector nodeCheckStatus;
+            const std::function<bool(SizeType)>* matchPredicate = nullptr;
+            PostingNavigation* postingNavigation = nullptr;
+            const std::function<void(SizeType, float, bool)>* scoredCandidate = nullptr;
+            bool lastNavigationMatch = false;
+            int postingAnchorCount = 8;
+            int postingAdditionalMaxCheck = 0;
+            void ObserveScored(SizeType id, float distance) {
+                if (scoredCandidate) (*scoredCandidate)(id, distance, lastNavigationMatch);
+            }
+            NavigationVisited nodeCheckStatus;
             OptHashPosVector resultCheckStatus;
             bool m_resultCheckInitialized = false;
 

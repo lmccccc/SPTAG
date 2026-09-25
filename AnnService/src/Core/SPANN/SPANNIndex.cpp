@@ -8,8 +8,9 @@
 #include "inc/Core/SPANN/ExtraDynamicSearcher.h"
 #include "inc/Core/SPANN/ExtraStaticSearcher.h"
 #include "inc/Core/SPANN/HeadCrossEdgeBuilder.h"
-#include "inc/Core/SPANN/SecondLevelHierarchy.h"
+#include "inc/Core/SPANN/HierarchyPostingBuilder.h"
 #include "inc/Core/SPANN/HierarchyVectorCatalog.h"
+#include "inc/Core/SPANN/CanonicalHierarchyVectors.h"
 #include "inc/Core/SPANN/HeadNodeMetadata.h"
 #include "inc/Helper/AtomicFile.h"
 #include "inc/Helper/HeadCrossEdges.h"
@@ -57,23 +58,6 @@ EdgeCompare Selection::g_edgeComparer;
 thread_local double g_bktSeedMs = 0.0;
 thread_local double g_pqGraphMs = 0.0;
 
-struct SecondLevelSearchProfile
-{
-    double m_graphMs = 0.0;
-    double m_mergeMs = 0.0;
-    double m_tagMs = 0.0;
-    double m_vectorMs = 0.0;
-    double m_sortMs = 0.0;
-    std::uint64_t m_upperScanned = 0;
-    std::uint64_t m_uniqueScanned = 0;
-    std::uint64_t m_assignments = 0;
-    int m_upperProbe = 0;
-    int m_maxCheck = 0;
-    int m_iterations = 0;
-};
-
-thread_local SecondLevelSearchProfile g_secondLevelProfile;
-
 namespace
 {
 constexpr std::uint32_t kHeadBundleManifestMagic = 0x48424D46U;
@@ -82,17 +66,7 @@ constexpr std::int32_t kHeadBundleManifestVersion = 2;
 constexpr int kRequiredHybridBaseGraphDegree = 32;
 constexpr int kRequiredHybridGraphDegree = 16;
 
-bool ValidHierarchyNavigationConfig(
-    const Options& p_options)
-{
-    return
-        std::isfinite(
-            p_options
-                .m_secondLevelInitialProbeRatio) &&
-        p_options.m_secondLevelInitialProbeRatio > 0.0 &&
-        p_options.m_secondLevelInitialProbeRatio <= 1.0 &&
-        p_options.m_secondLevelMaxCheck > 0;
-}
+
 
 bool ValidDynamicLimitedTagRepresentation(
     const Options& p_options,
@@ -221,7 +195,14 @@ std::uint64_t FingerprintFirstLevelHeadIDs(
     return fingerprint;
 }
 
-using SecondLevelHierarchyDetail::PrefetchL1;
+inline void PrefetchL1(const void* address)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    if (address) __builtin_prefetch(address, 0, 3);
+#elif defined(_MSC_VER)
+    if (address) _mm_prefetch(reinterpret_cast<const char*>(address), _MM_HINT_T0);
+#endif
+}
 
 std::uint64_t NewHybridBuildGeneration(
     std::uint64_t p_contentFingerprint)
@@ -459,17 +440,6 @@ int SecondLevelUpperLayerCount(
         p_options.m_secondLevelHierarchyLevels - 1);
 }
 
-std::string SecondLevelBuildIndexFolder(
-    const Options& p_options, int p_level)
-{
-    return p_level ==
-            SecondLevelUpperLayerCount(p_options)
-        ? p_options.m_secondLevelHeadIndexFolder
-        : p_options.m_secondLevelHeadIndexFolder +
-              ".level" + std::to_string(p_level) +
-              ".build";
-}
-
 bool ParseSecondLevelGenerations(
     const std::string& p_value, int p_levels,
     std::vector<std::uint64_t>& p_generations)
@@ -565,7 +535,7 @@ bool ValidLimitedTagArtifactLayout(
         p_options.m_secondLevelHeadVectorFile,
         p_options.m_secondLevelHeadIDFile,
         p_options.m_secondLevelPostingFile,
-        p_options.m_secondLevelHeadIndexFolder,
+        p_options.m_legacyTopVectorFolder,
         "indexloader.ini",
         "metadata.bin",
         "metadataIndex.bin",
@@ -651,11 +621,6 @@ bool ValidSecondLevelArtifactLayout(
             publishedNames.push_back(file);
             publishedNames.push_back(file + ".tmp");
         }
-        const std::string folder =
-            SecondLevelBuildIndexFolder(
-                p_options, level);
-        if (!IsSafeArtifactName(folder)) return false;
-        indexFolders.push_back(folder);
     }
 
     for (size_t left = 0;
@@ -2737,11 +2702,20 @@ ErrorCode Index<T>::EnsureHierarchyHeadMetadata(
     };
     if (!p_build)
     {
-        if (generation == 0 || !LoadHeadNodeMetadataV8(
-                path, m_index, m_index->GetNumSamples(), generation, canonicalVID))
+        const auto schema = m_options.Schema();
+        if (generation == 0 || !LoadHeadNodeMetadata(
+                path, m_index, m_index->GetNumSamples(), generation, canonicalVID,
+                m_options.m_columnTypes.empty() ? nullptr : &schema))
         {
             SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                "Hierarchy requires canonical generation-bound H1 V8 metadata: %s\n", path.c_str());
+                "Hierarchy requires canonical generation-bound H1 V8/V9 metadata: %s\n", path.c_str());
+            return ErrorCode::Fail;
+        }
+        if (m_index->GetHeadMetadataLayout().compact &&
+            m_index->GetHeadMetadataLayout().schema.text != schema.text) {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                "Compact metadata schema disagrees with the saved native index schema.\n");
+            m_index->ClearHeadNodeMeta();
             return ErrorCode::Fail;
         }
         return ErrorCode::Success;
@@ -2767,8 +2741,17 @@ ErrorCode Index<T>::EnsureHierarchyHeadMetadata(
     const int categoricalColumns =
         static_cast<int>(m_options.Schema().categorical.size());
     if (categoricalColumns > columns) return ErrorCode::Fail;
+    const auto& schema = m_options.Schema();
+    std::vector<Cache::NumQuantParam> numericParams(schema.numeric.size());
+    for (auto& param : numericParams) param.lo = (std::numeric_limits<std::uint32_t>::max)();
+    for (std::size_t vector = 0; vector < vectorCount; ++vector)
+        for (std::size_t lane = 0; lane < numericParams.size(); ++lane) {
+            const auto value = tags[vector * columns + schema.numeric[lane]];
+            numericParams[lane].lo = (std::min)(numericParams[lane].lo, value);
+            numericParams[lane].hi = (std::max)(numericParams[lane].hi, value);
+        }
     const Cache::HierWidthTable widths = Cache::HierWidths();
-    m_index->InitializeHeadNodeMeta(headCount, 0, widths, true);
+    m_index->InitializeCompactHeadNodeMeta(headCount, schema, widths, true);
     std::string records;
     for (SizeType head = 0; head < headCount; ++head)
     {
@@ -2817,6 +2800,14 @@ ErrorCode Index<T>::EnsureHierarchyHeadMetadata(
                         (offset < pureBytes ? pure : tail).Insert(tag);
                         if (offset < pureBytes) postingMask.Insert(column, tag, widths);
                     }
+                    else {
+                        const auto position = std::find(schema.numeric.begin(), schema.numeric.end(), column);
+                        if (position == schema.numeric.end()) return ErrorCode::Fail;
+                        const int lane = static_cast<int>(position - schema.numeric.begin());
+                        auto* quant = offset < pureBytes ? m_index->GetHeadNodeNumQuantMutable(head)
+                                                        : m_index->GetHeadNodeTailNumQuantMutable(head);
+                        Cache::NumQuantInsert(quant, lane, Cache::NumQuantBucket(numericParams[lane], tag));
+                    }
                 }
             }
         }
@@ -2826,8 +2817,52 @@ ErrorCode Index<T>::EnsureHierarchyHeadMetadata(
     }
     m_index->SetHeadNodeOwnTagsAvailable(true);
     m_index->SetHeadNodePostingHierMasksAvailable(true);
-    if (!SaveHeadNodeMetadataV8(path, m_index, generation))
+    if (!numericParams.empty()) {
+        std::uint64_t fingerprint = 0;
+        if (!SaveNumericMetaFile(p_baseDir + FolderSep + "numeric_meta.bin", categoricalColumns,
+                static_cast<int>(vectorCount), columns, generation, numericParams, &fingerprint))
+            return ErrorCode::FailedCreateFile;
+        m_index->SetHeadNodeNumericDomainFingerprint(fingerprint);
+    }
+    if (!SaveHeadNodeMetadata(path, m_index, generation))
         return ErrorCode::FailedCreateFile;
+    return ErrorCode::Success;
+}
+
+template <typename T>
+ErrorCode Index<T>::RefreshRoutingSignatures()
+{
+    std::unique_lock<std::shared_timed_mutex> lock(m_headTopologyLock);
+    if (!m_index) return ErrorCode::EmptyIndex;
+    const auto& schema = m_options.Schema();
+    NumericMetaDiskData domain;
+    std::vector<Cache::NumQuantParam> params;
+    const std::string base = m_headBundleBaseDir.empty() ? m_options.m_indexDirectory : m_headBundleBaseDir;
+    if (!schema.numeric.empty()) {
+        const bool valid = LoadNumericMetaFile(base + FolderSep + "numeric_meta.bin", domain) &&
+            domain.generationBound && domain.numBaseColumns == static_cast<int>(schema.categorical.size()) &&
+            domain.tagColumnCount == schema.Width() &&
+            domain.vectorCount == m_limitedTagSupport.VectorCount() &&
+            domain.params.size() == schema.numeric.size() &&
+            m_index->GetHeadNodeNumQuantCols() == static_cast<int>(domain.params.size()) &&
+            domain.generationFingerprint != 0 &&
+            domain.generationFingerprint == m_limitedTagSupport.GenerationFingerprint() &&
+            domain.contentFingerprint == m_index->GetHeadNodeNumericDomainFingerprint();
+        if (valid) params = std::move(domain.params);
+        else SPTAGLIB_LOG(Helper::LogLevel::LL_Warning,
+            "Numeric navigation domain missing or unauthenticated; numeric signatures are conservative unknown (%s).\n",
+            base.c_str());
+    }
+    const bool ready = m_routingSignatures.Build(*m_index, m_limitedTagSupport,
+        schema.categorical, schema.numeric, m_secondLevelPostings, std::move(params));
+    m_routingStaleWarning.store(!ready);
+    if (!ready) SPTAGLIB_LOG(Helper::LogLevel::LL_Warning,
+        "Routing metadata lacks complete own/region coverage; navigation signatures are conservative unknown.\n");
+    else SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+        "Routing signatures refreshed: numeric lanes=%zu, upper shared payload=%zu bytes, "
+        "upper allocated capacity=%zu bytes, no H1 mask copy.\n",
+        m_routingSignatures.params.size(), m_routingSignatures.SharedBytes(),
+        m_routingSignatures.SharedCapacityBytes());
     return ErrorCode::Success;
 }
 
@@ -2920,8 +2955,6 @@ template <typename T>
 ErrorCode Index<T>::BuildSecondLevelHeadPostings()
 {
     m_secondLevelPostings.clear();
-    m_graphlessHierarchyOffsets.clear();
-    m_graphlessHierarchyMembers.clear();
     if (!m_options.m_selectSecondLevel)
         return ErrorCode::Success;
     if (!ValidSecondLevelArtifactLayout(
@@ -2935,8 +2968,6 @@ ErrorCode Index<T>::BuildSecondLevelHeadPostings()
     const int hierarchyLevels =
         SecondLevelUpperLayerCount(m_options);
     if (m_index == nullptr ||
-        m_secondLevelIndexes.size() !=
-            static_cast<size_t>(hierarchyLevels) ||
         m_secondLevelCatalogs.size() !=
             static_cast<size_t>(hierarchyLevels) ||
         m_vectorTranslateMap.R() !=
@@ -2947,13 +2978,6 @@ ErrorCode Index<T>::BuildSecondLevelHeadPostings()
           m_limitedTagSupport.ContentFingerprint() == 0 ||
           !m_limitedTagSupport.HasTagVectorCounts())) ||
         m_index->GetNumSamples() <= 0 ||
-        std::any_of(
-            m_secondLevelIndexes.begin(),
-            m_secondLevelIndexes.end(),
-            [](const std::shared_ptr<VectorIndex>& p_index) {
-                return p_index == nullptr ||
-                    p_index->GetNumSamples() <= 0;
-            }) ||
         std::any_of(
             m_secondLevelCatalogs.begin(),
             m_secondLevelCatalogs.end(),
@@ -3034,16 +3058,11 @@ ErrorCode Index<T>::BuildSecondLevelHeadPostings()
         }
     }
 
-    if (buildSignatures)
-        m_secondLevelPostings.resize(
-            static_cast<size_t>(hierarchyLevels));
-    else
-    {
-        m_graphlessHierarchyOffsets.resize(
-            static_cast<size_t>(hierarchyLevels));
-        m_graphlessHierarchyMembers.resize(
-            static_cast<size_t>(hierarchyLevels));
+    if (!buildSignatures) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,"Hierarchy CSR requires completed native attribute support.\n");
+        return ErrorCode::Fail;
     }
+    m_secondLevelPostings.resize(static_cast<std::size_t>(hierarchyLevels));
 
     for (int level = 1;
          level <= hierarchyLevels; ++level)
@@ -3060,9 +3079,44 @@ ErrorCode Index<T>::BuildSecondLevelHeadPostings()
                 levelOffset]->Count();
         const auto& upperToLower =
             levelToLowerIDs[levelOffset];
-        auto& upperIndex =
-            m_secondLevelIndexes[
-                levelOffset];
+        // Native ANN candidates are needed only while assigning this layer's CSR.
+        // Keep the configured construction policy, but never save or retain this graph.
+        auto upperIndex = VectorIndex::CreateInstance(
+            m_options.m_indexAlgoType,
+            m_secondLevelCatalogs[levelOffset]->GetValueType());
+        if (upperIndex == nullptr) {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                "Cannot create temporary native H%d CSR assignment index.\n", level + 1);
+            return ErrorCode::Fail;
+        }
+        upperIndex->SetQuantizer(
+            m_options.m_quantizeHead ? m_pQuantizer : nullptr);
+        ErrorCode assignmentIndexStatus = upperIndex->SetParameter(
+            "DistCalcMethod",
+            Helper::Convert::ConvertToString(m_options.m_distCalcMethod));
+        if (assignmentIndexStatus == ErrorCode::Success) {
+            for (const auto& parameter : m_headParameters) {
+                assignmentIndexStatus = upperIndex->SetParameter(
+                    parameter.first.c_str(), parameter.second.c_str());
+                if (assignmentIndexStatus != ErrorCode::Success) break;
+            }
+        }
+        auto assignmentVectors = m_secondLevelCatalogs[levelOffset];
+        if (assignmentIndexStatus == ErrorCode::Success &&
+            !std::dynamic_pointer_cast<BasicVectorSet>(assignmentVectors)) {
+            // Native construction needs a contiguous temporary matrix. Runtime
+            // and export keep the canonical view; only this assignment graph borrows it.
+            assignmentIndexStatus = MaterializeHierarchyCatalog(
+                assignmentVectors, assignmentVectors, &error);
+        }
+        if (assignmentIndexStatus == ErrorCode::Success)
+            assignmentIndexStatus = upperIndex->BuildIndex(
+                assignmentVectors, nullptr, false, true, true);
+        if (assignmentIndexStatus != ErrorCode::Success) {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                "Cannot build temporary native H%d CSR assignment index.\n", level + 1);
+            return assignmentIndexStatus;
+        }
 
         std::vector<SizeType> lowerToUpper(
             static_cast<size_t>(lowerCount), -1);
@@ -3141,7 +3195,7 @@ ErrorCode Index<T>::BuildSecondLevelHeadPostings()
         std::vector<std::uint64_t> offsets;
         std::vector<Member> members;
         const ErrorCode assignmentStatus =
-            BuildSecondLevelHierarchyAssignments<T>(
+            BuildHierarchyPostingAssignments<T>(
                 lowerCount, upperCount, lowerToUpper,
                 lowerSample, upperIndex,
                 m_options.m_secondLevelReplicaCount,
@@ -3158,36 +3212,7 @@ ErrorCode Index<T>::BuildSecondLevelHeadPostings()
             return assignmentStatus;
         }
 
-        if (!buildSignatures)
-        {
-            for (SizeType upper = 0;
-                 upper < upperCount; ++upper)
-            {
-                std::sort(
-                    members.begin() +
-                        offsets[
-                            static_cast<size_t>(
-                                upper)],
-                    members.begin() +
-                        offsets[
-                            static_cast<size_t>(
-                                upper) + 1]);
-            }
-            m_graphlessHierarchyOffsets[
-                levelOffset] =
-                std::move(offsets);
-            m_graphlessHierarchyMembers[
-                levelOffset] =
-                std::move(members);
-            SPTAGLIB_LOG(
-                Helper::LogLevel::LL_Info,
-                "Prepared graphless placement H%d->H%d CSR: lower=%d upper=%d replicas=%d.\n",
-                level + 1, level,
-                static_cast<int>(lowerCount),
-                static_cast<int>(upperCount),
-                effectiveReplicas);
-            continue;
-        }
+
 
         std::vector<Signature> signatures(
             static_cast<size_t>(upperCount));
@@ -3313,46 +3338,10 @@ ErrorCode Index<T>::BuildSecondLevelHeadPostings()
         .m_secondLevelGenerationFingerprint =
         SerializeSecondLevelGenerations(
             m_secondLevelPostings);
-    for (int level = 1;
-         level < hierarchyLevels; ++level)
-    {
-        std::error_code removeError;
-        std::filesystem::remove_all(
-            m_options.m_indexDirectory +
-                FolderSep +
-                SecondLevelBuildIndexFolder(
-                    m_options, level),
-            removeError);
-        if (removeError)
-        {
-            SPTAGLIB_LOG(
-                Helper::LogLevel::LL_Error,
-                "Cannot remove temporary hierarchy level %d graph: %s.\n",
-                level,
-                removeError.message().c_str());
-            return ErrorCode::Fail;
-        }
-        m_secondLevelIndexes[
-            static_cast<size_t>(level - 1)]
-            .reset();
-    }
-    SPTAGLIB_LOG(
-        Helper::LogLevel::LL_Info,
-        "Hierarchy complete: levels=%d top=H%d count=%d graph=%s "
-        "selectivity=(%.8g,%.8g] eligibleTags=%llu excludedTags=%llu.\n",
-        hierarchyLevels,
-        hierarchyLevels + 1,
-        static_cast<int>(
-            m_secondLevelIndexes.back()
-                ->GetNumSamples()),
-        m_options
-            .m_secondLevelHeadIndexFolder.c_str(),
-        0.0, 1.0,
-        static_cast<unsigned long long>(
-            eligibleTagCount),
-        static_cast<unsigned long long>(
-            excludedTagCount));
-    return ErrorCode::Success;
+    SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+        "Built %d signed posting layers with representative catalogs; no upper ANN graph.\n", hierarchyLevels);
+    m_postingOwners = std::make_unique<PostingOwners>(m_secondLevelPostings);
+    return PrepareHierarchyExport(m_options.m_indexDirectory);
 }
 
 template <typename T>
@@ -3392,7 +3381,7 @@ template <typename T>
 ErrorCode Index<T>::LoadOwnedHierarchyCatalogs(
     const std::string& p_baseDir,
     const std::vector<std::vector<std::uint64_t>>& p_levelToLower,
-    const std::shared_ptr<VectorIndex>& p_topIndex,
+    const std::shared_ptr<VectorSet>& p_topIndex,
     std::vector<std::shared_ptr<VectorSet>>& p_catalogs) const
 {
     p_catalogs.clear();
@@ -3458,250 +3447,50 @@ ErrorCode Index<T>::LoadOwnedHierarchyCatalogs(
     return result;
 }
 
+
+
 template <typename T>
-ErrorCode Index<T>::CompactHierarchyVectors()
+ErrorCode Index<T>::PrepareHierarchyExport(const std::string& directory)
 {
-    if (!m_bReady || m_index == nullptr || m_options.m_buildH1Graph ||
-        !m_metadataOnlyHeadStore || m_pQuantizer != nullptr ||
-        m_options.m_storage != Storage::STATIC ||
-        m_secondLevelIndexes.empty() || m_secondLevelIndexes.back() == nullptr ||
-        m_secondLevelCatalogs.size() != m_secondLevelIndexes.size() ||
-        m_h1CatalogVectors == nullptr ||
-        !ValidSecondLevelArtifactLayout(m_options, true))
-    {
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-            "Hierarchy compaction requires a loaded, unquantized STATIC graphless hierarchy.\n");
-        return ErrorCode::FailedParseValue;
+    if (!m_metadataOnlyHeadStore && m_hierarchyCatalogVersion == 0 && m_index &&
+        !m_index->m_pQuantizer) {
+        std::vector<std::uint32_t> previous;
+        for (std::size_t level = 0; level < m_secondLevelCatalogs.size(); ++level) {
+            std::vector<std::uint64_t> lower;
+            std::vector<std::uint32_t> physical;
+            std::string error;
+            const auto idPath = m_options.m_indexDirectory + FolderSep +
+                SecondLevelArtifactName(m_options.m_secondLevelHeadIDFile, static_cast<int>(level + 1));
+            if (!LoadSecondLevelHeadIDs(idPath, m_secondLevelCatalogs[level]->Count(), lower, &error) ||
+                !FlattenHierarchyIDs(lower, m_index->GetNumSamples(), previous, physical))
+                return ErrorCode::FailedParseValue;
+            const auto path = directory + FolderSep +
+                SecondLevelArtifactName(m_options.m_secondLevelHeadVectorFile, static_cast<int>(level + 1));
+            if (!SaveCanonicalHierarchyVectors(path, m_index, physical, *m_secondLevelCatalogs[level])) {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Cannot save canonical hierarchy vectors: %s\n", path.c_str());
+                return ErrorCode::DiskIOFail;
+            }
+            previous = physical;
+            m_secondLevelCatalogs[level] =
+                std::make_shared<CanonicalHierarchyVectorView>(m_index, std::move(physical));
+        }
+        return ErrorCode::Success;
     }
-    std::unique_lock<std::recursive_mutex> dataLock(m_dataAddLock);
-    const std::string baseDir = m_options.m_indexDirectory;
-    const size_t upperLevels = m_secondLevelIndexes.size();
-    auto catalogName = [&](size_t level) {
-        return level == 0 ? m_options.m_headVectorFile :
-            SecondLevelArtifactName(m_options.m_secondLevelHeadVectorFile,
-                static_cast<int>(level));
-    };
-    if (m_hierarchyCatalogVersion != 2)
-    {
-        std::vector<std::vector<std::uint64_t>> ids(upperLevels);
-        std::vector<std::shared_ptr<VectorSet>> oldCatalogs = {m_h1CatalogVectors};
-        oldCatalogs.insert(oldCatalogs.end(), m_secondLevelCatalogs.begin(),
-            m_secondLevelCatalogs.end());
+    for (std::size_t level=0; level<m_secondLevelCatalogs.size(); ++level) {
+        std::shared_ptr<VectorSet> vectors;
         std::string error;
-        for (size_t level = 0; level < upperLevels; ++level)
-        {
-            const std::string idPath = baseDir + FolderSep +
-                SecondLevelArtifactName(m_options.m_secondLevelHeadIDFile,
-                    static_cast<int>(level + 1));
-            if (!LoadSecondLevelHeadIDs(idPath, oldCatalogs[level + 1]->Count(),
-                    ids[level], &error))
-            {
-                SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                    "Cannot compact hierarchy IDs: %s\n", error.c_str());
-                return ErrorCode::Fail;
-            }
-            std::shared_ptr<VectorSet> owned;
-            const ErrorCode packed = PackOwnedHierarchyVectors(
-                oldCatalogs[level], ids[level], owned, &error);
-            if (packed != ErrorCode::Success)
-            {
-                SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                    "Cannot pack hierarchy vectors: %s\n", error.c_str());
-                return packed;
-            }
-            const std::string destination = baseDir + FolderSep + catalogName(level) + ".owned";
-            const std::string temporary = destination + ".tmp";
-            if (owned->Save(temporary) != ErrorCode::Success ||
-                !Helper::AtomicReplaceFile(temporary, destination))
-            {
-                std::remove(temporary.c_str());
-                SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                    "Cannot publish owned hierarchy catalog: %s\n", destination.c_str());
-                return ErrorCode::Fail;
-            }
-        }
-        std::vector<std::shared_ptr<VectorSet>> catalogs;
-        const ErrorCode loaded = LoadOwnedHierarchyCatalogs(
-            baseDir, ids, m_secondLevelIndexes.back(), catalogs);
-        if (loaded != ErrorCode::Success) return loaded;
-        for (size_t level = 0; level < catalogs.size(); ++level)
-        {
-            if (catalogs[level]->Count() != oldCatalogs[level]->Count())
-                return ErrorCode::Fail;
-            for (SizeType id = 0; id < catalogs[level]->Count(); ++id)
-            {
-                if (std::memcmp(catalogs[level]->GetVector(id),
-                        oldCatalogs[level]->GetVector(id),
-                        static_cast<size_t>(m_options.m_dim) * sizeof(T)) != 0)
-                {
-                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                        "Hierarchy compaction changed vector bytes at level %zu, ID %d.\n",
-                        level + 1, static_cast<int>(id));
-                    return ErrorCode::Fail;
-                }
-            }
-        }
-        const std::string descriptor = baseDir + FolderSep + m_options.m_headIndexFolder +
-            FolderSep + "head_metaonly.bin";
-        std::uint64_t fingerprint = 0;
-        if (FingerprintHierarchyCatalog(catalogs.front(), fingerprint) != ErrorCode::Success)
+        if (MaterializeHierarchyCatalog(m_secondLevelCatalogs[level], vectors, &error)!=ErrorCode::Success)
             return ErrorCode::Fail;
-        if (!WriteMetadataOnlyHeadStore(
-                descriptor, m_vectorTranslateMap.R(), m_options.m_dim, 2, fingerprint))
-        {
-            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                "Cannot publish disjoint hierarchy descriptor: %s\n", descriptor.c_str());
-            return ErrorCode::Fail;
-        }
-        m_h1CatalogVectors = catalogs.front();
-        m_secondLevelCatalogs.assign(catalogs.begin() + 1, catalogs.end());
-        m_hierarchyCatalogVersion = 2;
-        m_hierarchyCatalogFingerprint = fingerprint;
+        const std::string path=directory+FolderSep+
+            SecondLevelArtifactName(m_options.m_secondLevelHeadVectorFile,static_cast<int>(level+1));
+        if (vectors->Save(path+".tmp")!=ErrorCode::Success ||
+            !Helper::AtomicReplaceFile(path+".tmp",path)) return ErrorCode::DiskIOFail;
     }
-    for (size_t level = 0; level <= upperLevels; ++level)
-    {
-        const std::string redundant = baseDir + FolderSep + catalogName(level);
-        std::error_code error;
-        std::filesystem::remove(redundant, error);
-        if (error)
-        {
-            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                "Disjoint hierarchy is published, but obsolete catalog cleanup failed: %s (%s).\n",
-                redundant.c_str(), error.message().c_str());
-            return ErrorCode::Fail;
-        }
-    }
-    if (!Helper::SyncParentDirectory(baseDir + FolderSep + catalogName(0)))
-        return ErrorCode::Fail;
-    SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
-        "Hierarchy vectors compacted: %d logical H1 vectors, %zu levels, one physical owner per vector.\n",
-        static_cast<int>(m_vectorTranslateMap.R()), upperLevels + 1);
     return ErrorCode::Success;
 }
 
-template <typename T>
-ErrorCode Index<T>::PrepareHierarchyExport(const std::string& p_directory)
-{
-    if (!m_options.m_selectSecondLevel) return ErrorCode::Success;
-    if (!ValidSecondLevelArtifactLayout(m_options, m_hierarchyCatalogVersion == 2) ||
-        m_secondLevelIndexes.empty() || m_secondLevelIndexes.back() == nullptr)
-        return ErrorCode::Fail;
-    if (m_hierarchyCatalogVersion >= 2)
-    {
-        std::uint64_t fingerprint = 0;
-        if (FingerprintHierarchyCatalog(m_h1CatalogVectors, fingerprint) != ErrorCode::Success ||
-            fingerprint != m_hierarchyCatalogFingerprint)
-            return ErrorCode::Fail;
-    }
-    if (m_hierarchyCatalogVersion != 3) return ErrorCode::Success;
-    m_secondLevelIndexes.back()->SetMetadata(nullptr);
-    m_secondLevelIndexes.back()->ClearHeadNodeMeta();
-    namespace fs = std::filesystem;
-    try
-    {
-        const fs::path topDirectory = fs::path(p_directory) / m_options.m_secondLevelHeadIndexFolder;
-        const fs::path topConfigPath = topDirectory / "indexloader.ini";
-        Helper::IniReader topConfig;
-        if (topConfig.LoadIniFile(topConfigPath.string()) != ErrorCode::Success)
-            return ErrorCode::FailedOpenFile;
-        for (const char* key : {"MetaDataFilePath", "MetaDataIndexPath"})
-        {
-            const std::string name = topConfig.GetParameter("MetaData", key, std::string());
-            if (!name.empty())
-            {
-                if (!IsSafeArtifactName(name)) return ErrorCode::FailedParseValue;
-                fs::remove(topDirectory / name);
-            }
-        }
-        for (const char* name : {"head_node_meta.bin", "metadata.bin", "metadataIndex.bin",
-                 "tag_node_index.bin", "signatures_bitmask.bin", "head_metaonly.bin"})
-            fs::remove(topDirectory / name);
-        if (topConfig.DoesSectionExist("MetaData"))
-        {
-            const fs::path stagedConfig = topConfigPath.string() + ".tmp";
-            fs::remove(stagedConfig);
-            std::ifstream input(topConfigPath);
-            std::ofstream output(stagedConfig, std::ios::trunc);
-            std::string line;
-            bool metadataSection = false;
-            while (std::getline(input, line))
-            {
-                const std::size_t begin = line.find_first_not_of(" \t\r");
-                const std::size_t end = line.find_last_not_of(" \t\r");
-                if (begin != std::string::npos && line[begin] == '[' && line[end] == ']')
-                {
-                    const std::string section = line.substr(begin + 1, end - begin - 1);
-                    metadataSection = Helper::StrUtils::StrEqualIgnoreCase(section.c_str(), "MetaData");
-                }
-                if (!metadataSection) output << line << '\n';
-            }
-            output.close();
-            if (!input.eof() || !output ||
-                !Helper::AtomicReplaceFile(stagedConfig.string(), topConfigPath.string()))
-                return ErrorCode::DiskIOFail;
-        }
-        if (m_hierarchyCatalogVersion == 3)
-        {
-            fs::remove(fs::path(p_directory) / (m_options.m_headVectorFile + ".owned"));
-            const int levels = SecondLevelUpperLayerCount(m_options);
-            for (int level = 1; level <= levels; ++level)
-            {
-                const std::string name = SecondLevelArtifactName(
-                    m_options.m_secondLevelHeadVectorFile, level);
-                fs::remove(fs::path(p_directory) / (name + ".owned"));
-                if (level == levels) fs::remove(fs::path(p_directory) / name);
-                else fs::remove_all(fs::path(p_directory) / SecondLevelBuildIndexFolder(m_options, level));
-            }
-        }
-        return ErrorCode::Success;
-    }
-    catch (const fs::filesystem_error& error)
-    {
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-            "Cannot prepare metadata-free routing hierarchy export: %s\n", error.what());
-        return ErrorCode::DiskIOFail;
-    }
-}
 
-template <typename T>
-ErrorCode Index<T>::FinalizeRoutingHierarchyStorage()
-{
-    if (!m_options.m_selectSecondLevel || m_options.m_buildH1Graph)
-        return ErrorCode::Success;
-    const std::size_t levels = m_secondLevelCatalogs.size();
-    if (levels == 0 || levels != m_secondLevelIndexes.size() ||
-        m_secondLevelIndexes.back() == nullptr || m_h1CatalogVectors == nullptr)
-        return ErrorCode::Fail;
-    std::vector<std::vector<std::uint64_t>> maps(levels);
-    std::string error;
-    for (std::size_t level = 0; level < levels; ++level)
-        if (!LoadSecondLevelHeadIDs(m_options.m_indexDirectory + FolderSep +
-                SecondLevelArtifactName(m_options.m_secondLevelHeadIDFile, static_cast<int>(level + 1)),
-                m_secondLevelCatalogs[level]->Count(), maps[level], &error))
-            return ErrorCode::Fail;
-    std::vector<std::shared_ptr<VectorSet>> lower = {m_h1CatalogVectors};
-    lower.insert(lower.end(), m_secondLevelCatalogs.begin(), m_secondLevelCatalogs.end() - 1);
-    std::vector<std::shared_ptr<VectorSet>> catalogs;
-    if (BuildIndependentHierarchyCatalogs(m_vectorTranslateMap.R(), maps, lower,
-            m_secondLevelIndexes.back(), catalogs, &error) != ErrorCode::Success ||
-        RefreshHierarchySignatures(maps, true) != ErrorCode::Success)
-        return ErrorCode::Fail;
-    std::uint64_t fingerprint = 0;
-    if (FingerprintHierarchyCatalog(catalogs.front(), fingerprint) != ErrorCode::Success ||
-        (m_hierarchyCatalogVersion >= 2 && fingerprint != m_hierarchyCatalogFingerprint))
-        return ErrorCode::Fail;
-    const std::string descriptor = m_options.m_indexDirectory + FolderSep +
-        m_options.m_headIndexFolder + FolderSep + "head_metaonly.bin";
-    if (!WriteMetadataOnlyHeadStore(descriptor, m_vectorTranslateMap.R(),
-            m_options.m_dim, 3, fingerprint))
-        return ErrorCode::FailedCreateFile;
-    m_hierarchyCatalogVersion = 3;
-    m_hierarchyCatalogFingerprint = fingerprint;
-    m_options.m_compactHierarchyVectors = false;
-    m_h1CatalogVectors = catalogs.front();
-    m_secondLevelCatalogs.assign(catalogs.begin() + 1, catalogs.end());
-    return PrepareHierarchyExport(m_options.m_indexDirectory);
-}
+
 
 template <typename T>
 ErrorCode Index<T>::MaterializeHierarchyVectors(const std::string& p_directory)
@@ -3709,8 +3498,7 @@ ErrorCode Index<T>::MaterializeHierarchyVectors(const std::string& p_directory)
     if (!m_bReady || m_index == nullptr || m_options.m_buildH1Graph ||
         !m_metadataOnlyHeadStore || m_pQuantizer != nullptr ||
         m_options.m_storage != Storage::STATIC || m_h1CatalogVectors == nullptr ||
-        m_secondLevelIndexes.empty() || m_secondLevelIndexes.back() == nullptr ||
-        m_secondLevelCatalogs.size() != m_secondLevelIndexes.size() ||
+        m_secondLevelCatalogs.empty() || m_secondLevelCatalogs.back() == nullptr ||
         !ValidSecondLevelArtifactLayout(m_options, true))
     {
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
@@ -3835,8 +3623,32 @@ ErrorCode Index<T>::MaterializeHierarchyVectors(const std::string& p_directory)
                 return ErrorCode::DiskIOFail;
         working->m_options.m_secondLevelGenerationFingerprint =
             SerializeSecondLevelGenerations(working->m_secondLevelPostings);
-        status = working->FinalizeRoutingHierarchyStorage();
-        if (status != ErrorCode::Success) return status;
+        const fs::path newHead=stage.path/"h1-graph-migration";
+        if (working->m_index->GetNumDeleted() != 0) {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                "Cannot migrate deletion labels from a physical metadata-only root to logical H1 IDs.\n");
+            return ErrorCode::FailedParseValue;
+        }
+        auto head=VectorIndex::CreateInstance(m_options.m_indexAlgoType,m_options.m_valueType);
+        head->SetParameter("DistCalcMethod",Helper::Convert::ConvertToString(m_options.m_distCalcMethod));
+        for(const auto& parameter:m_headParameters)
+            head->SetParameter(parameter.first.c_str(),parameter.second.c_str());
+        if(head->BuildIndex(fullCatalogs.front(),nullptr,false,true,true)!=ErrorCode::Success ||
+            head->SaveIndex(newHead.string())!=ErrorCode::Success) return ErrorCode::Fail;
+        const fs::path oldHead=stage.path/m_options.m_headIndexFolder;
+        for(const char* sidecar:{"head_node_meta.bin"}) {
+            if(fs::exists(oldHead/sidecar))
+                fs::copy_file(oldHead/sidecar,newHead/sidecar,fs::copy_options::overwrite_existing);
+        }
+        fs::rename(oldHead,stage.path/"legacy-h1-metadata");
+        fs::rename(newHead,oldHead);
+        working->m_index = head;
+        working->m_options.m_buildH1Graph=true;
+        working->m_options.m_compactHierarchyVectors=false;
+        working->m_hierarchyCatalogVersion=0;
+        working->m_metadataOnlyHeadStore=false;
+        status=working->PrepareHierarchyExport(stage.path.string());
+        if(status!=ErrorCode::Success) return status;
 
         const std::string configPath = (stage.path / "indexloader.ini").string();
         const std::string stagedConfig = configPath + ".tmp";
@@ -3867,7 +3679,6 @@ ErrorCode Index<T>::MaterializeHierarchyVectors(const std::string& p_directory)
         status = VectorIndex::LoadIndex(stage.path.string(), verified);
         auto* verifiedSPANN = dynamic_cast<ISPANNIndex*>(verified.get());
         if (status != ErrorCode::Success || verifiedSPANN == nullptr ||
-            !verifiedSPANN->HasRoutingOnlyHierarchy() ||
             verified->GetNumSamples() != GetNumSamples() ||
             verified->GetNumDeleted() != GetNumDeleted())
             return status == ErrorCode::Success ? ErrorCode::Fail : status;
@@ -3893,7 +3704,7 @@ ErrorCode Index<T>::MaterializeHierarchyVectors(const std::string& p_directory)
         stage.path.clear();
         if (!Helper::SyncParentDirectory(destination.string())) return ErrorCode::DiskIOFail;
         SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
-            "Materialized routing-only hierarchy at %s; source, H1 V8, SSD and sampling IDs preserved.\n",
+            "Materialized native H1 graph and posting hierarchy at %s; source, H1 V8, SSD and sampling IDs preserved.\n",
             destination.string().c_str());
         return ErrorCode::Success;
     }
@@ -3917,9 +3728,9 @@ template <typename T>
 ErrorCode Index<T>::LoadSecondLevelIndex(
     const std::string& p_baseDir)
 {
-    m_secondLevelIndexes.clear();
     m_secondLevelCatalogs.clear();
     m_secondLevelPostings.clear();
+    m_postingOwners.reset();
     if (!m_options.m_selectSecondLevel)
         return ErrorCode::Success;
     if (!ValidSecondLevelArtifactLayout(
@@ -3945,14 +3756,15 @@ ErrorCode Index<T>::LoadSecondLevelIndex(
 
     const int hierarchyLevels =
         SecondLevelUpperLayerCount(m_options);
-    m_secondLevelIndexes.resize(
-        static_cast<size_t>(hierarchyLevels));
     m_secondLevelCatalogs.resize(
         static_cast<size_t>(hierarchyLevels));
     std::vector<std::vector<std::uint64_t>>
         levelToLowerIDs(
             static_cast<size_t>(hierarchyLevels));
     std::string error;
+    const bool directCatalogs = !m_metadataOnlyHeadStore && m_hierarchyCatalogVersion == 0 &&
+        !m_index->m_pQuantizer;
+    std::vector<std::uint32_t> previousPhysical;
     for (int level = 1;
          level <= hierarchyLevels; ++level)
     {
@@ -3977,14 +3789,24 @@ ErrorCode Index<T>::LoadSecondLevelIndex(
                 idPath.c_str(), error.c_str());
             return ErrorCode::Fail;
         }
-        if (m_hierarchyCatalogVersion != 2 &&
-            !(m_hierarchyCatalogVersion == 3 && level == hierarchyLevels))
+        if (directCatalogs) {
+            std::vector<std::uint32_t> physical;
+            if (!FlattenHierarchyIDs(levelToLowerIDs[offset], m_index->GetNumSamples(),
+                    previousPhysical, physical)) {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid direct hierarchy mapping.\n");
+                return ErrorCode::Fail;
+            }
+            previousPhysical = std::move(physical);
+        }
+        if (m_hierarchyCatalogVersion != 2 || level == hierarchyLevels)
         {
             const std::string vectorPath = p_baseDir + FolderSep +
                 SecondLevelArtifactName(m_options.m_secondLevelHeadVectorFile, level);
-            if (LoadHierarchyVectorCatalog(vectorPath, m_options.m_valueType, m_options.m_dim,
+            if (level == hierarchyLevels && !fileexists(vectorPath.c_str())) continue;
+            if (LoadCanonicalOrOwnedHierarchyVectors(vectorPath, m_options.m_valueType, m_options.m_dim,
                     static_cast<SizeType>(levelToLowerIDs[offset].size()),
-                    m_secondLevelCatalogs[offset], &error) != ErrorCode::Success)
+                    m_index, m_secondLevelCatalogs[offset], &error,
+                    directCatalogs ? &previousPhysical : nullptr) != ErrorCode::Success)
             {
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
                     "Cannot load hierarchy H%d catalog %s: %s\n",
@@ -3997,55 +3819,21 @@ ErrorCode Index<T>::LoadSecondLevelIndex(
     if (ValidateSecondLevelSampleIDs(levelToLowerIDs) != ErrorCode::Success)
         return ErrorCode::Fail;
 
-    const std::string secondIndexPath =
-        p_baseDir + FolderSep +
-        m_options.m_secondLevelHeadIndexFolder;
-    if (VectorIndex::LoadIndex(
-            secondIndexPath,
-            m_secondLevelIndexes.back()) !=
-            ErrorCode::Success ||
-        m_secondLevelIndexes.back() == nullptr)
-    {
-        SPTAGLIB_LOG(
-            Helper::LogLevel::LL_Error,
-            "Cannot load second-level head index %s.\n",
-            secondIndexPath.c_str());
-        return ErrorCode::Fail;
+    if (!m_secondLevelCatalogs.back()) {
+        const std::string folder=p_baseDir+FolderSep+m_options.m_legacyTopVectorFolder;
+        Helper::IniReader legacy;
+        if (legacy.LoadIniFile(folder+FolderSep+"indexloader.ini")!=ErrorCode::Success)
+            return ErrorCode::FailedOpenFile;
+        const std::string file=legacy.GetParameter("Index","VectorFilePath",std::string("vectors.bin"));
+        if (!IsSafeArtifactName(file) ||
+            LoadCanonicalOrOwnedHierarchyVectors(folder+FolderSep+file,m_options.m_valueType,m_options.m_dim,
+                static_cast<SizeType>(levelToLowerIDs.back().size()),m_index,m_secondLevelCatalogs.back(),&error,
+                directCatalogs ? &previousPhysical : nullptr)!=ErrorCode::Success)
+            return ErrorCode::Fail;
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Warning,
+            "Reading legacy upper representative vectors only; ANN graph/tree files are ignored.\n");
     }
-    const auto& topIndex =
-        m_secondLevelIndexes.back();
-    if (m_hierarchyCatalogVersion == 3)
-    {
-        topIndex->SetMetadata(nullptr);
-        topIndex->ClearHeadNodeMeta();
-    }
-    topIndex->SetParameter(
-        "NumberOfThreads",
-        std::to_string(
-            m_options.m_iSSDNumberOfThreads));
-    topIndex->SetParameter(
-        "MaxCheck",
-        std::to_string(m_options.m_maxCheck));
-    topIndex->SetParameter(
-        "HashTableExponent",
-        std::to_string(m_options.m_hashExp));
-    topIndex->UpdateIndex();
-
-    if (topIndex->GetIndexAlgoType() !=
-            m_options.m_indexAlgoType ||
-        topIndex->GetVectorValueType() !=
-            m_index->GetVectorValueType() ||
-        topIndex->GetDistCalcMethod() !=
-            m_index->GetDistCalcMethod() ||
-        topIndex->GetFeatureDim() !=
-            m_index->GetFeatureDim())
-    {
-        SPTAGLIB_LOG(
-            Helper::LogLevel::LL_Error,
-            "Second-level graph does not match the H1 graph type.\n");
-        return ErrorCode::Fail;
-    }
-
+    const auto topIndex=m_secondLevelCatalogs.back();
     if (m_hierarchyCatalogVersion >= 2)
     {
         std::vector<std::shared_ptr<VectorSet>> catalogs;
@@ -4073,12 +3861,12 @@ ErrorCode Index<T>::LoadSecondLevelIndex(
         m_secondLevelCatalogs.assign(catalogs.begin() + 1, catalogs.end());
     }
 
-    if (topIndex->GetNumSamples() !=
+    if (topIndex->Count() !=
         m_secondLevelCatalogs.back()->Count())
     {
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
-            "Top hierarchy graph count does not match its vector catalog.\n");
+            "Top hierarchy representative count does not match its catalog.\n");
         return ErrorCode::Fail;
     }
 
@@ -4136,19 +3924,19 @@ ErrorCode Index<T>::LoadSecondLevelIndex(
             }
             if (level == hierarchyLevels &&
                 (topIndex
-                         ->GetSample(upper) ==
+                         ->GetVector(upper) ==
                      nullptr ||
                  std::memcmp(
                      upperVector,
                      topIndex
-                         ->GetSample(upper),
+                         ->GetVector(upper),
                      static_cast<size_t>(
                          m_options.m_dim) *
                          sizeof(T)) != 0))
             {
                 SPTAGLIB_LOG(
                     Helper::LogLevel::LL_Error,
-                    "Top hierarchy graph vector copy validation failed.\n");
+                    "Top hierarchy representative vector copy validation failed.\n");
                 return ErrorCode::Fail;
             }
         }
@@ -4242,97 +4030,39 @@ ErrorCode Index<T>::LoadSecondLevelIndex(
     std::ifstream metadataProbe(headMetadata, std::ios::binary);
     std::int32_t metadataVersion = 0;
     metadataProbe.read(reinterpret_cast<char*>(&metadataVersion), sizeof(metadataVersion));
-    const bool authenticatedMetadata = metadataProbe && metadataVersion == 8;
+    const bool authenticatedMetadata = metadataProbe && (metadataVersion == 8 || metadataVersion == 9);
     if ((m_hierarchyCatalogVersion == 3 || authenticatedMetadata) &&
         EnsureHierarchyHeadMetadata(p_baseDir, false) != ErrorCode::Success)
         return ErrorCode::Fail;
     if (RefreshHierarchySignatures(levelToLowerIDs, m_hierarchyCatalogVersion == 3) != ErrorCode::Success)
         return ErrorCode::Fail;
+    m_postingOwners=std::make_unique<PostingOwners>(m_secondLevelPostings);
+    if (directCatalogs) {
+        std::size_t payload = 0, capacity = 0;
+        for (const auto& catalog : m_secondLevelCatalogs) {
+            const auto canonical = std::dynamic_pointer_cast<CanonicalHierarchyVectorView>(catalog);
+            if (!canonical) {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Direct hierarchy unexpectedly retained an owned catalog.\n");
+                return ErrorCode::Fail;
+            }
+            payload += canonical->PhysicalIDs().size() * sizeof(std::uint32_t);
+            capacity += canonical->ResidentBytes();
+        }
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+            "Canonical upper catalogs: map payload=%zu capacity=%zu bytes, owned vectors=0 bytes.\n",
+            payload, capacity);
+    }
     SPTAGLIB_LOG(
         Helper::LogLevel::LL_Info,
-        "Loaded %d hierarchy layers with one top H%d graph (%d nodes).\n",
+        "Loaded %d hierarchy posting layers with H%d representative vectors (%d nodes); no upper ANN graph.\n",
         hierarchyLevels, hierarchyLevels + 1,
         static_cast<int>(
             topIndex
-                ->GetNumSamples()));
+                ->Count()));
     return ErrorCode::Success;
 }
 
-template <typename T>
-ErrorCode Index<T>::SearchSecondLevelHeads(
-    COMMON::QueryResultSet<T>* p_queryResults,
-    int p_graphResultNum,
-    const std::function<bool(SizeType)>& p_headAdmission,
-    int& p_scannedOut,
-    ExtraWorkSpace* p_workspace,
-    const std::function<bool(SizeType, const float*)>& p_headPointCandidate) const
-{
-    p_scannedOut = 0;
-    g_secondLevelProfile = SecondLevelSearchProfile();
-    if (p_queryResults == nullptr ||
-        m_secondLevelPostings.empty() ||
-        m_secondLevelCatalogs.size() != m_secondLevelPostings.size() ||
-        m_secondLevelIndexes.size() != m_secondLevelPostings.size() ||
-        std::any_of(
-            m_secondLevelPostings.begin(),
-            m_secondLevelPostings.end(),
-            [](const SecondLevelHeadPostings& p_postings) {
-                return !p_postings.Loaded();
-            }))
-    {
-        return ErrorCode::Fail;
-    }
 
-    SecondLevelHierarchySearchStats hierarchyStats;
-    std::string workLog;
-    const bool batchVectorPrefetch = Helper::StrUtils::StrEqualIgnoreCase(
-        m_options.m_secondLevelPrefetchMode.c_str(), "Batch64");
-    if (!batchVectorPrefetch && !Helper::StrUtils::StrEqualIgnoreCase(
-            m_options.m_secondLevelPrefetchMode.c_str(), "Rolling16"))
-    {
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-            "HierarchyPrefetchMode must be Rolling16 or Batch64.\n");
-        return ErrorCode::FailedParseValue;
-    }
-    const ErrorCode status = SearchSecondLevelHierarchy(
-        *p_queryResults,
-        p_graphResultNum,
-        m_options.m_secondLevelMaxCheck,
-        m_options.m_secondLevelInitialProbeRatio,
-        p_headAdmission,
-        m_index,
-        m_secondLevelIndexes,
-        m_secondLevelCatalogs,
-        m_secondLevelPostings,
-        hierarchyStats,
-        m_options.m_logPathStats ? &workLog : nullptr,
-        m_options.m_logPhaseTime,
-        p_headPointCandidate,
-        p_workspace != nullptr ? &p_workspace->m_hierarchy : nullptr,
-        batchVectorPrefetch);
-    if (status != ErrorCode::Success) return status;
-
-    g_secondLevelProfile.m_graphMs = hierarchyStats.m_graphMs;
-    g_secondLevelProfile.m_mergeMs = hierarchyStats.m_mergeMs;
-    g_secondLevelProfile.m_tagMs = hierarchyStats.m_tagMs;
-    g_secondLevelProfile.m_vectorMs = hierarchyStats.m_vectorMs;
-    g_secondLevelProfile.m_sortMs = hierarchyStats.m_sortMs;
-    g_secondLevelProfile.m_upperScanned = hierarchyStats.m_graphScanned;
-    g_secondLevelProfile.m_uniqueScanned = hierarchyStats.m_uniqueScanned;
-    g_secondLevelProfile.m_assignments = hierarchyStats.m_assignments;
-    g_secondLevelProfile.m_upperProbe = hierarchyStats.m_topProbe;
-    g_secondLevelProfile.m_maxCheck = hierarchyStats.m_maxCheck;
-    g_secondLevelProfile.m_iterations = hierarchyStats.m_iterations;
-    p_scannedOut = static_cast<int>((std::min)(
-        hierarchyStats.m_graphScanned + hierarchyStats.m_uniqueScanned,
-        static_cast<std::uint64_t>((std::numeric_limits<int>::max)())));
-    p_queryResults->SetScanned(p_scannedOut);
-    if (!workLog.empty())
-    {
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "%s\n", workLog.c_str());
-    }
-    return ErrorCode::Success;
-}
 
 template <typename T>
 ErrorCode Index<T>::EnsureHeadHybridGraph()
@@ -5109,7 +4839,8 @@ ErrorCode Index<T>::SearchHeadBundleCrossEdgesNative(
     COMMON::QueryResultSet<T>* p_queryResults,
     int p_entryNode,
     int p_graphResultNum,
-    int& p_scannedOut) const
+    int& p_scannedOut,
+    const std::function<bool(SizeType)>* p_resultFilter) const
 {
     p_scannedOut = 0;
     if (p_queryResults == nullptr || p_graphResultNum <= 0 ||
@@ -5167,7 +4898,7 @@ ErrorCode Index<T>::SearchHeadBundleCrossEdgesNative(
         *p_queryResults,
         context,
         std::max(1, m_options.m_maxCheck),
-        &stats);
+        &stats, p_resultFilter);
     if (status != ErrorCode::Success)
     {
         return status;
@@ -5214,7 +4945,8 @@ ErrorCode Index<T>::SearchHeadBundlesNative(
     COMMON::QueryResultSet<T>* p_queryResults,
     const std::vector<int>& p_candidateNodes,
     int p_graphResultNum,
-    int& p_scannedOut) const
+    int& p_scannedOut,
+    const std::function<bool(SizeType)>* p_resultFilter) const
 {
     p_scannedOut = 0;
     if (p_queryResults == nullptr || p_graphResultNum <= 0 ||
@@ -5256,7 +4988,12 @@ ErrorCode Index<T>::SearchHeadBundlesNative(
         if (nodeResultNum <= 0) continue;
         COMMON::QueryResultSet<T> nodeResults(
             p_queryResults->GetTarget(), nodeResultNum);
-        const ErrorCode status = nodeIndex->SearchIndex(nodeResults, false);
+        const std::function<bool(SizeType)> localFilter = [&](SizeType id) {
+            return (*p_resultFilter)(localToGlobal.at(static_cast<size_t>(id)));
+        };
+        const ErrorCode status = p_resultFilter
+            ? nodeIndex->SearchIndexWithResultFilter(nodeResults, localFilter, m_options.m_maxCheck)
+            : nodeIndex->SearchIndexWithMaxCheck(nodeResults, m_options.m_maxCheck);
         if (status != ErrorCode::Success)
         {
             return status;
@@ -5328,7 +5065,44 @@ template <typename T> void Index<T>::SetQuantizer(std::shared_ptr<SPTAG::COMMON:
 
 template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader)
 {
-    const auto legacyArtifactParameter = [](const std::string& name, const std::string& value, bool& handled) {
+    const auto legacyArtifactParameter = [this](const std::string& name, const std::string& value, bool& handled) {
+        handled = false;
+        if (Helper::StrUtils::StrEqualIgnoreCase(name.c_str(), "BuildH1Graph")) {
+            handled = true;
+            if (!Helper::Convert::ConvertStringTo<bool>(value.c_str(), m_options.m_buildH1Graph))
+                return ErrorCode::FailedParseValue;
+        } else if (Helper::StrUtils::StrEqualIgnoreCase(name.c_str(), "CompactHierarchyVectors")) {
+            handled = true;
+            if (!Helper::Convert::ConvertStringTo<bool>(value.c_str(), m_options.m_compactHierarchyVectors))
+                return ErrorCode::FailedParseValue;
+        } else if (Helper::StrUtils::StrEqualIgnoreCase(name.c_str(), "HierarchyHeadIndexFolder") ||
+                   Helper::StrUtils::StrEqualIgnoreCase(name.c_str(), "SecondLevelHeadIndexFolder")) {
+            handled = true;
+            if (!IsSafeArtifactName(value)) return ErrorCode::FailedParseValue;
+            m_options.m_legacyTopVectorFolder = value;
+        }
+        for (const char* retired : {"HierarchyInitialProbeRatio", "SecondLevelInitialProbeRatio",
+                "HierarchyMaxCheck", "SecondLevelMaxCheck", "HierarchyPrefetchMode",
+                "SecondLevelPrefetchMode", "HierarchyDedupMode", "HierarchyRoutingBudgets",
+                "HeadNavigationMode", "HierarchyGraphSignaturePruning", "SecondLevelGraphSignaturePruning",
+                "EnableUnfilterTail", "UnfilterPurePages", "UnfilterExtraTailPages",
+                "EnableAdaptiveFilteredNprobe", "ForceDenseTagSearch", "DirectSparseMaxPostings",
+                "FilteredSearchNprobeSafety", "FilteredSearchTargetRecall", "FilteredSearchCoverageExponent",
+                "LogAdaptiveNprobe", "FilterKeepUExtra", "HybridRouteSampleCount",
+                "HybridRouteSelectivityThreshold", "HybridRouteDeformationThreshold", "LogHybridRoute",
+                "UnfilterPureDistanceScanPercent", "AblateUExtra", "AblateTail",
+                "BuildPrimaryHeadCSR", "PrimaryHeadCSRFile", "EnablePrimaryHeadBypass",
+                "PrimaryHeadBypassRerankL"})
+            if (Helper::StrUtils::StrEqualIgnoreCase(name.c_str(), retired)) {
+                if (value.empty()) return ErrorCode::FailedParseValue;
+                handled = true;
+            }
+        if (handled) {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Warning,
+                "Legacy %s=%s is load-only layout/provenance; queries use native H1 post-filter, not upper ANN routing.\n",
+                name.c_str(), value.c_str());
+            return ErrorCode::Success;
+        }
         const bool seed = Helper::StrUtils::StrEqualIgnoreCase(name.c_str(), "BKTSeed") ||
             Helper::StrUtils::StrEqualIgnoreCase(name.c_str(), "TPTSeed");
         const bool domain = Helper::StrUtils::StrEqualIgnoreCase(name.c_str(), "HierarchySignatureMinSelectivity") ||
@@ -5407,14 +5181,7 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
     }
     std::vector<std::uint64_t>
         secondLevelGenerations;
-    if (!ValidHierarchyNavigationConfig(m_options))
-    {
-        SPTAGLIB_LOG(
-            Helper::LogLevel::LL_Error,
-            "HierarchyInitialProbeRatio must be in (0,1], "
-            "and HierarchyMaxCheck must be positive.\n");
-        return ErrorCode::FailedParseValue;
-    }
+
     if (m_options.m_selectSecondLevel &&
         (!m_options.m_enableLimitedTagPosting ||
          m_options.m_secondLevelHierarchyLevels < 2 ||
@@ -5424,7 +5191,7 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
          m_options.m_secondLevelReplicaCount <= 0 ||
          m_options.m_secondLevelHeadVectorFile.empty() ||
          m_options.m_secondLevelHeadIDFile.empty() ||
-         m_options.m_secondLevelHeadIndexFolder.empty() ||
+         m_options.m_legacyTopVectorFolder.empty() ||
          m_options.m_secondLevelPostingFile.empty() ||
          !ParseSecondLevelGenerations(
              m_options
@@ -5445,6 +5212,12 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
         "head_metaonly.bin");
     if (fileexists(metadataRootSidecar.c_str()))
     {
+        if (m_options.m_selectSecondLevel &&
+            !p_reader.DoesParameterExist("SelectHead", "BuildH1Graph")) {
+            m_options.m_buildH1Graph = false;
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Warning,
+                "Legacy metadata-only hierarchy descriptor requires H1 graph migration before search.\n");
+        }
         // The parent SPANN configuration retains the original BKT algorithm so bundle
         // graphs reload as BKT. The persisted root itself is intentionally a tiny KDT.
         auto metadataRoot = CreateInstance(IndexAlgoType::KDT, valueType);
@@ -5669,6 +5442,13 @@ ErrorCode Index<T>::LoadIndexData(const std::vector<std::shared_ptr<Helper::Disk
         return ErrorCode::Fail;
     if (LoadSecondLevelIndex(bundleBaseDir) !=
         ErrorCode::Success)
+        return ErrorCode::Fail;
+    if (!m_index->HasHeadNodeMeta() && m_limitedTagSupport.GenerationFingerprint() != 0 &&
+        fileexists((bundleBaseDir + FolderSep + m_options.m_headIndexFolder +
+                    FolderSep + "head_node_meta.bin").c_str()) &&
+        EnsureHierarchyHeadMetadata(bundleBaseDir, false) != ErrorCode::Success)
+        return ErrorCode::Fail;
+    if (RefreshRoutingSignatures() != ErrorCode::Success)
         return ErrorCode::Fail;
     if (!m_options.m_buildH1Graph) {
         // There is no H1 graph or bundle-local graph to augment in catalog mode.
@@ -5930,25 +5710,25 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             }
             return false;
         };
-    std::function<bool(SizeType)>
-        limitedTagHeadAdmission;
-    if (useLimitedTagMembership) {
-        limitedTagHeadAdmission =
-            [&](SizeType p_head) {
-                return limitedSupportMatchesPredicate(
-                           p_head) &&
-                    m_extraSearcher != nullptr &&
-                    m_extraSearcher->CheckValidPosting(
-                        p_head, nullptr);
-            };
+    std::function<bool(SizeType)> headAdmission;
+    const bool routingReady = m_routingSignatures.Current(m_index.get());
+    if (hasExactFilter && !routingReady && !m_routingStaleWarning.exchange(true))
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Warning,
+            "Routing metadata changed; signatures are conservative unknown until RefreshRoutingSignatures().\n");
+    const RoutingPredicate routingPredicate(queryDNF, queryTags, numQueryTags,
+        m_options.Schema().numeric, m_routingSignatures.params);
+    if (hasExactFilter) {
+        headAdmission = [&](SizeType head) {
+            return (!useLimitedTagMembership || limitedSupportMatchesPredicate(head)) &&
+                (!routingReady || m_routingSignatures.HeadMayMatch(
+                    routingPredicate, head, useLimitedTagMembership));
+        };
     }
-    const bool graphlessH1 =
-        m_metadataOnlyHeadStore &&
-        !m_options.m_buildH1Graph;
-    const bool forceH2Navigation = graphlessH1;
-    const bool useHierarchyNavigation =
-        forceH2Navigation || m_options.m_selectSecondLevel;
-
+    if (m_metadataOnlyHeadStore && !m_options.m_buildH1Graph) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+            "This legacy index has no H1 graph. Materialize an H1-graph clone before searching.\n");
+        return ErrorCode::FailedParseValue;
+    }
     const int dumpHeadsLimit = std::max(0, m_options.m_dumpHeads);
     static std::atomic<int> s_dumpHeadsQueryCount{0};
     const int dumpHeadsQueryId =
@@ -5994,147 +5774,12 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
 
     ErrorCode ret;
     bool usedHeadBundleSearch = false;
-    const std::function<bool(SizeType)>
-        secondLevelHeadAdmission =
-            limitedTagHeadAdmission
-                ? limitedTagHeadAdmission
-                : std::function<bool(SizeType)>(
-                      [](SizeType) { return true; });
-
     const bool s_phaseTime = m_options.m_logPhaseTime;
-    int phaseHeadMaxCheck = 0;
+    int phaseHeadMaxCheck = m_options.m_maxCheck;
     g_bktSeedMs = 0.0;
     g_pqGraphMs = 0.0;
-    g_secondLevelProfile =
-        SecondLevelSearchProfile();
-    bool usedSecondLevelSearch = false;
-    double secondLevelRouteMs = 0.0;
     auto _phT0 = s_phaseTime ? std::chrono::high_resolution_clock::now()
                              : std::chrono::high_resolution_clock::time_point{};
-
-    std::unique_ptr<ExtraWorkSpace> hierarchyWorkspace;
-    ExtraWorkSpace* hierarchyState = nullptr;
-    std::vector<std::pair<float, SizeType>>* headPointResults = nullptr;
-    std::function<bool(SizeType, const float*)> admitHeadPoint;
-    bool invalidHeadPoint = false;
-    if (useHierarchyNavigation && m_extraSearcher != nullptr)
-    {
-        hierarchyWorkspace = m_workSpaceFactory->GetWorkSpace();
-        if (!hierarchyWorkspace)
-        {
-            hierarchyWorkspace = std::make_unique<ExtraWorkSpace>();
-            m_extraSearcher->InitWorkSpace(hierarchyWorkspace.get(), false);
-        }
-        else m_extraSearcher->InitWorkSpace(hierarchyWorkspace.get(), true);
-        hierarchyState = hierarchyWorkspace.get();
-        hierarchyState->m_deduper.clear();
-        if (!hasExactFilter || m_limitedTagSupport.AttributeCount() > 0)
-        {
-            headPointResults = &hierarchyState->m_hierarchy.m_headPointResults;
-            headPointResults->assign(static_cast<size_t>(p_query.GetResultNum()), {MaxDist, -1});
-            admitHeadPoint = [&](SizeType head, const float* knownDistance) {
-                if (knownDistance == nullptr ||
-                    head < 0 || head >= m_vectorTranslateMap.R())
-                {
-                    invalidHeadPoint = true;
-                    return false;
-                }
-                const auto& worst = headPointResults->front();
-                // A head farther than k already accepted heads cannot enter the
-                // final top-k. Its posting routing remains independent.
-                if (!(*knownDistance <= worst.first)) return false;
-                const std::uint64_t mapped = *m_vectorTranslateMap[head];
-                if (mapped >= static_cast<std::uint64_t>(MaxSize) ||
-                    mapped >= static_cast<std::uint64_t>(m_versionMap.Count()))
-                {
-                    invalidHeadPoint = true;
-                    return false;
-                }
-                const SizeType vid = static_cast<SizeType>(mapped);
-                if (hierarchyState->m_deduper.CheckAndSet(vid) ||
-                    m_versionMap.Deleted(vid)) return false;
-                if (*knownDistance == worst.first && vid >= worst.second) return false;
-                if (hasExactFilter && !limitedHeadMatchesExactPredicate(head)) return false;
-                SecondLevelHierarchyDetail::RetainNearest(
-                    *headPointResults, {*knownDistance, vid});
-                return false;
-            };
-        }
-    }
-
-    if (useHierarchyNavigation)
-    {
-        const auto secondLevelStart =
-            s_phaseTime
-                ? std::chrono::high_resolution_clock::now()
-                : std::chrono::high_resolution_clock::time_point{};
-        p_queryResults->Reset();
-        int scanned = 0;
-        ret = SearchSecondLevelHeads(
-            p_queryResults, graphResultNum,
-            secondLevelHeadAdmission,
-            scanned, hierarchyState, admitHeadPoint);
-        if (invalidHeadPoint)
-        {
-            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                "H1 point admission encountered an invalid canonical VID or sample.\n");
-            return ErrorCode::Fail;
-        }
-        if (ret != ErrorCode::Success)
-        {
-            SPTAGLIB_LOG(
-                Helper::LogLevel::LL_Error,
-                "Hierarchy head navigation failed.\n");
-            return ret;
-        }
-        if (m_options.m_logPathStats)
-        {
-            int admitted = 0;
-            for (; admitted < graphResultNum;
-                 ++admitted)
-            {
-                const BasicResult* result =
-                    p_queryResults->GetResult(
-                        admitted);
-                if (result == nullptr ||
-                    result->VID < 0)
-                    break;
-            }
-            if (admitted < graphResultNum)
-            {
-                SPTAGLIB_LOG(
-                    Helper::LogLevel::LL_Info,
-                    "Hierarchy navigation returned %d/%d H1 candidates without H1 completion.\n",
-                    admitted, graphResultNum);
-            }
-        }
-        if (s_phaseTime)
-        {
-            secondLevelRouteMs =
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::high_resolution_clock::now() -
-                    secondLevelStart)
-                    .count();
-        }
-        if (ret == ErrorCode::Success)
-        {
-            p_queryResults->SetScanned(scanned);
-            usedSecondLevelSearch = true;
-            usedHeadBundleSearch = true;
-            if (m_options.m_logPathStats)
-            {
-                SPTAGLIB_LOG(
-                    Helper::LogLevel::LL_Info,
-                    "Using %d-level head hierarchy with %d top nodes and "
-                    "fixed distance-only downward CSR expansion.\n",
-                    static_cast<int>(
-                        m_secondLevelPostings.size()),
-                    static_cast<int>(
-                        m_secondLevelPostings.back()
-                            .SecondLevelHeadCount()));
-            }
-        }
-    }
 
     if (!usedHeadBundleSearch &&
         !candidateNodes.empty())
@@ -6163,16 +5808,6 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                     canUseHeadBundle = false;
                     break;
                 }
-                if (s_phaseTime) {
-                    if (auto* bkt = dynamic_cast<BKT::Index<T>*>(nodeIndex.get())) {
-                        phaseHeadMaxCheck =
-                            std::max(phaseHeadMaxCheck, bkt->GetCurrMaxCheck());
-                    } else if (auto* kdt =
-                                   dynamic_cast<KDT::Index<T>*>(nodeIndex.get())) {
-                        phaseHeadMaxCheck =
-                            std::max(phaseHeadMaxCheck, kdt->GetCurrMaxCheck());
-                    }
-                }
             }
 
             const bool useCrossEdges = canUseHeadBundle &&
@@ -6193,13 +5828,18 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
 
             if (canUseHeadBundle)
             {
+                if (headAdmission && m_options.m_enablePostingNavigation) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                        "EnablePostingNavigation requires a single full H1 graph, not bundle-local graphs.\n");
+                    return ErrorCode::FailedParseValue;
+                }
                 if (useCrossEdges)
                 {
                     ret = SearchHeadBundleCrossEdgesNative(
                         p_queryResults,
                         candidateNodes.front(),
                         graphResultNum,
-                        scanned);
+                        scanned, headAdmission ? &headAdmission : nullptr);
                     if (ret != ErrorCode::Success)
                     {
                         p_queryResults->Reset();
@@ -6207,7 +5847,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                             p_queryResults,
                             candidateNodes,
                             graphResultNum,
-                            scanned);
+                            scanned, headAdmission ? &headAdmission : nullptr);
                     }
                 }
                 else
@@ -6216,7 +5856,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                         p_queryResults,
                         candidateNodes,
                         graphResultNum,
-                        scanned);
+                        scanned, headAdmission ? &headAdmission : nullptr);
                 }
                 if (ret != ErrorCode::Success) {
                     canUseHeadBundle = false;
@@ -6246,8 +5886,38 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         // In the dual-pool slim head store the root index physically holds only the
         // U_extra heads, so its tree cannot navigate H1; skip this dead fallback.
         if (!m_metadataOnlyHeadStore) {
-            ret = m_index->SearchIndex(
-                *p_queryResults);
+            if (!headAdmission) ret=m_index->SearchIndexWithMaxCheck(*p_queryResults,m_options.m_maxCheck);
+            else if (!m_options.m_enablePostingNavigation)
+                ret=m_index->SearchIndexWithResultFilter(*p_queryResults,headAdmission,m_options.m_maxCheck);
+            else {
+                auto* bkt=dynamic_cast<BKT::Index<T>*>(m_index.get());
+                if (!bkt || m_options.m_storage != Storage::STATIC ||
+                    m_options.m_enableHybridDistance || m_pQuantizer ||
+                    !m_postingOwners || m_postingOwners->HeadCount()!=m_index->GetNumSamples()) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                        "Posting navigation requires unchanged H1 BKT geometry and loaded hierarchy CSR; disable EnablePostingNavigation for unsupported layouts.\n");
+                    return ErrorCode::FailedParseValue;
+                }
+                Cache::PostingBitmask signature; signature.Clear();
+                bool signatureReady=false;
+                const auto mayMatch=[&](std::size_t level,int head) {
+                    if (!signatureReady) {
+                        if (useLimitedTagMembership)
+                            signature=BuildHierarchyQuerySignature(limitedTagQueryValues,m_limitedTagSupport,m_secondLevelPostings);
+                        signatureReady=true;
+                    }
+                    return (!signature.Popcount() || m_secondLevelPostings[level].SignatureAt(head)->MayIntersect(signature)) &&
+                        (!routingReady || m_routingSignatures.UpperMayMatch(
+                            routingPredicate, level, head, useLimitedTagMembership));
+                };
+                const auto distance=[&](std::size_t level,int head) {
+                    return bkt->ComputeDistance(p_queryResults->GetQuantizedTarget(),m_secondLevelCatalogs[level]->GetVector(head));
+                };
+                HierarchyPostingQuery<decltype(m_secondLevelPostings),decltype(mayMatch),decltype(distance)>
+                    posting(*m_postingOwners,m_secondLevelPostings,mayMatch,distance);
+                ret=bkt->SearchIndexWithPostingNavigation(*p_queryResults,headAdmission,&posting,m_options.m_maxCheck,
+                    false,m_options.m_postingAnchorCount,m_options.m_postingAdditionalMaxCheck);
+            }
             if (ret != ErrorCode::Success) return ret;
         }
     }
@@ -6259,7 +5929,6 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         int n = p_queryResults->GetResultNum();
         std::string line = "DUMPHEADS q=" + std::to_string(dumpHeadsQueryId) +
             " bundle=" + std::to_string(usedHeadBundleSearch ? 1 : 0) +
-            " twoLayer=" + std::to_string(usedSecondLevelSearch ? 1 : 0) +
             " n=" + std::to_string(n) + " :";
         for (int di = 0; di < n; ++di) {
             auto* r = p_queryResults->GetResult(di);
@@ -6318,15 +5987,13 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     SearchStats* _phExtraStatsPtr = s_phaseTime ? &_phExtraStats : nullptr;
     if (m_extraSearcher != nullptr)
     {
-        auto workSpace = std::move(hierarchyWorkspace);
-        const bool reusedHierarchyState = workSpace != nullptr;
-        if (!workSpace) workSpace = m_workSpaceFactory->GetWorkSpace();
+        auto workSpace = m_workSpaceFactory->GetWorkSpace();
         if (!workSpace)
         {
             workSpace.reset(new ExtraWorkSpace());
             m_extraSearcher->InitWorkSpace(workSpace.get(), false);
         }
-        else if (!reusedHierarchyState)
+        else
         {
             m_extraSearcher->InitWorkSpace(workSpace.get(), true);
         }
@@ -6386,24 +6053,24 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                           Storage::STATIC)
                 ? tailPostingFilter
                 : (useLimitedTagMembership
-                       ? limitedTagHeadAdmission
+                       ? headAdmission
                        : postingFilter);
         // Propagate inline tag filter (for per-vector exact tag check in posting scan)
         workSpace->m_queryTags = queryTags;
         workSpace->m_numQueryTags = numQueryTags;
         workSpace->m_dnf = queryDNF;
-        if (!reusedHierarchyState) workSpace->m_deduper.clear();
+        workSpace->m_deduper.clear();
         workSpace->m_postingIDs.clear();
         workSpace->m_postingProbeStats.Reset();
 
         const bool hasTagFilter = queryTags != nullptr && numQueryTags > 0;
         const auto headHierWidths =
-            headPointResults == nullptr && m_index != nullptr
+            m_index != nullptr
                 ? m_index->GetHeadNodeHierWidths()
                 : SPTAG::Cache::HierWidthTable();
         // Build hierarchical query mask once
         SPTAG::Cache::HierarchicalPostingMask queryHierMask;
-        if (hasTagFilter && headPointResults == nullptr) {
+        if (hasTagFilter) {
             queryHierMask.Clear();
             for (int i = 0; i < numQueryTags; ++i) {
                 queryHierMask.Insert(
@@ -6478,9 +6145,9 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                     !m_index->IsHeadNodeHeadOnly(localHid)) {
                     return false;
                 }
-                const auto* ownTags = m_index->GetHeadNodeHierMask(localHid);
+                const auto ownTags = m_index->GetHeadNodeHierMask(localHid);
                 return ownTags != nullptr &&
-                    queryDNF->Matches(ownTags->tag, SPTAG::Cache::HIER_LEVELS);
+                    queryDNF->Matches(ownTags->tag, ownTags->count);
             }
             if (!hasTagFilter) return true;
             if (m_options.m_enableHybridDistance &&
@@ -6527,10 +6194,10 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             }
             if (!m_options.m_columnTypes.empty() && m_index != nullptr &&
                 m_index->HasHeadNodeMeta() && m_index->IsHeadNodeHeadOnly(localHid)) {
-                const auto* own = m_index->GetHeadNodeHierMask(localHid);
+                const auto own = m_index->GetHeadNodeHierMask(localHid);
                 if (own == nullptr) return false;
                 for (int column : m_options.Schema().categorical)
-                    if (column < Cache::HIER_LEVELS)
+                    if (column < own->count)
                         for (int query = 0; query < numQueryTags; ++query)
                             if (own->tag[column] == queryTags[query]) return true;
                 return false;
@@ -6561,7 +6228,6 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                     workSpace->m_postingIDs.emplace_back(localHid);
                 }
             }
-            if (headPointResults != nullptr) continue;
             SizeType globalVID = translateHeadVID(localHid);
             if (!shouldKeepHeadResult(localHid) || globalVID == MaxSize)
             {
@@ -6572,7 +6238,6 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             }
         }
 
-        if (headPointResults == nullptr)
         {
             for (; i < p_queryResults->GetResultNum(); ++i)
             {
@@ -6621,14 +6286,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             }
         }
 
-        if (invalidHeadPoint) return ErrorCode::Fail;
-        if (headPointResults != nullptr)
-        {
-            p_queryResults->Reset();
-            for (const auto& point : *headPointResults)
-                if (point.second >= 0) p_queryResults->AddPoint(point.second, point.first);
-        }
-        if (headPointResults == nullptr) p_queryResults->Reverse();
+        p_queryResults->Reverse();
         if (dumpHeadsLimit > 0) {
             std::string s = "HEADDUMP:";
             s.reserve(workSpace->m_postingIDs.size() * 8 + 16);
@@ -6669,29 +6327,11 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         double postMs  = std::chrono::duration<double, std::milli>(_phT2 - _phT1).count();
         uint32_t firstTag = (queryTags != nullptr && numQueryTags > 0) ? queryTags[0] : 0u;
         SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
-            "PhaseTime: tag=%u nprobe=%d twoLayer=%d h2=%.3f "
-            "h2Graph=%.3f h2Merge=%.3f h2Tag=%.3f h2Vec=%.3f h2Sort=%.3f "
-            "h2Upper=%llu h2Unique=%llu h2Assign=%llu h2Probe=%d h2MaxCheck=%d h2Iter=%d "
+            "PhaseTime: tag=%u nprobe=%d "
             "heads=%d headScanned=%d headMaxCheck=%d headR50=%.3f headR90=%.3f headRMax=%.3f "
             "headAt110=%d headAt125=%d headAt150=%d headAt200=%d headAt400=%d headAt800=%d "
             "postIO=%d postPages=%d bkt=%.3f pq=%.3f graphOther=%.3f post=%.3f io=%.3f scan=%.3f postOther=%.3f total=%.3f\n",
             firstTag, postingTarget,
-            usedSecondLevelSearch ? 1 : 0,
-            secondLevelRouteMs,
-            g_secondLevelProfile.m_graphMs,
-            g_secondLevelProfile.m_mergeMs,
-            g_secondLevelProfile.m_tagMs,
-            g_secondLevelProfile.m_vectorMs,
-            g_secondLevelProfile.m_sortMs,
-            static_cast<unsigned long long>(
-                g_secondLevelProfile.m_upperScanned),
-            static_cast<unsigned long long>(
-                g_secondLevelProfile.m_uniqueScanned),
-            static_cast<unsigned long long>(
-                g_secondLevelProfile.m_assignments),
-            g_secondLevelProfile.m_upperProbe,
-            g_secondLevelProfile.m_maxCheck,
-            g_secondLevelProfile.m_iterations,
             phaseHeadCandidates, phaseHeadScanned,
             phaseHeadMaxCheck, phaseHeadRatioP50, phaseHeadRatioP90, phaseHeadRatioMax,
             phaseHeadsAt110, phaseHeadsAt125, phaseHeadsAt150, phaseHeadsAt200,
@@ -7964,7 +7604,7 @@ bool Index<T>::SelectHeadInternal(std::shared_ptr<Helper::VectorSetReader> &p_re
             !m_pendingNodeHeadSelections.empty() &&
             m_pQuantizer == nullptr &&
             !m_options.m_enableDeltaEncoding &&
-            !hasBundleUExtra;
+            !hasBundleUExtra && !m_options.m_selectSecondLevel;
         if (buildMetadataOnlyBundleRoot) {
             for (auto& nodeHeads : m_pendingNodeHeadSelections) {
                 std::sort(nodeHeads.begin(), nodeHeads.end());
@@ -8071,14 +7711,7 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
             "an explicit legacy compatibility operation on an existing index.\n");
         return ErrorCode::FailedParseValue;
     }
-    if (!ValidHierarchyNavigationConfig(m_options))
-    {
-        SPTAGLIB_LOG(
-            Helper::LogLevel::LL_Error,
-            "HierarchyInitialProbeRatio must be in (0,1], "
-            "and HierarchyMaxCheck must be positive.\n");
-        return ErrorCode::FailedParseValue;
-    }
+
     if (!ValidSecondLevelArtifactLayout(
             m_options))
     {
@@ -8107,7 +7740,7 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
          m_options.m_secondLevelReplicaCount <= 0 ||
          m_options.m_secondLevelHeadVectorFile.empty() ||
          m_options.m_secondLevelHeadIDFile.empty() ||
-         m_options.m_secondLevelHeadIndexFolder.empty() ||
+         m_options.m_legacyTopVectorFolder.empty() ||
          m_options.m_secondLevelPostingFile.empty())) {
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
@@ -8152,13 +7785,6 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
                     m_options
                         .m_secondLevelPostingFile,
                     level));
-            std::error_code error;
-            std::filesystem::remove_all(
-                m_options.m_indexDirectory +
-                    FolderSep +
-                    SecondLevelBuildIndexFolder(
-                        m_options, level),
-                error);
         }
     }
     if (m_options.m_selectSecondLevel &&
@@ -8366,25 +7992,9 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
         !m_pendingNodeHeadSelections.empty() &&
         m_pQuantizer == nullptr &&
         !m_options.m_enableDeltaEncoding &&
-        !hasBundleUExtra;
-    const bool buildGraphlessH1Catalog = !m_options.m_buildH1Graph;
-    if (buildGraphlessH1Catalog && m_options.m_deleteHeadVectors)
-    {
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-            "A graphless hierarchy must retain its complete H1 and intermediate vector catalogs.\n");
-        return ErrorCode::FailedParseValue;
-    }
-    if (buildGraphlessH1Catalog &&
-        (m_options.m_storage != Storage::STATIC ||
-         !m_options.m_selectSecondLevel ||
-         m_pQuantizer != nullptr ||
-         hasBundleUExtra)) {
-        SPTAGLIB_LOG(
-            Helper::LogLevel::LL_Error,
-            "BuildH1Graph=false requires unquantized STATIC H1 catalog "
-            "build with HierarchyEnabled=true and no U_extra heads.\n");
-        return ErrorCode::FailedParseValue;
-    }
+        !hasBundleUExtra && !m_options.m_selectSecondLevel;
+
+
     bool resumedCompletedBundleHeads = false;
     if (resumedSelectHead && m_options.m_buildHead && buildMetadataOnlyBundleRoot)
     {
@@ -8490,77 +8100,10 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
             return true;
         };
 
-        if (buildGraphlessH1Catalog) {
-            std::shared_ptr<Helper::ReaderOptions> catalogOptions(
-                new Helper::ReaderOptions(
-                    m_options.m_valueType, m_options.m_dim,
-                    VectorFileType::DEFAULT));
-            auto catalogReader =
-                Helper::VectorSetReader::CreateInstance(catalogOptions);
-            const std::string catalogPath =
-                m_options.m_indexDirectory + FolderSep +
-                m_options.m_headVectorFile;
-            if (catalogReader == nullptr ||
-                catalogReader->LoadFile(catalogPath) != ErrorCode::Success ||
-                catalogReader->GetVectorSet() == nullptr) {
-                SPTAGLIB_LOG(
-                    Helper::LogLevel::LL_Error,
-                    "Could not load graphless H1 catalog: %s\n",
-                    catalogPath.c_str());
-                return ErrorCode::Fail;
-            }
-            const SizeType totalHeads =
-                catalogReader->GetVectorSet()->Count();
-            if (totalHeads <= 0 ||
-                LoadTopLevelHeadIDMap(totalHeads) != ErrorCode::Success) {
-                return ErrorCode::Fail;
-            }
-            auto metadataRoot = SPTAG::VectorIndex::CreateInstance(
-                SPTAG::IndexAlgoType::KDT, m_options.m_valueType);
-            if (metadataRoot == nullptr) {
-                return ErrorCode::Fail;
-            }
-            metadataRoot->SetParameter(
-                "DistCalcMethod",
-                SPTAG::Helper::Convert::ConvertToString(
-                    m_options.m_distCalcMethod));
-            ByteArray rootBytes = ByteArray::Alloc(
-                static_cast<size_t>(m_options.m_dim) * sizeof(T));
-            std::memset(rootBytes.Data(), 0, rootBytes.Length());
-            auto rootVectors = std::make_shared<BasicVectorSet>(
-                rootBytes, m_options.m_valueType, m_options.m_dim, 1);
-            if (metadataRoot->BuildIndex(
-                    rootVectors, nullptr, false, true, true) !=
-                ErrorCode::Success) {
-                return ErrorCode::Fail;
-            }
-            m_index = std::move(metadataRoot);
-            const std::string headDir =
-                m_options.m_indexDirectory + FolderSep +
-                m_options.m_headIndexFolder;
-            if (!EnsureDirectory(headDir) ||
-                m_index->SaveIndex(headDir) != ErrorCode::Success ||
-                !WriteMetadataOnlyHeadStore(
-                    headDir + FolderSep + "head_metaonly.bin",
-                    totalHeads, m_options.m_dim) ||
-                SetupMetadataOnlyHeadStore(
-                    m_options.m_indexDirectory) != ErrorCode::Success) {
-                SPTAGLIB_LOG(
-                    Helper::LogLevel::LL_Error,
-                    "Failed to create graphless H1 catalog root.\n");
-                return ErrorCode::Fail;
-            }
-            m_pendingNodeHeadSelections.clear();
-            SPTAGLIB_LOG(
-                Helper::LogLevel::LL_Info,
-                "BuildH1Graph=false: retained %d H1 catalog vectors without "
-                "an H1 BKT/RNG graph.\n",
-                static_cast<int>(totalHeads));
-        }
+
 
         if (!resumedCompletedBundleHeads &&
-            !buildMetadataOnlyBundleRoot &&
-            !buildGraphlessH1Catalog) {
+            !buildMetadataOnlyBundleRoot) {
         m_index = SPTAG::VectorIndex::CreateInstance(m_options.m_indexAlgoType, valueType);
         m_index->SetParameter("DistCalcMethod", SPTAG::Helper::Convert::ConvertToString(m_options.m_distCalcMethod));
         m_index->SetQuantizer(headQuant ? m_pQuantizer : nullptr);
@@ -8644,8 +8187,8 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
         }
 
         if (!resumedCompletedBundleHeads &&
-            !buildGraphlessH1Catalog &&
-            !m_pendingNodeHeadSelections.empty())
+            !m_pendingNodeHeadSelections.empty() &&
+            !(m_options.m_selectSecondLevel && m_pendingNodeHeadSelections.size() == 1 && !hasBundleUExtra))
         {
             m_headBundleNodes.clear();
             SizeType headOffset = 0;
@@ -8701,97 +8244,19 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
             InitializeDefaultHeadBundle();
         }
 
-        if (m_options.m_selectSecondLevel)
-        {
-            const int upperLayerCount =
-                SecondLevelUpperLayerCount(m_options);
-            m_secondLevelIndexes.assign(
-                static_cast<size_t>(
-                    upperLayerCount),
-                nullptr);
-            m_secondLevelCatalogs.assign(
-                static_cast<size_t>(
-                    upperLayerCount),
-                nullptr);
-            for (int level = 1;
-                 level <= upperLayerCount;
-                 ++level)
-            {
-                const std::string vectorFile =
-                    m_options.m_indexDirectory +
-                    FolderSep +
-                    SecondLevelArtifactName(
-                        m_options
-                            .m_secondLevelHeadVectorFile,
-                        level);
-                const std::string indexDir =
-                    m_options.m_indexDirectory +
-                    FolderSep +
-                    SecondLevelBuildIndexFolder(
-                        m_options, level);
-                if (!buildHeadIndexFromFile(
-                        vectorFile, indexDir))
-                {
-                    SPTAGLIB_LOG(
-                        Helper::LogLevel::LL_Error,
-                        "Failed to build hierarchy level %d head graph.\n",
-                        level);
-                    return ErrorCode::Fail;
-                }
-                std::shared_ptr<VectorIndex> levelIndex;
-                if (VectorIndex::LoadIndex(
-                        indexDir, levelIndex) !=
-                        ErrorCode::Success ||
-                    levelIndex == nullptr)
-                {
-                    SPTAGLIB_LOG(
-                        Helper::LogLevel::LL_Error,
-                        "Cannot reload hierarchy level %d graph %s.\n",
-                        level, indexDir.c_str());
-                    return ErrorCode::Fail;
-                }
-                m_secondLevelIndexes[
-                    static_cast<size_t>(
-                        level - 1)] = levelIndex;
-
-                std::shared_ptr<Helper::ReaderOptions>
-                    catalogOptions(
-                        new Helper::ReaderOptions(
-                            valueType, dims,
-                            VectorFileType::DEFAULT));
-                auto catalogReader =
-                    Helper::VectorSetReader::
-                        CreateInstance(catalogOptions);
-                if (catalogReader == nullptr ||
-                    catalogReader->LoadFile(
-                        vectorFile) !=
-                        ErrorCode::Success ||
-                    catalogReader->GetVectorSet() ==
-                        nullptr ||
-                    catalogReader->GetVectorSet()
-                            ->Count() !=
-                        levelIndex->GetNumSamples())
-                {
-                    SPTAGLIB_LOG(
-                        Helper::LogLevel::LL_Error,
-                        "Cannot bind hierarchy level %d vector catalog %s.\n",
-                        level, vectorFile.c_str());
-                    return ErrorCode::Fail;
-                }
-                m_secondLevelCatalogs[
-                    static_cast<size_t>(
-                        level - 1)] =
-                    catalogReader->GetVectorSet();
+        if (m_options.m_selectSecondLevel) {
+            const int levels=SecondLevelUpperLayerCount(m_options);
+            m_secondLevelCatalogs.resize(levels);
+            for(int level=1;level<=levels;++level) {
+                const std::string file=m_options.m_indexDirectory+FolderSep+
+                    SecondLevelArtifactName(m_options.m_secondLevelHeadVectorFile,level);
+                std::string error;
+                if(LoadCanonicalOrOwnedHierarchyVectors(file,m_options.m_valueType,m_options.m_dim,-1,
+                    m_index,m_secondLevelCatalogs[level-1],&error)!=ErrorCode::Success) return ErrorCode::Fail;
             }
-            SPTAGLIB_LOG(
-                Helper::LogLevel::LL_Info,
-                "Built %d total hierarchy levels; only H%d graph will be persisted.\n",
-                m_options.m_secondLevelHierarchyLevels,
-                m_options.m_secondLevelHierarchyLevels);
         }
 
         if (buildMetadataOnlyBundleRoot &&
-            !buildGraphlessH1Catalog &&
             !resumedCompletedBundleHeads)
         {
             if (ActivateMetadataOnlyBundleRoot() != ErrorCode::Success) {
@@ -8831,12 +8296,6 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
                 static_cast<size_t>(
                     SecondLevelUpperLayerCount(
                         m_options));
-            if (m_secondLevelIndexes.size() !=
-                hierarchyLevels)
-            {
-                m_secondLevelIndexes.assign(
-                    hierarchyLevels, nullptr);
-            }
             if (m_secondLevelCatalogs.size() !=
                 hierarchyLevels)
             {
@@ -8861,24 +8320,10 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
                 if (m_secondLevelCatalogs[offset] ==
                     nullptr)
                 {
-                    std::shared_ptr<
-                        Helper::ReaderOptions>
-                        catalogOptions(
-                            new Helper::ReaderOptions(
-                                m_options.m_valueType,
-                                m_options.m_dim,
-                                VectorFileType::DEFAULT));
-                    auto catalogReader =
-                        Helper::VectorSetReader::
-                            CreateInstance(
-                                catalogOptions);
-                    if (catalogReader == nullptr ||
-                        catalogReader->LoadFile(
-                            vectorPath) !=
-                            ErrorCode::Success ||
-                        catalogReader
-                                ->GetVectorSet() ==
-                            nullptr)
+                    std::string error;
+                    if (LoadCanonicalOrOwnedHierarchyVectors(
+                            vectorPath, m_options.m_valueType, m_options.m_dim, -1,
+                            m_index, m_secondLevelCatalogs[offset], &error) != ErrorCode::Success)
                     {
                         SPTAGLIB_LOG(
                             Helper::LogLevel::LL_Error,
@@ -8886,111 +8331,11 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
                             level, vectorPath.c_str());
                         return ErrorCode::Fail;
                     }
-                    m_secondLevelCatalogs[offset] =
-                        catalogReader
-                            ->GetVectorSet();
                 }
-                if (m_secondLevelIndexes[offset] ==
-                    nullptr)
-                {
-                    const std::string indexDir =
-                        m_options.m_indexDirectory +
-                        FolderSep +
-                        SecondLevelBuildIndexFolder(
-                            m_options, level);
-                    if (VectorIndex::LoadIndex(
-                            indexDir,
-                            m_secondLevelIndexes[
-                                offset]) !=
-                            ErrorCode::Success ||
-                        m_secondLevelIndexes[
-                            offset] == nullptr)
-                    {
-                        if (level ==
-                            static_cast<int>(
-                                hierarchyLevels))
-                        {
-                            SPTAGLIB_LOG(
-                                Helper::LogLevel::LL_Error,
-                                "Cannot load top hierarchy graph %s.\n",
-                                indexDir.c_str());
-                            return ErrorCode::Fail;
-                        }
-                        auto temporaryIndex =
-                            VectorIndex::CreateInstance(
-                                m_options
-                                    .m_indexAlgoType,
-                                m_options.m_valueType);
-                        if (temporaryIndex == nullptr)
-                            return ErrorCode::Fail;
-                        temporaryIndex->SetParameter(
-                            "DistCalcMethod",
-                            Helper::Convert::
-                                ConvertToString(
-                                    m_options
-                                        .m_distCalcMethod));
-                        for (const auto& parameter :
-                             m_headParameters)
-                        {
-                            temporaryIndex
-                                ->SetParameter(
-                                    parameter.first
-                                        .c_str(),
-                                    parameter.second
-                                        .c_str());
-                        }
-                        if (temporaryIndex->BuildIndex(
-                                m_secondLevelCatalogs[
-                                    offset],
-                                nullptr, false, true,
-                                true) !=
-                            ErrorCode::Success)
-                        {
-                            SPTAGLIB_LOG(
-                                Helper::LogLevel::LL_Error,
-                                "Cannot rebuild temporary hierarchy level %d assignment graph.\n",
-                                level);
-                            return ErrorCode::Fail;
-                        }
-                        m_secondLevelIndexes[
-                            offset] =
-                            std::move(
-                                temporaryIndex);
-                        SPTAGLIB_LOG(
-                            Helper::LogLevel::LL_Info,
-                            "Rebuilt temporary hierarchy level %d assignment graph in memory.\n",
-                            level);
-                    }
-                }
-            }
-            for (const auto& levelIndex :
-                 m_secondLevelIndexes)
-            {
-                levelIndex->SetParameter(
-                    "NumberOfThreads",
-                    std::to_string(
-                        m_options
-                            .m_iSSDNumberOfThreads));
-                levelIndex->SetParameter(
-                    "MaxCheck",
-                    std::to_string(
-                        m_options.m_maxCheck));
-                levelIndex->SetParameter(
-                    "HashTableExponent",
-                    std::to_string(
-                        m_options.m_hashExp));
-                levelIndex->UpdateIndex();
             }
         }
 
-        if (m_metadataOnlyHeadStore &&
-            m_options.m_selectSecondLevel &&
-            BuildSecondLevelHeadPostings() != ErrorCode::Success) {
-            SPTAGLIB_LOG(
-                Helper::LogLevel::LL_Error,
-                "Cannot build graphless H1 placement CSR.\n");
-            return ErrorCode::Fail;
-        }
+
 
         if (m_options.m_storage == Storage::STATIC)
         {
@@ -9034,18 +8379,6 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
         }
         if (auto* staticSearcher =
                 dynamic_cast<ExtraStaticSearcher<T>*>(m_extraSearcher.get())) {
-            if (m_metadataOnlyHeadStore) {
-                staticSearcher->SetHeadPlacementSearch(
-                    [this](const T* target,
-                           int resultCount,
-                           const std::function<bool(SizeType)>& filter,
-                           COMMON::QueryResultSet<T>& results) {
-                        return SearchSecondLevelHierarchyForPlacement(
-                            target, resultCount, filter, results, m_index,
-                            m_secondLevelIndexes, m_secondLevelCatalogs,
-                            m_graphlessHierarchyOffsets, m_graphlessHierarchyMembers);
-                    });
-            }
             staticSearcher->SetHeadVectorOwnersView(&m_pendingHeadVectorOwners);
             if (m_metadataOnlyHeadStore) {
                 staticSearcher->SetHeadBundleBuildView(
@@ -9205,6 +8538,14 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
                     return secondLevelStatus;
                 }
             }
+            else if (m_options.m_buildSsdIndex && m_options.m_enableLimitedTagPosting &&
+                     m_options.m_storage == Storage::STATIC && m_options.m_excludehead &&
+                     !m_options.m_enableDataCompression && !m_options.m_enableDeltaEncoding &&
+                     !m_options.m_enablePostingListRearrange &&
+                     Helper::StrUtils::StrEqualIgnoreCase(m_options.m_postingQuantizer.c_str(), "None")) {
+                const auto status = EnsureHierarchyHeadMetadata(m_options.m_indexDirectory, true);
+                if (status != ErrorCode::Success) return status;
+            }
             if ((m_options.m_storage != Storage::STATIC) && m_options.m_preReassign)
             {
                 if (m_options.m_enableLimitedTagPosting)
@@ -9217,6 +8558,8 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
                 if (m_extraSearcher->RefineIndex(m_index) != ErrorCode::Success)
                     return ErrorCode::Fail;
             }
+            if (RefreshRoutingSignatures() != ErrorCode::Success)
+                return ErrorCode::Fail;
         }
     }
 
@@ -9230,7 +8573,7 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
     // to HeadIndex/vectors.bin and at search-load is only a never-triggered fallback for
     // head count (SPTAGHeadVectorIDs.bin is always present). Dropping it removes one full
     // copy of the head vectors from disk.
-    if ((m_options.m_deleteHeadVectors && !buildGraphlessH1Catalog) ||
+    if ((m_options.m_deleteHeadVectors) ||
         (!m_pendingNodeHeadSelections.empty() &&
          m_options.m_buildH1Graph))
     {
@@ -9346,7 +8689,7 @@ template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Hel
     }
 
     m_bReady = true;
-    return FinalizeRoutingHierarchyStorage();
+    return PrepareHierarchyExport(m_options.m_indexDirectory);
 }
 template <typename T> ErrorCode Index<T>::BuildIndex(bool p_normalized)
 {
@@ -9559,27 +8902,17 @@ template <typename T> ErrorCode Index<T>::SetParameter(const char *p_param, cons
 
     if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_section, "SearchSSDIndex"))
     {
-        if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(
-                p_param, "HierarchyInitialProbeRatio"))
-        {
-            double ratio = 0.0;
-            if (!SPTAG::Helper::Convert::ConvertStringTo<double>(
-                    p_value, ratio) ||
-                !std::isfinite(ratio) ||
-                ratio <= 0.0 || ratio > 1.0)
-            {
-                SPTAGLIB_LOG(
-                    Helper::LogLevel::LL_Error,
-                    "HierarchyInitialProbeRatio must be in (0,1].\n");
-                return ErrorCode::FailedParseValue;
-            }
-        }
-        storeParameter(m_searchSSDParameters, p_param, p_value);
 
         // These are SSDServing control flags, not mutable runtime options.
         if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_param, "isExecute") ||
             SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_param, "BuildSsdIndex"))
         {
+            bool enabled;
+            if (!Helper::Convert::ConvertStringTo<bool>(p_value, enabled)) {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid native control %s=%s.\n", p_param, p_value);
+                return ErrorCode::FailedParseValue;
+            }
+            storeParameter(m_searchSSDParameters, p_param, p_value);
             return ErrorCode::Success;
         }
 
@@ -9608,18 +8941,16 @@ template <typename T> ErrorCode Index<T>::SetParameter(const char *p_param, cons
                 break;
             }
         }
+        const std::string buildValue = hasBuildValue ? std::string() :
+            m_options.GetParameter("BuildSSDIndex", runtimeParam);
+        const auto status = m_options.SetParameter("BuildSSDIndex", runtimeParam, p_value);
+        if (status != ErrorCode::Success) return status;
         if (!hasBuildValue)
         {
-            const std::string buildValue =
-                m_options.GetParameter("BuildSSDIndex", runtimeParam);
             storeParameter(m_buildSSDParameters, runtimeParam, buildValue.c_str());
         }
-        return m_options.SetParameter("BuildSSDIndex", runtimeParam, p_value);
-    }
-
-    if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_section, "BuildSSDIndex"))
-    {
-        storeParameter(m_buildSSDParameters, p_param, p_value);
+        storeParameter(m_searchSSDParameters, p_param, p_value);
+        return ErrorCode::Success;
     }
 
     if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_section, "BuildHead") &&
@@ -9639,6 +8970,8 @@ template <typename T> ErrorCode Index<T>::SetParameter(const char *p_param, cons
     {
         const auto status = m_options.SetParameter(p_section, p_param, p_value);
         if (status != ErrorCode::Success) return status;
+        if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_section, "BuildSSDIndex"))
+            storeParameter(m_buildSSDParameters, p_param, p_value);
     }
     if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_param, "DistCalcMethod"))
     {

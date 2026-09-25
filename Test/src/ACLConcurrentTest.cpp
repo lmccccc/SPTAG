@@ -366,7 +366,6 @@ BOOST_AUTO_TEST_CASE(SearchWithACLSameTenantThreadLocalState)
 
     ScopedTempDir saveDir(MakeTempDir());
     BOOST_REQUIRE(builder.SaveAll(saveDir.path.c_str()));
-
     TenantIndexManager loaded(kDim, "SPANN", "Float");
     BOOST_REQUIRE(loaded.LoadAll(saveDir.path.c_str()));
 
@@ -740,7 +739,7 @@ BOOST_AUTO_TEST_CASE(HeadMetadataV8WithoutTailRoundTrips)
             reinterpret_cast<char*>(header.data()),
             static_cast<std::streamsize>(sizeof(header)));
         BOOST_REQUIRE(input.good());
-        BOOST_CHECK_EQUAL(header[0], 8);
+        BOOST_CHECK_EQUAL(header[0], 9);
         input.seekg(
             static_cast<std::streamoff>(
                 5 * sizeof(std::int32_t)),
@@ -872,7 +871,7 @@ BOOST_AUTO_TEST_CASE(LimitedTagRescueSignaturesRepairAndExport)
     BOOST_REQUIRE(loaded.LoadAll(exported.path.c_str()));
 }
 
-BOOST_AUTO_TEST_CASE(GraphlessHeadMetadataUsesCanonicalVIDs)
+BOOST_AUTO_TEST_CASE(HierarchyHeadMetadataUsesCanonicalVIDs)
 {
     constexpr int kDim = 16;
     constexpr int kNumVectors = 256;
@@ -894,7 +893,6 @@ BOOST_AUTO_TEST_CASE(GraphlessHeadMetadataUsesCanonicalVIDs)
     ByteArray metadataBytes(
         reinterpret_cast<std::uint8_t*>(metadata.data()), metadata.size(), false);
 
-    for (bool graphless : {false, true})
     {
         ScopedTempDir saved(MakeTempDir());
         ScopedEnvironmentVariable inPlace(
@@ -913,8 +911,6 @@ BOOST_AUTO_TEST_CASE(GraphlessHeadMetadataUsesCanonicalVIDs)
         builder.SetBuildParam("HierarchyEnabled", "true", "SelectHead");
         builder.SetBuildParam("HierarchyLevels", "3", "SelectHead");
         builder.SetBuildParam("HierarchyReplicaCount", "2", "SelectHead");
-        builder.SetBuildParam("BuildH1Graph", graphless ? "false" : "true", "SelectHead");
-        builder.SetBuildParam("CompactHierarchyVectors", "false", "SelectHead");
         builder.SetBuildParam("NumberOfThreads", "1", "BuildHead");
         builder.SetBuildParam("NeighborhoodSize", "16", "BuildHead");
         builder.SetBuildParam("RefineIterations", "1", "BuildHead");
@@ -949,8 +945,8 @@ BOOST_AUTO_TEST_CASE(GraphlessHeadMetadataUsesCanonicalVIDs)
                       SPTAG::ErrorCode::Success);
         auto* spann = dynamic_cast<SPTAG::SPANN::Index<float>*>(index.get());
         BOOST_REQUIRE(spann != nullptr);
-        BOOST_CHECK_EQUAL(spann->GetOptions()->m_buildH1Graph, !graphless);
-        BOOST_CHECK_EQUAL(spann->HasRoutingOnlyHierarchy(), graphless);
+        BOOST_CHECK_EQUAL(spann->GetOptions()->m_buildH1Graph, true);
+        BOOST_CHECK_EQUAL(spann->HasRoutingOnlyHierarchy(), false);
         BOOST_REQUIRE(LoadHeadNodeMetaFile(tenantDirectory, index));
         auto head = spann->GetMemoryIndex();
         BOOST_REQUIRE(head != nullptr);
@@ -962,7 +958,7 @@ BOOST_AUTO_TEST_CASE(GraphlessHeadMetadataUsesCanonicalVIDs)
             const SPTAG::SizeType vid = head->GetHeadNodeGlobalVID(local);
             BOOST_REQUIRE(vid >= 0 && vid < kNumVectors);
             BOOST_CHECK_EQUAL(vid, spann->GetGlobalVID(local));
-            const auto* ownTags = head->GetHeadNodeHierMask(local);
+            const auto ownTags = head->GetHeadNodeHierMask(local);
             BOOST_REQUIRE(ownTags != nullptr);
             BOOST_CHECK_EQUAL(ownTags->tag[0], tags[static_cast<size_t>(vid)]);
         }
@@ -971,7 +967,7 @@ BOOST_AUTO_TEST_CASE(GraphlessHeadMetadataUsesCanonicalVIDs)
         const std::string exportedTenant = exported.path + "/tenant_0";
         const auto sourceFiles = SnapshotFiles(tenantDirectory);
         BOOST_REQUIRE(builder.SaveAll(exported.path.c_str()));
-        CheckSavedFiles(sourceFiles, SnapshotFiles(tenantDirectory), graphless);
+        CheckSavedFiles(sourceFiles, SnapshotFiles(tenantDirectory), false);
         CheckSavedFiles(sourceFiles, SnapshotFiles(exportedTenant), false);
         for (const auto& file : sourceFiles)
         {
@@ -985,9 +981,8 @@ BOOST_AUTO_TEST_CASE(GraphlessHeadMetadataUsesCanonicalVIDs)
                           SPTAG::ErrorCode::Success);
             BOOST_CHECK_EQUAL(config.GetParameter("Base", "IndexDirectory", std::string()),
                               exportedTenant);
-            BOOST_CHECK_EQUAL(config.GetParameter("SelectHead", "BuildH1Graph", graphless),
-                              !graphless);
-            BOOST_CHECK(!config.GetParameter("SelectHead", "CompactHierarchyVectors", true));
+            BOOST_CHECK(!config.DoesParameterExist("SelectHead", "BuildH1Graph"));
+            BOOST_CHECK(!config.DoesParameterExist("SelectHead", "CompactHierarchyVectors"));
             BOOST_CHECK_EQUAL(config.GetParameter("SelectHead", "HierarchyLevels", 0), 3);
             BOOST_CHECK_EQUAL(config.GetParameter("BuildSSDIndex", "ReplicaCount", 0), 2);
             BOOST_CHECK(config.GetParameter("BuildSSDIndex", "EnableLimitedTagPosting", false));
@@ -1019,19 +1014,10 @@ BOOST_AUTO_TEST_CASE(GraphlessHeadMetadataUsesCanonicalVIDs)
                 BOOST_CHECK_EQUAL(restoredHead->GetHeadNodeHierMask(local)->tag[0],
                                   tags[static_cast<size_t>(vid)]);
             }
-            BOOST_CHECK(PathExists(exportedTenant + "/SecondLevelHeadIndex/graph.bin"));
+            BOOST_CHECK(!PathExists(exportedTenant + "/SecondLevelHeadIndex"));
+            BOOST_CHECK(PathExists(exportedTenant + "/HeadIndex/graph.bin"));
             BOOST_CHECK(!PathExists(exportedTenant + "/SecondLevelHeadIndex.level1.build"));
-            if (graphless)
-            {
-                BOOST_CHECK(PathExists(exportedTenant + "/HeadIndex/head_metaonly.bin"));
-                BOOST_CHECK(PathExists(exportedTenant + "/SPTAGHeadVectors.bin"));
-                BOOST_CHECK(PathExists(exportedTenant + "/SPTAGSecondLevelHeadVectors.bin"));
-                BOOST_CHECK(!PathExists(exportedTenant + "/SPTAGHeadVectors.bin.owned"));
-                BOOST_CHECK(!PathExists(exportedTenant + "/SPTAGSecondLevelHeadVectors.bin.owned"));
-                BOOST_CHECK(!PathExists(exportedTenant + "/SPTAGSecondLevelHeadVectors.bin.level2"));
-                BOOST_CHECK(!PathExists(exportedTenant + "/SecondLevelHeadIndex/head_node_meta.bin"));
-                BOOST_CHECK(!PathExists(exportedTenant + "/SecondLevelHeadIndex/metadata.bin"));
-            }
+
             TenantIndexManager loaded(kDim, "SPANN", "Float");
             BOOST_REQUIRE(loaded.LoadAll(exported.path.c_str()));
             BOOST_REQUIRE_EQUAL(loaded.GetInternalTenantId("tenant0"), 0);
@@ -1048,118 +1034,12 @@ BOOST_AUTO_TEST_CASE(GraphlessHeadMetadataUsesCanonicalVIDs)
                 BOOST_REQUIRE(vid >= 0 && vid < kNumVectors);
                 BOOST_CHECK_EQUAL(tags[static_cast<size_t>(vid)], tags[0]);
             }
-            if (graphless)
-            {
-                TenantIndexManager unloaded(kDim, "SPANN", "Float");
-                BOOST_REQUIRE(unloaded.LoadAll(exported.path.c_str()));
-                ScopedTempDir coldExport(MakeTempDir());
-                BOOST_REQUIRE(unloaded.SaveAll(coldExport.path.c_str()));
-                std::shared_ptr<SPTAG::VectorIndex> coldReload;
-                BOOST_REQUIRE(SPTAG::VectorIndex::LoadIndex(
-                    coldExport.path + "/tenant_0", coldReload) == SPTAG::ErrorCode::Success);
-                auto* coldSPANN = dynamic_cast<SPTAG::SPANN::ISPANNIndex*>(coldReload.get());
-                BOOST_REQUIRE(coldSPANN != nullptr);
-                BOOST_CHECK(coldSPANN->HasRoutingOnlyHierarchy());
-                BOOST_REQUIRE(LoadHeadNodeMetaFile(coldExport.path + "/tenant_0", coldReload));
-                BOOST_CHECK_EQUAL(coldSPANN->GetMemoryIndex()->GetHeadNodeMetaSampleCount(), headCount);
-            }
         }
 
-        if (graphless)
-        {
-            BOOST_REQUIRE(index->SaveIndex(tenantDirectory + "/.") == SPTAG::ErrorCode::Success);
-            CheckSavedFiles(sourceFiles, SnapshotFiles(tenantDirectory), false);
-            const auto savedInPlace = SnapshotFiles(tenantDirectory);
-            BOOST_REQUIRE(index->SaveIndex(tenantDirectory) == SPTAG::ErrorCode::Success);
-            CheckSavedFiles(savedInPlace, SnapshotFiles(tenantDirectory));
-            BOOST_REQUIRE(index->SaveIndex(exportedTenant) == SPTAG::ErrorCode::Success);
-            CheckSavedFiles(savedInPlace, SnapshotFiles(tenantDirectory));
-            const auto publishedFiles = SnapshotFiles(exportedTenant);
-
-            ScopedTempDir failures(MakeTempDir());
-            const std::string missingExport = failures.path + "/missing";
-            const std::string requiredRelative = "SPTAGHeadVectors.bin";
-            const std::string required = tenantDirectory + "/" + requiredRelative;
-            const std::vector<std::string> requiredArtifacts = {
-                requiredRelative, "HeadIndex/deletes.bin",
-                "SPTAGHeadVectorIDs.bin", "SecondLevelHeadIndex/graph.bin",
-                "SPTAGSecondLevelHeadVectors.bin", "HeadIndex/head_node_meta.bin",
-                spann->GetOptions()->m_secondLevelPostingFile};
-            for (const auto& artifact : requiredArtifacts)
-            {
-                BOOST_TEST_CONTEXT("missing export artifact: " << artifact)
-                {
-                    const std::string path = tenantDirectory + "/" + artifact;
-                    const std::string withheld = path + ".withheld";
-                    std::filesystem::rename(path, withheld);
-                    const auto missingFiles = SnapshotFiles(tenantDirectory);
-                    BOOST_CHECK(index->SaveIndex(missingExport) != SPTAG::ErrorCode::Success);
-                    BOOST_CHECK(!PathExists(missingExport));
-                    BOOST_CHECK(index->SaveIndex(tenantDirectory) != SPTAG::ErrorCode::Success);
-                    CheckSavedFiles(missingFiles, SnapshotFiles(tenantDirectory));
-                    std::filesystem::rename(withheld, path);
-                    CheckSavedFiles(savedInPlace, SnapshotFiles(tenantDirectory));
-                }
-            }
-
-            const auto original = savedInPlace.at(requiredRelative);
-            BOOST_REQUIRE(!original.empty());
-            auto corrupt = original;
-            corrupt[0] ^= 1;
-            const auto writeArtifact = [&](const std::vector<char>& bytes)
-            {
-                std::ofstream output(required, std::ios::binary | std::ios::trunc);
-                BOOST_REQUIRE(output.good());
-                output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-                output.close();
-                BOOST_REQUIRE(output.good());
-            };
-            writeArtifact(corrupt);
-            const auto corruptFiles = SnapshotFiles(tenantDirectory);
-            BOOST_CHECK(index->SaveIndex(exportedTenant) != SPTAG::ErrorCode::Success);
-            BOOST_CHECK(index->SaveIndex(tenantDirectory + "/.") != SPTAG::ErrorCode::Success);
-            BOOST_CHECK(!builder.SaveAll(failures.path.c_str()));
-            BOOST_CHECK(!PathExists(failures.path + "/manifest.txt"));
-            BOOST_CHECK(!PathExists(failures.path + "/tenant_0/indexloader.ini"));
-            BOOST_REQUIRE(std::filesystem::is_empty(failures.path + "/tenant_0"));
-            BOOST_REQUIRE(std::filesystem::remove(failures.path + "/tenant_0"));
-            CheckSavedFiles(corruptFiles, SnapshotFiles(tenantDirectory));
-            CheckSavedFiles(publishedFiles, SnapshotFiles(exportedTenant));
-            BOOST_CHECK_EQUAL(index->GetParameter("IndexDirectory", "Base"), tenantDirectory);
-            writeArtifact(original);
-            CheckSavedFiles(savedInPlace, SnapshotFiles(tenantDirectory));
-
-            const std::string nestedExport = tenantDirectory + "/nested_export";
-            BOOST_CHECK(index->SaveIndex(nestedExport) != SPTAG::ErrorCode::Success);
-            BOOST_CHECK(!PathExists(nestedExport));
-            CheckSavedFiles(savedInPlace, SnapshotFiles(tenantDirectory));
-            const std::string upperMetadata = tenantDirectory + "/SecondLevelHeadIndex/head_node_meta.bin";
-            {
-                std::ofstream output(upperMetadata, std::ios::binary);
-                output << "obsolete upper result metadata";
-                BOOST_REQUIRE(output.good());
-            }
-            const auto withUpperMetadata = SnapshotFiles(tenantDirectory);
-            const std::string metadataFreeExport = failures.path + "/metadata_free";
-            BOOST_REQUIRE(index->SaveIndex(metadataFreeExport) == SPTAG::ErrorCode::Success);
-            BOOST_CHECK(!PathExists(metadataFreeExport + "/SecondLevelHeadIndex/head_node_meta.bin"));
-            CheckSavedFiles(withUpperMetadata, SnapshotFiles(tenantDirectory));
-            std::filesystem::remove(upperMetadata);
-            std::filesystem::remove_all(metadataFreeExport);
-            CheckSavedFiles(savedInPlace, SnapshotFiles(tenantDirectory));
-            BOOST_CHECK(std::filesystem::is_empty(failures.path));
-        }
 
         std::uint64_t generation = 0;
         BOOST_REQUIRE(SPTAG::Helper::Convert::ConvertStringTo<std::uint64_t>(
             spann->GetOptions()->m_limitedTagGenerationFingerprint.c_str(), generation));
-        if (graphless)
-        {
-            head->InitializeHeadNodeMeta(headCount + 1);
-            BOOST_CHECK(!spann->PopulateHeadNodeGlobalVIDsFromBundles());
-            BOOST_CHECK(!SaveHeadNodeMetaFile(tenantDirectory, head, generation));
-            BOOST_REQUIRE(LoadHeadNodeMetaFile(tenantDirectory, index));
-        }
         head->SetHeadNodeGlobalVID(0, SPTAG::MaxSize);
         BOOST_CHECK(!SaveHeadNodeMetaFile(tenantDirectory, head, generation));
         BOOST_REQUIRE(LoadHeadNodeMetaFile(tenantDirectory, index));
@@ -1568,7 +1448,7 @@ BOOST_AUTO_TEST_CASE(HybridTagRoutingStatsPersistRepairAndReload)
             &version,
             validHeadMetadata.data(),
             sizeof(version));
-        BOOST_CHECK_EQUAL(version, 8);
+        BOOST_CHECK_EQUAL(version, 9);
         std::uint32_t flags = 0;
         std::memcpy(
             &flags,

@@ -1,0 +1,93 @@
+{
+  "stages": {
+    "unfilter_broad": [
+      "unfilter",
+      "broad_tag"
+    ],
+    "medium_extreme": [
+      "medium_tag",
+      "extreme_tag"
+    ],
+    "numeric_mixed": [
+      "numeric",
+      "mixed_dnf"
+    ]
+  },
+  "scenarios": [
+    "unfilter",
+    "broad_tag",
+    "medium_tag",
+    "extreme_tag",
+    "numeric",
+    "mixed_dnf"
+  ],
+  "cases": [
+    "h1",
+    "h3",
+    "supplier"
+  ],
+  "grid": [
+    16,
+    24,
+    32,
+    48,
+    62,
+    80,
+    96,
+    128,
+    192,
+    256,
+    384
+  ],
+  "repeats": 2,
+  "unique_points": 198,
+  "ordinary_batches": 396,
+  "ordinary_index_loads": 36,
+  "stage_unique_points": 66,
+  "stage_ordinary_batches": 132,
+  "stage_ordinary_index_loads": 12,
+  "warmup_per_probe": 1000,
+  "measured_per_probe": 1000,
+  "threads": 1,
+  "numa": 2,
+  "topk": 10,
+  "MaxCheck": 2048,
+  "HierarchyMaxCheck": 512,
+  "HierarchyInitialProbeRatio": 0.666666,
+  "page_limit": 15,
+  "O_DIRECT": true,
+  "retained_ratio": 0.5,
+  "minimum_physical_degree": 16,
+  "supplier_degree_semantics": "retained_eligible_ratio",
+  "sweep_execution": "single_load_nprobe_array",
+  "nprobe_ini_api": "SearchSweep.NProbe",
+  "accepted_summary_sha256": "6917dd7c20901c77dce946fd81832383f0bcff8cb2aa30e7c1080433f9ef2c8d",
+  "schedule_sha256": "29e5f97ff65408d613b5c040b4ac68a5f8c674d24cd101a4527b29b88c1c80ae",
+  "configs": {
+    "h1_fixture_asc.ini": "3c659a7eff9226d0aae1e2b5a2e068f1b684809f23cca69e3323f36e9d9a6d06",
+    "h1_fixture_desc.ini": "2535c61d0f93653f6bf6d1b887a07fc63d3d9900f27e221af1686058e6c1b80c",
+    "h1_r1.ini": "ff9a7cc3113b8485f600f2c98fdae82287f13eaa8b8f4f0be6c12cebcf28662b",
+    "h1_r2.ini": "7c1cb5b31d2a2110325790a02e77fa12c56c328695c4a98a948fbac2c2b94ba1",
+    "h3_fixture_asc.ini": "da052918050781fb3d7b945f3c01860698967360fdc1fcabb9a7f5ff5a5e1367",
+    "h3_fixture_desc.ini": "baf58bcd15b56e2712dc03e8798c34338cc39c6dd09e44250297e3dbe8f375d4",
+    "h3_r1.ini": "9d60a2d227c822157adbe81479d7a5b4fc6aad1dc369773cfa7635faefb83621",
+    "h3_r2.ini": "092aff102cbea06736a052fe98d023b7753c0fa17c95699a3a87be1701fab4ef",
+    "supplier_fixture_asc.ini": "5b65a62821adef055bba841464e371fff771efbffad9cb2ce7d9087226947e4c",
+    "supplier_fixture_desc.ini": "a6457fddfca764f824f2246fd6cea3ce58641ecaabe48b626ec9f82d853ad466",
+    "supplier_r1.ini": "c77cc155c6666d0ebdc274ac9ab159e8317c67dd0f7c02abe80bb3dd31d35915",
+    "supplier_r2.ini": "63d2d94cc0e72157aa4b912b8bf0b5c099acfcd82a1975ae6cbb0f06b41b315c"
+  },
+  "execution": "Explicit stage only; no auto-continuation. Canonical summary only after198 complete pairs.",
+  "timing": "No fine query clocks/profiles. Coarse native load/capture/warmup/batch/serialization clocks only.",
+  "compatibility": "Benchmark-only H3 admission validation/observation and coarse operation logging; link unchanged accepted native libraries and wrapper object; no algorithm/hook changes.",
+  "preflight_format_amendment": {
+    "previous_registration_sha256": "db0efdbde0ca54d86de1d72b60cca6cb8078e130abb26971a5890177d3bbc964",
+    "preserved_failure": "/mnt/nvme/baotonglu/mocheng/datasets/sift1m_zipf200_sparse193_numeric/comparisons/h1_native_ratio_curve_20260917",
+    "reason": "Frozen native IniReader preserves value whitespace after =; emit delimiter without spaces. No completed query batches or policy changes."
+  },
+  "native_counter_compatibility_amendment": {
+    "preserved_preflight": "/mnt/nvme/baotonglu/mocheng/datasets/sift1m_zipf200_sparse193_numeric/comparisons/h1_native_ratio_curve_20260917_v2",
+    "previous_registration_sha256": "f3a0395e82a20fd797a3355fe4889ab6e1b54ce9823342b530a888ee25e7c12f",
+    "reason": "Use existing authentic h3_core_work ownership exception for contributing postings; preserve actual values. All deterministic counters and outputs still exact. Native libraries unchanged."
+  }
+}

@@ -1,0 +1,42 @@
+import os
+import shutil
+import subprocess
+import time
+from prepare import HERE,TOOL,OUTPUT,install,protect,sha,write
+
+def main():
+    install()
+    (TOOL/"compiler-work").mkdir(exist_ok=True)
+    env=dict(os.environ,TMPDIR=str(TOOL/"compiler-work"))
+    commands=[
+        ("configure",["cmake","-S",str(TOOL/"source"),"-B",str(TOOL/"build"),
+            "-DCMAKE_BUILD_TYPE=Release","-DSPDK=OFF","-DROCKSDB=OFF"]),
+        ("build",["cmake","--build",str(TOOL/"build"),"--target","SPTAGLibStatic","-j2"]),
+        ("harness-configure",["cmake","-S",str(HERE),"-B",str(TOOL/"harness"),
+            "-DCMAKE_BUILD_TYPE=Release","-DSPANN_ROOT="+str(TOOL/"source")]),
+        ("harness-build",["cmake","--build",str(TOOL/"harness"),"-j2"]),
+        ("native-tests",["ctest","--test-dir",str(TOOL/"harness"),"--output-on-failure"]),
+        ("protocol-tests",["python3",str(HERE/"test_protocol.py")])]
+    records=[]
+    for name,command in commands:
+        start=time.monotonic()
+        with (OUTPUT/(name+".log")).open("w") as log:
+            result=subprocess.run(command,env=env,stdout=log,stderr=subprocess.STDOUT)
+        records.append({"name":name,"command":command,"seconds":time.monotonic()-start,
+            "returncode":result.returncode,"compiler_work":env["TMPDIR"]})
+        write(OUTPUT/"build_commands.json",records)
+        assert result.returncode==0,(name,result.returncode)
+    protect()
+    shutil.copyfile(TOOL/"harness/Testing/Temporary/LastTest.log",OUTPUT/"native-fixtures-detail.log")
+    write(OUTPUT/"build_artifacts.json",{
+        "binary_sha256":sha(TOOL/"harness/postfilter-bench"),
+        "native_tests_sha256":sha(TOOL/"harness/native-tests"),
+        "libraries":{str(p):sha(p) for p in (TOOL/"source/Release").glob("*.a")}})
+    write(OUTPUT/"source_tree_manifest.json",{
+        str(p):sha(p) for p in (TOOL/"source").rglob("*")
+        if p.is_file() and "__pycache__" not in p.parts})
+    write(OUTPUT/"compiler_metadata_manifest.json",{
+        str(p):sha(p) for root in (TOOL/"build",TOOL/"harness")
+        for p in root.rglob("*") if p.is_file() and p.name in
+        ("CMakeCache.txt","flags.make","link.txt","DependInfo.cmake")})
+if __name__=="__main__":main()

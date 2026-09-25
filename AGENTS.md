@@ -98,17 +98,101 @@ python setup.py build_ext --inplace
   - `AnnService/inc/Core/Common/Dataset.h`
 
 ## Unified Spatial Query Pipeline (DO NOT REGRESS)
-Current attribute SPANN uses one global spatial H1..H5 hierarchy. Attribute
+Current attribute SPANN navigates the native H1 graph with result-only
+post-filtering. Spatial H2..H5 catalogs and signed CSR are auxiliary posting
+data, not independently searched upper ANN graphs. Attribute
 pivot planning, per-tag head selection, grouping files and tag-to-bundle routing
 are removed; removed INI/environment interfaces fail explicitly. Do not restore
-them. Filtered and unfiltered requests use the same graph nodes, distance
-calculations, beams, max-check limits, posting target, and cross-edge policy.
-Tags may select an H/O posting region and admit exact results, but they must not
-select a graph, prune graph traversal, widen a budget, trigger a retry, or invoke
-a direct/exhaustive posting path. Sparse predicates may return fewer than top-k.
+them. Nonmatching ordinary nodes remain navigable; predicates admit matching
+H1 results and exact final records without an additional own-result heap.
+`[SearchSSDIndex] EnablePostingNavigation=false` is the library default.
+When enabled, run the original native H1 result-only post-filter graph to
+normal completion first, without any auxiliary calls inside graph expansion.
+The same four-byte visited/match workspace survives into supplementation.
+Count actual valid H1 results C against the configured head-result capacity
+(nprobe, not final top10). If C is sufficient, perform no posting-owner,
+upper-signature, representative or CSR work. Otherwise at most one query-level
+supplement phase may fill the missing slots, without evicting original heads.
+`PostingAnchorCount=8` (positive) bounds nearest actually scored H1 anchors,
+including negatives and tree candidates promoted to native navigation.
+Reuse their distances; do not scan the visited directory or re-score anchors.
+Merge/dedup stored owners across anchors. All discovered signature-admitted
+H2+ postings share one query-to-representative-distance priority frontier.
+Each selected posting exposes its owners once; complete upper rows register
+children in that same frontier rather than eagerly draining lower levels.
+Rejected anchor-owner entries and explicitly promoted owners may expose their
+owners once to reach matching siblings, without scoring their representatives
+or reading their CSR. A rejected child discovered by descending a selected
+upper row is cached but does not expose its other owners. This prevents
+negative-child fanout from turning pruning into eager upward exploration.
+A cached rejection must still permit later entry/owner promotion; signature
+caching must not suppress that recovery. Pending admitted children remain
+reachable; every selected CSR row completes before checking the budget.
+Filling the missing-slot heap is not a stopping condition: continue replacing
+worse supplementary heads until frontier convergence, checked-leaf budget, or
+reachable-posting exhaustion. BKT supplies the native navigation-pool width
+`max(effective MaxCheck / 16, head-result capacity)` only on activation.
+Reuse `COMMON::DistPriorityQueue` for discovered signature-admitted H2 row
+representatives; H3+ nodes participate in expansion priority but cannot consume
+H2 convergence slots. Stop when the nearest pending representative is worse
+than that pool. This ANN convergence heuristic works even with underfilled results;
+it is not proof that unseen posting members cannot be closer. Never describe
+representative distance as a certified member lower bound. Original H1 heads
+remain protected, and no new INI knob or full-catalog query allocation is added.
+`PostingAdditionalMaxCheck=0` is the nonnegative default. Original graph
+MaxCheck is unchanged; only supplementation can spend unused budget plus the
+explicit extra. Zero extra with an exhausted graph budget means no supplement.
+After graph completion, fresh auxiliary predicate negatives are cached as
+terminal visits and skipped without vector prefetch, distance or checked-leaf
+cost. A rejected collapsed representative still checks its aliases; its shared
+vector is scored once only if a live matching alias needs admission. Ordinary
+H1 graph negatives remain genuinely scored navigation bridges. Do not resume
+graph traversal after terminal rejection visits or enqueue supplementary
+members into its unused frontier. Matching fresh members retain native
+distance/checked-leaf accounting; complete-row budget overshoot is unchanged.
+Native result admission, aliases and liveness determine filled missing slots;
+fresh may-matches alone do not. The temporary missing-slot container is a
+bounded H1 candidate container, never a supplementary own-record heap.
+`PostingMinCandidates` is retired and rejected with a migration error.
+The old row-percentage, fresh-floor and cumulative-density policies exist
+only in archived experiments. No rate threshold or recall controller is added.
+Keep posting state query-touched; no catalog clear, second ANN search,
+whole-index predicate cache or eager own/liveness/alias qualification.
 Keep exact categorical/numeric filtering, support assignments, H/O regions and
-signed spatial CSR. Persisted signatures in legacy artifacts are compatibility
-metadata only and must not affect traversal.
+native final VID/liveness/dedup handling. Upper query state is proportional to
+touched IDs, not total catalog size; no full-layer allocation, clear or scan
+belongs in a query. Signature may-match is not exact predicate truth.
+Unfiltered queries retain native navigation.
+
+Ordinary unfiltered BKT search retains the pinned upstream adaptive stop:
+the distance pool stays `max(MaxCheck / 16, resultNum)`, pivots/refills are
+unclipped, and the checked-leaf budget is tested on a live popped candidate
+worse than the result boundary. Nominal MaxCheck overshoot is intentional.
+Nonempty result/metadata predicates separately retain a hard graph checked-leaf
+cap and bounded tree calls, including when results remain underfilled.
+`SearchTrees` processes the popped leaf before checking its limit; filtered
+callers must not call it with an already-exhausted budget. Do not discard a
+popped leaf or expand internal cells past that post-leaf stopping point.
+Query-sized workspace initialization is a separate retained project optimization.
+
+Numeric/DNF H1 admission uses authenticated region signatures in both baseline
+and auxiliary modes; pure numeric and unanchored OR still select O. Own values
+are merged once, not qualified per visit. Upper H/O unions are shared and built
+only at load/build/explicit metadata refresh. No duplicate H1 numeric mask array
+or query-time catalog scan is allowed. Missing/stale domains are logged and
+treated as conservative unknown. Keep wrapper and native metadata refresh
+lifecycle paths consistent.
+
+Implementation belongs only in main `AnnService`, including
+`Common/NavigationVisited.h`, `Common/PostingNavigation.h` and
+`SPANN/PostingNavigation.h`. Benchmark clients link the main native library;
+do not restore the retired generated-core prototype or its hook framework.
+New builds persist H1 navigation and upper vector/CSR/signature catalogs.
+Temporary native upper ANN indexes remain only for the unchanged construction
+assignment algorithm; never save, load or query them as runtime navigation.
+Legacy upper directories may supply vectors without loading their graph/tree.
+Graphless-H1 layouts require explicit migration to a new output directory,
+not an implicit rebuild or fallback to old upper ANN search.
 
 | Layer | What it builds | How to enable | Code |
 | ----- | -------------- | ------------- | ---- |
@@ -126,6 +210,20 @@ pruning; their construction settings cannot be used as search overlays.
 `SPTAG_OPQ_PREFILTER`, `SPTAG_PAGE_SELECT`, `SPTAG_PAGE_DIAG`,
 `SPTAG_DNF_NODROP`, and `SPTAG_RBQ_EXHAUSTIVE` are rejected on presence.
 No predicate diagnostic may trigger a whole-posting-store scan during search.
+
+### Fixed SIFT1B comparison configuration
+
+Use `Tools/benchmarks/run_sift1b_official.py` and the repository-owned
+`Tools/benchmarks/configs/sift1b_official/benchmark.ini` for PipeANN/SPANN
+comparisons. Native search INIs, filter JSON and the read-only CMake profile
+are checked in beside it. Launchers may copy them unchanged for provenance;
+they must not render temporary configurations, invent parameters, or use
+data/search environment overrides. Unfiltered PipeANN requires its matching
+1% memory-entry index and `mem_L=10`; missing prerequisites fail instead of
+silently using zero. Filtered PipeANN retains its documented auto/mem_L=0.
+Pure query benchmarking requires READ_ONLY_TESTS and NO_MAPPING, and must
+not conflate one query thread with whole-process single-CPU confinement.
+Keep historical results and index bytes unchanged.
 
 ### Billion-scale build options (resume / pin-balance / in-place)
 
@@ -244,23 +342,25 @@ How the `.ini` maps to the engine (`Wrappers/src/SpannAttrBuilder.cpp` `-c` read
   saved-index audits report beyond-cut H, not an inferred rescue count.
   The independent
   `LimitedTagMaxExpandedPostingPages` option is removed and rejected.
-  Hierarchy query navigation is exactly one distance-only top-graph search
-  followed by fixed-beam signed CSR descent. `HierarchyInitialProbeRatio` is
-  the one-pass beam fraction and `HierarchyMaxCheck` is a fixed shared budget;
-  neither depends on predicates or underfill. Every reached H1 child is
-  distance-scored before membership admission. There is no saved-frontier
-  widening, signature admission/pruning, second pass, graph restart, or
-  whole-layer scan. `HeadNavigationMode`,
-  `HierarchyGraphSignaturePruning`, `HierarchyRouteSelectivityThreshold` and
-  their legacy aliases are removed and rejected. An enabled hierarchy is used
-  for sparse, dense, numeric-only and unfiltered requests alike; a disabled
-  hierarchy retains native H1. Migrate retired keys only in a writable clone;
+  Hierarchy levels now describe posting catalogs, not a top-graph query path.
+  H1 result-only post-filter is the query baseline; the optional native
+  `EnablePostingNavigation` extension uses signed CSR neighbors in that same
+  frontier. `BuildH1Graph`, `CompactHierarchyVectors`,
+  `HierarchyInitialProbeRatio`, `HierarchyMaxCheck`, `HierarchyPrefetchMode`
+  and obsolete upper routing/beam/dedup controls are rejected by fresh setters.
+  `HeadNavigationMode`, `HierarchyGraphSignaturePruning`,
+  `HierarchyRouteSelectivityThreshold` and their retired aliases must not
+  restore an alternative query algorithm. Required saved layout/provenance
+  metadata is decoded explicitly with warnings. Native H1 `MaxCheck` retains
+  its checked-work meaning, not a bound on all upper references or complete
+  auxiliary CSR rows. Migrate old graphless layouts only into a writable clone;
   never rewrite historical index artifacts.
   Direct tag-to-H1 completion,
   its early-widening stop callback, and `SparseFallbackMaxHeads`/
   `SparseFallbackMaxPostingPages` are removed and rejected (even explicit zero).
-  Only visited H1 children may contribute own points, including empty-posting
-  heads. Budget-limited queries can return fewer matches; never repair this
+  Only native selected H1 heads may contribute their own records, including
+  matching empty-posting heads; no supplementary own heap is added.
+  Budget-limited queries can return fewer matches; never repair this
   with a global support-head scan. TagHeads remains for construction,
   maintenance and audit. `LimitedTagMaxExtraSupports` is removed/rejected,
   including saved INIs (remove only in a writable clone). Expansion state grows
@@ -287,7 +387,31 @@ comments are NOT stripped, so a value line must contain only the value; sections
 and keys are lowercased (case-insensitive). An explicit CLI flag still overrides
 any ini value (later `SetSSDBuildParam` push wins).
 
+## Compact storage reconstruction
+
+Explicit-schema head metadata uses authenticated V9 records with one index-owned
+layout descriptor. Store only declared own columns, categorical lanes and numeric
+lanes; H/O remain distinct. Access packed own/column blocks through typed views,
+never fixed five-column POD pointers. V8 without an explicit schema retains its
+legacy layout; V8 with an authenticated explicit schema converts with a bounded
+4096-record input chunk. Schema, widths, region flags, numeric domain, generation
+and payload are covered by authentication. Do not reinterpret a mismatched schema.
+
+Canonical upper vector catalogs store direct uint32 H1 physical IDs and retain
+the existing full H1 vector owner. Validate exact representative bytes and mapping
+bounds; do not follow an inter-layer mapping chain during a distance evaluation.
+CSR memberships, owners, H1 graph and SSD records are unchanged. Distinct support
+and H/O signatures cannot be assumed equivalent: sharing requires an exact
+whole-layer comparison at build/refresh, with owned capacity actually released.
+
+`compactspannindex SOURCE_TENANT NEW_TENANT` reconstructs into a new directory,
+authenticates V8/V9 metadata and canonical vectors, and references immutable
+geometry/payload files. It never selects heads or rebuilds the SSD index.
+SIFT1M acceptance is required before any incremental 1B writes. Storage changes
+must not alter the post-graph search policy or native INI budget settings.
+
 ## Billion-scale derived inputs — pure-C++ prep (no Python, no generic quantizer)
+
 The attribute SPANN build needs three derived sidecars that are NOT in the repo
 (too large). Generate them in **C++** via `spannbuilder` subcommands — mirroring
 `AnnService/src/Quantizer/main.cpp` — so they match the in-posting convention the

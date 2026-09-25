@@ -1,0 +1,53 @@
+{
+  "index": "/mnt/nvme/baotonglu/mocheng/datasets/sift1m_zipf200_sparse193_numeric/toolchains/matched_baseline_20260917/buffered_view",
+  "io": "buffered",
+  "warmup": 1000,
+  "queries": 1000,
+  "measure_offset": 0,
+  "topk": 10,
+  "MaxCheck": 2048,
+  "HierarchyMaxCheck": 512,
+  "HierarchyInitialProbeRatio": 0.666666,
+  "pages": 15,
+  "query_threads": 1,
+  "numa_cpu_node": 2,
+  "numa_memory_node": 2,
+  "grid": [
+    16,
+    24,
+    32,
+    48,
+    62,
+    80,
+    96,
+    128,
+    192,
+    256,
+    384
+  ],
+  "repetitions": 2,
+  "sweep_execution": "single_load_nprobe_array",
+  "nprobe_ini_api": "SearchSweep.NProbe",
+  "cases": [
+    "h1_original",
+    "h1",
+    "h3",
+    "supplier"
+  ],
+  "stages": {
+    "unfilter_broad": [
+      "unfilter",
+      "broad_tag"
+    ],
+    "medium_extreme": [
+      "medium_tag",
+      "extreme_tag"
+    ],
+    "numeric_mixed": [
+      "numeric",
+      "mixed_dnf"
+    ]
+  },
+  "supplier_retained_ratio": 0.5,
+  "supplier_minimum_degree": 16
+}

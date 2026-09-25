@@ -1,0 +1,958 @@
+#include "inc/CoreInterface.h"
+#include "inc/Core/VectorIndex.h"
+#include "inc/Helper/SimpleIniReader.h"
+#include "inc/Core/Common/WorkSpace.h"
+#include "NativeNProbeSweep.h"
+#ifdef MATCHED_CURRENT
+#include <FullHooks.h>
+#endif
+#include <array>
+#include <iomanip>
+#include <map>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <regex>
+#include <sstream>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+using namespace SPTAG;
+extern char** environ;
+
+namespace {
+
+struct Options
+{
+    std::string caseName, scenarioName, configFile;
+    std::vector<int> probes;
+    std::string indexDir;
+    std::string queryFile;
+    std::string truthFile;
+    std::string truthDir;
+    std::string queryTagsFile;
+    std::string queryDNFFile;
+    std::string searchIni;
+    std::vector<std::string> searchSweepInis;
+    std::string valueType = "Float";
+    int tagColumn = -1;
+    int orTagCount = 0;
+    std::vector<int> dnfAndColumns;
+    int tenant = 0;
+    int topk = 10;
+    std::size_t warmup = 200;
+    std::size_t maxQueries = 0;
+    std::size_t measureOffset = 0;
+    bool directSearch = false;
+    bool allAclLevels = false;
+};
+
+struct NpyHeader
+{
+    std::string descr;
+    std::vector<std::size_t> shape;
+    std::size_t dataOffset = 0;
+};
+
+struct TruthMatrix
+{
+    std::vector<std::int64_t> values;
+    std::size_t rows = 0;
+    std::size_t cols = 0;
+};
+
+void Usage(const char* p_program)
+{
+    std::cerr << "Usage: " << p_program
+              << " --index <index-dir> --queries <query.npy>"
+              << " (--truth <truth.npy> | --truth-dir <directory>)"
+              << " [--query-tags <tags.npy> --tag-column <0..N-1>]"
+              << " [--query-tags <tags.npy> --or-tag-count <N>]"
+              << " [--dnf-and-cols <col[,col...]>]"
+              << " [--query-dnf <length-prefixed-dnf3.npy>]"
+              << " [--search-ini <native-search.ini>]"
+              << " [--search-sweep-ini <native-search.ini>]..."
+              << " [--value-type Float|UInt8]"
+              << " [--direct-search] [--tenant 0] [--topk 10]"
+              << " [--warmup 200] [--measure-offset 0] [--max-queries N]"
+              << " [--all-acl-levels]\n";
+}
+
+bool ParseSize(const char* p_text, std::size_t& p_value)
+{
+    if (p_text == nullptr || *p_text == '\0') return false;
+    char* end = nullptr;
+    const unsigned long long value = std::strtoull(p_text, &end, 10);
+    if (end == p_text || *end != '\0' ||
+        value > static_cast<unsigned long long>((std::numeric_limits<std::size_t>::max)())) {
+        return false;
+    }
+    p_value = static_cast<std::size_t>(value);
+    return true;
+}
+
+bool ParseInt(const char* p_text, int& p_value)
+{
+    std::size_t value = 0;
+    if (!ParseSize(p_text, value) ||
+        value > static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
+        return false;
+    }
+    p_value = static_cast<int>(value);
+    return true;
+}
+
+bool ParseColumnList(const char* p_text, std::vector<int>& p_columns)
+{
+    if (p_text == nullptr || *p_text == '\0') return false;
+    p_columns.clear();
+    std::stringstream input(p_text);
+    std::string token;
+    while (std::getline(input, token, ',')) {
+        char* end = nullptr;
+        const long value = std::strtol(token.c_str(), &end, 10);
+        if (end == token.c_str() || *end != '\0' || value < 0 ||
+            value > static_cast<long>((std::numeric_limits<int>::max)())) {
+            return false;
+        }
+        if (std::find(p_columns.begin(), p_columns.end(), static_cast<int>(value)) != p_columns.end()) {
+            return false;
+        }
+        p_columns.push_back(static_cast<int>(value));
+    }
+    return !p_columns.empty();
+}
+
+bool ParseArgs(int p_argc, char** p_argv, Options& p_options)
+{
+    for (int i = 1; i < p_argc; ++i) {
+        const char* arg = p_argv[i];
+        if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
+            Usage(p_argv[0]);
+            std::exit(0);
+        }
+        if (std::strcmp(arg, "--direct-search") == 0) {
+            p_options.directSearch = true;
+            continue;
+        }
+        if (std::strcmp(arg, "--all-acl-levels") == 0) {
+            p_options.allAclLevels = true;
+            continue;
+        }
+        if (i + 1 >= p_argc) return false;
+        const char* value = p_argv[++i];
+        if (std::strcmp(arg, "--index") == 0) {
+            p_options.indexDir = value;
+        } else if (std::strcmp(arg, "--queries") == 0) {
+            p_options.queryFile = value;
+        } else if (std::strcmp(arg, "--truth") == 0) {
+            p_options.truthFile = value;
+        } else if (std::strcmp(arg, "--truth-dir") == 0) {
+            p_options.truthDir = value;
+        } else if (std::strcmp(arg, "--query-tags") == 0) {
+            p_options.queryTagsFile = value;
+        } else if (std::strcmp(arg, "--query-dnf") == 0) {
+            p_options.queryDNFFile = value;
+        } else if (std::strcmp(arg, "--search-ini") == 0) {
+            p_options.searchIni = value;
+        } else if (std::strcmp(arg, "--search-sweep-ini") == 0) {
+            p_options.searchSweepInis.emplace_back(value);
+        } else if (std::strcmp(arg, "--value-type") == 0) {
+            p_options.valueType = value;
+        } else if (std::strcmp(arg, "--tag-column") == 0) {
+            if (!ParseInt(value, p_options.tagColumn)) return false;
+        } else if (std::strcmp(arg, "--or-tag-count") == 0) {
+            if (!ParseInt(value, p_options.orTagCount) ||
+                p_options.orTagCount <= 0) {
+                return false;
+            }
+        } else if (std::strcmp(arg, "--dnf-and-cols") == 0) {
+            if (!ParseColumnList(value, p_options.dnfAndColumns)) return false;
+        } else if (std::strcmp(arg, "--tenant") == 0) {
+            if (!ParseInt(value, p_options.tenant)) return false;
+        } else if (std::strcmp(arg, "--topk") == 0) {
+            if (!ParseInt(value, p_options.topk) || p_options.topk <= 0) return false;
+        } else if (std::strcmp(arg, "--warmup") == 0) {
+            if (!ParseSize(value, p_options.warmup)) return false;
+        } else if (std::strcmp(arg, "--max-queries") == 0) {
+            if (!ParseSize(value, p_options.maxQueries)) return false;
+        } else if (std::strcmp(arg, "--measure-offset") == 0) {
+            if (!ParseSize(value, p_options.measureOffset)) return false;
+        } else {
+            return false;
+        }
+    }
+    const bool hasSingleTruth = !p_options.truthFile.empty() && p_options.truthDir.empty();
+    const bool hasAllLevelTruth = p_options.truthFile.empty() && !p_options.truthDir.empty();
+    const bool basicOptions = (p_options.valueType == "Float" || p_options.valueType == "UInt8") &&
+        !p_options.indexDir.empty() && !p_options.queryFile.empty() &&
+        (p_options.allAclLevels ? hasAllLevelTruth : hasSingleTruth);
+    const int filterModes =
+        (p_options.tagColumn >= 0 ? 1 : 0) +
+        (p_options.orTagCount > 0 ? 1 : 0) +
+        (!p_options.dnfAndColumns.empty() ? 1 : 0) +
+        (!p_options.queryDNFFile.empty() ? 1 : 0);
+    if (!basicOptions || filterModes > 1) {
+        return false;
+    }
+    if (p_options.allAclLevels) {
+        return !p_options.directSearch && p_options.tagColumn < 0 &&
+            p_options.orTagCount == 0 &&
+            p_options.dnfAndColumns.empty() &&
+            p_options.queryDNFFile.empty() &&
+            !p_options.queryTagsFile.empty();
+    }
+    const bool validFilterInput =
+        (filterModes == 0 &&
+         p_options.queryTagsFile.empty() &&
+         p_options.queryDNFFile.empty()) ||
+        (filterModes == 1 &&
+         ((!p_options.queryDNFFile.empty() &&
+           p_options.queryTagsFile.empty()) ||
+          (p_options.queryDNFFile.empty() &&
+           !p_options.queryTagsFile.empty())));
+    return validFilterInput &&
+        (!p_options.directSearch ||
+         filterModes == 0);
+}
+
+bool ReadNpyHeader(std::ifstream& p_input, NpyHeader& p_header)
+{
+    char magic[6] = {};
+    std::uint8_t major = 0;
+    std::uint8_t minor = 0;
+    if (!p_input.read(magic, sizeof(magic)) || !p_input.read(reinterpret_cast<char*>(&major), 1) ||
+        !p_input.read(reinterpret_cast<char*>(&minor), 1) ||
+        std::memcmp(magic, "\x93NUMPY", sizeof(magic)) != 0) {
+        return false;
+    }
+
+    std::uint32_t headerLength = 0;
+    if (major == 1) {
+        std::uint16_t length16 = 0;
+        if (!p_input.read(reinterpret_cast<char*>(&length16), sizeof(length16))) return false;
+        headerLength = length16;
+    } else if (major == 2 || major == 3) {
+        if (!p_input.read(reinterpret_cast<char*>(&headerLength), sizeof(headerLength))) return false;
+    } else {
+        return false;
+    }
+
+    std::string header(headerLength, '\0');
+    if (!p_input.read(header.data(), static_cast<std::streamsize>(header.size()))) return false;
+    const std::regex descrPattern("'descr':\\s*'([^']+)'");
+    const std::regex shapePattern("'shape':\\s*\\(([^)]*)\\)");
+    std::smatch match;
+    if (!std::regex_search(header, match, descrPattern)) return false;
+    p_header.descr = match[1].str();
+    if (!std::regex_search(header, match, shapePattern)) return false;
+
+    std::stringstream shapeStream(match[1].str());
+    std::string token;
+    while (std::getline(shapeStream, token, ',')) {
+        std::stringstream valueStream(token);
+        std::size_t value = 0;
+        if (valueStream >> value) p_header.shape.push_back(value);
+    }
+    p_header.dataOffset = static_cast<std::size_t>(p_input.tellg());
+    return !p_header.shape.empty();
+}
+
+template <typename T>
+bool ReadNpyMatrix(const std::string& p_path, const std::string& p_expectedDescr,
+                   std::vector<T>& p_values, std::size_t& p_rows, std::size_t& p_cols)
+{
+    std::ifstream input(p_path, std::ios::binary);
+    NpyHeader header;
+    if (!input || !ReadNpyHeader(input, header) || header.descr != p_expectedDescr ||
+        header.shape.size() != 2 || header.shape[0] == 0 || header.shape[1] == 0) {
+        return false;
+    }
+    p_rows = header.shape[0];
+    p_cols = header.shape[1];
+    if (p_rows > (std::numeric_limits<std::size_t>::max)() / p_cols ||
+        p_rows * p_cols > (std::numeric_limits<std::size_t>::max)() / sizeof(T)) {
+        return false;
+    }
+    p_values.resize(p_rows * p_cols);
+    return static_cast<bool>(input.read(
+        reinterpret_cast<char*>(p_values.data()),
+        static_cast<std::streamsize>(p_values.size() * sizeof(T))));
+}
+
+std::size_t RecallHits(const std::vector<std::int64_t>& p_truth, std::size_t p_truthCols,
+                       const std::vector<std::int32_t>& p_results, std::size_t p_truthOffset,
+                       std::size_t p_queryCount, int p_topk)
+{
+    std::size_t hits = 0;
+    for (std::size_t query = 0; query < p_queryCount; ++query) {
+        std::unordered_set<std::int64_t> expected;
+        const auto* truth = p_truth.data() + (p_truthOffset + query) * p_truthCols;
+        for (std::size_t i = 0; i < p_truthCols && expected.size() < static_cast<std::size_t>(p_topk); ++i) {
+            if (truth[i] >= 0) expected.insert(truth[i]);
+        }
+        std::unordered_set<std::int32_t> seen;
+        const auto* result = p_results.data() + query * static_cast<std::size_t>(p_topk);
+        for (int i = 0; i < p_topk; ++i) {
+            if (result[i] >= 0 && seen.insert(result[i]).second &&
+                expected.count(result[i]) != 0) {
+                ++hits;
+            }
+        }
+    }
+    return hits;
+}
+
+bool ApplySearchIni(TenantIndexManager& p_manager, const std::string& p_path)
+{
+    Helper::IniReader searchIni;
+    if (searchIni.LoadIniFile(p_path) != ErrorCode::Success ||
+        !searchIni.DoesSectionExist("SearchSSDIndex")) {
+        std::cerr << "Invalid native [SearchSSDIndex] INI: " << p_path << "\n";
+        return false;
+    }
+    const auto& parameters = searchIni.GetParameters("SearchSSDIndex");
+    if (parameters.empty()) {
+        std::cerr << "Empty native [SearchSSDIndex] INI: " << p_path << "\n";
+        return false;
+    }
+    for (const auto& parameter : parameters) {
+        if (parameter.first=="visitedmatchmode" || parameter.first=="postingneighbormatchratio") continue;
+        p_manager.SetSearchParam(
+            parameter.first.c_str(), parameter.second.c_str(), "SearchSSDIndex");
+    }
+    return true;
+}
+
+Options ReadProtocol(const char* path)
+{
+    Helper::IniReader ini;
+    if (ini.LoadIniFile(path) != ErrorCode::Success ||
+        !ini.DoesSectionExist("Benchmark") || !ini.DoesSectionExist("SearchSSDIndex") ||
+        !ini.DoesSectionExist("SearchSweep"))
+        throw std::runtime_error("Missing native matched protocol sections");
+    const auto get = [&](const char* key) {
+        if (!ini.DoesParameterExist("Benchmark", key))
+            throw std::runtime_error(std::string("Missing Benchmark.") + key);
+        return ini.GetParameter<std::string>("Benchmark", key, "");
+    };
+    Options out;
+    out.configFile = out.searchIni = path;
+    out.indexDir = get("Index");
+    out.queryFile = get("Queries");
+    out.truthFile = get("Truth");
+    out.caseName = get("Case");
+    out.scenarioName = get("Scenario");
+    const auto diagnostic = ini.GetParameter<std::string>("Benchmark", "DiagnosticOnly", "false");
+    if (diagnostic != "true" && diagnostic != "false")
+        throw std::runtime_error("Invalid DiagnosticOnly");
+    const std::string count = diagnostic == "true" ? "32" : "1000";
+    if (get("Warmup") != count || get("MaxQueries") != count ||
+        get("MeasureOffset") != "0" || get("NumaNode") != "2" || get("IO") != "buffered")
+        throw std::runtime_error("Wrong matched benchmark protocol");
+    out.warmup = out.maxQueries = diagnostic == "true" ? 32 : 1000;
+    out.measureOffset = 0;
+    const auto kind = get("Predicate");
+    if (kind == "categorical") {
+        out.queryTagsFile = get("PredicateFile");
+        out.tagColumn = 0;
+    } else if (kind == "dnf") out.queryDNFFile = get("PredicateFile");
+    else if (kind != "empty") throw std::runtime_error("Unsupported predicate format");
+    const auto& params = ini.GetParameters("SearchSSDIndex");
+    const std::set<std::string> allowedSearch{
+        "isexecute","buildssdindex","internalresultnum","numberofthreads","hashtableexponent",
+        "resultnum","maxcheck","hierarchyinitialproberatio","hierarchymaxcheck",
+        "hierarchygraphsignaturepruning","maxdistratio","searchpostingpagelimit",
+        "disablecrossedges","enableunfiltertail","unfilterpurepages","unfilterextratailpages",
+        "headnavigationmode","logphasetime","logpathstats","dumpheads",
+        "enablehybriddistance","enableadaptivefilterednprobe",
+        "visitedmatchmode","postingneighbormatchratio"};
+    for (const auto& p:params)
+        if (!allowedSearch.count(p.first)) throw std::runtime_error("Unknown native search parameter: "+p.first);
+    for (const auto& expected : std::map<std::string, std::string>{
+        {"resultnum", "10"}, {"numberofthreads", "1"}, {"maxcheck", "2048"},
+        {"hierarchymaxcheck", "512"}, {"hierarchyinitialproberatio", "0.666666"},
+        {"searchpostingpagelimit", "15"}}) {
+        if (!params.count(expected.first) || params.at(expected.first) != expected.second)
+            throw std::runtime_error("Wrong native matched setting: " + expected.first);
+    }
+    for (const auto& key : {"dumpheads", "logphasetime", "logpathstats"}) {
+        const std::string actual = key;
+        if (!params.count(actual) || params.at(actual) != (actual == "dumpheads" ? "0" : "false"))
+            throw std::runtime_error("Query profiling/logging must be off");
+    }
+    out.probes = NativeNProbeSweep::Parse(ini.GetParameter<std::string>("SearchSweep", "NProbe", ""), 10);
+    if (out.probes!=std::vector<int>{24}) throw std::runtime_error("Bounded experiment requires NProbe=[24]");
+    if (ini.GetParameters("SearchSweep").size() != 1)
+        throw std::runtime_error("SearchSweep supports only NProbe");
+#ifdef MATCHED_CURRENT
+    ShortcutFull::Configure(params);
+    if (ShortcutFull::profile || ShortcutFull::capture ||
+        out.caseName != "visited_"+ShortcutFull::mode+"_ratio_"+params.at("postingneighbormatchratio"))
+        throw std::runtime_error("Wrong ordinary supplier configuration");
+#else
+    if (out.caseName != "h1_original")
+        throw std::runtime_error("Original core supports h1_original case only");
+    for (const auto& p : params)
+        if (p.first.rfind("shortcut", 0) == 0)
+            throw std::runtime_error("Supplier controls passed to original core");
+#endif
+    if (params.at("headnavigationmode") != (out.caseName == "h3" ? "H2Only" : "H1Only"))
+        throw std::runtime_error("Wrong native hierarchy route");
+    return out;
+}
+
+using Work = std::array<std::uint64_t, 8>;
+template<class Stats>
+Work QueryWork(const Stats& s, int scanned)
+{
+    return {s.m_readPostings, s.m_scannedVectors, s.m_matchedVectors,
+            s.m_dedupSkippedVectors, static_cast<std::uint64_t>((std::max)(scanned, 0)),
+            s.m_postingPageReads, s.m_postingLogicalBytes, s.m_postingPhysicalBytes};
+}
+
+} // namespace
+
+int Run(int argc, char** argv)
+{
+    for (char** p=environ;*p;++p) {
+        const std::string text=*p,key=text.substr(0,text.find('='));
+        if (key.rfind("SPTAG_",0)==0 || key.rfind("SPANN_",0)==0 ||
+            key.rfind("SHORTCUT_",0)==0 || key.rfind("NAVIX_",0)==0 ||
+            key=="LD_PRELOAD" || key=="OMP_NUM_THREADS" || key=="OMP_PROC_BIND" || key=="OMP_PLACES")
+            throw std::runtime_error("Forbidden native environment override: "+key);
+    }
+    if (argc != 3 || std::string(argv[1]) != "--config")
+        throw std::runtime_error("Usage: matchedbench --config native.ini");
+    Options options = ReadProtocol(argv[2]);
+    std::cout << std::setprecision(12);
+
+    std::vector<float> queries;
+    std::vector<std::uint32_t> queryTags;
+    std::vector<std::uint32_t> queryDNF;
+    std::size_t queryCount = 0, dimension = 0;
+    std::size_t tagCount = 0, tagCols = 0;
+    std::size_t dnfCount = 0, dnfCols = 0;
+    const bool requiresQueryTags =
+        options.allAclLevels || options.tagColumn >= 0 ||
+        options.orTagCount > 0 ||
+        !options.dnfAndColumns.empty();
+    if (!ReadNpyMatrix(options.queryFile, "<f4", queries, queryCount, dimension) ||
+        (requiresQueryTags &&
+         (!ReadNpyMatrix(options.queryTagsFile, "<u4", queryTags, tagCount, tagCols) ||
+          tagCount != queryCount ||
+          (options.allAclLevels && tagCols < 4) ||
+          (options.tagColumn >= 0 && static_cast<std::size_t>(options.tagColumn) >= tagCols) ||
+          (options.orTagCount > 0 &&
+           static_cast<std::size_t>(options.orTagCount) > tagCols) ||
+          std::any_of(options.dnfAndColumns.begin(), options.dnfAndColumns.end(),
+                      [tagCols](int column) { return static_cast<std::size_t>(column) >= tagCols; })))) {
+        std::cerr << "Invalid query, truth, or tag npy input\n";
+        return 1;
+    }
+    if (!options.queryDNFFile.empty()) {
+        constexpr std::uint32_t kDNF3Magic =
+            0x444E4633U;
+        if (!ReadNpyMatrix(
+                options.queryDNFFile, "<u4",
+                queryDNF, dnfCount, dnfCols) ||
+            dnfCount != queryCount ||
+            dnfCols < 2) {
+            std::cerr << "Invalid per-query DNF input\n";
+            return 1;
+        }
+        for (std::size_t query = 0;
+             query < dnfCount; ++query) {
+            const std::uint32_t* row =
+                queryDNF.data() + query * dnfCols;
+            if (row[0] == 0 ||
+                row[0] >= dnfCols ||
+                row[1] != kDNF3Magic) {
+                std::cerr
+                    << "Invalid length-prefixed DNF3 row "
+                    << query << "\n";
+                return 1;
+            }
+        }
+    }
+
+    const char* allLevelNames[] = {"unfilter", "org", "dept", "team", "project"};
+    std::vector<TruthMatrix> truthMatrices;
+    truthMatrices.reserve(options.allAclLevels ? 5 : 1);
+    const auto loadTruth = [&](const std::string& p_path) {
+        truthMatrices.emplace_back();
+        TruthMatrix& matrix = truthMatrices.back();
+        if (!ReadNpyMatrix(p_path, "<i8", matrix.values, matrix.rows, matrix.cols) ||
+            matrix.rows != queryCount ||
+            matrix.cols < static_cast<std::size_t>(options.topk)) {
+            truthMatrices.pop_back();
+            return false;
+        }
+        return true;
+    };
+    if (options.allAclLevels) {
+        for (const char* level : allLevelNames) {
+            if (!loadTruth(
+                    options.truthDir + "/groundtruth_" + level + "_local_ids.npy")) {
+                std::cerr << "Invalid ground truth for " << level << "\n";
+                return 1;
+            }
+        }
+    } else if (!loadTruth(options.truthFile)) {
+        std::cerr << "Invalid ground truth input\n";
+        return 1;
+    }
+
+    if (options.measureOffset >= queryCount) {
+        std::cerr << "Measurement offset exceeds available queries\n";
+        return 1;
+    }
+    const std::size_t availableQueries = queryCount - options.measureOffset;
+    const std::size_t measuredQueries = options.maxQueries == 0
+        ? availableQueries
+        : (std::min)(options.maxQueries, availableQueries);
+    if (measuredQueries == 0) return 1;
+
+    std::vector<std::uint8_t> uint8Queries;
+    if (options.valueType == "UInt8") {
+        uint8Queries.reserve(queries.size());
+        for (float value : queries) {
+            if (!std::isfinite(value) || value < 0.0f || value > 255.0f ||
+                std::trunc(value) != value) {
+                std::cerr << "UInt8 query input contains a non-integral or out-of-range value\n";
+                return 1;
+            }
+            uint8Queries.push_back(static_cast<std::uint8_t>(value));
+        }
+    }
+
+    TenantIndexManager manager(
+        static_cast<DimensionType>(dimension), "SPANN", options.valueType.c_str());
+    if (!options.searchIni.empty() && !ApplySearchIni(manager, options.searchIni)) return 1;
+    const auto loadStart = std::chrono::steady_clock::now();
+    if (!manager.LoadAll(options.indexDir.c_str())) {
+        std::cerr << "LoadAll failed: " << options.indexDir << "\n";
+        return 1;
+    }
+    std::cout << "MATCHED_LOAD calls=1 seconds="
+              << std::chrono::duration<double>(std::chrono::steady_clock::now() - loadStart).count() << "\n";
+
+    struct Scenario
+    {
+        const char* level;
+        int tagColumn;
+        int orTagCount;
+        const std::vector<int>* dnfAndColumns;
+        bool queryDNF;
+        const TruthMatrix* truth;
+    };
+
+    std::vector<Scenario> scenarios;
+    if (options.allAclLevels) {
+        scenarios = {
+            {"unfilter", -1, 0, nullptr, false, &truthMatrices[0]},
+            {"org", 0, 0, nullptr, false, &truthMatrices[1]},
+            {"dept", 1, 0, nullptr, false, &truthMatrices[2]},
+            {"team", 2, 0, nullptr, false, &truthMatrices[3]},
+            {"project", 3, 0, nullptr, false, &truthMatrices[4]},
+        };
+    } else {
+        scenarios.push_back(
+            {!options.queryDNFFile.empty()
+                 ? "dnf"
+                 : options.orTagCount > 0
+                 ? "or"
+                 : (options.tagColumn < 0 ? "unfilter" : "custom"),
+             options.tagColumn,
+             options.orTagCount,
+             &options.dnfAndColumns,
+             !options.queryDNFFile.empty(),
+             &truthMatrices.front()});
+    }
+
+    const std::size_t warmup = (std::min)(options.warmup, queryCount);
+    std::size_t probePosition = 0;
+    for (int nprobe : options.probes) {
+        manager.SetSearchParam("InternalResultNum", std::to_string(nprobe).c_str(), "SearchSSDIndex");
+        COMMON::ThreadLocalWorkSpaceFactory<COMMON::WorkSpace>::m_workspace.reset();
+        const std::string& activeSearchIni = options.searchIni;
+        for (const Scenario& scenario : scenarios) {
+            auto search = [&](std::size_t p_queryIndex) {
+                const ByteArray queryBytes = options.valueType == "UInt8"
+                    ? ByteArray(
+                        uint8Queries.data() + p_queryIndex * dimension, dimension, false)
+                    : ByteArray(
+                        reinterpret_cast<std::uint8_t*>(queries.data() + p_queryIndex * dimension),
+                        dimension * sizeof(float), false);
+                if (options.directSearch) {
+                    return manager.Search(queryBytes, options.tenant, options.topk);
+                }
+                if (scenario.orTagCount > 0) {
+                    auto* tags = queryTags.data() +
+                        p_queryIndex * tagCols;
+                    const ByteArray tagBytes(
+                        reinterpret_cast<std::uint8_t*>(tags),
+                        static_cast<std::size_t>(
+                            scenario.orTagCount) *
+                            sizeof(std::uint32_t),
+                        false);
+                    return manager.SearchWithPredicate(
+                        queryBytes, options.tenant,
+                        options.topk, tagBytes,
+                        scenario.orTagCount);
+                }
+                if (scenario.queryDNF) {
+                    auto* row = queryDNF.data() +
+                        p_queryIndex * dnfCols;
+                    const ByteArray dnfBytes(
+                        reinterpret_cast<std::uint8_t*>(
+                            row + 1),
+                        static_cast<size_t>(row[0]) *
+                            sizeof(std::uint32_t),
+                        false);
+                    return manager.SearchWithPredicate(
+                        queryBytes, options.tenant,
+                        options.topk, dnfBytes, -1);
+                }
+                if (scenario.dnfAndColumns != nullptr && !scenario.dnfAndColumns->empty()) {
+                    constexpr std::uint32_t kDNF3Magic = 0x444E4633U;
+                    std::vector<std::uint32_t> dnf;
+                    dnf.reserve(3 + scenario.dnfAndColumns->size() * 4);
+                    dnf.push_back(kDNF3Magic);
+                    dnf.push_back(1); // one OR clause
+                    dnf.push_back(static_cast<std::uint32_t>(scenario.dnfAndColumns->size()));
+                    for (int column : *scenario.dnfAndColumns) {
+                        dnf.push_back(0); // categorical
+                        dnf.push_back(static_cast<std::uint32_t>(column));
+                        dnf.push_back(SPTAG::Cache::DNF_EQ);
+                        dnf.push_back(queryTags[
+                            p_queryIndex * tagCols + static_cast<std::size_t>(column)]);
+                    }
+                    const ByteArray dnfBytes(
+                        reinterpret_cast<std::uint8_t*>(dnf.data()),
+                        dnf.size() * sizeof(std::uint32_t),
+                        false);
+                    return manager.SearchWithPredicate(
+                        queryBytes, options.tenant, options.topk, dnfBytes, -1);
+                }
+                std::uint32_t predicate[] = {
+                    0x444E4633U, 1, 1, 0,
+                    static_cast<std::uint32_t>(scenario.tagColumn), SPTAG::Cache::DNF_EQ,
+                    scenario.tagColumn >= 0 ? queryTags[
+                        p_queryIndex * tagCols + static_cast<std::size_t>(scenario.tagColumn)] : 0};
+                const ByteArray tagBytes(
+                    reinterpret_cast<std::uint8_t*>(predicate),
+                    scenario.tagColumn >= 0 ? sizeof(predicate) : 0, false);
+                return manager.SearchWithPredicate(
+                    queryBytes,
+                    options.tenant,
+                    options.topk,
+                    tagBytes,
+                    scenario.tagColumn >= 0 ? -1 : 0);
+            };
+            const auto warmStart = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < warmup; ++i) {
+                search(i);
+            }
+            const double warmSeconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - warmStart).count();
+
+            // Ordinary capture-off queries, outside timing: only visited-backend events.
+            std::vector<std::array<std::uint64_t,11>> storageWork;
+#ifdef MATCHED_CURRENT
+            using Storage=COMMON::OptHashPosVector;
+            for (std::size_t i=0;i<measuredQueries;++i) {
+                Storage::StorageDiagnostics diagnostic;
+                Storage::Diagnostics()=&diagnostic;
+                const auto result=search(options.measureOffset+i);
+                Storage::Diagnostics()=nullptr;
+                auto& workspace=COMMON::ThreadLocalWorkSpaceFactory<COMMON::WorkSpace>::m_workspace;
+                if (!result || !workspace || diagnostic.allocations || diagnostic.conversions || !diagnostic.resets)
+                    throw std::runtime_error("Warmed ordinary visited storage allocated or converted");
+                const auto& table=workspace->nodeCheckStatus;
+                const auto& dedup=workspace->resultCheckStatus;
+                storageWork.push_back({diagnostic.allocations,diagnostic.conversions,diagnostic.allocatedBytes,
+                    diagnostic.resets,diagnostic.modeChanges,table.SlotBytes(),table.AllocatedBytes(),
+                    table.Capacity(),table.Occupied(),
+                    workspace->m_resultCheckInitialized?dedup.AllocatedBytes():0,dedup.SlotBytes()});
+            }
+            std::cout<<"STORAGE_PREFLIGHT queries="<<storageWork.size()
+                     <<" allocations=0 conversions=0 capture=off timing=off\n";
+#endif
+
+            std::vector<std::int32_t> resultIds(
+                measuredQueries * static_cast<std::size_t>(options.topk), -1);
+            std::vector<float> resultDistances(resultIds.size(), MaxDist);
+            std::vector<Work> queryWork(measuredQueries);
+            std::size_t failed = 0;
+            std::uint64_t readPostings = 0;
+            std::uint64_t matchedPostings = 0;
+            std::uint64_t uniqueMatchedPostings = 0;
+            std::uint64_t scannedVectors = 0;
+            std::uint64_t matchedVectors = 0;
+            std::uint64_t dedupSkippedVectors = 0;
+            std::uint64_t uniqueMatchedVectors = 0;
+            std::uint64_t distanceComputations = 0;
+            std::uint64_t postingPageReads = 0;
+            std::uint64_t postingLogicalBytes = 0;
+            std::uint64_t postingPhysicalBytes = 0;
+            const auto start = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < measuredQueries; ++i) {
+                const auto result = search(options.measureOffset + i);
+                const auto postingStats = VectorIndex::GetThreadLocalPostingScanStats();
+                readPostings += postingStats.m_readPostings;
+                matchedPostings += postingStats.m_matchedPostings;
+                uniqueMatchedPostings += postingStats.m_uniqueMatchedPostings;
+                scannedVectors += postingStats.m_scannedVectors;
+                matchedVectors += postingStats.m_matchedVectors;
+                dedupSkippedVectors += postingStats.m_dedupSkippedVectors;
+                uniqueMatchedVectors += postingStats.m_uniqueMatchedVectors;
+                postingPageReads += postingStats.m_postingPageReads;
+                postingLogicalBytes += postingStats.m_postingLogicalBytes;
+                postingPhysicalBytes += postingStats.m_postingPhysicalBytes;
+                if (result == nullptr) {
+                    ++failed;
+                    continue;
+                }
+                queryWork[i] = QueryWork(postingStats, result->GetScanned());
+                distanceComputations += static_cast<std::uint64_t>(
+                    (std::max)(result->GetScanned(), 0));
+                const int count = (std::min)(result->GetResultNum(), options.topk);
+                for (int j = 0; j < count; ++j) {
+                    const auto* item = result->GetResult(j);
+                    if (item != nullptr && item->VID >= 0 &&
+                        item->VID <= static_cast<SizeType>((std::numeric_limits<std::int32_t>::max)())) {
+                        resultIds[
+                            i * static_cast<std::size_t>(options.topk) + static_cast<std::size_t>(j)] =
+                            static_cast<std::int32_t>(item->VID);
+                        resultDistances[i * options.topk + j] = item->Dist;
+                    }
+                }
+            }
+            const auto finish = std::chrono::steady_clock::now();
+            const double elapsed = std::chrono::duration<double>(finish - start).count();
+            if (failed) throw std::runtime_error("Native query failed");
+            const auto captureStart = std::chrono::steady_clock::now();
+            std::uint64_t helperCalls = 0, parents = 0, members = 0, childDistances = 0;
+            std::uint64_t defaultQueries = 0, captureQueries = 0;
+            std::vector<std::array<std::uint64_t, 18>> nativeWork;
+            std::vector<std::array<std::uint64_t, 14>> postingWork;
+            std::vector<std::array<std::uint64_t, 8>> operatorWork;
+            std::vector<std::array<double,16>> decisions;
+            std::vector<std::array<std::uint64_t,10>> matchWork;
+            std::vector<std::array<std::uint64_t,4>> admissionWork;
+            std::vector<std::array<std::uint64_t,3>> visitedTrace;
+            std::vector<std::array<double,3>> evaluatedTrace;
+            std::vector<std::array<std::uint64_t,5>> csrRows;
+            std::vector<int> headIDs, ownIDs;
+            std::vector<float> headDistances;
+#ifdef MATCHED_CURRENT
+            ShortcutFull::capture = true;
+#endif
+            for (std::size_t i = 0; i < measuredQueries; ++i) {
+                const auto result = search(i);
+                if (!result || QueryWork(VectorIndex::GetThreadLocalPostingScanStats(),
+                                         result->GetScanned()) != queryWork[i])
+                    throw std::runtime_error("Untimed capture changed deterministic native work");
+                for (int j = 0; j < options.topk; ++j) {
+                    const auto* item = result->GetResult(j);
+                    const auto id = item && item->VID >= 0 ? item->VID : -1;
+                    if (id != resultIds[i * options.topk + j] ||
+                        (id >= 0 && item->Dist != resultDistances[i * options.topk + j]))
+                        throw std::runtime_error("Untimed capture changed final result");
+                }
+#ifdef MATCHED_CURRENT
+                if (options.caseName != "h3") {
+                    const ShortcutFull::Observation emptyObservation;
+                    const auto& observation = options.scenarioName=="unfilter"
+                        ? emptyObservation : ShortcutFull::Last();
+                    if (options.scenarioName!="unfilter" &&
+                        (!observation.invoked || !observation.native.originalDistanceFunction))
+                        throw std::runtime_error("Missing native H1 capture");
+                    const auto& n = observation.native;
+                    admissionWork.push_back({observation.selectedHeads,observation.matchingHeads,
+                        n.nativePredicateEvaluations,n.nativePredicateBitReads});
+                    matchWork.push_back({n.visitedProbes,n.firstMatchEvaluations,n.reusedMatchReads,
+                        n.matchEvaluations,n.rejectedAuxiliaryEvaluations,n.physicalDegree,
+                        n.effectiveDegree,n.eligibleVisited,n.oracleEvaluations,n.matchComponentCalls});
+                    for (const auto& v:n.allVisited)
+                        visitedTrace.push_back({i,static_cast<std::uint64_t>(v.first),v.second});
+                    for (const auto& v:n.evaluated)
+                        evaluatedTrace.push_back({double(i),double(v.first),double(v.second)});
+                    operatorWork.push_back({n.outerExpansions,n.ordinaryNeighborEntries,n.ordinaryPredicateCalls,
+                        n.ordinaryPredicatePasses,n.ordinaryPredicateCalls-n.ordinaryPredicatePasses,
+                        n.checksZeroRows,n.auxiliaryPredicateCalls,n.nativePredicateCalls});
+                    for (const auto& row:n.rows)
+                        csrRows.push_back({i,static_cast<std::uint64_t>(row.level),
+                            static_cast<std::uint64_t>(row.id),row.size,row.consumed});
+                    nativeWork.push_back({n.headDistances, n.routingDistances, n.childDistances,
+                        static_cast<std::uint64_t>(n.checked), n.calls, n.returns, n.parentDistances,
+                        n.members, n.signatureChecks, n.signatureRejects, n.h2Rows, n.h3Rows,
+                        n.queueOffers, n.queueAccepted, n.queueRejected,
+                        n.filteredAdmission, n.defaultAdmission, n.originalDistanceFunction});
+                    headIDs.push_back(static_cast<int>(observation.heads.size()));
+                    headIDs.insert(headIDs.end(), observation.heads.begin(), observation.heads.end());
+                    headDistances.insert(headDistances.end(), observation.distances.begin(), observation.distances.end());
+                    ownIDs.push_back(static_cast<int>(observation.ownIDs.size()));
+                    ownIDs.insert(ownIDs.end(), observation.ownIDs.begin(), observation.ownIDs.end());
+                    postingWork.push_back({n.sparseActivations,n.selectedActions,
+                        0,0,
+                        n.graphWork.members,n.graphWork.fresh,n.graphWork.predicateChecks,
+                        n.graphWork.predicatePasses,n.graphWork.useful,n.postingWork.members,
+                        n.postingWork.fresh,n.postingWork.predicateChecks,n.postingWork.predicatePasses,
+                        n.postingWork.useful});
+                    for (const auto& d:n.decisions) {
+                        std::array<double,16> row{};
+                        std::size_t at=0;
+                        const auto put=[&](auto value){row[at++]=static_cast<double>(value);};
+                        put(i);put(d.head);put(d.checks);put(d.passes);put(d.complete);put(d.activated);
+                        put(d.checkedBefore);put(d.checkedAfter);put(d.signatures);
+                        put(d.representatives);put(d.members);
+                        put(d.degree);put(d.eligible);put(d.eligibleVisited);put(d.oracleDegree);put(d.oracleEligible);
+                        if (at!=row.size()) throw std::runtime_error("Decision schema mismatch");
+                        decisions.push_back(row);
+                    }
+                    helperCalls += n.calls;
+                    parents += n.parentDistances;
+                    members += n.members;
+                    childDistances += n.childDistances;
+                    defaultQueries += n.defaultAdmission;
+                    ++captureQueries;
+                    if (options.scenarioName == "unfilter" &&
+                        (observation.invoked || n.calls || n.parentDistances || n.childDistances || n.members))
+                        throw std::runtime_error("Unfilter initialized new runtime hooks");
+                }
+#endif
+            }
+#ifdef MATCHED_CURRENT
+            ShortcutFull::capture = false;
+#endif
+            const double captureSeconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - captureStart).count();
+            const std::string prefix = "nprobe_" + std::to_string(nprobe);
+            const auto save = [&](const std::string& suffix, const auto& data) {
+                std::ofstream out(prefix + suffix, std::ios::binary);
+                out.write(reinterpret_cast<const char*>(data.data()),
+                          data.size() * sizeof(data.front()));
+                if (!out) throw std::runtime_error("Cannot save native result evidence");
+            };
+            save(".ids.i32", resultIds);
+            save(".dist.f32", resultDistances);
+            save(".work.u64", queryWork);
+            save(".native.u64", nativeWork);
+            save(".head.i32", headIDs);
+            save(".head.f32", headDistances);
+            save(".own.i32", ownIDs);
+            save(".posting.u64", postingWork);
+            save(".operators.u64", operatorWork);
+            save(".rows.u64", csrRows);
+            save(".decisions.f64", decisions);
+            save(".match.u64", matchWork);
+            save(".admission.u64", admissionWork);
+            save(".storage.u64", storageWork);
+            save(".visited.u64", visitedTrace);
+            save(".evaluated.f64", evaluatedTrace);
+            const std::size_t hits = RecallHits(
+                scenario.truth->values,
+                scenario.truth->cols,
+                resultIds,
+                options.measureOffset,
+                measuredQueries,
+                options.topk);
+            const double recall = static_cast<double>(hits) /
+                static_cast<double>(measuredQueries * static_cast<std::size_t>(options.topk));
+            const auto perQuery = [measuredQueries](std::uint64_t value) {
+                return static_cast<double>(value) / static_cast<double>(measuredQueries);
+            };
+            const auto ratio = [](std::uint64_t numerator, std::uint64_t denominator) {
+                return denominator == 0 ? 0.0 : static_cast<double>(numerator) / static_cast<double>(denominator);
+            };
+            if (dedupSkippedVectors > scannedVectors) {
+                throw std::runtime_error("Duplicate scan count exceeds scanned records");
+            }
+            const std::uint64_t uniqueScannedVectors =
+                scannedVectors - dedupSkippedVectors;
+
+            std::cout << "{"
+                      << "\"engine\":\"static_per_tag_bkt\","
+                      << "\"case\":\"" << options.caseName << "\","
+                      << "\"scenario\":\"" << options.scenarioName << "\","
+                      << "\"nprobe\":" << nprobe << ","
+                      << "\"probe_position\":" << probePosition << ","
+                      << "\"probe_count\":" << options.probes.size() << ","
+                      << "\"index_load_count\":1,"
+                      << "\"workspace_resets\":" << probePosition + 1 << ","
+                      << "\"sweep_execution\":\"single_load_nprobe_array\","
+                      << "\"nprobe_ini_api\":\"SearchSweep.NProbe\","
+                      << "\"warmup_seconds\":" << warmSeconds << ","
+                      << "\"ordinary_seconds\":" << elapsed << ","
+                      << "\"capture_seconds\":" << captureSeconds << ","
+                      << "\"helper_calls_capture\":" << helperCalls << ","
+                      << "\"parent_distances_capture\":" << parents << ","
+                      << "\"child_distances_capture\":" << childDistances << ","
+                      << "\"csr_members_capture\":" << members << ","
+                      << "\"native_default_queries_capture\":" << defaultQueries << ","
+                      << "\"h1_capture_queries\":" << captureQueries << ","
+                      << "\"level\":\"" << scenario.level << "\","
+                      << "\"queries\":" << measuredQueries << ","
+                      << "\"measure_offset\":" << options.measureOffset << ","
+                      << "\"value_type\":\"" << options.valueType << "\","
+                      << "\"search_ini\":\"" << activeSearchIni << "\","
+                      << "\"search_api\":\"" << (options.directSearch ? "Search" : "SearchWithPredicate") << "\","
+                      << "\"filter_column\":" << scenario.tagColumn << ","
+                      << "\"or_tag_count\":" << scenario.orTagCount << ","
+                      << "\"dnf_and_columns\":"
+                      << (scenario.dnfAndColumns == nullptr ? 0 : scenario.dnfAndColumns->size()) << ","
+                      << "\"query_dnf\":"
+                      << (scenario.queryDNF ? "true" : "false") << ","
+                      << "\"recall\":" << recall << ","
+                      << "\"qps\":" << static_cast<double>(measuredQueries) / elapsed << ","
+                      << "\"mean_latency_ms\":" << 1000.0 * elapsed / measuredQueries << ","
+                      << "\"postings_per_query\":" << perQuery(readPostings) << ","
+                      << "\"contributing_postings_per_query\":" << perQuery(matchedPostings) << ","
+                      << "\"unique_matched_postings_per_query\":" << perQuery(uniqueMatchedPostings) << ","
+                      << "\"scanned_vectors_per_query\":" << perQuery(scannedVectors) << ","
+                      << "\"unique_scanned_vectors_per_query\":" << perQuery(uniqueScannedVectors) << ","
+                      << "\"matched_vectors_per_query\":"
+                      << perQuery(matchedVectors) << ","
+                      << "\"unique_matched_vectors_per_query\":" << perQuery(uniqueMatchedVectors) << ","
+                      << "\"distance_computations_per_query\":"
+                      << perQuery(distanceComputations) << ","
+                      << "\"dedup_skipped_vectors_per_query\":"
+                      << perQuery(dedupSkippedVectors) << ","
+                      << "\"match_rate\":" << ratio(matchedVectors, uniqueScannedVectors) << ","
+                      << "\"unique_match_rate\":" << ratio(uniqueMatchedVectors, uniqueScannedVectors) << ","
+                      << "\"unique_vectors_per_loaded_posting\":"
+                      << ratio(uniqueMatchedVectors, readPostings) << ","
+                      << "\"unique_vectors_per_contributing_posting\":"
+                      << ratio(uniqueMatchedVectors, uniqueMatchedPostings) << ","
+                      << "\"scanned_occurrence_to_unique_ratio\":"
+                      << ratio(scannedVectors, uniqueScannedVectors) << ","
+                      << "\"posting_page_reads_per_query\":" << perQuery(postingPageReads) << ","
+                      << "\"posting_logical_bytes_per_query\":" << perQuery(postingLogicalBytes) << ","
+                      << "\"posting_physical_bytes_per_query\":" << perQuery(postingPhysicalBytes) << ","
+                      << "\"failed_queries\":" << failed
+                      << "}\n";
+        }
+        ++probePosition;
+    }
+
+    return 0;
+}
+
+int main(int argc, char** argv)
+{
+    try { return Run(argc, argv); }
+    catch (const std::exception& error) {
+        std::cerr << "MATCHED_FAILURE " << error.what() << "\n";
+        return 1;
+    }
+}

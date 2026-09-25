@@ -95,14 +95,14 @@ public:
     {
         return Fail(ErrorCode::Undefined,
                     "Save is unsupported for logical hierarchy vector views; "
-                    "save the owned BasicVectorSets and the native top index instead.", nullptr);
+                    "save the owned BasicVectorSets and the top vector catalog instead.", nullptr);
     }
 
     ErrorCode AppendSave(const std::string&) const override
     {
         return Fail(ErrorCode::Undefined,
                     "AppendSave is unsupported for logical hierarchy vector views; "
-                    "save the owned BasicVectorSets and the native top index instead.", nullptr);
+                    "save the owned BasicVectorSets and the top vector catalog instead.", nullptr);
     }
 
 protected:
@@ -119,12 +119,12 @@ private:
     const SizeType m_rowSize;
 };
 
-class TopVectorView final : public ImmutableVectorView
+class ReadOnlyVectorView final : public ImmutableVectorView
 {
 public:
-    TopVectorView(const std::shared_ptr<VectorIndex>& index, SizeType rowSize)
-        : ImmutableVectorView(index->GetVectorValueType(), index->GetFeatureDim(),
-                              index->GetNumSamples(), rowSize),
+    ReadOnlyVectorView(const std::shared_ptr<VectorSet>& index, SizeType rowSize)
+        : ImmutableVectorView(index->GetValueType(), index->Dimension(),
+                              index->Count(), rowSize),
           m_index(index)
     {
     }
@@ -132,11 +132,11 @@ public:
     void* GetVector(SizeType id) const override
     {
         if (id < 0 || id >= Count()) return nullptr;
-        return const_cast<void*>(m_index->GetSample(id));
+        return const_cast<void*>(m_index->GetVector(id));
     }
 
 private:
-    const std::shared_ptr<const VectorIndex> m_index;
+    const std::shared_ptr<const VectorSet> m_index;
 };
 
 class LowerVectorView final : public ImmutableVectorView
@@ -258,7 +258,7 @@ inline ErrorCode PackOwnedHierarchyVectors(
     }
 }
 
-// Preserve all logical rows; the native top index is not materialized a second time.
+// Preserve all logical rows; the top vector catalog is not materialized a second time.
 inline ErrorCode MaterializeHierarchyCatalog(
     const std::shared_ptr<VectorSet>& logicalCatalog,
     std::shared_ptr<VectorSet>& catalog,
@@ -320,7 +320,7 @@ inline ErrorCode BuildIndependentHierarchyCatalogs(
     SizeType headCount,
     const std::vector<std::vector<std::uint64_t>>& upperToLower,
     const std::vector<std::shared_ptr<VectorSet>>& fullLowerCatalogs,
-    const std::shared_ptr<VectorIndex>& topIndex,
+    const std::shared_ptr<VectorSet>& topIndex,
     std::vector<std::shared_ptr<VectorSet>>& catalogs,
     std::string* error = nullptr)
 {
@@ -330,14 +330,14 @@ inline ErrorCode BuildIndependentHierarchyCatalogs(
     {
         if (headCount <= 0 || upperToLower.empty() ||
             fullLowerCatalogs.size() != upperToLower.size() ||
-            topIndex == nullptr || !topIndex->IsReady() || topIndex->GetNumSamples() <= 0)
+            topIndex == nullptr || !topIndex->Available() || topIndex->Count() <= 0)
             return Fail(ErrorCode::FailedParseValue, "Incomplete routing-only hierarchy catalogs.", error);
         SizeType rowSize = 0;
         const ErrorCode shape = CheckedRowSize(
-            topIndex->GetVectorValueType(), topIndex->GetFeatureDim(), rowSize, error);
+            topIndex->GetValueType(), topIndex->Dimension(), rowSize, error);
         if (shape != ErrorCode::Success) return shape;
         std::vector<std::shared_ptr<VectorSet>> result = fullLowerCatalogs;
-        result.push_back(std::make_shared<TopVectorView>(topIndex, rowSize));
+        result.push_back(std::make_shared<ReadOnlyVectorView>(topIndex, rowSize));
         SizeType lowerCount = headCount;
         for (std::size_t level = 0; level < upperToLower.size(); ++level)
         {
@@ -346,12 +346,12 @@ inline ErrorCode BuildIndependentHierarchyCatalogs(
             const auto& map = upperToLower[level];
             if (std::dynamic_pointer_cast<BasicVectorSet>(lower) == nullptr ||
                 lower->Count() != lowerCount || !lower->Available() ||
-                lower->GetValueType() != topIndex->GetVectorValueType() ||
-                lower->Dimension() != topIndex->GetFeatureDim() ||
+                lower->GetValueType() != topIndex->GetValueType() ||
+                lower->Dimension() != topIndex->Dimension() ||
                 lower->PerVectorDataSize() != rowSize ||
                 upper == nullptr || upper->Count() <= 0 || !upper->Available() ||
-                upper->GetValueType() != topIndex->GetVectorValueType() ||
-                upper->Dimension() != topIndex->GetFeatureDim() ||
+                upper->GetValueType() != topIndex->GetValueType() ||
+                upper->Dimension() != topIndex->Dimension() ||
                 upper->PerVectorDataSize() != rowSize ||
                 map.size() != static_cast<std::size_t>(upper->Count()) ||
                 map.size() > static_cast<std::size_t>(lowerCount))
@@ -388,7 +388,7 @@ inline ErrorCode BuildIndependentHierarchyCatalogs(
 
 // upperToLower[i] is the existing H(i+2)->H(i+1) sampling map, not a global VID
 // table. Each non-top physical BasicVectorSet contains the complement of that
-// map in increasing logical-ID order. The ready native top index owns all top
+// map in increasing logical-ID order. The ready top vector catalog owns all top
 // rows; no vector buffer is copied here. Positive logical layer counts are required.
 //
 // All returned views retain their backing owners, reject GetData/Normalize with
@@ -400,7 +400,7 @@ inline ErrorCode BuildDisjointHierarchyCatalogs(
     SizeType headCount,
     const std::vector<std::vector<std::uint64_t>>& upperToLower,
     const std::vector<std::shared_ptr<VectorSet>>& ownedLowerCatalogs,
-    const std::shared_ptr<VectorIndex>& topIndex,
+    const std::shared_ptr<VectorSet>& topIndex,
     std::vector<std::shared_ptr<VectorSet>>& logicalCatalogs,
     std::string* error = nullptr)
 {
@@ -416,10 +416,10 @@ inline ErrorCode BuildDisjointHierarchyCatalogs(
                         "Hierarchy requires one owned lower catalog per sampling map.", error);
         if (topIndex == nullptr)
             return Fail(ErrorCode::LackOfInputs,
-                        "Hierarchy is missing its native top index.", error);
-        if (!topIndex->IsReady() || topIndex->GetNumSamples() <= 0)
+                        "Hierarchy is missing its top vector catalog.", error);
+        if (!topIndex->Available() || topIndex->Count() <= 0)
             return Fail(ErrorCode::EmptyIndex,
-                        "Hierarchy requires a ready, nonempty native top index.", error);
+                        "Hierarchy requires a ready, nonempty top vector catalog.", error);
 
         SizeType lowerCount = headCount;
         for (const auto& map : upperToLower)
@@ -433,12 +433,12 @@ inline ErrorCode BuildDisjointHierarchyCatalogs(
                             "Hierarchy upper count must be positive and no larger than its lower count.", error);
             lowerCount = static_cast<SizeType>(map.size());
         }
-        if (topIndex->GetNumSamples() != lowerCount)
+        if (topIndex->Count() != lowerCount)
             return Fail(ErrorCode::FailedParseValue,
-                        "Native top index count does not match the logical top catalog.", error);
+                        "Top vector catalog count does not match the logical top catalog.", error);
 
-        const VectorValueType type = topIndex->GetVectorValueType();
-        const DimensionType dimension = topIndex->GetFeatureDim();
+        const VectorValueType type = topIndex->GetValueType();
+        const DimensionType dimension = topIndex->Dimension();
         SizeType rowSize = 0;
         const ErrorCode shape = CheckedRowSize(type, dimension, rowSize, error);
         if (shape != ErrorCode::Success) return shape;
@@ -479,15 +479,15 @@ inline ErrorCode BuildDisjointHierarchyCatalogs(
             }
             lowerCount = upperCount;
         }
-        for (SizeType id = 0; id < topIndex->GetNumSamples(); ++id)
+        for (SizeType id = 0; id < topIndex->Count(); ++id)
         {
-            if (topIndex->GetSample(id) == nullptr)
+            if (topIndex->GetVector(id) == nullptr)
                 return Fail(ErrorCode::VectorNotFound,
-                            "Native top index contains a missing hierarchy vector row.", error);
+                            "Top vector catalog contains a missing hierarchy vector row.", error);
         }
 
         views.resize(upperToLower.size() + 1);
-        views.back() = std::make_shared<TopVectorView>(topIndex, rowSize);
+        views.back() = std::make_shared<ReadOnlyVectorView>(topIndex, rowSize);
         for (std::size_t level = upperToLower.size(); level > 0; --level)
         {
             const std::size_t lowerLevel = level - 1;

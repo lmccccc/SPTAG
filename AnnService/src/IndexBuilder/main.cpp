@@ -124,7 +124,11 @@ int main(int argc, char *argv[])
     }
     if (code == ErrorCode::Success)
     {
-        indexBuilder->SaveIndex(options->m_outputFolder);
+        if (indexBuilder->SaveIndex(options->m_outputFolder) != ErrorCode::Success)
+        {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to save index.\n");
+            return 1;
+        }
     }
     else
     {

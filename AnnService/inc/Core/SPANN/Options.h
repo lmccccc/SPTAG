@@ -12,6 +12,8 @@
 #include <memory>
 #include <string>
 #include <cmath>
+#include <sstream>
+#include <limits>
 
 namespace SPTAG {
     namespace SPANN {
@@ -86,19 +88,19 @@ namespace SPTAG {
             std::string m_secondLevelHeadVectorFile;
             std::string m_secondLevelHeadIDFile;
             int m_secondLevelReplicaCount;
-            std::string m_secondLevelHeadIndexFolder;
+            std::string m_legacyTopVectorFolder = "SecondLevelHeadIndex";
             std::string m_secondLevelPostingFile;
             std::string m_secondLevelGenerationFingerprint;
-            double m_secondLevelInitialProbeRatio;
-            int m_secondLevelMaxCheck;
-            std::string m_secondLevelPrefetchMode;
 
             // Section 3: for build head
             bool m_buildHead;
-            bool m_buildH1Graph;
-            bool m_compactHierarchyVectors; // Legacy V2 option: accepted on load, rejected by fresh builds.
+            bool m_buildH1Graph = true; // Read-only legacy layout marker.
+            bool m_compactHierarchyVectors = false; // Legacy V2 option: accepted on load, rejected by fresh builds.
 
             // Section 4: for build ssd and search ssd
+            bool m_enablePostingNavigation;
+            int m_postingAnchorCount;
+            int m_postingAdditionalMaxCheck;
             bool m_enableSSD;
             bool m_buildSsdIndex;
             int m_iSSDNumberOfThreads;
@@ -364,12 +366,8 @@ namespace SPTAG {
                     {"SecondLevelHeadVectors", "HierarchyHeadVectors", true},
                     {"SecondLevelHeadVectorIDs", "HierarchyHeadVectorIDs", true},
                     {"SecondLevelReplicaCount", "HierarchyReplicaCount", true},
-                    {"SecondLevelHeadIndexFolder", "HierarchyHeadIndexFolder", true},
                     {"SecondLevelPostingFile", "HierarchyPostingFile", true},
                     {"SecondLevelGenerationFingerprint", "HierarchyGenerationFingerprint", true},
-                    {"SecondLevelInitialProbeRatio", "HierarchyInitialProbeRatio", false},
-                    {"SecondLevelMaxCheck", "HierarchyMaxCheck", false},
-                    {"SecondLevelPrefetchMode", "HierarchyPrefetchMode", false},
                 };
                 for (const auto& alias : aliases)
                     if ((alias.select ? select : ssd) &&
@@ -402,7 +400,13 @@ namespace SPTAG {
 
             static bool IsRemovedParameter(const char* name)
             {
-                for (const char* removed : {"HierarchyRouteSelectivityThreshold", "SecondLevelRouteSelectivityThreshold",
+                for (const char* removed : {"BuildH1Graph", "CompactHierarchyVectors",
+                                            "HierarchyHeadIndexFolder", "SecondLevelHeadIndexFolder",
+                                            "HierarchyInitialProbeRatio", "SecondLevelInitialProbeRatio",
+                                            "HierarchyMaxCheck", "SecondLevelMaxCheck",
+                                            "HierarchyPrefetchMode", "SecondLevelPrefetchMode",
+                                            "HierarchyDedupMode", "HierarchyRoutingBudgets",
+                                            "HierarchyRouteSelectivityThreshold", "SecondLevelRouteSelectivityThreshold",
                                             "ACLCols", "HierLevelWidths", "PivotForceNodeCount",
                                             "DisablePivotEstimator", "RoutingCols", "PerVectorTagsFile",
                                             "NumericCols", "EnableExtremeSparseTag", "ExtremeSparseTagMinCount",
@@ -411,7 +415,7 @@ namespace SPTAG {
                                             "LogUExtra", "PostingQuantBits", "HybridGraphDegree",
                                             "EnableHierPostingFilter", "LimitedTagVoteHeadCount",
                                             "LimitedTagMaxExpandedPostingPages", "LimitedTagMaxExtraSupports",
-                                            "TagOffset", "BKTSeed", "TPTSeed",
+                                            "TagOffset", "BKTSeed", "TPTSeed", "PostingMinCandidates",
                                             "SparseFallbackMaxHeads", "SparseFallbackMaxPostingPages",
                                             "HierarchySignatureMinSelectivity", "HierarchySignatureMaxSelectivity",
                                             "SecondLevelSignatureMinSelectivity", "SecondLevelSignatureMaxSelectivity",
@@ -480,9 +484,31 @@ namespace SPTAG {
                 return true;
             }
 
+            static bool ParsePostingInteger(const char* value, int minimum, int& parsed)
+            {
+                if (value == nullptr || *value == '\0') return false;
+                int result = 0;
+                for (const char* digit = value; *digit; ++digit) {
+                    if (*digit < '0' || *digit > '9' ||
+                        result > ((std::numeric_limits<int>::max)() - (*digit - '0')) / 10)
+                        return false;
+                    result = result * 10 + (*digit - '0');
+                }
+                if (result < minimum) return false;
+                parsed = result;
+                return true;
+            }
+
             ErrorCode SetParameter(const char* p_section, const char* p_param, const char* p_value)
             {
                 if (nullptr == p_section || nullptr == p_param || nullptr == p_value) return ErrorCode::Fail;
+                if (Helper::StrUtils::StrEqualIgnoreCase(p_param, "PostingMinCandidates")) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                        "PostingMinCandidates was removed, including when EnablePostingNavigation=false. "
+                        "Remove it from build/search/saved INIs; use PostingAnchorCount=8 and "
+                        "PostingAdditionalMaxCheck=0 for post-graph completion. No floor policy is retained.\n");
+                    return ErrorCode::FailedParseValue;
+                }
                 if (IsRemovedParameter(p_param) || IsRemovedSectionAlias(p_section, p_param) ||
                     ((Helper::StrUtils::StrEqualIgnoreCase(p_param, "SelectHeadType") ||
                       Helper::StrUtils::StrEqualIgnoreCase(p_param, "SelectType")) &&
@@ -493,6 +519,24 @@ namespace SPTAG {
                     return ErrorCode::FailedParseValue;
                 }
                 p_param = CanonicalParameter(p_section, p_param);
+                const auto invalid = [&]() {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                        "Unknown or invalid native parameter [%s] %s=%s.\n", p_section, p_param, p_value);
+                    return ErrorCode::FailedParseValue;
+                };
+                if (Helper::StrUtils::StrEqualIgnoreCase(p_section, "BuildSSDIndex")) {
+                    const bool anchor = Helper::StrUtils::StrEqualIgnoreCase(p_param, "PostingAnchorCount");
+                    const bool additional = Helper::StrUtils::StrEqualIgnoreCase(p_param, "PostingAdditionalMaxCheck");
+                    const bool maxCheck = Helper::StrUtils::StrEqualIgnoreCase(p_param, "MaxCheck");
+                    if (anchor || additional || maxCheck) {
+                        int parsed = 0;
+                        if (!ParsePostingInteger(p_value, additional ? 0 : 1, parsed)) return invalid();
+                        const int base = maxCheck ? parsed : m_maxCheck;
+                        const int extra = additional ? parsed : m_postingAdditionalMaxCheck;
+                        if (base < 0 || extra < 0 || base > (std::numeric_limits<int>::max)() - extra)
+                            return invalid();
+                    }
+                }
                 if (Helper::StrUtils::StrEqualIgnoreCase(p_param, "ColumnTypes") &&
                     Helper::StrUtils::StrEqualIgnoreCase(p_section, "BuildSSDIndex")) {
                     try {
@@ -510,75 +554,85 @@ namespace SPTAG {
                     return ErrorCode::Success;
                 }
 
+                // Native serializers emit enum defaults (for example QueryType=Undefined)
+                // which the generic enum converter intentionally omits.
                 if (Helper::StrUtils::StrEqualIgnoreCase(p_section, "Base")) {
 #define DefineBasicParameter(VarName, VarType, DefaultValue, RepresentStr) \
     if (Helper::StrUtils::StrEqualIgnoreCase(p_param, RepresentStr)) \
     { \
         SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Setting %s with value %s\n", RepresentStr, p_value); \
-        VarType tmp; \
-        if (Helper::Convert::ConvertStringTo<VarType>(p_value, tmp)) \
+        VarType tmp = DefaultValue; \
+        if (Helper::Convert::ConvertStringTo<VarType>(p_value, tmp) || \
+            Helper::StrUtils::StrEqualIgnoreCase(p_value, Helper::Convert::ConvertToString<VarType>(DefaultValue).c_str())) \
         { \
             VarName = tmp; \
         } \
+        else return invalid(); \
     } else \
 
 #include "inc/Core/SPANN/ParameterDefinitionList.h"
 #undef DefineBasicParameter
 
-                    ;
+                    return invalid();
                 }
                 else if (Helper::StrUtils::StrEqualIgnoreCase(p_section, "SelectHead")) {
 #define DefineSelectHeadParameter(VarName, VarType, DefaultValue, RepresentStr) \
     if (Helper::StrUtils::StrEqualIgnoreCase(p_param, RepresentStr)) \
     { \
         SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Setting %s with value %s\n", RepresentStr, p_value); \
-        VarType tmp; \
-        if (Helper::Convert::ConvertStringTo<VarType>(p_value, tmp)) \
+        VarType tmp = DefaultValue; \
+        if (Helper::Convert::ConvertStringTo<VarType>(p_value, tmp) || \
+            Helper::StrUtils::StrEqualIgnoreCase(p_value, Helper::Convert::ConvertToString<VarType>(DefaultValue).c_str())) \
         { \
             VarName = tmp; \
         } \
-        else return ErrorCode::FailedParseValue; \
+        else return invalid(); \
     } else \
 
 #include "inc/Core/SPANN/ParameterDefinitionList.h"
 #undef DefineSelectHeadParameter
 
-                    ;
+                    return invalid();
                 }
                 else if (Helper::StrUtils::StrEqualIgnoreCase(p_section, "BuildHead")) {
 #define DefineBuildHeadParameter(VarName, VarType, DefaultValue, RepresentStr) \
     if (Helper::StrUtils::StrEqualIgnoreCase(p_param, RepresentStr)) \
     { \
         SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Setting %s with value %s\n", RepresentStr, p_value); \
-        VarType tmp; \
-        if (Helper::Convert::ConvertStringTo<VarType>(p_value, tmp)) \
+        VarType tmp = DefaultValue; \
+        if (Helper::Convert::ConvertStringTo<VarType>(p_value, tmp) || \
+            Helper::StrUtils::StrEqualIgnoreCase(p_value, Helper::Convert::ConvertToString<VarType>(DefaultValue).c_str())) \
         { \
             VarName = tmp; \
         } \
+        else return invalid(); \
     } else \
 
 #include "inc/Core/SPANN/ParameterDefinitionList.h"
 #undef DefineBuildHeadParameter
 
-                    ;
+                    return invalid();
                 }
                 else if (Helper::StrUtils::StrEqualIgnoreCase(p_section, "BuildSSDIndex")) {
 #define DefineSSDParameter(VarName, VarType, DefaultValue, RepresentStr) \
     if (Helper::StrUtils::StrEqualIgnoreCase(p_param, RepresentStr)) \
     { \
         SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Setting %s with value %s\n", RepresentStr, p_value); \
-        VarType tmp; \
-        if (Helper::Convert::ConvertStringTo<VarType>(p_value, tmp)) \
+        VarType tmp = DefaultValue; \
+        if (Helper::Convert::ConvertStringTo<VarType>(p_value, tmp) || \
+            Helper::StrUtils::StrEqualIgnoreCase(p_value, Helper::Convert::ConvertToString<VarType>(DefaultValue).c_str())) \
         { \
             VarName = tmp; \
         } \
+        else return invalid(); \
     } else \
 
 #include "inc/Core/SPANN/ParameterDefinitionList.h"
 #undef DefineSSDParameter
 
-                    ;
+                    return invalid();
                 }
+                else return invalid();
                 return ErrorCode::Success;
             }
             

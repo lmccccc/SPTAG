@@ -1,6 +1,7 @@
 #include "inc/CoreInterface.h"
 #include "inc/Core/VectorIndex.h"
 #include "inc/Helper/SimpleIniReader.h"
+#include "NativeNProbeSweep.h"
 
 #include <algorithm>
 #include <chrono>
@@ -42,6 +43,7 @@ struct Options
     std::size_t measureOffset = 0;
     bool directSearch = false;
     bool allAclLevels = false;
+    bool dumpResults = false;
 };
 
 struct NpyHeader
@@ -72,7 +74,9 @@ void Usage(const char* p_program)
               << " [--value-type Float|UInt8]"
               << " [--direct-search] [--tenant 0] [--topk 10]"
               << " [--warmup 200] [--measure-offset 0] [--max-queries N]"
-              << " [--all-acl-levels]\n";
+              << " [--all-acl-levels] [--dump-results]\n";
+    std::cerr << "Native search INIs may specify [SearchSweep] NProbe=[16,24,32]"
+              << " to search every probe after one index load.\n";
 }
 
 bool ParseSize(const char* p_text, std::size_t& p_value)
@@ -134,6 +138,10 @@ bool ParseArgs(int p_argc, char** p_argv, Options& p_options)
         }
         if (std::strcmp(arg, "--all-acl-levels") == 0) {
             p_options.allAclLevels = true;
+            continue;
+        }
+        if (std::strcmp(arg, "--dump-results") == 0) {
+            p_options.dumpResults = true;
             continue;
         }
         if (i + 1 >= p_argc) return false;
@@ -320,6 +328,61 @@ bool ApplySearchIni(TenantIndexManager& p_manager, const std::string& p_path)
     return true;
 }
 
+struct SearchPoint
+{
+    std::string ini;
+    int nprobe;
+};
+
+bool ReadSearchPoints(const Options& options, std::vector<SearchPoint>& points)
+{
+    auto paths = options.searchSweepInis;
+    if (paths.empty()) paths.push_back(options.searchIni);
+    if (!options.searchIni.empty() && !options.searchSweepInis.empty()) {
+        Helper::IniReader base;
+        if (base.LoadIniFile(options.searchIni) != ErrorCode::Success) {
+            std::cerr << "Invalid base search INI: " << options.searchIni << "\n";
+            return false;
+        }
+        if (base.DoesSectionExist("SearchSweep")) {
+            std::cerr << "Put [SearchSweep] in the active --search-sweep-ini, not the base INI\n";
+            return false;
+        }
+    }
+    for (const auto& path : paths) {
+        if (path.empty()) {
+            points.push_back({path, 0});
+            continue;
+        }
+        Helper::IniReader ini;
+        if (ini.LoadIniFile(path) != ErrorCode::Success ||
+            !ini.DoesSectionExist("SearchSSDIndex") ||
+            ini.GetParameters("SearchSSDIndex").empty()) {
+            std::cerr << "Invalid native [SearchSSDIndex] INI: " << path << "\n";
+            return false;
+        }
+        if (!ini.DoesSectionExist("SearchSweep")) {
+            points.push_back({path, 0});
+            continue;
+        }
+        if (ini.GetParameters("SearchSweep").size() != 1 ||
+            !ini.DoesParameterExist("SearchSweep", "NProbe")) {
+            std::cerr << "[SearchSweep] must contain only NProbe: " << path << "\n";
+            return false;
+        }
+        try {
+            for (int probe : NativeNProbeSweep::Parse(
+                     ini.GetParameter<std::string>("SearchSweep", "NProbe", ""), options.topk)) {
+                points.push_back({path, probe});
+            }
+        } catch (const std::invalid_argument& error) {
+            std::cerr << error.what() << ": " << path << "\n";
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -329,6 +392,8 @@ int main(int argc, char** argv)
         Usage(argv[0]);
         return 2;
     }
+    std::vector<SearchPoint> searchPoints;
+    if (!ReadSearchPoints(options, searchPoints)) return 2;
 
     std::vector<float> queries;
     std::vector<std::uint32_t> queryTags;
@@ -432,10 +497,12 @@ int main(int argc, char** argv)
     TenantIndexManager manager(
         static_cast<DimensionType>(dimension), "SPANN", options.valueType.c_str());
     if (!options.searchIni.empty() && !ApplySearchIni(manager, options.searchIni)) return 1;
+    std::size_t indexLoadCount = 0;
     if (!manager.LoadAll(options.indexDir.c_str())) {
         std::cerr << "LoadAll failed: " << options.indexDir << "\n";
         return 1;
     }
+    ++indexLoadCount;
 
     struct Scenario
     {
@@ -470,13 +537,17 @@ int main(int argc, char** argv)
              &truthMatrices.front()});
     }
 
-    std::vector<std::string> searchPoints = options.searchSweepInis;
-    if (searchPoints.empty()) searchPoints.emplace_back();
     const std::size_t warmup = (std::min)(options.warmup, queryCount);
-    for (const std::string& searchPoint : searchPoints) {
-        if (!searchPoint.empty() && !ApplySearchIni(manager, searchPoint)) return 1;
-        const std::string& activeSearchIni =
-            searchPoint.empty() ? options.searchIni : searchPoint;
+    std::string activeSearchIni = options.searchIni;
+    for (const SearchPoint& searchPoint : searchPoints) {
+        if (!searchPoint.ini.empty() && searchPoint.ini != activeSearchIni) {
+            if (!ApplySearchIni(manager, searchPoint.ini)) return 1;
+            activeSearchIni = searchPoint.ini;
+        }
+        if (searchPoint.nprobe > 0) {
+            const auto value = std::to_string(searchPoint.nprobe);
+            manager.SetSearchParam("InternalResultNum", value.c_str(), "SearchSSDIndex");
+        }
         for (const Scenario& scenario : scenarios) {
             auto search = [&](std::size_t p_queryIndex) {
                 const ByteArray queryBytes = options.valueType == "UInt8"
@@ -552,7 +623,12 @@ int main(int argc, char** argv)
                     scenario.tagColumn >= 0 ? -1 : 0);
             };
             for (std::size_t i = 0; i < warmup; ++i) {
-                search(i);
+                const auto result = search(i);
+                if (searchPoint.nprobe > 0 && result == nullptr) {
+                    std::cerr << "Warmup failed at nprobe " << searchPoint.nprobe
+                              << ", query " << i << "\n";
+                    return 1;
+                }
             }
 
             std::vector<std::int32_t> resultIds(
@@ -629,7 +705,12 @@ int main(int argc, char** argv)
                       << "\"queries\":" << measuredQueries << ","
                       << "\"measure_offset\":" << options.measureOffset << ","
                       << "\"value_type\":\"" << options.valueType << "\","
-                      << "\"search_ini\":\"" << activeSearchIni << "\","
+                      << "\"search_ini\":\"" << activeSearchIni << "\",";
+            if (searchPoint.nprobe > 0) {
+                std::cout << "\"nprobe\":" << searchPoint.nprobe << ","
+                          << "\"sweep_execution\":\"single_load_nprobe_array\",";
+            }
+            std::cout << "\"index_load_count\":" << indexLoadCount << ","
                       << "\"search_api\":\"" << (options.directSearch ? "Search" : "SearchWithPredicate") << "\","
                       << "\"filter_column\":" << scenario.tagColumn << ","
                       << "\"or_tag_count\":" << scenario.orTagCount << ","
@@ -663,8 +744,20 @@ int main(int argc, char** argv)
                       << "\"posting_page_reads_per_query\":" << perQuery(postingPageReads) << ","
                       << "\"posting_logical_bytes_per_query\":" << perQuery(postingLogicalBytes) << ","
                       << "\"posting_physical_bytes_per_query\":" << perQuery(postingPhysicalBytes) << ","
-                      << "\"failed_queries\":" << failed
-                      << "}\n";
+                      << "\"failed_queries\":" << failed;
+            if (options.dumpResults) {
+                std::cout << ",\"result_ids\":[";
+                for (std::size_t i = 0; i < resultIds.size(); ++i) {
+                    if (i != 0) std::cout << ',';
+                    std::cout << resultIds[i];
+                }
+                std::cout << ']';
+            }
+            std::cout << "}\n";
+            if (searchPoint.nprobe > 0 && failed != 0) {
+                std::cerr << "Measured queries failed at nprobe " << searchPoint.nprobe << "\n";
+                return 1;
+            }
         }
     }
     return 0;

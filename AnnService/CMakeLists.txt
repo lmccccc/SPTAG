@@ -179,8 +179,20 @@ add_executable(spannaclbench ${PROJECT_SOURCE_DIR}/Tools/benchmarks/SpannAclBenc
 target_include_directories(spannaclbench PRIVATE ${PROJECT_SOURCE_DIR}/Wrappers)
 target_link_libraries(spannaclbench SPTAGLibStatic ${Boost_LIBRARIES} ${RocksDB_LIBRARIES} ${uring_LIBRARIES} ${TBB_LIBRARIES} ${SPDK_LIBRARIES})
 
+set(POSTFILTER_CLIENT ${PROJECT_SOURCE_DIR}/Tools/benchmarks/hierarchical_shortcut_native/native_postfilter)
+foreach(client IN ITEMS Bench OwnOnlyTest)
+    add_executable(native${client} ${POSTFILTER_CLIENT}/${client}.cpp ${PROJECT_SOURCE_DIR}/Wrappers/src/CoreInterface.cpp)
+    target_include_directories(native${client} PRIVATE ${PROJECT_SOURCE_DIR}/Wrappers)
+    target_link_libraries(native${client} SPTAGLibStatic ${Boost_LIBRARIES})
+endforeach()
+
 add_executable(spannsupportaudit ${PROJECT_SOURCE_DIR}/Tools/benchmarks/InspectLimitedTagCoverage.cpp)
 target_link_libraries(spannsupportaudit SPTAGLibStatic ${Boost_LIBRARIES} ${RocksDB_LIBRARIES} ${uring_LIBRARIES} ${TBB_LIBRARIES} ${SPDK_LIBRARIES})
+
+add_executable(compactspannindex ${PROJECT_SOURCE_DIR}/Tools/CompactSpannIndex.cpp)
+target_link_libraries(compactspannindex SPTAGLibStatic ${Boost_LIBRARIES})
+add_executable(nativestorageload ${PROJECT_SOURCE_DIR}/Tools/benchmarks/NativeStorageLoad.cpp)
+target_link_libraries(nativestorageload SPTAGLibStatic ${Boost_LIBRARIES})
 
 # Offline RaBitQ2 in-posting code-sidecar encoders. rabitq2_encode loads the full
 # float matrix into RAM (small/legacy); rabitq2_encode_stream streams the base file

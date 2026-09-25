@@ -1,3 +1,5 @@
+#include "inc/Core/SPANN/PostingNavigation.h"
+#include "inc/Core/SPANN/RoutingSignatures.h"
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
@@ -77,12 +79,13 @@ namespace SPTAG
         public:
             virtual ~ISPANNIndex() = default;
             virtual std::shared_ptr<VectorIndex> GetMemoryIndex() = 0;
+            // Explicit metadata replacement is serialized by the caller with searches.
+            virtual ErrorCode RefreshRoutingSignatures() = 0;
             virtual std::shared_ptr<IExtraSearcher> GetDiskIndex() = 0;
             virtual Options* GetOptions() = 0;
             virtual bool HasLimitedTagLayout() const = 0;
             virtual SizeType GetGlobalVID(SizeType vid) = 0;
-            virtual bool PopulateHeadNodeGlobalVIDsFromBundles() = 0;
-            virtual ErrorCode CompactHierarchyVectors() { return ErrorCode::Undefined; }
+            virtual bool PopulateHeadNodeGlobalVIDsFromBundles(bool validateOnly = false) = 0;
             // Output-only offline migration; destination must not exist or overlap the source.
             virtual ErrorCode MaterializeHierarchyVectors(const std::string&) { return ErrorCode::Undefined; }
             // Called only on private export/build staging directories before validation.
@@ -134,7 +137,9 @@ namespace SPTAG
             mutable LimitedTagSupport m_limitedTagSupport;
             // One slot per configured hierarchy layer. Lower-layer indexes are
             // build-time-only; the highest slot retains the persisted graph.
-            std::vector<std::shared_ptr<VectorIndex>> m_secondLevelIndexes;
+            std::unique_ptr<PostingOwners> m_postingOwners;
+            RoutingSignatures m_routingSignatures;
+            mutable std::atomic<bool> m_routingStaleWarning{false};
             std::vector<std::shared_ptr<VectorSet>> m_secondLevelCatalogs;
             std::vector<SecondLevelHeadPostings> m_secondLevelPostings;
             mutable std::atomic<bool> m_headHybridGraphLoaded{false};
@@ -159,9 +164,6 @@ namespace SPTAG
             mutable std::shared_ptr<VectorSet> m_h1CatalogVectors;
             // Build-time hierarchy CSR used only while creating graphless-H1
             // postings. Persisted signatures are added after support is learned.
-            std::vector<std::vector<std::uint64_t>> m_graphlessHierarchyOffsets;
-            std::vector<std::vector<SecondLevelHeadPostings::Member>>
-                m_graphlessHierarchyMembers;
             // Precomputed H1 head-id -> resolved bundle sample pointer table. Built once at
             // load (SetupMetadataOnlyHeadStore) after every bundle is eager-loaded and
             // immutable, so the external sample resolver is a lock-free O(1) array lookup
@@ -225,9 +227,9 @@ namespace SPTAG
             ~Index() {}
 
             inline std::shared_ptr<VectorIndex> GetMemoryIndex() { return m_index; }
+            ErrorCode RefreshRoutingSignatures() override;
             inline std::shared_ptr<IExtraSearcher> GetDiskIndex() { return m_extraSearcher; }
             // Offline maintenance: the caller must quiesce searches before compaction.
-            ErrorCode CompactHierarchyVectors() override;
             ErrorCode MaterializeHierarchyVectors(const std::string& p_directory) override;
             ErrorCode PrepareHierarchyExport(const std::string& p_directory) override;
             bool HasRoutingOnlyHierarchy() const override { return m_hierarchyCatalogVersion == 3; }
@@ -475,24 +477,15 @@ namespace SPTAG
             ErrorCode LoadOwnedHierarchyCatalogs(
                 const std::string& p_baseDir,
                 const std::vector<std::vector<std::uint64_t>>& p_levelToLower,
-                const std::shared_ptr<VectorIndex>& p_topIndex,
+                const std::shared_ptr<VectorSet>& p_topIndex,
                 std::vector<std::shared_ptr<VectorSet>>& p_catalogs) const;
             ErrorCode FingerprintHierarchyCatalog(
                 const std::shared_ptr<VectorSet>& p_heads,
                 std::uint64_t& p_fingerprint) const;
-            ErrorCode FinalizeRoutingHierarchyStorage();
             ErrorCode EnsureHierarchyHeadMetadata(const std::string& p_baseDir, bool p_build);
             ErrorCode RefreshHierarchySignatures(
                 const std::vector<std::vector<std::uint64_t>>& p_levelToLower,
                 bool p_validateOnly);
-            ErrorCode SearchSecondLevelHeads(
-                COMMON::QueryResultSet<T>* p_queryResults,
-                int p_graphResultNum,
-                const std::function<bool(SizeType)>&
-                    p_headAdmission,
-                int& p_scannedOut,
-                ExtraWorkSpace* p_workspace = nullptr,
-                const std::function<bool(SizeType, const float*)>& p_headPointCandidate = nullptr) const;
             ErrorCode LoadHeadCrossEdges() const;
             ErrorCode EnsureHeadHybridGraph();
             ErrorCode EnsureStaticTailCrossEdges();
@@ -505,12 +498,14 @@ namespace SPTAG
                 COMMON::QueryResultSet<T>* p_queryResults,
                 int p_entryNode,
                 int p_graphResultNum,
-                int& p_scannedOut) const;
+                int& p_scannedOut,
+                const std::function<bool(SizeType)>* p_resultFilter = nullptr) const;
             ErrorCode SearchHeadBundlesNative(
                 COMMON::QueryResultSet<T>* p_queryResults,
                 const std::vector<int>& p_candidateNodes,
                 int p_graphResultNum,
-                int& p_scannedOut) const;
+                int& p_scannedOut,
+                const std::function<bool(SizeType)>* p_resultFilter = nullptr) const;
 
             ErrorCode SetParameter(const char* p_param, const char* p_value, const char* p_section = nullptr);
             std::string GetParameter(const char* p_param, const char* p_section = nullptr) const;
@@ -588,7 +583,7 @@ namespace SPTAG
             // Monolithic and graphless catalogs share the existing head-ID map.
             // Only legacy bundle-backed slim roots resolve IDs from bundles.
             // Caller must InitializeHeadNodeMeta first.
-            bool PopulateHeadNodeGlobalVIDsFromBundles()
+            bool PopulateHeadNodeGlobalVIDsFromBundles(bool validateOnly = false)
             {
                 if (m_index == nullptr || !m_index->HasHeadNodeMeta()) return false;
                 const SizeType metaCount = m_index->GetHeadNodeMetaSampleCount();
@@ -610,12 +605,17 @@ namespace SPTAG
                         }
                     }
                     for (SizeType localHeadId = 0; localHeadId < metaCount; ++localHeadId) {
+                        if (validateOnly) {
+                            if (m_index->GetHeadNodeGlobalVID(localHeadId) !=
+                                static_cast<SizeType>(*(m_vectorTranslateMap[localHeadId]))) return false;
+                            continue;
+                        }
                         m_index->SetHeadNodeGlobalVID(
                             localHeadId,
                             static_cast<SizeType>(*(m_vectorTranslateMap[localHeadId])));
                         m_index->SetHeadNodeBundleNodeId(localHeadId, 0);
                     }
-                    for (size_t slot = 0; slot < m_headBundleNodes.size() &&
+                    for (size_t slot = 0; !validateOnly && slot < m_headBundleNodes.size() &&
                                           slot < m_headBundleLocalToGlobalHIDs.size(); ++slot) {
                         for (SizeType head : m_headBundleLocalToGlobalHIDs[slot]) {
                             if (head >= 0 && head < metaCount)
@@ -649,6 +649,10 @@ namespace SPTAG
                     if (local < 0 || (size_t)local >= l2g.size()) continue;
                     SizeType globalHeadId = l2g[(size_t)local];
                     if (globalHeadId < 0 || globalHeadId >= metaCount) continue;
+                    if (validateOnly) {
+                        if (m_index->GetHeadNodeGlobalVID(globalHeadId) != globalVID) return false;
+                        continue;
+                    }
                     m_index->SetHeadNodeGlobalVID(globalHeadId, globalVID);
                     m_index->SetHeadNodeBundleNodeId(
                         globalHeadId, m_headBundleNodes[static_cast<size_t>(nodeId)].nodeId);

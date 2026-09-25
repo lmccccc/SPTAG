@@ -1,0 +1,7 @@
+{
+  "attr_indexes": [
+    {"name": "num", "key": 1, "type": "range", "file": "base.label.1"}
+  ],
+  "filter": "num = $$range",
+  "bindings": {"range": "numeric.spmat"}
+}

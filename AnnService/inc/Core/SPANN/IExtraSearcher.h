@@ -8,7 +8,6 @@
 
 #include "inc/Core/VectorIndex.h"
 #include "inc/Core/Common/VersionLabel.h"
-#include "inc/Core/SPANN/SecondLevelHierarchy.h"
 #include "inc/Helper/AsyncFileReader.h"
 #include "inc/Helper/KeyValueIO.h"
 #include "inc/Helper/VectorSetReader.h"
@@ -164,7 +163,6 @@ namespace SPTAG {
 
         struct ExtraWorkSpace : public SPTAG::COMMON::IWorkSpace
         {
-            SecondLevelHierarchyDetail::SearchWorkspace m_hierarchy;
             struct PostingProbeStats {
                 std::uint64_t m_readPostings = 0;
                 std::uint64_t m_matchedPostings = 0;

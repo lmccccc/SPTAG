@@ -1,0 +1,7 @@
+{
+  "attr_indexes": [
+    {"name": "tag", "key": 0, "type": "label", "file": "base.label.0"}
+  ],
+  "filter": "tag = $$tag",
+  "bindings": {"tag": "extreme_tag.spmat"}
+}

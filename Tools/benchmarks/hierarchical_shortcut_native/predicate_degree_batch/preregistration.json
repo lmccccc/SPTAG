@@ -1,0 +1,73 @@
+{
+  "grid": [
+    16,
+    24,
+    32,
+    48,
+    62,
+    80,
+    96,
+    128,
+    192,
+    256,
+    384
+  ],
+  "scenarios": [
+    "unfilter",
+    "broad_tag",
+    "medium_tag",
+    "extreme_tag",
+    "numeric",
+    "mixed_dnf"
+  ],
+  "cases": [
+    "h1",
+    "h3",
+    "supplier"
+  ],
+  "ordinary_index_load_invocations": 36,
+  "ordinary_measurement_batches": 396,
+  "unique_points": 198,
+  "repetitions": 2,
+  "query_count": 1000,
+  "warmup_per_probe": 1000,
+  "untimed_capture_per_probe": 1000,
+  "fixture_query_count": 8,
+  "fixture_warmup_per_probe": 8,
+  "array_fixture_invocations": 36,
+  "new_scalar_fixture_invocations": 9,
+  "fixture_scalar_reference": "Actual completed per-point native captures at16/24/384, first8 queries; nine new scalar executions additionally verify scalar compatibility.",
+  "array_policy": "Ordered positive decimal integers, optional brackets; empty, malformed, duplicate, overflowing or below-ResultNum values rejected before index load.",
+  "timing_protocol": "One loaded index per fixed mode/scenario/repetition; independent warmup and measurement for each probe; caches/index persist across probes. Fresh batch data only.",
+  "supplier_degree_semantics": "predicate_valid_neighbors",
+  "configs": {
+    "h1_fixture_asc.ini": "ca2abb1fd30b57afa6f33e02381ecddee832784c1a130176ddc277936e8852c8",
+    "h1_fixture_desc.ini": "6b6994b8537970e09d2726f0a2ba4121a4374867df2ebaf6e9548090bef81901",
+    "h1_r1.ini": "a7c75cb38360db6f1bb5e77a3ab08fbe78af141d9543482afbdf09910ecfe2b7",
+    "h1_r2.ini": "75be6614e1cf3c6370ea6077c0b4d841df6eb82478b737d324a17e5fa4594546",
+    "h1_scalar_16.ini": "4c184d42170c4e1fb49b720a64b6c3edd2b0f95e52a954c57c741a1140df7e50",
+    "h1_scalar_24.ini": "b4cc417af028fa6d1b3682b0a5637b6f7558af5eb0405365e8572450e126d99c",
+    "h1_scalar_384.ini": "402e032ad41d7f9c5f2f0f63ed9c2f1e727c345aeabaadd643ac09450ea5c848",
+    "h3_fixture_asc.ini": "faeabe2f0e8d6adf2f0eeec669dec6cceaeab5cad35a8a2df934918f6402f3e6",
+    "h3_fixture_desc.ini": "838695ce6f75809843b6bc5322c8e659dfda04f69c5424fee1310ab365efbbd9",
+    "h3_r1.ini": "e3cd93d91ce0be874a4e58dcef4ea64a812f4b63016b363256c83e2f8eb8eeee",
+    "h3_r2.ini": "19879d424122f7913bfcfc58a0eb97e29f884946aad7fa7d57f00966485a0703",
+    "h3_scalar_16.ini": "15fb3bb1f7449c5091d899069fa3b86a40593ed8f3109679876081b2b32ac176",
+    "h3_scalar_24.ini": "f4293745d4231d98ecb2a95c23a45f730facded56f7fb81645b8ee4c80ec191b",
+    "h3_scalar_384.ini": "e92bae2ef8b74b3e64d121276558d6fea0e9c1d62dc53d6ed6efd75e8515413c",
+    "supplier_fixture_asc.ini": "75f00bcc475686a051eaa90bcd0ac48b637cb3cf768ea75100ec213b9d3f84ef",
+    "supplier_fixture_desc.ini": "6ee29908f5a41be2e876d269bb98f2b72aaa1ef033e0add7ee75a3de2aacbf29",
+    "supplier_r1.ini": "781cc2f23d3d2d29392a6d6f556b95bcf4d189d30dafe3e18df778e8bece2b44",
+    "supplier_r2.ini": "627930a6295535d411779a68b410611e7c08d68df93450d4084d942a12f03880",
+    "supplier_scalar_16.ini": "d3ccf444e04e8c66f98294de2fa933b658ef60881b66361172df2a1d605751a0",
+    "supplier_scalar_24.ini": "3097a6c32112facbb21e38d9ab736fef3ff5e93b2ab55dcc431cf43223a89155",
+    "supplier_scalar_384.ini": "b4e99a79fa909422338cef61dca5affcd1e452564ce0bb752eec85fed917327d"
+  },
+  "schedule_sha256": "68b0f8c3dfe3c9f3283145b7266a346753d0fc0ac91009b81252088a29f626e5",
+  "previous_status_observed": {
+    "state": "completed",
+    "measured_points": 198,
+    "native_processes": 468,
+    "ordinary_repetitions": 2
+  }
+}

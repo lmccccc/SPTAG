@@ -1,0 +1,26 @@
+{
+  "version": 2,
+  "dtype": "little-endian float64",
+  "width": 44,
+  "fields": [
+    "query", "head", "candidate_level", "candidate_row", "chosen_level",
+    "checked_before", "checked_after", "remaining_objective", "remaining_checks",
+    "graph_cost", "graph_gain", "graph_novelty", "graph_useful_given_fresh", "graph_length",
+    "posting_cost", "posting_gain", "posting_novelty", "posting_useful_given_fresh", "posting_length",
+    "immediate_child_row",
+    "tail_cost", "tail_gain", "tail_novelty", "tail_useful_given_fresh", "tail_length",
+    "previous_graph_members", "previous_graph_fresh", "previous_graph_predicate_checks",
+    "previous_graph_predicate_passes", "previous_graph_useful",
+    "realized_members", "realized_fresh", "realized_predicate_checks",
+    "realized_predicate_passes", "realized_useful",
+    "descriptor_members", "new_representative_distances",
+    "posting_history_source", "selected_spatial_distance", "posting_unpaid_setup",
+    "tail_unpaid_setup", "tail_spatial_distance", "new_retained_descriptors", "retained_h2_chosen_later"
+  ],
+  "history_sources": {"0": "native graph", "1": "direct H2", "2": "discovered H2"},
+  "levels": {"0": "graph continuation", "1": "H2 full H1-member row", "2": "H3 full H2-descriptor row"},
+  "timing": "All trace capture and serialization are outside the unchanged ordinary timed body.",
+  "sunk_work": "Candidate representative distances are counted when first paid and reused. Graph decisions may pay estimator representatives, but never consume auxiliary rows. Recorded action cost excludes those sunk representative distances.",
+  "h3_reserve": "H3 planning conservatively reserves a full descriptor signature scan and one hypothetical child representative. Actual H2 tail comparison uses cached signature/representative metadata and actual row length.",
+  "selection": "Each family first screens prospective cost/gain against graph, then uses native nearest-parent vector distance; family winners compete on remaining unpaid cost/gain. Graph wins cost ties. Spatial ties use row ID."
+}

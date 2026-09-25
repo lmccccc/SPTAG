@@ -717,7 +717,8 @@ struct DNFPredicate {
         return false;
     }
 
-    bool MayMatchHier(const HierarchicalPostingMask& h,
+    template<class Mask>
+    bool MayMatchHier(const Mask& h,
                       const HierWidthTable& widths) const {
         for (const auto& c : clauses) {
             if (c.lits.empty()) continue;
@@ -737,16 +738,57 @@ struct DNFPredicate {
         return MayMatchHier(h, HierWidths());
     }
 
+    // Intersect raw bounds before quantization. Testing each literal against a
+    // posting independently would let different members satisfy the two ends
+    // of a range containing none of them.
+    static bool NumericRangeBuckets(
+        const DNFClause& clause, uint32_t column, const NumQuantParam& domain,
+        int& bucketLow, int& bucketHigh) {
+        uint32_t low = 0;
+        uint32_t high = (std::numeric_limits<uint32_t>::max)();
+        for (const auto& literal : clause.lits) {
+            if (literal.kind == 0 || literal.col != column) continue;
+            switch (literal.op) {
+                case DNF_EQ:
+                    low = (std::max)(low, literal.val);
+                    high = (std::min)(high, literal.val);
+                    break;
+                case DNF_LT:
+                    if (literal.val == 0) return false;
+                    high = (std::min)(high, literal.val - 1);
+                    break;
+                case DNF_LE:
+                    high = (std::min)(high, literal.val);
+                    break;
+                case DNF_GT:
+                    if (literal.val == (std::numeric_limits<uint32_t>::max)())
+                        return false;
+                    low = (std::max)(low, literal.val + 1);
+                    break;
+                case DNF_GE:
+                    low = (std::max)(low, literal.val);
+                    break;
+                default:
+                    return false;
+            }
+            if (low > high) return false;
+        }
+        bucketLow = NumQuantBucket(domain, low);
+        bucketHigh = NumQuantBucket(domain, high);
+        return true;
+    }
+
     // Combined categorical + quantized-numeric posting pre-filter. A clause
     // passes iff EVERY one of its literals may match: categorical literals against
     // the hierarchical mask `h`, numeric literals against the posting's quantized
     // numeric mask `quant` (M*NUM_QUANT_WORDS uint64). `qp` holds the per-column
     // [lo,hi] domains. Explicit schemas supply original-column numericLanes;
     // legacy callers use the numeric suffix beginning at numBaseCols.
-    // Conservative: a numeric literal "may match" iff some bucket overlapping its
-    // range is set. When `quant` is null (no numeric signature present) numeric
+    // Numeric bounds on one column are intersected within each clause before
+    // checking its bucket range. When `quant` is null (no numeric signature present) numeric
     // literals are treated as always-may-match (fail open).
-    bool MayMatchHierQuant(const HierarchicalPostingMask& h,
+    template<class Mask>
+    bool MayMatchHierQuant(const Mask& h,
                            const uint64_t* quant, int numQuantCols,
                            const NumQuantParam* qp, int numQuantParams,
                            int numBaseCols,
@@ -771,8 +813,11 @@ struct DNFPredicate {
                         continue;  // unknown col: fail open
                     }
                     int blo, bhi;
-                    NumQuantPredBuckets(qp[lane], l.op, l.val, blo, bhi);
-                    if (!NumQuantAnyInRange(quant, lane, blo, bhi)) { all = false; break; }
+                    if (!NumericRangeBuckets(c, l.col, qp[lane], blo, bhi) ||
+                        !NumQuantAnyInRange(quant, lane, blo, bhi)) {
+                        all = false;
+                        break;
+                    }
                 }
             }
             if (all) return true;
@@ -819,10 +864,9 @@ struct DNFPredicate {
                     }
                     int bucketLow = 0;
                     int bucketHigh = 0;
-                    NumQuantPredBuckets(
-                        qp[lane], l.op, l.val,
-                        bucketLow, bucketHigh);
-                    if (!NumQuantAnyInRange(
+                    if (!NumericRangeBuckets(
+                            c, l.col, qp[lane], bucketLow, bucketHigh) ||
+                        !NumQuantAnyInRange(
                             quant, lane,
                             bucketLow, bucketHigh)) {
                         all = false;

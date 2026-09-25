@@ -4,6 +4,8 @@
 #include "inc/Core/SPANN/HierarchyVectorCatalog.h"
 #include "inc/Core/SPANN/HeadNodeMetadata.h"
 #include "inc/Core/SPANN/LimitedTagSupport.h"
+#include "inc/Core/Common/GraphAccessStats.h"
+#include "inc/Core/Common/QueryResultSet.h"
 #include "inc/Test.h"
 
 #include <boost/filesystem/operations.hpp>
@@ -116,7 +118,7 @@ struct TinyHierarchy
     std::shared_ptr<VectorSet> h1;
     std::shared_ptr<VectorSet> h2;
     Catalogs owned;
-    std::shared_ptr<VectorIndex> top;
+    std::shared_ptr<VectorSet> top;
 
     explicit TinyHierarchy(IndexAlgoType algorithm = IndexAlgoType::BKT) : owned(2)
     {
@@ -129,7 +131,7 @@ struct TinyHierarchy
         }
         h1 = NativeCatalog<float>(3, values);
         h2 = NativeSelection(h1, maps[0]);
-        top = NativeTopIndex(NativeSelection(h2, maps[1]), algorithm);
+        top = NativeSelection(h2, maps[1]);
         BOOST_REQUIRE(PackOwnedHierarchyVectors(h1, maps[0], owned[0]) == ErrorCode::Success);
         BOOST_REQUIRE(PackOwnedHierarchyVectors(h2, maps[1], owned[1]) == ErrorCode::Success);
     }
@@ -375,6 +377,38 @@ void UpdateNativeSupportFingerprint(std::vector<std::uint8_t>& bytes)
 
 BOOST_AUTO_TEST_SUITE(HierarchyCatalogTest)
 
+BOOST_AUTO_TEST_CASE(GraphAccessCountersPreserveNativeResultsAndScope)
+{
+    auto vectors = NativeCatalog<float>(2, {
+        0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f,
+        8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f});
+    auto index = NativeTopIndex(vectors);
+    const float query[] = {3.0f, 4.0f};
+    COMMON::QueryResultSet<float> reference(query, 4), measured(query, 4);
+    BOOST_REQUIRE(index->SearchIndexWithMaxCheck(reference, 16) == ErrorCode::Success);
+    COMMON::GraphAccessStats stats;
+    {
+        COMMON::ScopedGraphAccessStats scope(&stats);
+        BOOST_REQUIRE(index->SearchIndexWithMaxCheck(measured, 16) == ErrorCode::Success);
+        {
+            COMMON::ScopedGraphAccessStats paused(nullptr);
+            BOOST_CHECK(COMMON::g_graphAccessStats == nullptr);
+        }
+        BOOST_CHECK(COMMON::g_graphAccessStats == &stats);
+    }
+    BOOST_CHECK(COMMON::g_graphAccessStats == nullptr);
+    BOOST_CHECK_GT(stats.m_distanceCalls, 0U);
+    BOOST_CHECK_GT(stats.m_graphRows, 0U);
+    BOOST_CHECK_GT(stats.m_visitedChecks, 0U);
+    BOOST_CHECK_GT(stats.m_treeNodeVisits, 0U);
+    BOOST_CHECK_EQUAL(reference.GetScanned(), measured.GetScanned());
+    for (int rank = 0; rank < 4; ++rank)
+    {
+        BOOST_CHECK_EQUAL(reference.GetResult(rank)->VID, measured.GetResult(rank)->VID);
+        BOOST_CHECK_EQUAL(reference.GetResult(rank)->Dist, measured.GetResult(rank)->Dist);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(PreservesLogicalRowsAndUniquePhysicalOwnership)
 {
     for (const auto algorithm : {IndexAlgoType::BKT, IndexAlgoType::KDT})
@@ -391,16 +425,16 @@ BOOST_AUTO_TEST_CASE(PreservesLogicalRowsAndUniquePhysicalOwnership)
             BOOST_CHECK(hierarchy.maps == originalMaps);
 
             std::set<const void*> physicalRows;
-            SizeType ownedCount = hierarchy.top->GetNumSamples();
+            SizeType ownedCount = hierarchy.top->Count();
             for (const auto& catalog : hierarchy.owned)
             {
                 ownedCount += catalog->Count();
                 for (SizeType row = 0; row < catalog->Count(); ++row)
                     BOOST_CHECK(physicalRows.insert(catalog->GetVector(row)).second);
             }
-            for (SizeType row = 0; row < hierarchy.top->GetNumSamples(); ++row)
+            for (SizeType row = 0; row < hierarchy.top->Count(); ++row)
             {
-                const void* sample = hierarchy.top->GetSample(row);
+                const void* sample = hierarchy.top->GetVector(row);
                 BOOST_CHECK(physicalRows.insert(sample).second);
                 BOOST_CHECK(views.back()->GetVector(row) == sample);
             }
@@ -429,8 +463,8 @@ BOOST_AUTO_TEST_CASE(PreservesLogicalRowsAndUniquePhysicalOwnership)
                         static_cast<SizeType>(hierarchy.maps[level][upper])) ==
                         views[level + 1]->GetVector(static_cast<SizeType>(upper)));
             }
-            BOOST_CHECK(views[0]->GetVector(7) == hierarchy.top->GetSample(0));
-            BOOST_CHECK(views[0]->GetVector(6) == hierarchy.top->GetSample(1));
+            BOOST_CHECK(views[0]->GetVector(7) == hierarchy.top->GetVector(0));
+            BOOST_CHECK(views[0]->GetVector(6) == hierarchy.top->GetVector(1));
             const SizeType h1OwnedIDs[] = {0, 2, 4, 5};
             for (SizeType packed = 0; packed < 4; ++packed)
                 BOOST_CHECK(views[0]->GetVector(h1OwnedIDs[packed]) ==
@@ -438,9 +472,6 @@ BOOST_AUTO_TEST_CASE(PreservesLogicalRowsAndUniquePhysicalOwnership)
             BOOST_CHECK(views[1]->GetVector(1) == hierarchy.owned[1]->GetVector(0));
             BOOST_CHECK(views[1]->GetVector(3) == hierarchy.owned[1]->GetVector(1));
 
-            QueryResult query(hierarchy.top->GetSample(0), 1, false);
-            BOOST_REQUIRE(hierarchy.top->SearchIndex(query) == ErrorCode::Success);
-            BOOST_CHECK_EQUAL(query.GetResult(0)->VID, 0);
         }
     }
 }
@@ -455,7 +486,7 @@ BOOST_AUTO_TEST_CASE(RetainsOwnersAndLocatorsUntilTheLastLowerViewDies)
     std::memcpy(expected.data(), hierarchy.h1->GetData(), expected.size());
     std::vector<const void*> pointers;
     for (SizeType row = 0; row < count; ++row) pointers.push_back(views[0]->GetVector(row));
-    std::weak_ptr<VectorIndex> topOwner = hierarchy.top;
+    std::weak_ptr<VectorSet> topOwner = hierarchy.top;
     std::weak_ptr<VectorSet> h1Owner = hierarchy.owned[0];
     std::weak_ptr<VectorSet> h2Owner = hierarchy.owned[1];
     std::weak_ptr<VectorSet> middleView = views[1];
@@ -496,7 +527,7 @@ BOOST_AUTO_TEST_CASE(SupportsZeroOwnedLowerAndIntermediateLayersAndTopOnly)
             : NativeCatalog<std::int16_t>(2, {17, -31, 29, -43});
         const std::vector<std::uint64_t> map = count == 1
             ? std::vector<std::uint64_t>{0} : std::vector<std::uint64_t>{1, 0};
-        const auto top = NativeTopIndex(source);
+        const auto top = source;
         std::shared_ptr<VectorSet> empty;
         BOOST_REQUIRE(PackOwnedHierarchyVectors(source, map, empty) == ErrorCode::Success);
         BOOST_REQUIRE_EQUAL(empty->Count(), 0);
@@ -514,15 +545,15 @@ BOOST_AUTO_TEST_CASE(SupportsZeroOwnedLowerAndIntermediateLayersAndTopOnly)
         }
         for (SizeType row = 0; row < count; ++row)
         {
-            BOOST_CHECK(views[0]->GetVector(row) == top->GetSample(row));
+            BOOST_CHECK(views[0]->GetVector(row) == top->GetVector(row));
             BOOST_CHECK(views[1]->GetVector(row) ==
-                        top->GetSample(static_cast<SizeType>(map[static_cast<std::size_t>(row)])));
+                        top->GetVector(static_cast<SizeType>(map[static_cast<std::size_t>(row)])));
         }
         BOOST_REQUIRE(BuildDisjointHierarchyCatalogs(
             count, {}, {}, top, views) == ErrorCode::Success);
         BOOST_REQUIRE_EQUAL(views.size(), 1U);
         CheckRows(views.front(), source);
-        BOOST_CHECK(views.front()->GetVector(0) == top->GetSample(0));
+        BOOST_CHECK(views.front()->GetVector(0) == top->GetVector(0));
     }
 }
 
@@ -606,7 +637,7 @@ BOOST_AUTO_TEST_CASE(PacksLogicalViewsAndSupportsAliasedOutputs)
     BOOST_REQUIRE_EQUAL(inputAndOutput.size(), 3U);
     CheckRows(inputAndOutput[0], hierarchy.h1);
     CheckRows(inputAndOutput[1], hierarchy.h2);
-    BOOST_CHECK(inputAndOutput[2]->GetVector(0) == hierarchy.top->GetSample(0));
+    BOOST_CHECK(inputAndOutput[2]->GetVector(0) == hierarchy.top->GetVector(0));
 }
 
 BOOST_AUTO_TEST_CASE(RejectsInvalidSamplingMapsWithoutReplacingViews)
@@ -642,13 +673,13 @@ BOOST_AUTO_TEST_CASE(RejectsInvalidSamplingMapsWithoutReplacingViews)
     CheckRows(views[0], hierarchy.h1);
 }
 
-BOOST_AUTO_TEST_CASE(RejectsInconsistentNativeCatalogsAndTopGraph)
+BOOST_AUTO_TEST_CASE(RejectsInconsistentNativeCatalogs)
 {
     TinyHierarchy hierarchy;
     auto views = hierarchy.Build();
     const auto original = views;
     const auto reject = [&](SizeType count, const SamplingMaps& maps, const Catalogs& owned,
-                            const std::shared_ptr<VectorIndex>& top, ErrorCode expected)
+                            const std::shared_ptr<VectorSet>& top, ErrorCode expected)
     {
         std::string error;
         BOOST_CHECK(BuildDisjointHierarchyCatalogs(
@@ -663,7 +694,7 @@ BOOST_AUTO_TEST_CASE(RejectsInconsistentNativeCatalogsAndTopGraph)
     reject(8, hierarchy.maps, hierarchy.owned, nullptr, ErrorCode::LackOfInputs);
     reject(3, {}, {}, hierarchy.top, ErrorCode::FailedParseValue);
     reject(8, hierarchy.maps, hierarchy.owned,
-           VectorIndex::CreateInstance(IndexAlgoType::BKT, VectorValueType::Float), ErrorCode::EmptyIndex);
+           NativeCatalog<float>(3, {}), ErrorCode::EmptyIndex);
 
     auto owned = hierarchy.owned;
     owned[0].reset();
@@ -742,8 +773,8 @@ BOOST_AUTO_TEST_CASE(MaterializationRestoresEveryIndependentLocalRow)
     BOOST_CHECK_EQUAL(independent[0]->Count(), 8);
     BOOST_CHECK_EQUAL(independent[1]->Count(), 4);
     BOOST_CHECK_EQUAL(independent[2]->Count(), 2);
-    for (SizeType row = 0; row < hierarchy.top->GetNumSamples(); ++row)
-        BOOST_CHECK(independent.back()->GetVector(row) == hierarchy.top->GetSample(row));
+    for (SizeType row = 0; row < hierarchy.top->Count(); ++row)
+        BOOST_CHECK(independent.back()->GetVector(row) == hierarchy.top->GetVector(row));
     for (std::size_t level = 0; level < hierarchy.maps.size(); ++level)
         for (std::size_t row = 0; row < hierarchy.maps[level].size(); ++row)
             BOOST_CHECK(independent[level]->GetVector(static_cast<SizeType>(hierarchy.maps[level][row])) !=
@@ -776,7 +807,7 @@ BOOST_AUTO_TEST_CASE(MaterializationRestoresEveryIndependentLocalRow)
     BOOST_CHECK(independent == retained);
     *upperByte ^= 1U;
     auto* topByte = const_cast<std::uint8_t*>(
-        static_cast<const std::uint8_t*>(hierarchy.top->GetSample(0)));
+        static_cast<const std::uint8_t*>(hierarchy.top->GetVector(0)));
     *topByte ^= 1U;
     BOOST_CHECK(BuildIndependentHierarchyCatalogs(
         hierarchy.h1->Count(), hierarchy.maps, full, hierarchy.top, independent) != ErrorCode::Success);
