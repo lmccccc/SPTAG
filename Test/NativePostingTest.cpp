@@ -66,6 +66,83 @@ void StorageTests() {
     std::cout<<"PASS 4-byte native domain, generic maximum, collisions/rehash/first-once, cached negative visit, 128 mixed queries zero allocations\n";
 }
 
+void PostingStateArenaTests() {
+    struct Resource : std::pmr::memory_resource {
+        std::size_t allocated = 0, released = 0, bytes = 0, live = 0;
+        void* do_allocate(std::size_t size, std::size_t alignment) override {
+            auto* pointer = std::pmr::new_delete_resource()->allocate(size, alignment);
+            ++allocated; bytes += size; live += size;
+            return pointer;
+        }
+        void do_deallocate(void* pointer, std::size_t size, std::size_t alignment) override {
+            ++released; live -= size;
+            std::pmr::new_delete_resource()->deallocate(pointer, size, alignment);
+        }
+        bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+            return this == &other;
+        }
+    };
+    struct Restore {
+        std::pmr::memory_resource* previous;
+        ~Restore() { std::pmr::set_default_resource(previous); }
+    };
+    struct Owners {
+        int count;
+        std::vector<int> ids;
+        std::size_t Levels() const { return 1; }
+        int Count(std::size_t) const { return count; }
+        SPANN::PostingOwners::Range Parents(std::size_t, int) const {
+            return {ids.data(), ids.data() + ids.size()};
+        }
+    };
+    struct Layer {
+        const std::uint32_t* Begin(int) const { throw std::logic_error("Rejected CSR read"); }
+        const std::uint32_t* End(int) const { throw std::logic_error("Rejected CSR read"); }
+    };
+    std::size_t expectedAllocations = 0, expectedBytes = 0;
+    for (int catalog : {32768, 1000000000, MaxSize}) {
+        Resource resource;
+        Restore restore{std::pmr::set_default_resource(&resource)};
+        Owners owners{catalog, std::vector<int>(32768)};
+        owners.ids[0] = catalog - 1;
+        for (std::size_t i = 1; i < owners.ids.size(); ++i)
+            owners.ids[i] = static_cast<int>((std::uint64_t(i - 1) * 32749) % (catalog - 1));
+        CHECK(std::set<int>(owners.ids.begin(), owners.ids.end()).size() == owners.ids.size());
+        const std::vector<Layer> layers(1);
+        int checks = 0;
+        std::sort(owners.ids.begin(), owners.ids.end());
+        const auto signature = [&](std::size_t, int id) {
+            CHECK(id == owners.ids.at(checks));
+            ++checks; return false;
+        };
+        const auto distance = [](std::size_t, int) -> float {
+            throw std::logic_error("Rejected representative scored");
+        };
+        const auto consume = [](const std::uint32_t*, int) -> COMMON::PostingNavigation::RowResult {
+            throw std::logic_error("Rejected row consumed");
+        };
+        {
+            SPANN::HierarchyPostingQuery<decltype(layers),decltype(signature),decltype(distance),Owners>
+                query(owners,layers,signature,distance);
+            query.SetSearchCapacity(64);
+            CHECK(resource.allocated == 0);
+            query.Expand(0,consume);
+            CHECK(checks == 32768 && resource.allocated > 0 && resource.allocated < 128);
+            CHECK(resource.bytes < 8 * 1024 * 1024);
+            const auto allocated = resource.allocated;
+            query.Expand(0,consume);
+            CHECK(checks == 32768 && resource.allocated == allocated);
+        }
+        CHECK(resource.live == 0 && resource.released == resource.allocated);
+        if (!expectedAllocations) {
+            expectedAllocations = resource.allocated;
+            expectedBytes = resource.bytes;
+        }
+        CHECK(resource.allocated == expectedAllocations && resource.bytes == expectedBytes);
+    }
+    std::cout<<"PASS query-touched arena: chunked allocations, cached rejections, catalog-independent bytes and full release\n";
+}
+
 struct OneRow : COMMON::PostingNavigation {
     std::vector<std::uint32_t> ids;
     int calls=0;
@@ -454,6 +531,7 @@ template<class T> void AuxiliaryNegativeSkipTest() {
 int main(int argc,char** argv) {
     try {
         StorageTests();
+        PostingStateArenaTests();
         if(argc!=2 || std::string(argv[1])!="--storage-only") {
             SearchTests();SignatureTests();PostingStateScalingTests();NumericRoutingTests();
             AuxiliaryNegativeSkipTest<float>();AuxiliaryNegativeSkipTest<std::uint8_t>();

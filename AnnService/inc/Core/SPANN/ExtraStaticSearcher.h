@@ -1869,6 +1869,8 @@ namespace SPTAG
                         selectedEdges.reserve(
                             static_cast<size_t>(
                                 p_opt.m_replicaCount));
+                        std::vector<SizeType> selectedHeads;
+                        selectedHeads.reserve(static_cast<size_t>(p_opt.m_replicaCount));
                         while (!failed.load()) {
                             const SizeType vectorID =
                                 nextVector.fetch_add(1);
@@ -1925,33 +1927,18 @@ namespace SPTAG
                             const auto selectRNG =
                                 [&](COMMON::QueryResultSet<ValueType>& candidates) {
                                     selectedEdges.clear();
-                                    for (int rank = 0;
-                                         rank < candidates.GetResultNum() &&
-                                         selectedEdges.size() < static_cast<size_t>(p_opt.m_replicaCount);
-                                         ++rank) {
-                                        const BasicResult* result = candidates.GetResult(rank);
-                                        if (result == nullptr || result->VID < 0) break;
-                                        if (result->VID >= headCount ||
-                                            !p_support.Supports(result->VID, tag))
-                                            return false;
-                                        bool accepted = true;
-                                        for (const auto& prior : selectedEdges) {
-                                            const float headDistance = p_headIndex->ComputeDistance(
-                                                p_headIndex->GetSample(result->VID),
-                                                p_headIndex->GetSample(prior.node));
-                                            if (p_opt.m_rngFactor * headDistance <= result->Dist) {
-                                                accepted = false;
-                                                break;
-                                            }
-                                        }
-                                        if (!accepted) continue;
-                                        Edge edge;
-                                        edge.node = result->VID;
-                                        edge.tonode = vectorID;
-                                        edge.distance = result->Dist;
-                                        selectedEdges.push_back(edge);
-                                    }
-                                    return true;
+                                    return SelectLimitedTagPostingCandidates(candidates, headCount,
+                                        p_opt.m_replicaCount, p_opt.m_rngFactor, filter,
+                                        [&](SizeType left, SizeType right) {
+                                            return p_headIndex->ComputeDistance(
+                                                p_headIndex->GetSample(left), p_headIndex->GetSample(right));
+                                        }, selectedHeads, [&](const BasicResult& result) {
+                                            Edge edge;
+                                            edge.node = result.VID;
+                                            edge.tonode = vectorID;
+                                            edge.distance = result.Dist;
+                                            selectedEdges.push_back(edge);
+                                        });
                                 };
                             bool validCandidates = selectRNG(results);
                             if (validCandidates && selectedEdges.empty()) {

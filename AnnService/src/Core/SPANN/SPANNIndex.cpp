@@ -9,6 +9,7 @@
 #include "inc/Core/SPANN/ExtraStaticSearcher.h"
 #include "inc/Core/SPANN/HeadCrossEdgeBuilder.h"
 #include "inc/Core/SPANN/HierarchyPostingBuilder.h"
+#include "inc/Core/SPANN/LayeredLabelHierarchyBuilder.h"
 #include "inc/Core/SPANN/HierarchyVectorCatalog.h"
 #include "inc/Core/SPANN/CanonicalHierarchyVectors.h"
 #include "inc/Core/SPANN/HeadNodeMetadata.h"
@@ -2855,6 +2856,13 @@ ErrorCode Index<T>::RefreshRoutingSignatures()
     }
     const bool ready = m_routingSignatures.Build(*m_index, m_limitedTagSupport,
         schema.categorical, schema.numeric, m_secondLevelPostings, std::move(params));
+    if (m_sparseHierarchy) {
+        if (!ready) {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Sparse hierarchy requires authenticated H1 routing metadata.\n");
+            return ErrorCode::Fail;
+        }
+        m_sparseHierarchy->Refresh(*m_index, m_routingSignatures.params);
+    }
     m_routingStaleWarning.store(!ready);
     if (!ready) SPTAGLIB_LOG(Helper::LogLevel::LL_Warning,
         "Routing metadata lacks complete own/region coverage; navigation signatures are conservative unknown.\n");
@@ -2949,6 +2957,36 @@ ErrorCode Index<T>::RefreshHierarchySignatures(
         }
     }
     return ErrorCode::Success;
+}
+
+template <typename T>
+ErrorCode Index<T>::RebuildSparseHierarchy(const Options& p_options, const std::string& p_file) const
+{
+    if (!m_bReady || !m_index || !m_postingOwners || m_sparseHierarchy ||
+        m_metadataOnlyHeadStore || m_pQuantizer || m_options.m_enableHybridDistance ||
+        m_options.m_storage != Storage::STATIC || m_options.m_indexAlgoType != IndexAlgoType::BKT ||
+        !m_routingSignatures.Current(m_index.get())) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+            "Sparse reconstruction requires a loaded, immutable canonical H1 BKT/STATIC source hierarchy.\n");
+        return ErrorCode::FailedParseValue;
+    }
+    try {
+        auto hierarchy = BuildLayeredLabelHierarchy<T>(*m_index, m_limitedTagSupport,
+            m_secondLevelCatalogs, *m_postingOwners, p_options, FingerprintFirstLevelHeadIDs(m_vectorTranslateMap),
+            m_headParameters);
+        hierarchy.Save(p_file);
+        const auto fingerprint = hierarchy.Fingerprint();
+        SparseLabelHierarchy verified;
+        verified.Load(p_file, m_limitedTagSupport, FingerprintFirstLevelHeadIDs(m_vectorTranslateMap),
+            SparseLabelHierarchy::AdmissionParameters(p_options),
+            m_index->GetFeatureDim(), m_index->GetVectorValueType());
+        verified.Refresh(*m_index, m_routingSignatures.params);
+        SparseLabelHierarchy::Require(verified.Fingerprint() == fingerprint, "Sparse reconstruction reload mismatch");
+        return ErrorCode::Success;
+    } catch (const std::exception& error) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Sparse hierarchy reconstruction failed: %s\n", error.what());
+        return ErrorCode::Fail;
+    }
 }
 
 template <typename T>
@@ -3452,6 +3490,11 @@ ErrorCode Index<T>::LoadOwnedHierarchyCatalogs(
 template <typename T>
 ErrorCode Index<T>::PrepareHierarchyExport(const std::string& directory)
 {
+    if (m_sparseHierarchy) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+            "Sparse hierarchy snapshots are read-only; use rebuildsparselabelhierarchy into a new directory.\n");
+        return ErrorCode::FailedParseValue;
+    }
     if (!m_metadataOnlyHeadStore && m_hierarchyCatalogVersion == 0 && m_index &&
         !m_index->m_pQuantizer) {
         std::vector<std::uint32_t> previous;
@@ -3731,6 +3774,7 @@ ErrorCode Index<T>::LoadSecondLevelIndex(
     m_secondLevelCatalogs.clear();
     m_secondLevelPostings.clear();
     m_postingOwners.reset();
+    m_sparseHierarchy.reset();
     if (!m_options.m_selectSecondLevel)
         return ErrorCode::Success;
     if (!ValidSecondLevelArtifactLayout(
@@ -3752,6 +3796,29 @@ ErrorCode Index<T>::LoadSecondLevelIndex(
             Helper::LogLevel::LL_Error,
             "Cannot load second-level routing before H1 is available.\n");
         return ErrorCode::Fail;
+    }
+
+    if (m_options.HasSparseHierarchy()) {
+        try {
+            if (m_metadataOnlyHeadStore || m_pQuantizer || m_options.m_storage != Storage::STATIC ||
+                m_options.m_enableHybridDistance || m_options.m_indexAlgoType != IndexAlgoType::BKT ||
+                EnsureHierarchyHeadMetadata(p_baseDir, false) != ErrorCode::Success)
+                throw std::runtime_error("Sparse hierarchy requires unchanged authenticated H1 BKT metadata");
+            auto hierarchy = std::make_unique<SparseLabelHierarchy>();
+            hierarchy->Load(p_baseDir + FolderSep + m_options.m_secondLevelPostingFile,
+                m_limitedTagSupport, FingerprintFirstLevelHeadIDs(m_vectorTranslateMap),
+                SparseLabelHierarchy::AdmissionParameters(m_options),
+                m_index->GetFeatureDim(), m_index->GetVectorValueType());
+            hierarchy->ReleaseLocalStatistics();
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                "Loaded %d sparse label postings; direct H1 representatives, no legacy upper catalogs.\n",
+                hierarchy->Count());
+            m_sparseHierarchy = std::move(hierarchy);
+            return ErrorCode::Success;
+        } catch (const std::exception& error) {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Cannot load sparse hierarchy: %s\n", error.what());
+            return ErrorCode::FailedParseValue;
+        }
     }
 
     const int hierarchyLevels =
@@ -5193,18 +5260,28 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
          m_options.m_secondLevelHeadIDFile.empty() ||
          m_options.m_legacyTopVectorFolder.empty() ||
          m_options.m_secondLevelPostingFile.empty() ||
-         !ParseSecondLevelGenerations(
+         (!m_options.HasSparseHierarchy() && !ParseSecondLevelGenerations(
              m_options
                  .m_secondLevelGenerationFingerprint,
              SecondLevelUpperLayerCount(
                  m_options),
-             secondLevelGenerations)))
+             secondLevelGenerations))))
     {
         SPTAGLIB_LOG(
             Helper::LogLevel::LL_Error,
             "Enabled second-level routing has an invalid persisted "
             "configuration or generation.\n");
         return ErrorCode::FailedParseValue;
+    }
+    if (m_options.HasSparseHierarchy()) {
+        try {
+            SparseLabelHierarchy::AdmissionParameters(m_options);
+            if (!m_options.m_selectSecondLevel || m_options.m_secondLevelHierarchyLevels != 5)
+                throw std::invalid_argument("Sparse admission requires HierarchyEnabled and HierarchyLevels=5");
+        } catch (const std::invalid_argument& error) {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid sparse hierarchy INI: %s\n", error.what());
+            return ErrorCode::FailedParseValue;
+        }
     }
 
     const std::string metadataRootSidecar = JoinPath(
@@ -5886,37 +5963,98 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         // In the dual-pool slim head store the root index physically holds only the
         // U_extra heads, so its tree cannot navigate H1; skip this dead fallback.
         if (!m_metadataOnlyHeadStore) {
+            std::vector<std::uint32_t> sparseLabels;
+            if (m_sparseHierarchy && useLimitedTagMembership)
+                for (auto tag : limitedTagQueryValues)
+                    if (m_sparseHierarchy->Local() ? m_sparseHierarchy->HasQueryLabel(tag) :
+                        (m_sparseHierarchy->Layered()
+                            ? SparseLabelHierarchy::Admitted(m_limitedTagSupport, tag, m_sparseHierarchy->Metadata().thresholds, 2)
+                            : SparseLabelHierarchy::Tier(m_limitedTagSupport, tag, m_sparseHierarchy->Metadata().thresholds) != 0))
+                        sparseLabels.push_back(tag);
             if (!headAdmission) ret=m_index->SearchIndexWithMaxCheck(*p_queryResults,m_options.m_maxCheck);
-            else if (!m_options.m_enablePostingNavigation)
+            else if (!m_options.m_enablePostingNavigation || (m_sparseHierarchy && sparseLabels.empty()))
                 ret=m_index->SearchIndexWithResultFilter(*p_queryResults,headAdmission,m_options.m_maxCheck);
             else {
                 auto* bkt=dynamic_cast<BKT::Index<T>*>(m_index.get());
                 if (!bkt || m_options.m_storage != Storage::STATIC ||
                     m_options.m_enableHybridDistance || m_pQuantizer ||
-                    !m_postingOwners || m_postingOwners->HeadCount()!=m_index->GetNumSamples()) {
+                    ((!m_sparseHierarchy || m_sparseHierarchy->HeadCount() != m_index->GetNumSamples()) &&
+                     (!m_postingOwners || m_postingOwners->HeadCount()!=m_index->GetNumSamples()))) {
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
                         "Posting navigation requires unchanged H1 BKT geometry and loaded hierarchy CSR; disable EnablePostingNavigation for unsupported layouts.\n");
                     return ErrorCode::FailedParseValue;
                 }
+                if (m_sparseHierarchy) {
+                    if (!routingReady) {
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Sparse hierarchy routing metadata is stale.\n");
+                        return ErrorCode::Fail;
+                    }
+                    const auto& hierarchy = *m_sparseHierarchy;
+                    const auto mayMatch = [&](std::size_t, int id) {
+                        return hierarchy.MayMatch(id, sparseLabels, routingPredicate);
+                    };
+                    const auto childMayMatch = [&](std::size_t, int id) {
+                        return hierarchy.TerminalMayMatchLabels(id, sparseLabels);
+                    };
+                    std::vector<std::uint32_t> selectedMembers;
+                    const auto selectRow = [&](std::size_t, int id) {
+                        return hierarchy.SelectMembers(id, sparseLabels, selectedMembers);
+                    };
+                    const auto distance = [&](std::size_t, int id) {
+                        return bkt->ComputeDistance(p_queryResults->GetQuantizedTarget(),
+                            m_index->GetSample(hierarchy.At(id).representative));
+                    };
+                    const auto prefetch = [&](std::size_t level, std::uint32_t id) {
+                        if (level == 0) {
+                            if (id < static_cast<std::uint32_t>(m_index->GetNumSamples()))
+                                _mm_prefetch(reinterpret_cast<const char*>(m_limitedTagSupport.HeadLookupData(id)), _MM_HINT_T0);
+                        } else if (id < static_cast<std::uint32_t>(hierarchy.Count())) hierarchy.Prefetch(id);
+                    };
+                    HierarchyPostingQuery<SparseLabelHierarchy, decltype(mayMatch), decltype(distance),
+                        SparseLabelHierarchy, decltype(prefetch), SparsePostingLayout, decltype(childMayMatch),
+                        decltype(selectRow)>
+                        posting(hierarchy, hierarchy, mayMatch, distance, prefetch,
+                            m_options.m_postingNavigationWidth, childMayMatch, selectRow);
+                    ret = bkt->SearchIndexWithPostingNavigation(*p_queryResults, headAdmission, &posting,
+                        m_options.m_maxCheck, false, m_options.m_postingAnchorCount, m_options.m_postingAdditionalMaxCheck);
+                } else {
                 Cache::PostingBitmask signature; signature.Clear();
                 bool signatureReady=false;
+                bool signatureActive=false;
                 const auto mayMatch=[&](std::size_t level,int head) {
                     if (!signatureReady) {
                         if (useLimitedTagMembership)
                             signature=BuildHierarchyQuerySignature(limitedTagQueryValues,m_limitedTagSupport,m_secondLevelPostings);
+                        signatureActive=signature.Popcount()!=0;
                         signatureReady=true;
                     }
-                    return (!signature.Popcount() || m_secondLevelPostings[level].SignatureAt(head)->MayIntersect(signature)) &&
+                    return (!signatureActive || m_secondLevelPostings[level].SignatureAt(head)->MayIntersect(signature)) &&
                         (!routingReady || m_routingSignatures.UpperMayMatch(
                             routingPredicate, level, head, useLimitedTagMembership));
                 };
                 const auto distance=[&](std::size_t level,int head) {
                     return bkt->ComputeDistance(p_queryResults->GetQuantizedTarget(),m_secondLevelCatalogs[level]->GetVector(head));
                 };
-                HierarchyPostingQuery<decltype(m_secondLevelPostings),decltype(mayMatch),decltype(distance)>
-                    posting(*m_postingOwners,m_secondLevelPostings,mayMatch,distance);
+                const auto prefetch=[&](std::size_t level,std::uint32_t head) {
+                    if (level == 0) {
+                        if (useLimitedTagMembership && head < static_cast<std::uint32_t>(m_index->GetNumSamples()))
+                            _mm_prefetch(reinterpret_cast<const char*>(
+                                m_limitedTagSupport.HeadLookupData(static_cast<SizeType>(head))), _MM_HINT_T0);
+                    } else if (head < static_cast<std::uint32_t>(m_postingOwners->Count(level - 1))) {
+                        if (useLimitedTagMembership)
+                            _mm_prefetch(reinterpret_cast<const char*>(
+                                m_secondLevelPostings[level - 1].SignatureAt(static_cast<SizeType>(head))), _MM_HINT_T0);
+                        if (routingReady)
+                            m_routingSignatures.PrefetchUpper(level - 1, static_cast<SizeType>(head), useLimitedTagMembership);
+                    }
+                };
+                HierarchyPostingQuery<decltype(m_secondLevelPostings),decltype(mayMatch),decltype(distance),
+                    PostingOwners,decltype(prefetch)>
+                    posting(*m_postingOwners,m_secondLevelPostings,mayMatch,distance,prefetch,
+                        m_options.m_postingNavigationWidth);
                 ret=bkt->SearchIndexWithPostingNavigation(*p_queryResults,headAdmission,&posting,m_options.m_maxCheck,
                     false,m_options.m_postingAnchorCount,m_options.m_postingAdditionalMaxCheck);
+                }
             }
             if (ret != ErrorCode::Success) return ret;
         }
@@ -7701,6 +7839,12 @@ bool Index<T>::SelectHeadInternal(std::shared_ptr<Helper::VectorSetReader> &p_re
 
 template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Helper::VectorSetReader> &p_reader)
 {
+    if (m_options.HasSparseHierarchy()) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+            "Sparse label admission is an upper-only reconstruction setting; "
+            "use rebuildsparselabelhierarchy on an existing canonical index, not an H1/SSD rebuild.\n");
+        return ErrorCode::FailedParseValue;
+    }
     if (!m_options.ValidateTagSchema()) return ErrorCode::FailedParseValue;
     LatchMutableLimitedTagLayout();
     if (m_options.m_compactHierarchyVectors)
@@ -8873,6 +9017,28 @@ template <typename T> ErrorCode Index<T>::SetParameter(const char *p_param, cons
         Options::IsRemovedSectionAlias(p_section, p_param))
         return m_options.SetParameter(p_section, p_param, p_value);
     p_param = Options::CanonicalParameter(p_section, p_param);
+    if (Helper::StrUtils::StrEqualIgnoreCase(p_param, "HierarchyLocalTarget") ||
+        Helper::StrUtils::StrEqualIgnoreCase(p_param, "HierarchyLocalWindow")) {
+        int value = -1;
+        if (!Helper::StrUtils::StrEqualIgnoreCase(p_section, "SelectHead") ||
+            !Helper::Convert::ConvertStringTo(p_value, value) || value < 0 ||
+            (m_bReady && m_options.GetParameter("SelectHead", p_param) != p_value)) {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                "Local admission settings are nonnegative immutable [SelectHead] metadata.\n");
+            return ErrorCode::FailedParseValue;
+        }
+    }
+    if (Helper::StrUtils::StrEqualIgnoreCase(p_param, "HierarchyLabelSelectivity")) {
+        try {
+            if (!Helper::StrUtils::StrEqualIgnoreCase(p_section, "SelectHead") ||
+                (m_bReady && m_options.m_hierarchyLabelSelectivity != p_value))
+                throw std::invalid_argument("HierarchyLabelSelectivity is immutable build metadata in [SelectHead]");
+            if (*p_value) SparseLabelHierarchy::ParseThresholds(p_value);
+        } catch (const std::invalid_argument& error) {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid sparse hierarchy parameter: %s\n", error.what());
+            return ErrorCode::FailedParseValue;
+        }
+    }
     if ((m_bReady || Helper::StrUtils::StrEqualIgnoreCase(p_section, "SearchSSDIndex")) &&
         (Helper::StrUtils::StrEqualIgnoreCase(p_param, "ColumnTypes") ||
          Helper::StrUtils::StrEqualIgnoreCase(p_param, "TagSchemaVersion") ||

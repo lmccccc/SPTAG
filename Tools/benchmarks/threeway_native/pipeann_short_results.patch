@@ -1,0 +1,152 @@
+--- a/benchmark.h
++++ b/benchmark.h
+@@ -291,6 +291,7 @@
+     uint32_t query_count = 0, warmup_queries = 0, top_k = 0, single_repeats = 0, throughput_repeats = 0;
+     double minimum_seconds = 0;
+     uint64_t aio_reserve = 0;
++    bool allow_short_results = false;
+     std::vector<uint32_t> controls, throughput_threads;
+     std::vector<Scenario> scenarios;
+     std::vector<Job> jobs;
+@@ -303,6 +304,8 @@
+         require(phase == "single" || phase == "throughput", "Phase must be single or throughput");
+         require(engine == "Filtered_DiskANN" || engine == "SPTAG_adaptive" || engine == "PipeANN",
+                 "Unknown engine identifier: " + engine);
++        allow_short_results = engine == "PipeANN" && ini.has("PipeANN", "AllowShortResults") &&
++                              ini.bool_value("PipeANN", "AllowShortResults");
+         ini.only("Dataset", {"vectors", "queries", "attributes", "vectorcount", "dimension", "attributecolumns",
+                              "categoricalcolumn", "numericcolumn", "querypayloadsha256"});
+         ini.only("Run", {"outputdirectory", "prepareddirectory", "builddirectory", "buildcontrollerpid", "pollseconds",
+@@ -780,10 +783,11 @@
+ {
+     std::vector<uint32_t> ids;
+     std::vector<float> distances;
++    std::vector<uint64_t> counts;
+     std::vector<Call> calls;
+     Cohort(uint32_t rows, uint32_t cols)
+         : ids(static_cast<size_t>(checked_product(rows, cols, "Cohort")), UINT32_MAX),
+-          distances(ids.size(), std::numeric_limits<float>::quiet_NaN()), calls(rows)
++          distances(ids.size(), std::numeric_limits<float>::quiet_NaN()), counts(rows), calls(rows)
+     {
+     }
+ };
+@@ -798,6 +802,7 @@
+         const size_t offset = static_cast<size_t>(query) * options.top_k;
+         Call &call = cohort.calls[query];
+         call = Call{};
++        cohort.counts[query] = 0;
+         std::fill_n(cohort.ids.data() + offset, options.top_k, UINT32_MAX);
+         std::fill_n(cohort.distances.data() + offset, options.top_k, std::numeric_limits<float>::quiet_NaN());
+         try
+@@ -808,6 +813,7 @@
+                                         cohort.ids.data() + offset, cohort.distances.data() + offset);
+             call.latency_us = std::chrono::duration<double, std::micro>(Clock::now() - start).count();
+             call.completed = true;
++            cohort.counts[query] = call.stats.count;
+         }
+         catch (...)
+         {
+@@ -822,6 +828,7 @@
+     uint64_t queries = 0, hits = 0, invalid_queries = 0, invalid_ids = 0, duplicate_ids = 0;
+     uint64_t nonmatching_ids = 0, nonfinite_distances = 0, underfilled_queries = 0, query_exceptions = 0;
+     uint64_t io_observations = 0;
++    uint64_t returned_neighbors = 0, missing_neighbors = 0;
+     long double latency_us = 0, ios = 0;
+     LatencyHistogram histogram;
+ 
+@@ -850,15 +857,19 @@
+                         ++io_observations;
+                     }
+                 }
+-                if (call.stats.count != options.top_k)
++                returned_neighbors += call.stats.count;
++                if (call.stats.count < options.top_k)
+                 {
+                     ++underfilled_queries;
++                    missing_neighbors += options.top_k - call.stats.count;
++                    invalid = invalid || !options.allow_short_results;
++                }
++                else if (call.stats.count > options.top_k)
+                     invalid = true;
+-                }
+             }
+             uint64_t query_hits = 0;
+             const size_t offset = static_cast<size_t>(q) * options.top_k;
+-            for (uint32_t k = 0; k < options.top_k; ++k)
++            for (uint32_t k = 0; k < std::min<uint64_t>(call.stats.count, options.top_k); ++k)
+             {
+                 const uint32_t id = cohort.ids[offset + k];
+                 const bool bad_id = id >= options.vector_count;
+@@ -894,6 +905,7 @@
+ {
+     write_matrix(directory / (name + ".ids.u32bin"), cohort.ids, rows, cols);
+     write_matrix(directory / (name + ".distances.f32bin"), cohort.distances, rows, cols);
++    write_matrix(directory / (name + ".counts.u64bin"), cohort.counts, rows, 1);
+ }
+ 
+ inline void rethrow_query_error(const Cohort &cohort, uint32_t count)
+@@ -938,12 +950,15 @@
+     backend.configure(job, options.scenarios[job.scenario_index]);
+     Cohort current(options.query_count, options.top_k), first(options.query_count, options.top_k);
+     uint32_t warmed = 0;
++    uint64_t warmup_underfilled = 0, warmup_missing = 0;
+     while (warmed < options.warmup_queries)
+     {
+         const uint32_t count = std::min(options.query_count, options.warmup_queries - warmed);
+         batch(backend, options, inputs, job, count, current);
+         Totals warmup;
+         warmup.add(options, inputs, job, count, current);
++        warmup_underfilled += warmup.underfilled_queries;
++        warmup_missing += warmup.missing_neighbors;
+         if (warmup.invalid_queries)
+         {
+             // Preserve the complete fixed-size buffer, including sentinel slots
+@@ -973,6 +988,7 @@
+         {
+             first.ids = current.ids;
+             first.distances = current.distances;
++            first.counts = current.counts;
+             first_recall = last_recall;
+         }
+         ++passes;
+@@ -987,7 +1003,8 @@
+     std::ostringstream result;
+     result.imbue(std::locale::classic());
+     result << std::setprecision(17)
+-           << "{\"schema_version\":1,\"engine\":" << json_string(options.engine)
++           << "{\"schema_version\":" << (options.allow_short_results ? 2 : 1)
++           << ",\"engine\":" << json_string(options.engine)
+            << ",\"phase\":" << json_string(options.phase)
+            << ",\"scenario\":" << json_string(options.scenarios[job.scenario_index].name)
+            << ",\"L\":" << job.L << ",\"threads\":" << job.threads << ",\"repeat\":" << job.repeat
+@@ -1013,7 +1030,16 @@
+            << ",\"first_distances\":" << json_string((directory / (name + ".first.distances.f32bin")).string())
+            << ",\"last_ids\":" << json_string((directory / (name + ".last.ids.u32bin")).string())
+            << ",\"last_distances\":" << json_string((directory / (name + ".last.distances.f32bin")).string())
+-           << ",\"latency_quantile_method\":" << json_string(LatencyHistogram::method()) << "}";
++           << ",\"latency_quantile_method\":" << json_string(LatencyHistogram::method());
++    if (options.allow_short_results)
++        result << ",\"result_policy\":\"native-count-prefix-v1\""
++               << ",\"returned_neighbors\":" << total.returned_neighbors
++               << ",\"missing_neighbors\":" << total.missing_neighbors
++               << ",\"warmup_underfilled_queries\":" << warmup_underfilled
++               << ",\"warmup_missing_neighbors\":" << warmup_missing
++               << ",\"first_counts\":" << json_string((directory / (name + ".first.counts.u64bin")).string())
++               << ",\"last_counts\":" << json_string((directory / (name + ".last.counts.u64bin")).string());
++    result << "}";
+     write_text(directory / (name + ".result.json"), result.str() + "\n");
+     std::cout << "THREEWAY_RESULT " << result.str() << std::endl;
+     if (total.invalid_queries)
+--- a/pipeann_bench.cpp
++++ b/pipeann_bench.cpp
+@@ -178,7 +178,9 @@
+         : options_(options), max_threads_(max_threads)
+     {
+         options.ini.only("PipeANN", {"indexprefix", "benchmarkbinary", "sourcedirectory", "lsweep", "pipelinewidth",
+-                                     "searchmode", "unfilteredmemoryl", "filteredmemoryl", "filtermode"});
++                                     "searchmode", "unfilteredmemoryl", "filteredmemoryl", "filtermode",
++                                     "allowshortresults"});
++        require(options.allow_short_results, "This client requires explicit PipeANN.AllowShortResults=true");
+         require(fs::equivalent(options.resolve("PipeANN", "SourceDirectory"), THREEWAY_PIPEANN_SOURCE),
+                 "PipeANN.SourceDirectory differs from the authenticated frozen core");
+         if (options.ini.has("PipeANN", "BenchmarkBinary"))

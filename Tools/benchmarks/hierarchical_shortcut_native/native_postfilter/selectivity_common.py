@@ -37,7 +37,7 @@ def validate_identities(expected):
         require(identity(path) == recorded, f"Registered input identity changed: {path}")
 
 
-def confine_outputs(root):
+def confine_outputs(root, *, allow_shared_memory=False):
     """Use the preserved-head controller's Landlock policy for native children."""
     libc = ctypes.CDLL(None, use_errno=True)
     abi = libc.syscall(444, 0, 0, 1)
@@ -56,6 +56,15 @@ def confine_outputs(root):
         rule = Beneath(access, directory)
         require(libc.syscall(445, descriptor, 1, ctypes.byref(rule), 0) == 0,
                 f"Landlock rule failed: errno={ctypes.get_errno()}")
+        if allow_shared_memory:
+            # Intel OpenMP registers each process through shm_open/shm_unlink.
+            shared_memory = os.open("/dev/shm", os.O_PATH | os.O_DIRECTORY)
+            try:
+                rule = Beneath(sum(1 << bit for bit in (1, 5, 8, 14)), shared_memory)
+                require(libc.syscall(445, descriptor, 1, ctypes.byref(rule), 0) == 0,
+                        f"Landlock shared-memory rule failed: errno={ctypes.get_errno()}")
+            finally:
+                os.close(shared_memory)
         require(libc.prctl(38, 1, 0, 0, 0) == 0, "Cannot set no_new_privs")
         require(libc.syscall(446, descriptor, 0) == 0,
                 f"Landlock restriction failed: errno={ctypes.get_errno()}")

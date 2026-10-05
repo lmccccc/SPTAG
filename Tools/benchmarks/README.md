@@ -1,5 +1,388 @@
 # Benchmark Scripts
 
+## SIFT1B three-algorithm comparison
+
+`run_sift1b_threeway.py` adds the original C++ Filtered-DiskANN categorical
+baseline without rebuilding SPANN/PipeANN or replacing their existing figures.
+The checked-in `configs/sift1b_threeway/benchmark.ini` is the only source of
+data paths, native search controls, warmup, repetitions and concurrency grids.
+Client TSV plans contain **ordinal selections**, not replacement parameters;
+configuration snapshots are copied unchanged. Data/search environment overrides
+and reuse of an existing campaign directory are rejected.
+
+```bash
+python3 Tools/benchmarks/threeway_native/build_diskann_client.py \
+  --output-directory Tools/benchmarks/threeway_native/build/diskann-final \
+  --publish-binary ../datasets/sift1b/toolchains/threeway_native_20260929/bin/diskannBench
+python3 Tools/benchmarks/threeway_native/build_spann_client.py \
+  --output-directory ../datasets/sift1b/toolchains/threeway_native_20260929/spann-final \
+  --publish-binary ../datasets/sift1b/toolchains/threeway_native_20260929/bin/spannBench_guarded
+python3 Tools/benchmarks/threeway_native/build_pipeann_client.py \
+  --output-directory Tools/benchmarks/threeway_native/build/pipeann-final --publish
+python3 Tools/benchmarks/run_sift1b_threeway.py check-config
+python3 Tools/benchmarks/run_sift1b_threeway.py prepare
+python3 ../datasets/sift1b/comparisons/threeway_categorical_loader_linear_20260930_v2/code/run_sift1b_threeway.py \
+  run --config ../datasets/sift1b/comparisons/threeway_categorical_loader_linear_20260930_v2/config/benchmark.ini
+```
+
+Run the build commands from the SPTAG repository root, using fresh output paths;
+they compile only the clients, one compiler worker per command. The registered
+`BenchmarkBinary` paths and adjacent `.build.json` records must exist before
+preparation. These clients share the
+same resident measurement harness and preserve the native search algorithms.
+SPANN libraries remain unchanged. The separately authorized DiskANN loader-only
+and PipeANN page-lifetime corrections require the provenance described below;
+neither permits index reconstruction or search retuning.
+Preparation authenticates compiler, client/header/build-script hashes,
+linked original archives/objects and installed binary hashes. The original
+clients share the pinned measurement header; only the explicitly authorized
+PipeANN native-count client may use its authenticated isolated header patch.
+Native-call timing and the cohort loop remain unchanged; the additional
+returned-prefix accounting is disclosed separately.
+The final command waits for the authenticated production DiskANN
+completion marker, not graph progress or the mere existence of an SSD file.
+A failed builder, reused/dead controller PID, malformed result or failed resource
+guard stops explicitly and writes `failure.json`. Running this command in an
+attached background shell does not make it survive the CLI session.
+
+Preparation freezes the Python import closure, R plotter, native client sources,
+build records and executables. It also archives `ldd`-resolved ELF libraries and
+requires copied executables to resolve the same live libraries. Those library
+copies are provenance, not substituted search implementations: existing ELF
+RPATHs and the recorded `LD_LIBRARY_PATH` remain unchanged, and the live files
+are protected by full hashes. This does not claim a complete runtime closure
+over providers loaded later through `dlopen`. Launch the frozen runner and INI,
+not the mutable repository entry point.
+
+### Isolated PipeANN page-lifetime correction and continuation
+
+The retained original PipeANN query path can keep a landed, unexpanded
+`DiskNode` view after its 128-slot I/O scratch ring wraps. Reusing that slot can
+pair the old ID with another node's vector and attributes. This caused a real
+`broad_tag`, L120, T2 failure, not a low-recall observation. Failed results must
+not be repaired, padded, counted as valid throughput, or silently retried.
+
+`threeway_native/build_pipeann_page_lifetime.py` creates a fresh isolated source,
+archive and resident client from the pinned read-only PipeANN toolchain. It
+applies only `pipeann_page_lifetime.patch`: immediately before slot reuse, an
+unexpanded landed page takes ownership of its existing bytes. Ordinary pages
+are not copied, and retained bytes are released after expansion or query exit.
+Candidate ordering, filtering, I/O requests, search budgets and termination stay
+unchanged. The two original dependent objects must reproduce byte-for-byte;
+only their replacements may differ in the otherwise unchanged archive.
+The proof authenticates every original/corrected source, exact native compile
+flags, compiler, archive operations and a `__FILE__`-only prefix mapping.
+The original source, libraries, indexes and failed campaigns are never modified.
+
+```bash
+python3 Tools/benchmarks/threeway_native/build_pipeann_page_lifetime.py \
+  --source-directory ../datasets/sift1b/toolchains/pipeann_query_readonly_fds_20260924/source \
+  --output-directory /absolute/fresh-corrected-toolchain
+```
+
+`threeway_native/tests/pipeann_page_lifetime_test.cpp` exercises the real native
+search APIs with a bounded, deterministic I/O-completion scheduler. Short/no-wrap
+controls must pass; the preserved original fails only the held-page/wrap cases.
+The corrected library must pass all cases, genuine bounded-index single/multiple
+worker checks, and the original full-data failing control before continuation.
+`configs/sift1b_threeway/pipeann_lifetime_recheck.ini` owns that read-only L120/T2
+recheck; its three registered repetitions are diagnostics, not formal points.
+
+`continue_sift1b_threeway.py` preserves and revalidates the completed single-thread
+publication and all 390 SPANN throughput jobs. A fresh continuation uses
+`benchmark_pipeann_lifetime.ini`; only output paths and the accepted PipeANN
+binary/source differ from the failed campaign. The old source INI stays unchanged.
+Preparation requires the accepted corrected-native report, raw successful
+lifecycles, exact captured vector distances, unchanged operating-point selection
+and all protected inputs. It retains the old single-stage figures through
+authenticated links and runs only complete PipeANN and DiskANN throughput grids,
+serially. No partial PipeANN jobs are reused and SPANN is not rerun.
+
+```bash
+python3 Tools/benchmarks/continue_sift1b_threeway.py prepare \
+  --config Tools/benchmarks/configs/sift1b_threeway/benchmark_pipeann_lifetime.ini \
+  --previous-campaign ../datasets/sift1b/comparisons/threeway_categorical_loader_linear_20260930_v2 \
+  --acceptance ../datasets/sift1b/toolchains/threeway_native_20260929/pipeann-page-lifetime-20260930/corrected-native-002/parent-acceptance.json
+python3 ../datasets/sift1b/comparisons/threeway_categorical_pipeann_lifetime_20260930/code/continue_sift1b_threeway.py \
+  run --directory ../datasets/sift1b/comparisons/threeway_categorical_pipeann_lifetime_20260930
+```
+
+PipeANN throughput legends explicitly identify the page-lifetime fix.
+Historical PipeANN single-thread results predate it and remain unchanged: the
+comparison is **not same-binary scaling**. The correction executes in the timed
+query path, unlike DiskANN's loading-only fix. Concurrent recall gates remain
+read-only acceptance checks; failed targets never trigger retuning.
+
+The single-thread stage uses the unchanged first 1,000 SIFT1B queries, top10,
+1,000 warmup queries per point, two repetitions and NUMA node 3. It appends new
+DiskANN curves to authenticated historical SPANN/PipeANN measurements; the
+historical values are not recomputed and are visibly identified as reused.
+Original DiskANN supports one categorical label, not numeric-range conjunctions
+or mixed DNF. Its missing mixed-DNF series is marked unsupported, never given
+synthetic results. Unfiltered DiskANN measurements still use the same
+**categorical-focused R64/L1/FilteredL100/PQ32 graph**, not an optimized
+unfiltered rebuild.
+
+### Explicit PipeANN native short-result protocol
+
+`[PipeANN] AllowShortResults=true` is a separately authorized measurement
+protocol, not a search knob. Speculative mixed-DNF prefiltering at the registered
+L35 can naturally return fewer than ten matches. The native API returns the
+valid prefix length; rejected candidate IDs and `FLT_MAX` distances may remain
+in its unused output-buffer tail. Those tail slots are not returned neighbors.
+The original library, graph, candidate budget and filter strategy stay unchanged.
+
+`threeway_native/build_pipeann_short_results.py` builds an isolated client from
+the accepted page-lifetime-corrected client. It applies exactly the checked-in
+`pipeann_short_results.patch` to copies of the adapter and measurement header;
+the original client sources remain untouched for earlier provenance. Its
+manifest binds the exact patch, compiler/link command, generated sources and
+unchanged corrected native archive. Only this declared PipeANN client may emit
+schema-2 results. SPANN/DiskANN remain on the strict full-K contract, including
+DiskANN's pre-query safety admission.
+
+Schema 2 preserves the native ID/distance buffers verbatim and writes actual
+API return counts to each `.counts.u64bin` capture: native uint32 `(rows,1)`
+header followed by uint64 counts. Only the returned prefix is scored and
+validated. Invalid IDs, duplicates, wrong predicates, nonfinite or incorrect
+captured distances inside that prefix still fail; counts above K fail.
+Natural counts from zero through K are allowed. Recall's denominator is always
+`completed_queries * K`, **never returned-neighbor count**. Missing neighbors
+therefore reduce Recall@10 without padding, extra search, repair or widening.
+Warmup and measured missing/underfilled counts are retained explicitly.
+
+The throughput CSV and peak CSV additionally preserve total completed queries,
+returned and missing neighbors, underfilled queries, returned neighbors per
+query, underfilled-query fraction and native result schema versions. Figure
+captions disclose the protocol. Existing recall/duration acceptance gates and
+operating-point selection are unchanged; short output never triggers retuning.
+
+The authorized continuation can retain the 91 independently validated full-K
+jobs before the old mixed-DNF warmup failure. Their schema-1 counters prove the
+original full-K invariant; their raw results and figures are not rewritten or
+given synthetic count sidecars. The exact remaining ordinal-plan suffix uses
+schema 2 with the same native library. Reused schema-1 and new schema-2 accounting
+are disclosed per aggregate; failed warmup data is evidence, not a measurement.
+All completed SPANN and single-thread results remain retained.
+
+```bash
+python3 Tools/benchmarks/threeway_native/build_pipeann_short_results.py \
+  --source-directory /absolute/accepted-native-toolchain/source \
+  --base-client /absolute/accepted-native-toolchain/bin/pipeannBench \
+  --output-directory /absolute/fresh-count-aware-client
+python3 Tools/benchmarks/continue_sift1b_threeway.py prepare \
+  --config Tools/benchmarks/configs/sift1b_threeway/benchmark_native_short_results.ini \
+  --previous-campaign ../datasets/sift1b/comparisons/threeway_categorical_pipeann_lifetime_20260930 \
+  --acceptance ../datasets/sift1b/toolchains/threeway_native_20260929/pipeann-native-short-results-20260930/client-001/parent-acceptance.json
+python3 ../datasets/sift1b/comparisons/threeway_categorical_native_short_20260930/code/continue_sift1b_threeway.py \
+  run --directory ../datasets/sift1b/comparisons/threeway_categorical_native_short_20260930
+```
+
+### Incremental unfiltered parameter supplementation
+
+`supplement_sift1b_threeway.py` appends a separately registered experiment to the
+completed native-count campaign. It does not use the failed-phase continuation
+interface or modify old INIs, results, figures, native clients or indexes.
+`configs/sift1b_threeway/benchmark_unfilter_supplement.ini` declares PipeANN
+search L80/120 and DiskANN search L800/1600/3200. Only those two grids and the
+fresh output/prepared paths differ from the completed campaign profile.
+
+The controller authenticates the completed publication, retained prefixes,
+native logs, captures and recomputed throughput aggregates. It measures all five
+new **unfiltered** controls twice with the current accepted clients. Only missing
+unfiltered R90/R95 scopes are eligible for new throughput; already valid PipeANN
+R90, all SPANN results and all filtered scenarios are retained without replay.
+For each missing target, the smallest newly measured control meeting the original
+minimum-recall rule is selected. The original thread grid, three repetitions,
+30-second minimum, exact output checks and live AIO/resource guards remain.
+Failure of a recall threshold never triggers another parameter or index change.
+
+```bash
+python3 Tools/benchmarks/supplement_sift1b_threeway.py prepare \
+  --config Tools/benchmarks/configs/sift1b_threeway/benchmark_unfilter_supplement.ini \
+  --previous-campaign ../datasets/sift1b/comparisons/threeway_categorical_native_short_20260930
+python3 ../datasets/sift1b/comparisons/threeway_unfilter_supplement_20261001/code/supplement_sift1b_threeway.py \
+  run --directory ../datasets/sift1b/comparisons/threeway_unfilter_supplement_20261001
+```
+
+New R figures retain every original single-thread point and add a separately
+labeled current-client PipeANN series, including when its L overlaps a historical
+point. Lines never connect different PipeANN client versions. DiskANN extends
+the same categorical-focused graph: increasing **search L does not change
+construction L=1**, and any remaining unfiltered threshold gap is specific to
+this graph and measured grid, not an algorithm-wide limitation.
+`retained/` preserves original tables/raw throughput, while
+`superseded_availability.csv` preserves old missing-target annotations replaced
+by the supplemental measurements. Merged throughput and peak tables retain
+`source_campaign`; raw records remain unchanged and new repetitions are counted
+separately in `completion.json`. Both single-stage and complete PNG/PDF figures
+are rendered automatically into new directories.
+
+A single-thread-only SPANN implementation refresh may replace its old coordinates
+in a new figure while retaining the other engines' measured values. Register
+`spann_single_refresh` with mode `optimized-main-single-v1`, the prior directory,
+native binary path/SHA256 and unchanged `nprobe` grid. The R renderer requires
+all five SPANN curves, two repetitions per coordinate, `spann_optimized` series
+and `measurement_reused=false`; peer series must be marked reused. It labels
+SPTAG as optimized and preserves separate historical/current PipeANN curves.
+This declaration is single-stage only: it cannot relabel old throughput or
+peak figures as optimized. Use a clock-free native run, never latency scaling
+from diagnostic phase timings, and preserve the original figures.
+Native batch descriptors must use `CaseCount=10`, not `CaseCount = 10`:
+the native reader retains leading value whitespace and the benchmark's integer
+and absolute-path parsers reject it.
+
+The optional `[DiskANN] LoaderPolicy` names an immutable `[Loader]` INI containing
+only `Mode`, `Proof`, `ProofSHA256`, `StockBinary`, and `Library`. The authorized
+`linear-label-delimiters-v1` mode fixes the original loader's two unbounded comma
+searches, which repeatedly scan the file suffix for single-label rows. The
+original source checkout, library, stock executable and index bytes stay intact.
+The proof binds the exact two delimiter replacements, base source revision,
+corrected stock executable/library, and unchanged remaining archive members.
+`[DiskANN] Library` continues to identify the preserved original archive;
+`LoaderPolicy` selects the corrected linked archive separately. The isolated
+source inventory must match the pinned original tree except for those two calls.
+Compiler flags and the original stock object/link options remain unchanged;
+only source/output paths and an exact `-ffile-prefix-map` preserving original
+`__FILE__` strings may differ. The original parser object and stock executable
+must reproduce byte-for-byte. Native loader-policy helpers are included in the
+authenticated, frozen client source closure.
+This is a loading-only compatibility fix, not a different graph or search
+algorithm; loading remains outside query timing and the figure metadata
+discloses the exception.
+
+Guarded preparation accepts `--loader-policy POLICY.ini` only with a separately
+accepted corrected native delivery. The standalone certificate must bind the
+same policy, corrected library and intended stock executable, while retaining
+the complete historical original-build input/executable inventory. The original
+validation caller receives a parser clone with only its executable directory
+rebound; its data, filters, K/L/threads and stock argv otherwise stay unchanged.
+Undeclared replacements, missing policy bindings and changed original inputs fail
+before native search. A loader fix never authorizes skipping top-K admission.
+
+The DiskANN adapter rejects unsafe top-K admission before any native search.
+Once per resident load it makes one extra sequential, read-only pass over the
+exact native label sidecar, builds temporary membership bitsets for planned
+labels, and checks bounded reachability from every possible native medoid start.
+It requires at least K distinct admissible reachable nodes, L >= K, finite
+distance bounds, cache0, no frozen/reorder/universal-label layout, and no
+nonempty dummy remapping. Temporary membership storage is released before
+`ready.json`, warmup and measurement; the scan and witnesses are load costs,
+not query timings. The parent requires `diskann-admission.json`, authenticates
+its phase/PID, source identities, plan coverage and witness accounting, and
+keeps its hash with the native completion record. Its one-pass FNV label digest
+is diagnostic, not a cryptographic content hash. Rejection fails explicitly;
+there is no padding, retry with a different budget or algorithm modification.
+This prevents reachable-component underfill on valid immutable indexes with
+successful native I/O; it is not a full-index corruption audit or a recall
+guarantee. The stock library copies K results unchecked, so post-search count
+checks alone are insufficient. Separate stock callers, including a build
+script's own search validation, are not protected merely by building this client.
+
+`threeway_native/build_diskann_admission.py` builds the separate
+`diskannBuildAdmission` tool using the same `diskann_admission.h` implementation
+and the declared native library (original by default, or the approved loader-only
+replacement). Its data/search inputs come from `--config ORIGINAL_BUILD/config.ini`;
+`--certificate FRESH.json` and optional `--loader-policy POLICY.ini` select only
+fresh evidence and authenticated loader provenance. It derives K/L/threads and the complete label
+selection from that original INI, loads no replacement graph and performs zero
+searches. It covers every native start for every eligible external label,
+including labels outside the four recall-reporting groups. The registered stock
+caller has warmup disabled, cache0 and explicit beam2, so neither hidden
+unfiltered searches nor beam autotuning are added. Its immutable certificate
+also binds the original input, controller and stock-executable identities.
+
+For the explicitly authorized saved-graph handoff, `finish_diskann_build.py`
+provides `prepare` and frozen `run` stages. Preparation requires the accepted
+admission-tool provenance and a fresh child directory of the layout continuation.
+The runner waits for the authenticated layout controller to exit, checks the
+successful original graph save and controlled controller retirement, then admits
+all labels **before** allowing the unchanged stock validation command. It keeps
+the original build INI and resource thresholds, never rebuilds or repairs the
+graph, and refuses retries over existing outputs. A rejected preflight cannot
+invoke stock search. The benchmark's `Run.BuildDirectory` must name this final
+guarded-validation directory, and `BuildControllerPID` its frozen runner's PID,
+not the retired controller or the layout-only stage. That runner must still be
+alive unless its authenticated completion is already present. Production admission
+requires its final `completion.json`, all-label certificate, actual child
+execution records and original result checks; `layout_completion.json` alone
+is never enough.
+
+Preserve failed supervision attempts and their frozen files. Linux can clear
+`/proc/PID/cmdline` and `VmRSS` during `PF_EXITING` before the process becomes a zombie;
+an empty command line or missing RSS alone proves neither failure nor completion.
+Guarded validation retains PID/start-time/parent authentication, records missing
+RSS explicitly only during authenticated kernel exit, and still requires the
+actual child wait result. Shared-host memory/disk reserves remain enforced.
+A saved-graph
+recovery requires the original PID/start-time/parent, its actual zero exit status,
+and authenticated graph/preservation records. Use fresh layout, validation and
+campaign directories, changing only output paths and controller authority in the
+INI. Never erase failure markers or rebuild the graph to hide a monitoring error.
+
+`continue_diskann_layout.py` handles the separately authorized disk-capacity
+continuation, not a graph restart. Its `prepare --config
+configs/sift1b_threeway/diskann_continuation.ini` stage freezes the prior failed
+layout, successful graph handoff, retired-controller evidence and exact partial
+output identity. Run the frozen `code/continue_diskann_layout.py run --directory
+CONTINUATION_DIRECTORY`. It may unlink only that singly owned, incomplete,
+zero-header SSD file, records the removal, and invokes the unchanged native
+`create_disk_layout` command from the preserved original graph. Other outputs
+and all failure records remain untouched.
+
+This explicit authorization sets **only** the post-build disk reserve to
+64 GiB. The immutable original build INI/manifest still record their original
+100-GiB policy. `resource-policy.json` binds the separate continuation INI;
+the layout and guarded stock runner derive their effective disk reserve from
+it while retaining every other original resource/data/search setting. The final
+benchmark authenticates the policy, cleanup and successful native execution
+chain as well as the all-label admission. There is no implicit resource fallback,
+partial-file resume, graph rebuild, AIO-limit change or unguarded validation.
+The current benchmark INI also retains at least 64 GiB during measurement.
+
+Throughput selects the smallest registered search budget that attained each
+Recall@10 target, **90% and 95%**, in every single-thread repetition. It runs the
+engines serially with identical four-NUMA-node CPU/memory-interleave allocation,
+three repetitions per concurrency and at least **30 actual wall-clock seconds**
+per repetition. Entire 1,000-query cohorts repeat until the duration is reached.
+QPS is completed queries divided by the continuous measured interval, not
+inverse latency or the sum of per-query timings. All-cohort predicate/ID/recall
+accounting is included; original-vector checks of uniquely saved first/last
+cohorts occur after native execution. Capture files cannot alias one another,
+every native error counter must be zero, and the resident-index ready marker
+must identify the actual launched child and maximum planned concurrency.
+Latency means are exact; reported quantiles use the explicitly identified
+bounded histogram rather than retaining an unbounded per-query sample array.
+Two recall-target views may share one
+measured operating point; this does not create additional independent repeats.
+Failed concurrent recall gates remain explicit and do not trigger retuning.
+
+Keep existing shared-host limits. Original DiskANN reserves 1,024 AIO events
+per query thread; plans exclude thread counts that do not fit the current
+`aio-max-nr - aio-nr - reserve`, with reasons in `availability.csv`. No sysctl,
+queue-size patch, global cache flush or silent thread reduction is used.
+SPANN retains its frozen core's four shared 1,024-event AIO contexts, with native
+modulo selection and per-context locking. It checks room for 4,096 events plus
+the reserve; its query workers do not each require a separate AIO context.
+DiskANN's per-worker AIO cap must not be applied to SPANN.
+Published peaks are **maximum observed feasible throughput**, not a proof of an
+unconstrained algorithm maximum. Boundary maxima remain censored. Likewise,
+PipeANN's historical medium-label grid reaches roughly 90% recall, not 95%;
+the missing 95% operating point must stay visible.
+
+This is a native end-to-end, warm fixed-query-working-set comparison:
+SPANN retains buffered I/O; PipeANN and DiskANN retain direct I/O. It is not a
+matched-I/O algorithm-only test or cold random-corpus throughput. Resource logs,
+raw measurements, original-vector result checks, ordinal plans, protected-file
+identities and full-precision CSVs accompany the R-generated PNG/PDF figures.
+`plots_single` is published before throughput starts; `plots_complete` adds
+scaling/peak figures without overwriting the first publication. Each stage keeps
+its exact registration/CSV inputs in `plot_inputs_single` or
+`plot_inputs_complete`, so subsequent availability updates cannot change the
+source of an earlier figure. Publication requires a successful renderer status
+and checks its metadata, point counts, PNG/PDF files and recorded hashes before
+writing its completion record.
+
 ## Main posting Recall-QPS figures
 
 `plot_posting_min_sweep.R` renders registered native measurements with R.
@@ -1482,7 +1865,220 @@ use first-visited records, while `scanned_occurrence_to_unique_ratio` measures
 all scanned replicas. The legacy `FalsePositivePostings()` counter now includes
 postings containing only already-visited matches.
 
-`[SelectHead] HierarchyLevels` counts H1. H1 is the sole query graph;
+### Label-specialized resident upper postings
+
+`rebuildsparselabelhierarchy -c Tools/benchmarks/rebuild_sift1b_sparse_label_hierarchy_v4.ini`
+constructs only a replacement resident hierarchy in a **new** index directory.
+The original H1 graph/vectors, head metadata, support table, H/O SSD posting
+records and benchmark evidence remain unchanged. They are referenced by
+canonical symlinks; no corpus copy, H1 build or SSD posting rewrite occurs.
+The output is read-only: insertion, deletion and ordinary export are rejected.
+The output parent must already exist, and an existing output is an error.
+
+```ini
+[RebuildHierarchy]
+SourceIndex=/absolute/canonical/source/tenant_0
+OutputIndex=/absolute/new/output/tenant_0
+
+[SelectHead]
+HierarchyLabelSelectivity=0.01,0.001,0.0001,0.00001
+NumberOfThreads=32
+```
+
+Global-threshold reconstruction writes **V4**, an adjacent hierarchy of limited-label
+postings. H2 references H1, H3 references H2, and so on. For entry into H2/H3/H4/H5,
+the example requires original-vector label selectivity strictly below
+1%/0.1%/0.01%/0.001%, respectively. A head with no eligible supported label
+does not enter that transition; ineligible labels are not carried upward.
+Labels can therefore participate in several consecutive levels, not just one
+terminal tier. Original corpus counts remain authoritative even when a head
+has several labels or replicas.
+
+Each layer selects unique physical representatives by the native BKT policy,
+using the source Ratio on its unique eligible physical children and the source
+tier's head-count cap. A representative anchors one admitted child-label item.
+The source LimitedTagSlotsPerHead bounds its base candidate selection: retain
+the anchor, then take the nearest candidate prefix, **allowing repeated labels
+to consume positions**. Store distinct resulting support labels, anchor first.
+This is deliberately not H1's nearest-*distinct*-label choice. Source
+LimitedTagMinHeadCount and EnableLimitedTagSupportExpansion retain the native
+retained-O support behavior; no additional upper-only coverage guarantee is
+added. An enabled native deficit expansion can add support beyond base slots,
+as on disk; it is not an implicit relaxation introduced by the hierarchy.
+
+Each `(child ID, eligible label)` is independently assigned with the shared
+native disk-H ANN/RNG selector. HierarchyReplicaCount is an **upper bound**;
+RNG-rejected copies are not filled to a target. Selected anchor items retain
+their own child once; only empty constrained searches use the native exact
+support fallback. Failed placement is an error, not a dropped label. Upper
+resident rows do not introduce a disk-page truncation. Two labels can double
+logical assignments, but never copy the child vector, and previous replica
+edges never become new head inputs at the next level.
+
+Each physical posting contains a sorted label-to-child directory. Search
+selects only query-label rows, merges/deduplicates OR children, and reuses the
+existing shared distance frontier. Reverse owners deduplicate physical edges,
+and H1 anchors also have one spatial H2 entry; no mixed global root is needed.
+The selected support set, not the child-label union, determines upper label
+admission. Numeric pruning stays conservative. Full selected rows finish
+before budget checks; H1-first search, protected H1 results, one supplement,
+navigation cutoff and native convergence remain unchanged.
+
+V4 adds authenticated label directories to the upper artifact; no H1 vector,
+graph or SSD record changes. Legacy V1/V2/V3 remain readable unchanged.
+Do not use old binaries to read V4, overwrite old build outputs, or compare
+V4 against historical curves as though its construction policy were identical.
+
+#### V5 local capacity admission
+
+Replace the four global fractions with these mutually exclusive native settings:
+
+```ini
+[SelectHead]
+HierarchyLocalTarget=128
+HierarchyLocalWindow=4096
+NumberOfThreads=32
+```
+
+The target is a matching-H1 candidate capacity, not final top-k. The base window
+is spatial H1 mass, not `MaxCheck`. At transition Hk to H(k+1), request a window
+mass `min(H1 count, ceil(baseWindow / Ratio^(k-1)))`. Use the smallest enclosing
+statistical region reaching that mass; its actual mass can exceed the request.
+Estimate candidate capacity as `regionLabelCount * requestedMass / regionMass`;
+an oversized region cannot supply an unbudgeted capacity bonus. Admit each
+child-label while this estimate is below the target. Re-evaluate at each scale,
+but never restart a label after its lower-level admission has stopped. Do not
+substitute a global label fraction.
+
+The full-domain source CSR supplies deterministic primary statistical owners
+(the first canonical owner, not an additional nearest-owner search). Each
+level merges only adjacent label/count summaries; mass and every label's
+support count must be conserved. Runtime limited-label truncation and RNG
+replicas do not alter census counts. A small native binary BKT over only the
+source H5 representatives defines expanded, nested coarse windows. Statistical
+regions are an approximation of useful search coverage, not a proof of
+runtime reachability or recall. No H1 per-label ANN or recursive descendant
+vector scan is performed by the census.
+
+V5 retains V4's native H/O construction and adjacent child IDs, but persists an
+authenticated local policy appendix. Its address map and region masks are
+released after index-load validation; search retains only actual H2 label
+presence and continues to use the existing H1-first, single-supplement policy.
+Historical V1--V4 remain readable; old clients cannot read V5. Use a fresh
+output directory and distinct experiment provenance.
+
+Census logs report adjacent transfers, histogram additions, summary storage,
+coarse representative count and elapsed time. These do not bound the complete
+rebuild: admitting more children can increase native BKT/H/O assignment work,
+including the existing exact-support fallback. Validate on SIFT1M before
+starting an upper-only SIFT1B reconstruction.
+Positive `PostingNavigationWidth` can prune different branches after rebuilding
+the hierarchy, even when both artifacts contain every admitted H1 member.
+Compare against width zero only as a controlled diagnostic; passing that
+diagnostic does not establish non-regression under the original positive width.
+The SIFT1M local-admission profiles use the existing Float record budget:
+16 construction pages (with the native 118-vector uplift) and 12 search pages.
+Do not copy a UInt8 index's three-page search setting into Float validation:
+with 128 Float dimensions and two attributes, each record occupies 524 bytes,
+so three pages expose only about 23 records rather than the roughly 90 records
+available with 128-dimensional UInt8 and one attribute.
+
+#### Historical V1/V2/V3 policy
+
+`HierarchyLabelSelectivity` lists four strictly decreasing fractions, not
+percentages. The historical example assigns H2 `(0.1%,1%]`, H3 `(0.01%,0.1%]`, H4
+`(0.001%,0.01%]`, and H5 `(0,0.001%]`; labels above 1% have no terminal
+posting. Selectivity uses authenticated original vector counts, not the OR
+union, head counts or a benchmark estimate. Other construction settings come
+unchanged from the source native INI. This parameter is for explicit
+upper-only reconstruction; full-index builders reject it instead of changing
+H1/SSD construction. Empty/missing admission metadata retains the old format.
+
+A terminal posting contains only H1 head IDs that support its one label.
+Every supported sparse `(label, head)` pair is covered, including heads whose
+own label differs from the label of their searchable H records. This preserves
+access to existing H1 posting replicas without broadening their allowed labels.
+Terminal representatives are actual sparse members, addressed directly in the
+existing H1 vector owner. Higher tiers can contain direct H1 rows; an extremely
+sparse label does not need H2 rows. Label combinations are never materialized.
+
+V3 builds a native BKT inside each label's supported H1 set and takes unique
+centers from the largest remaining spatial subtrees until its static quota is
+filled. Final members are assigned inside that label's pool with the existing
+native ANN/RNG construction helper, not by old coarse-cell addresses.
+Temporary native assignment graphs use
+the source `BuildHead` settings and reconstruction thread count, and are discarded.
+Every terminal tier directly addresses H1, so the requested row count is
+`max(1,ceil(supported_heads*Ratio))`, not the V1/V2 repeated compression
+`Ratio^(tier-1)`. Reserve capacity for spatial navigation, then apportion any
+source-tier shortage among labels with at least one row each. Impossible
+coverage fails explicitly. Each supported `(label,head)` has
+exactly `min(HierarchyReplicaCount,label_postings)` distinct upper references.
+These are upper-directory references, not new SSD copies or a guarantee that
+all old upper assignments survive. Total posting nodes per tier, including
+spatial parents, cannot exceed the old tier's node count. An empty admission
+band can still contain spatial parents of lower-tier sparse postings.
+
+All original upper CSR/vector catalogs are omitted from the derived snapshot.
+One precomputed, label-independent spatial reference per physical H1 head keeps
+ordinary negative/dense anchors connected to the sparse hierarchy.
+V3 additionally derives a reverse-owner CSR from the authenticated terminal
+members once at load/build, making every actual H1-to-posting membership usable
+as an entry. The derived arrays are not duplicated on disk.
+After H1 completes, the nearest existing H1 results receive priority within
+the anchor limit; remaining slots retain already-scored spatial anchors.
+Native `PostingAnchorCount=0` (the default) makes this limit the current nprobe,
+not final top10. Positive values preserve fixed-count historical controls.
+All selected anchors contribute their owners before the shared posting
+distance frontier selects rows; duplicate owners are scored only once.
+On descent, a terminal's immutable label can exclude it before allocating
+query state or reading its full signature. Sparse descriptor prefetch follows
+that access order. This is exact label exclusion, not a distance cutoff or
+new search budget, and it applies only to children: rejected entry/owner nodes
+must still expose parents for negative-anchor and OR reachability. Matching
+children retain full numeric/DNF signature checks, common-frontier ordering and
+complete-row work semantics. This fast path does not rebuild or change the index.
+Zero-match queries still have entries. Legacy V1/V2 retain spatial-only anchors.
+Query
+execution remains **native H1 first, then at most one posting supplement**:
+the existing shared frontier, touched-ID allocator, aliases, full-row budget
+checks, protected original head results and final exact record predicates are
+reused. Only direct H1 terminal rows enter the convergence pool, including
+those in H3..H5. Parent representative distances are still heuristic, never
+certified bounds on member distances. No upper ANN graph or per-query catalog
+scan is introduced.
+
+OR evaluates admitted labels in this one traversal and deduplicates H1 IDs
+through the native workspace. Numeric summaries are conservative unions;
+unrepresented categorical columns remain unknown until exact H1/record
+admission. Dense-only, unanchored/numeric-only and unfiltered queries use H1
+without the removed generic supplement. Consequently their filtered recall
+can differ from the old curves and must be reported rather than repaired.
+This does **not** convert the scalar-label SIFT1B corpus into multi-label
+vectors or change the current predicate schema.
+
+The V2/V3 binaries authenticate configuration, H1-ID/support identities, row shape,
+acyclic ownership, sparse support membership, complete per-label coverage and
+replica counts, unique sorted representatives, and exact file size.
+Experimental V1/V2 artifacts remain readable without silently rebuilding or
+changing their assignments/entry policies. Native reconstruction reloads its own artifact before
+publishing `indexloader.ini` and a completion record. Failed outputs remain
+for inspection and are never silently reused. Performance relative to
+DiskANN must come from fresh, recall-matched measurements; this architecture
+alone is not evidence of a speedup.
+
+The original `rebuild_sift1b_sparse_label_hierarchy.ini` output and measurements
+are preserved as V1 evidence; the V2 recipe and experiment retain the subsequent
+label-local reassignment. Use the fresh
+`rebuild_sift1b_sparse_label_hierarchy_v3.ini` recipe for bounded native-BKT
+terminal selection and true multi-owner entry. Never overwrite earlier indexes.
+V3 does not change H1 work, the one-shot supplementation schedule, protected
+original results, or the native search budgets. There is no online selectivity
+estimator, graph/posting alternation or per-OR-branch search.
+
+### Legacy full-domain spatial upper postings
+
+When `HierarchyLabelSelectivity` is empty, `[SelectHead] HierarchyLevels` counts H1. H1 is the sole query graph;
 H2 and higher levels are representative/CSR/signature catalogs. Filtered H1
 results use native result-only admission: nonmatching graph nodes still
 participate in distance navigation. The query retains native `MaxCheck`,
@@ -1493,8 +2089,11 @@ Upper representatives do not enter final top-k.
 supplier; false is the library default. The native H1 graph completes first.
 Only an underfilled head result set with remaining
 `MaxCheck + PostingAdditionalMaxCheck` budget starts one supplemental phase.
-`PostingAnchorCount` bounds nearest already-scored anchors, including negatives;
-their owners are merged and signature-qualified H2+ postings compete in one
+`PostingAnchorCount=0` uses up to nprobe nearest already-scored anchors, including
+negatives, and resolves again when a search sweep changes nprobe. Positive values
+retain an explicit fixed limit. If H1 scored fewer distinct candidates, use only
+those available without extra graph traversal or rescoring.
+Their owners are merged and signature-qualified H2+ postings compete in one
 representative-distance frontier. Each selected posting exposes its owners
 once; complete upper rows add children to that same frontier. Rejected rows
 may expose owners without representative or CSR access. The phase preserves
@@ -1509,9 +2108,32 @@ also handles predicates with fewer eligible heads than nprobe. It is not a
 proof that representative distances lower-bound all members or guarantee recall.
 The old in-row percentage and `PostingMinCandidates` policies are retired.
 
+`configs/sift1b_nprobe_anchors/{sel_01pct,mixed_dnf}.ini` enables the nprobe-sized
+entry set on the existing V3 index at nprobe 48/96, with the additional-check
+budget 2048 and navigation width 8 unchanged. This requires a newly built native
+binary; older binaries reject the zero anchor setting. Historical INIs and
+measurements remain unchanged. Native benchmark events retain the configured
+`posting_anchor_count` and additionally report the resolved `posting_anchor_limit`;
+the latter is an upper bound, not a claim that H1 found that many distinct heads.
+
+`[SearchSSDIndex] PostingNavigationWidth=8` enables an additional shared
+navigation-only distance beam. The default `0` preserves the existing search.
+Each logical tier keeps its own nearest discovered navigation-head distances,
+independent of nprobe, terminal head count, labels and OR branch count. A pending
+navigation head outside that tier's beam is discarded before CSR or owner
+expansion; other tiers continue in the same frontier. Sparse V1/V2/V3 and
+adjacent catalogs use this same implementation. Exact-distance ties are retained.
+Terminal rows, full-row consumption and H1 work/result protection are unchanged.
+This ANN heuristic can reduce recall; neither representative distance nor the
+beam is a certified subtree bound. It does not remove the cost of enumerating
+the full child list of a near parent. Enabling it needs only a search INI, not
+an upper-index rebuild. Counter schema 7 appends `m_navigationDistancePrunes`
+to the prior 57 fields, providing direct evidence of pre-expansion clipping.
+Benchmark batches explicitly reset an omitted width to 0 between cases.
+
 Signature rejection precedes representative/member access. Within an admitted
 H2 row, the compact visited/match lookup checks predicates before vector work.
-Fresh rejected members are marked visited and skipped without prefetch, distance
+Fresh rejected members are marked visited and skipped without vector prefetch, distance
 or checked-leaf cost; replicas reuse that rejection. A rejected collapsed
 representative still checks aliases, scoring its shared vector once only when
 a live matching alias needs admission. Ordinary graph negatives remain scored
@@ -1526,6 +2148,20 @@ bound. Upper query state contains only touched IDs, and discovered candidates
 use a distance-ordered cache rather than repeatedly scanning the whole list.
 This avoids catalog-sized per-query allocation/clearing; it does not bound
 owner fanout or the maximum CSR row length.
+
+Touched upper states use contiguous eight-byte open-addressed slots backed by
+query-owned monotonic allocation blocks, without per-node allocation or hash
+chains. Tables remain at most half full; no slot reference survives
+child expansion, and all blocks are released when the query object is destroyed.
+The resource allocates nothing until supplementation actually touches states,
+and its size follows touched IDs, never the total catalog size. The lazy query
+signature's nonempty flag is computed once. Selected upper rows prefetch upcoming
+child signatures, and selected H2 rows prefetch member support metadata.
+These hints do not evaluate predicates or touch representative vectors or
+unselected CSR rows. Within a selected H2 row, a bounded
+lookahead prefetches only graph-tail alias metadata; it does not evaluate future
+predicates, prefetch rejected vectors, skip aliases, or change visit/scoring order.
+These are implementation optimizations, not additional budgets or search knobs.
 
 H1 selected heads and SSD records retain native global-VID translation,
 liveness, exact predicates and deduplication. Matching heads with empty SSD

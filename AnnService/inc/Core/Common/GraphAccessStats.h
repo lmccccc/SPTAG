@@ -59,6 +59,7 @@ struct GraphAccessStats
     std::uint64_t m_graphUnique = 0, m_graphMatches = 0, m_anchorCount = 0;
     std::uint64_t m_supplementReason = 0, m_graphLeaves = 0, m_supplementLeaves = 0;
     std::uint64_t m_graphDistances = 0, m_supplementDistances = 0, m_preservedHeads = 0;
+    std::uint64_t m_navigationDistancePrunes = 0;
     std::vector<std::int32_t> m_graphHeadIds;
     std::vector<float> m_graphHeadDistances;
 #endif

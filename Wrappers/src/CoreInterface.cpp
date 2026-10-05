@@ -28,6 +28,7 @@
 #include <vector>
 #include <sstream>
 #include <fstream>
+#include <filesystem>
 #include <cstring>
 #include <unordered_set>
 #include <unordered_map>
@@ -1089,7 +1090,7 @@ bool ValidatePostingParameters(const char* name, const char* value)
     if (!name) return false;
     if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(name, "PostingMinCandidates")) {
         fprintf(stderr, "[ERROR] PostingMinCandidates was removed even with posting navigation OFF. "
-            "Remove it from build/search/saved INIs; migrate to PostingAnchorCount=8 and "
+            "Remove it from build/search/saved INIs; migrate to PostingAnchorCount=0 (nprobe anchors) and "
             "PostingAdditionalMaxCheck=0. No candidate-floor policy is retained.\n");
         return false;
     }
@@ -1097,10 +1098,9 @@ bool ValidatePostingParameters(const char* name, const char* value)
     const bool additional = SPTAG::Helper::StrUtils::StrEqualIgnoreCase(name, "PostingAdditionalMaxCheck");
     int parsed = 0;
     if ((anchor || additional) &&
-        !SPTAG::SPANN::Options::ParsePostingInteger(value, additional ? 0 : 1, parsed)) {
-        fprintf(stderr, "[ERROR] %s requires a %s integer within int range; rejected value %s.\n",
-            name, additional ? "nonnegative" : "positive",
-            value ? value : "(null)");
+        !SPTAG::SPANN::Options::ParsePostingInteger(value, 0, parsed)) {
+        fprintf(stderr, "[ERROR] %s requires a nonnegative integer within int range; rejected value %s.\n",
+            name, value ? value : "(null)");
         return false;
     }
     return true;
@@ -2627,7 +2627,17 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             // path passed to SaveAll (i.e. the ini IndexDirectory).
             std::string spannWorkDir;
             bool inPlaceBuild = false;
-            if (const char* ip = std::getenv("SPTAG_SPANN_INPLACE_DIR")) {
+            bool nativeWorkDir = false;
+            for (const auto& param : m_pendingBuildParams) {
+                if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(std::get<2>(param).c_str(), "Base") &&
+                    SPTAG::Helper::StrUtils::StrEqualIgnoreCase(std::get<0>(param).c_str(), "IndexDirectory")) {
+                    if (std::get<1>(param).empty())
+                        throw std::invalid_argument("Native in-place IndexDirectory must not be empty");
+                    spannWorkDir = std::get<1>(param) + "/tenant_" + std::to_string(tenantId);
+                    nativeWorkDir = inPlaceBuild = true;
+                }
+            }
+            if (!nativeWorkDir) if (const char* ip = std::getenv("SPTAG_SPANN_INPLACE_DIR")) {
                 if (ip[0] != '\0') {
                     inPlaceBuild = true;
                     spannWorkDir = std::string(ip) + "/tenant_" + std::to_string(tenantId);
@@ -2650,7 +2660,11 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             }();
             const std::string checkpointFile = spannWorkDir + "/head_select_state.bin";
             const bool checkpointExists = std::ifstream(checkpointFile, std::ios::binary).good();
-            if (resumeBuild && checkpointExists) {
+            if (nativeWorkDir) {
+                std::filesystem::create_directories(std::filesystem::path(spannWorkDir).parent_path());
+                if (!std::filesystem::create_directory(spannWorkDir))
+                    throw std::runtime_error("Native in-place build requires a new tenant directory: " + spannWorkDir);
+            } else if (resumeBuild && checkpointExists) {
                 fprintf(stderr, "[INFO] Tenant %d: RESUME — keeping work dir %s (checkpoint present, skipping wipe)\n",
                         tenantId, spannWorkDir.c_str());
             } else {
@@ -2660,7 +2674,8 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                 }
                 RemovePathRecursive(spannWorkDir);
             }
-            EnsureDir(spannWorkDir);
+            if (!EnsureDir(spannWorkDir))
+                throw std::runtime_error("Cannot create SPANN work directory: " + spannWorkDir);
             if (inPlaceBuild) {
                 fprintf(stderr, "[INFO] Tenant %d: IN-PLACE build — writing directly to final dir %s (SaveAll will skip the copy)\n",
                         tenantId, spannWorkDir.c_str());

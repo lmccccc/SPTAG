@@ -30,6 +30,7 @@ public:
         if (capacity <= 0) throw std::invalid_argument("Posting search capacity must be positive");
     }
     virtual bool Converged() const { return false; }
+    virtual bool PreferResultAnchors() const { return false; }
     virtual void Expand(const std::vector<int>& heads, const Consumer& consume) = 0;
     void Expand(int head, const Consumer& consume) { Expand(std::vector<int>{head}, consume); }
     virtual ~PostingNavigation() = default;

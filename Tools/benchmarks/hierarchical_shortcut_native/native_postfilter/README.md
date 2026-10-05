@@ -17,11 +17,131 @@ ctest --test-dir build-native -R '^NativePosting\.' --output-on-failure
 `nativeBench workload.ini` performs equal warmup and measured query windows,
 then checks deterministic IDs, distances and SSD work by replay. It writes
 `ids.i32`, `dist.f32`, `work.u64` and per-query `latency_us.f64`.
+The required native `[SearchSSDIndex] ResultNum` sets the returned top-k,
+the result payload width and the `topk` field in each point event. It must be
+a positive native integer; both `InternalResultNum` and every swept nprobe
+must be at least that value. Top100 uses `ResultNum=100`, not a top10 query
+with a wider head search. Recall evaluation requires matching top-k truth.
 `MaxQueries=all` and `Warmup=all` consume the entire provided query cohort.
 The existing `[SearchSweep] NProbe=[...]` API loads the index once and runs
 every registered probe, writing separate `nprobe_N/` output directories.
+Batch manifests support `[Batch] WarmupPolicy=once`: after loading the shared
+index and query corpus, run one full warmup using the first declared case and
+its first nprobe, then time all probes, cases and repetitions without further
+warmup. Native `batch_warmup_begin/end` events record this phase; every measured
+point reports `warmup_queries=0`, and `batch_end` reports the total warmup count.
+This is an explicit change in cache preparation, not a promise that every later
+predicate/probe has a separately warmed cache. Deterministic replay remains
+outside each timed window. Omitted `WarmupPolicy`, or explicit `per_point`,
+preserves the historical per-probe warmup protocol.
 `nativeOwnOnlyTest workload.ini` exercises a real selected own head with an
 empty posting. Both link the normal main `SPTAGLibStatic` target.
+
+The SIFT1B top100 comparison uses
+`Tools/benchmarks/configs/sift1b_top100_20261004/groundtruth.ini` and the native
+profiles beside it. Generate fresh exact truth with
+`generate_spann_predicate_groundtruth.py --config <groundtruth.ini>`, then run
+`run_sift1b_top100.py --config <benchmark.ini>`. Its new client links the
+accepted V5 normal archives without rebuilding the core or indexes.
+All three categorical scenarios receive full single-worker sweeps for latest
+SPTAG, PipeANN and Filtered DiskANN. SPTAG's separately labeled wider profile
+uses larger graph/supplement budgets; it is pooled into the per-scenario
+Pareto frontier, not compared at a matched probe value. Results and R figures
+remain in a separate top100 campaign and do not replace top10 paper data.
+The once-warmup restart uses
+`Tools/benchmarks/configs/sift1b_top100_once_20261004/benchmark.ini`, reuses the
+completed exact truth read-only, and writes a fresh campaign. Its
+`SPANN.WarmupPolicy=once` is copied into the native batch manifest; the native
+search profiles, core archives and indexes are unchanged. The interrupted
+per-point-warmup measurements are preserved but never merged into this curve.
+
+The unfiltered top100 extension uses `run_sift1b_top100_unfiltered.py --config
+Tools/benchmarks/configs/sift1b_top100_unfiltered_20261005/experiment.ini`.
+Its local official SIFT1B `idx_1000M.ivecs`/`dis_1000M.fvecs` supply the first
+100 neighbors of the same first 1000 queries, without ANN-generated truth,
+dataset downloads or another full-corpus distance scan. All 100,000 distances,
+the previous top10 ID prefix, and original compressed bvecs query/base prefixes
+are checked against native original-order vectors before registration.
+The original shared evaluator is preserved under `provenance/` and authenticated
+against the completed parent before enabling its explicit unfiltered predicate.
+No native client, algorithm archive or index is rebuilt.
+
+Four SPTAG profile families retain the accepted native search settings and add
+nprobe=3072: 24 configurations, two reversed profile repetitions, one resident
+load and one initial 1000-query warmup. Unfiltered uses `Predicate=empty`, not
+a universal categorical label; auxiliary label-posting navigation is not used.
+PipeANN uses its matching 1% memory-entry index with `mem_L=10` and eight L
+settings. DiskANN uses native unfiltered search on the same categorical
+R64/buildL1/FilteredL100/PQ32 index, with seven L settings from 100 to 6144;
+this is explicitly not a separately optimized unfiltered graph.
+The extension appends 78 measurements to the accepted 216, preserves all 108
+filtering settings, and produces both standalone unfiltered and four-panel
+full/zoom R figures. Repetition ranges and the inherited broad timing-variation
+warning remain visible. Native SPTAG replay and exact baseline capture checks
+remain outside measured timing; the baselines retain per-point warmup.
+
+Native children remain write-confined by Landlock. Baseline children additionally
+allow regular-file creation, writing, truncation and removal under `/dev/shm`,
+required by Intel OpenMP's process-local runtime registration. Directory creation
+and other writes outside the campaign remain denied; dataset/index permissions,
+native binaries and INI search/thread settings are unchanged.
+
+After a baseline startup failure with no partial native output, use
+`run_sift1b_top100.py --config <same-benchmark.ini> --resume`. Completed engines
+are revalidated from saved results without rerunning queries. Failed launch
+evidence is archived under `recovery/initial/`; the original registration and
+completed outputs remain unchanged, and `recovery/registration.json` authenticates
+the continuation. Launcher fixes require byte-verified original source snapshots
+in `recovery/source-snapshots.json`, bound to the original registration hash.
+Only this controller and its confinement helper may change through that explicit
+source transition; other frozen inputs must still match. Partial native baseline
+output is rejected rather than overwritten or silently merged.
+
+`diagnose_sift1b_medium.py --config
+Tools/benchmarks/configs/sift1b_medium_expansion_20261004/experiment.ini`
+investigates the medium-label top100 plateau without rebuilding the V5 index.
+Its native INIs separate additional checked-leaf budget, navigation-width
+pruning and H1 MaxCheck changes. One diagnostic process loads the index once,
+warms the declared prefix once, and retains native replay at each point.
+Control results must match the corresponding normal top100 prefix exactly.
+The report separates exhausted reachable frontiers from budget/convergence
+stops and records graph versus supplemental heads, leaves and upper-row work.
+Instrumented QPS and prefix recall must not enter the full-cohort performance
+frontier; candidate profiles require a separate normal-client measurement.
+
+After diagnostic completion, `measure_sift1b_medium_expansion.py --config
+Tools/benchmarks/configs/sift1b_medium_expansion_20261004/normal/experiment.ini`
+measures the same candidate grid on all three labels using the unchanged
+normal binary, full 1000-query cohort and two reversed repetitions. The
+declared profiles change only H1 MaxCheck (16384/32768) and nprobe; additional
+budget remains 2048 and navigation width 8. A broad/base/nprobe100 control
+brackets the new measurements, preserves the original one-time warmup setup,
+and reports timing drift without entering the frontier. Prior completed
+SPTAG/base/wide and baseline measurements are reused with explicit provenance;
+no interrupted campaign, diagnostic timings or duplicate control wins enter
+the combined plot. This is same-cohort parameter exploration, not an
+independent held-out validation.
+
+The completed 2026-10-04 extension adds 24 settings to the original 84-point
+comparison. For medium, `MaxCheck=16384, nprobe=384` obtains Recall@100 0.92946
+at 106.23 QPS, while `MaxCheck=32768, nprobe=768` obtains 0.97014 at 51.34 QPS.
+These are observed frontier tradeoffs, not new library defaults or matched-recall
+speedup claims. Increasing nprobe to 1536 at MaxCheck 32768 reaches 0.97358 but
+is dominated by Filtered DiskANN in this comparison. Larger H1 budgets do not
+improve the sparse joint frontier and should not replace its cheaper profiles.
+
+The full-cohort diagnostic found identical medium output/work after increasing
+the supplemental budget to 32768, disabling navigation-width pruning, or both.
+All those queries exhausted their reachable frontier; tag9 has only 6585 H2
+label rows and no H3+ label rows in the accepted index. Increasing H1 search
+work compensates for that limited admitted coverage; it does not change the
+index's local-admission target/window or repair its upper topology.
+Several new broad points have substantial repetition variation (up to 2.51x);
+the stable bracketing control does not establish stability for every setting.
+Retain both observations and the plotted ranges without normalization or
+selective dropping. Results and `result-audit.json` are under
+`datasets/sift1b/comparisons/top100_medium_expansion_20261004/normal`
+in the workspace, separately from the original campaign and paper data.
 
 ## Native behavior and configuration
 
@@ -37,9 +157,13 @@ supplementary own-point heap.
 `[SearchSSDIndex] EnablePostingNavigation=false` is the default. Setting it to
 `true` enables bounded **post-graph** signed-posting completion. The ordinary
 native graph phase runs first without in-row posting activation. Its native
-head results are retained. Completion uses `PostingAnchorCount=8` (positive
-integer) and `PostingAdditionalMaxCheck=0` (nonnegative integer), not the old
-density/floor policies. Additional zero shares remaining native checked work;
+head results are retained. Completion uses `PostingAnchorCount=0` (nonnegative
+integer; zero follows the current nprobe, positive values retain a fixed limit)
+and `PostingAdditionalMaxCheck=0` (nonnegative integer), not the old density/floor
+policies. Resolve the anchor limit per query, including when a sweep changes
+nprobe; it is not final top10. Native point events report the configured
+`posting_anchor_count` and resolved `posting_anchor_limit` separately.
+Additional zero shares remaining native checked work;
 it is not permission to start a row after budget exhaustion or a promise to
 fill nprobe. Once selected, a whole CSR row completes even across the budget.
 The sum of `MaxCheck` and the additional budget must fit a signed native int.
@@ -61,7 +185,10 @@ guarantee. Unfiltered queries retain the ordinary native path.
 The nearest-anchor heap uses already-scored native navigation candidates,
 including promoted tree seeds and negatives, never arbitrary internal-tree
 checks or a visited-directory scan. At most one phase merges/deduplicates
-their owners.
+their owners across all selected anchors before selecting posting rows. If H1
+scored fewer distinct candidates than the limit, use those available rather
+than restart the graph. Sparse V3 prefers the nearest admitted H1 results and
+fills remaining anchor slots with the already-scored spatial candidates.
 All discovered H2+ postings now compete in one representative-distance heap,
 with deterministic level/ID tie-breaking. Selecting a posting exposes its
 owners once. Complete upper rows register their children into the same heap;

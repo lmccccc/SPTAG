@@ -3487,7 +3487,7 @@ BOOST_AUTO_TEST_CASE(PostgraphNativeParameterValidation)
 {
     auto index = VectorIndex::CreateInstance(IndexAlgoType::SPANN, VectorValueType::Float);
     BOOST_REQUIRE(index != nullptr);
-    BOOST_CHECK_EQUAL(index->GetParameter("PostingAnchorCount", "SearchSSDIndex"), "8");
+    BOOST_CHECK_EQUAL(index->GetParameter("PostingAnchorCount", "SearchSSDIndex"), "0");
     BOOST_CHECK_EQUAL(index->GetParameter("PostingAdditionalMaxCheck", "SearchSSDIndex"), "0");
     BOOST_REQUIRE(index->SetParameter("EnablePostingNavigation", "false", "SearchSSDIndex") == ErrorCode::Success);
     for (const char* section : {"BuildSSDIndex", "SearchSSDIndex"}) {
@@ -3495,8 +3495,9 @@ BOOST_AUTO_TEST_CASE(PostgraphNativeParameterValidation)
             BOOST_CHECK(index->SetParameter("PostingMinCandidates", value, section) == ErrorCode::FailedParseValue);
         }
     }
+    BOOST_REQUIRE(index->SetParameter("PostingAnchorCount", "0", "SearchSSDIndex") == ErrorCode::Success);
     BOOST_REQUIRE(index->SetParameter("PostingAnchorCount", "13", "SearchSSDIndex") == ErrorCode::Success);
-    for (const char* value : {"0", "-1", "bad", "10bad", "2147483648", "1.0", " 8", "8 ", "+8", ""}) {
+    for (const char* value : {"-1", "bad", "10bad", "2147483648", "1.0", " 8", "8 ", "+8", ""}) {
         BOOST_CHECK(index->SetParameter("PostingAnchorCount", value, "SearchSSDIndex") == ErrorCode::FailedParseValue);
         BOOST_CHECK_EQUAL(index->GetParameter("PostingAnchorCount", "SearchSSDIndex"), "13");
     }

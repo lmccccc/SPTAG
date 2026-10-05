@@ -234,7 +234,7 @@ namespace SPTAG
                 const std::function<bool(SizeType)>& predicate,
                 COMMON::PostingNavigation* postingNavigation = nullptr,
                 int maxCheck = 0, bool searchDeleted = false,
-                int anchorCount = 8, int additionalMaxCheck = 0) const;
+                int anchorCount = 0, int additionalMaxCheck = 0) const;
 
             ErrorCode SearchIndexWithResultFilter(
                 QueryResult& p_query,

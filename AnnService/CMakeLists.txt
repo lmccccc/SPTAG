@@ -191,6 +191,8 @@ target_link_libraries(spannsupportaudit SPTAGLibStatic ${Boost_LIBRARIES} ${Rock
 
 add_executable(compactspannindex ${PROJECT_SOURCE_DIR}/Tools/CompactSpannIndex.cpp)
 target_link_libraries(compactspannindex SPTAGLibStatic ${Boost_LIBRARIES})
+add_executable(rebuildsparselabelhierarchy ${PROJECT_SOURCE_DIR}/Tools/RebuildSparseLabelHierarchy.cpp)
+target_link_libraries(rebuildsparselabelhierarchy SPTAGLibStatic ${Boost_LIBRARIES})
 add_executable(nativestorageload ${PROJECT_SOURCE_DIR}/Tools/benchmarks/NativeStorageLoad.cpp)
 target_link_libraries(nativestorageload SPTAGLibStatic ${Boost_LIBRARIES})
 

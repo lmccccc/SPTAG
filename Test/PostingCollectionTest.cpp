@@ -337,6 +337,76 @@ void SharedAnchorOwners() {
 #endif
     std::cout<<"PASS one phase merges shared anchor owners; query-representative ranking; full selected row\n";
 }
+void NProbeAnchorOwners() {
+    for(int probe : {48,96}) {
+        Fixture f({probe+1});
+        std::vector<int> anchors(probe), checks(probe+1), scores(probe+1);
+        std::iota(anchors.begin(),anchors.end(),0);
+        for(int head=0;head<probe;++head) f.owners.parents[0][head]={head,probe};
+        for(int id=0;id<=probe;++id) {
+            f.layers[0].rows[id]={static_cast<std::uint32_t>(id)};
+            f.layers[0].distances[id]=id==probe ? 1000.0f : static_cast<float>(probe-id);
+        }
+        auto signature=[&](std::size_t,int id) { ++checks[id]; return true; };
+        auto distance=[&](std::size_t,int id) { ++scores[id]; return f.layers[0].distances[id]; };
+        SPANN::HierarchyPostingQuery<decltype(f.layers),decltype(signature),decltype(distance),Owners>
+            query(f.owners,f.layers,signature,distance);
+        query.SetSearchCapacity(probe+1);
+        std::vector<unsigned> consumed;
+        query.Expand(anchors,[&](const std::uint32_t* ids,int count) {
+            CHECK(std::all_of(checks.begin(),checks.end(),[](int n) { return n==1; }));
+            CHECK(std::all_of(scores.begin(),scores.end(),[](int n) { return n==1; }));
+            CHECK(count==1);
+            consumed.push_back(ids[0]);
+            return f.Consumer(2-f.fresh)(ids,count);
+        });
+        CHECK((consumed==std::vector<unsigned>{static_cast<unsigned>(probe-1),
+                                               static_cast<unsigned>(probe-2)}));
+        CHECK(f.fresh==2 && f.layers[0].reads[probe]==0);
+        for(int id=0;id<probe;++id) CHECK(f.layers[0].reads[id]==(id>=probe-2 ? 1 : 0));
+    }
+    std::cout<<"PASS every nprobe48/96 anchor contributes owners before shared distance ranking; duplicate owners scored once; best rows can come after anchor8\n";
+}
+void ChildPrefilterPreservesPromotion() {
+    for(bool early : {false,true}) {
+        Fixture f({3,2});
+        f.layers[0].allowed[2]=false;
+        f.layers[0].rows[1]={42};
+        f.layers[1].rows={{0,2},{2,1}};
+        f.owners.parents[0][0]={0}; f.owners.parents[0][1]={2};
+        f.owners.parents[1][0]={0}; f.owners.parents[1][1]={1}; f.owners.parents[1][2]={0,1};
+        int rejectedSignatures=0;
+        const auto signature=[&](std::size_t level,int id) {
+            if(level==0 && id==2) ++rejectedSignatures;
+            return f.layers[level].allowed[id];
+        };
+        auto distance=f.Distance();
+        const auto childMayMatch=[&](std::size_t level,int id) {
+            return !early || f.layers[level].allowed[id];
+        };
+        SPANN::HierarchyPostingQuery<decltype(f.layers),decltype(signature),decltype(distance),
+            Owners,SPANN::NoPostingPrefetch,SPANN::AdjacentPostingLayout,decltype(childMayMatch)>
+            query(f.owners,f.layers,signature,distance,{},0,childMayMatch);
+        query.SetSearchCapacity(64);
+        query.Expand(0,f.Consumer(1));
+        CHECK(f.fresh==0 && f.layers[1].reads[1]==0 && rejectedSignatures==(early?0:1));
+        query.Expand(1,f.Consumer(1));
+        CHECK(f.fresh==1 && f.visited.count(42)==1 && rejectedSignatures==1);
+        CHECK(f.layers[0].reads[2]==0 && f.layers[1].reads[1]==1);
+    }
+    Fixture invalid({1,1});
+    invalid.layers[1].rows[0]={99};
+    auto signature=invalid.Signature(); auto distance=invalid.Distance();
+    const auto rejectChild=[](std::size_t,int) { return false; };
+    SPANN::HierarchyPostingQuery<decltype(invalid.layers),decltype(signature),decltype(distance),
+        Owners,SPANN::NoPostingPrefetch,SPANN::AdjacentPostingLayout,decltype(rejectChild)>
+        query(invalid.owners,invalid.layers,signature,distance,{},0,rejectChild);
+    query.SetSearchCapacity(64);
+    bool rejected=false;
+    try { query.Expand(0,invalid.Consumer()); } catch(const std::out_of_range&) { rejected=true; }
+    CHECK(rejected);
+    std::cout<<"PASS exact child prefilter avoids rejection state but retains later owner promotion and invalid-ID errors\n";
+}
 void CompetingAncestorsAndLevels() {
     for(bool competingLower:{false,true}) {
         Fixture f({4,2});
@@ -430,8 +500,107 @@ void AdaptiveFrontierConvergence() {
     CHECK(coarse.layers[0].reads[0]==0 && coarse.layers[0].reads[1]==1);
     std::cout<<"PASS full/underfilled native frontier convergence; closer children update the H2 pool; coarse ancestors cannot occupy H2 beam slots; invalid capacity is rejected\n";
 }
+void PrefetchPreservesOrder() {
+    const auto run = [](auto prefetch, bool invalid) {
+        Fixture f({257,2,1});
+        for (int id=0;id<257;++id) {
+            f.layers[0].allowed[id]=id%3!=0;
+            f.layers[0].rows[id]={static_cast<std::uint32_t>(id)};
+            f.owners.parents[1][id]={id<128 ? 0 : 1};
+        }
+        f.Row(1,0,0,128); f.Row(1,1,128,129);
+        f.layers[2].rows[0]={0,1};
+        if (invalid) f.layers[1].rows[1].push_back((std::numeric_limits<std::uint32_t>::max)());
+        std::vector<std::tuple<char,std::size_t,std::uint32_t>> events;
+        const auto signature = [&](std::size_t level,int id) {
+            events.emplace_back('s',level,id);
+            return f.layers[level].allowed[id];
+        };
+        const auto distance = [&](std::size_t level,int id) {
+            events.emplace_back('d',level,id);
+            CHECK(f.layers[level].allowed[id]);
+            return f.layers[level].distances[id];
+        };
+        const auto consume = [&](const std::uint32_t* members,int count) {
+            for(int i=0;i<count;++i) events.emplace_back('c',0,members[i]);
+            return f.Consumer(10000)(members,count);
+        };
+        SPANN::HierarchyPostingQuery<decltype(f.layers),decltype(signature),decltype(distance),
+            Owners,decltype(prefetch)> query(f.owners,f.layers,signature,distance,prefetch);
+        query.SetSearchCapacity(512);
+        bool rejected=false;
+        try { query.Expand(0,consume); }
+        catch(const std::out_of_range&) { rejected=true; }
+        CHECK(rejected==invalid);
+        return std::make_tuple(events,f.visited,f.fresh,f.members,f.consumed);
+    };
+    for(bool invalid : {false,true}) {
+        std::set<std::pair<std::size_t,std::uint32_t>> hints;
+        const auto prefetch = [&](std::size_t level,std::uint32_t id) {
+            const int counts[]={4096,257,2,1};
+            CHECK(level<4 && id<static_cast<std::uint32_t>(counts[level]));
+            hints.emplace(level,id);
+        };
+        const auto expected=run(SPANN::NoPostingPrefetch{},invalid);
+        CHECK(run(prefetch,invalid)==expected);
+        CHECK(hints.count({1,3}) && hints.count({2,1}));
+        if(!invalid) CHECK(hints.count({0,1}));
+    }
+    std::cout<<"PASS metadata prefetch preserves signature/distance/member order and malformed-ID exceptions across state rehashes\n";
+}
+void NavigationDistanceCutoff() {
+    for (int capacity : {64,192,384}) for (int width : {0,1,2,8}) for (bool ties : {false,true}) {
+        Fixture f({6,3,1});
+        f.layers[0].allowed[0]=false;
+        f.owners.parents[1][0]={0,1,2};
+        f.layers[1].distances={1,ties?1.0f:5.0f,50};
+        f.layers[1].rows={{1,2},{3,4},{5}};
+        f.layers[2].distances={100};
+        f.layers[2].rows={{0,1,2}};
+        for (int id=1;id<6;++id) {
+            f.layers[0].rows[id]={static_cast<unsigned>(id)};
+            f.layers[0].distances[id]=float(20+id);
+            f.owners.parents[1][id]={(id-1)/2};
+        }
+        std::set<std::pair<std::size_t,int>> checked;
+        const auto signature=[&](std::size_t level,int id) {
+            CHECK(checked.emplace(level,id).second);
+            return f.layers[level].allowed[id];
+        };
+        auto distance=f.Distance();
+        using Query=SPANN::HierarchyPostingQuery<decltype(f.layers),decltype(signature),decltype(distance),Owners>;
+        for (int invalid : {-1,MaxSize}) {
+            bool rejected=false;
+            try { Query bad(f.owners,f.layers,signature,distance,{},invalid); }
+            catch (const std::invalid_argument&) { rejected=true; }
+            CHECK(rejected);
+        }
+        Query query(f.owners,f.layers,signature,distance,{},width);
+        query.SetSearchCapacity(capacity);
+        COMMON::GraphAccessStats stats;
+        {
+            COMMON::ScopedGraphAccessStats capture(&stats);
+            query.Expand({0,0},f.Consumer(1000));
+        }
+        const int kept=width==0 || width>=3 ? 3 : ties ? 2 : width;
+        CHECK(f.layers[2].reads[0]==1);
+        CHECK(query.Converged()==(kept<3));
+        for (int parent=0;parent<3;++parent) {
+            CHECK(f.layers[1].reads[parent]==(parent<kept?1:0));
+            for (auto child : f.layers[1].rows[parent]) {
+                CHECK(f.layers[0].reads[child]==(parent<kept?1:0));
+                CHECK(checked.count({0,child})==(parent<kept?1U:0U));
+            }
+        }
+        CHECK(f.fresh==(kept==3?5:kept*2));
+#ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
+        CHECK(stats.m_navigationDistancePrunes==static_cast<unsigned>(3-kept));
+#endif
+    }
+    std::cout<<"PASS posting-scale per-tier cutoff before CSR/signature descent, nprobe independence, ties, zero-match ascent, dedup and disabled parity\n";
+}
 int main() {
-    try { BoundaryAndOrdering(); UniqueH1CountsAndDepth(); BudgetCacheAndPruning(); PendingChildrenAfterCompleteUpperRow(); RejectedReferenceCounts(); RejectedDescentDoesNotFanOut(); CachedRejectionCanAscend(); SharedAnchorOwners(); CompetingAncestorsAndLevels(); AdaptiveFrontierConvergence(); }
+    try { BoundaryAndOrdering(); UniqueH1CountsAndDepth(); BudgetCacheAndPruning(); PendingChildrenAfterCompleteUpperRow(); RejectedReferenceCounts(); RejectedDescentDoesNotFanOut(); CachedRejectionCanAscend(); SharedAnchorOwners(); NProbeAnchorOwners(); ChildPrefilterPreservesPromotion(); CompetingAncestorsAndLevels(); AdaptiveFrontierConvergence(); PrefetchPreservesOrder(); NavigationDistanceCutoff(); }
     catch(const std::exception& error) { std::cerr<<error.what()<<'\n'; return 1; }
     return 0;
 }

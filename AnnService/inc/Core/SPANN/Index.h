@@ -1,5 +1,6 @@
 #include "inc/Core/SPANN/PostingNavigation.h"
 #include "inc/Core/SPANN/RoutingSignatures.h"
+#include "inc/Core/SPANN/SparseLabelHierarchy.h"
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
@@ -90,6 +91,7 @@ namespace SPTAG
             virtual ErrorCode MaterializeHierarchyVectors(const std::string&) { return ErrorCode::Undefined; }
             // Called only on private export/build staging directories before validation.
             virtual ErrorCode PrepareHierarchyExport(const std::string&) { return ErrorCode::Success; }
+            virtual ErrorCode RebuildSparseHierarchy(const Options&, const std::string&) const { return ErrorCode::Undefined; }
             virtual bool HasRoutingOnlyHierarchy() const { return false; }
             virtual void SetVectorTags(const uint32_t* tags, int numVecs, int numTagsPerVec) = 0;
             // The caller keeps this view alive until BuildIndex returns.
@@ -142,6 +144,7 @@ namespace SPTAG
             mutable std::atomic<bool> m_routingStaleWarning{false};
             std::vector<std::shared_ptr<VectorSet>> m_secondLevelCatalogs;
             std::vector<SecondLevelHeadPostings> m_secondLevelPostings;
+            std::unique_ptr<SparseLabelHierarchy> m_sparseHierarchy;
             mutable std::atomic<bool> m_headHybridGraphLoaded{false};
             mutable std::mutex m_headHybridGraphMutex;
             mutable std::shared_timed_mutex m_headTopologyLock;
@@ -349,6 +352,11 @@ namespace SPTAG
             ErrorCode PrepareIndexSave(
                 const std::string& p_folderPath) override
             {
+                if (m_sparseHierarchy) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                        "Sparse hierarchy snapshots are read-only; reconstruct into a new output directory.\n");
+                    return ErrorCode::Undefined;
+                }
                 if (IsRecoveredLimitedTagReadOnly()) {
                     SPTAGLIB_LOG(
                         Helper::LogLevel::LL_Error,
@@ -470,6 +478,7 @@ namespace SPTAG
             ErrorCode LoadLimitedTagSupport(
                 const std::string& p_baseDir);
             ErrorCode BuildSecondLevelHeadPostings();
+            ErrorCode RebuildSparseHierarchy(const Options& p_options, const std::string& p_file) const override;
             ErrorCode ValidateSecondLevelSampleIDs(
                 const std::vector<std::vector<std::uint64_t>>& p_levelToLower);
             ErrorCode LoadSecondLevelIndex(
@@ -772,7 +781,7 @@ namespace SPTAG
 
             bool IsLimitedTagMutationReadOnly() const
             {
-                return IsRecoveredLimitedTagReadOnly() ||
+                return m_sparseHierarchy != nullptr || IsRecoveredLimitedTagReadOnly() ||
                     m_limitedTagSupport.HasExpansion();
             }
 

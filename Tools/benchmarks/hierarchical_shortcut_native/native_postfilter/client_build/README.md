@@ -4,6 +4,9 @@ This client-only build links an existing corrected native core archive and its
 matching compiled `CoreInterface.cpp` object. It never configures or rebuilds
 the core. Use separate new build directories for ordinary and diagnostic clients;
 `CLIENT_DIAGNOSTIC` must match the frozen core's CMake cache.
+Archive paths follow that cache's `SPTAG_OUTPUT_DIRECTORY`, or the legacy
+`CORRECTED_CORE_DIR/bin` layout when the key is absent. Missing archives fail
+configuration; no core artifact is copied over or rebuilt.
 
 ```sh
 cmake -S CLIENT_BUILD_SOURCE -B NEW_CLIENT_BUILD \
@@ -30,6 +33,15 @@ Point JSON adds `value_type` and `search_posting_page_limit`. Existing navigatio
 schema 6 / 57 columns and result/distance/work payload formats remain unchanged.
 Warmup, timing boundaries and deterministic replay remain the same. Query bytes
 are `128 * sizeof(T)`, and the tenant manager uses the declared native type.
+
+`MaxCheck` accepts any native strictly positive integer, with native validation
+of the combined `MaxCheck + PostingAdditionalMaxCheck` range. There is no
+benchmark-only 2048/4096 whitelist. Each experiment must register its own fixed
+budget grid. The core still derives its H1 and terminal convergence capacities
+from `max(MaxCheck/16,nprobe)`; lowering MaxCheck may therefore also narrow those
+capacities, and comparisons must report this coupling. `ctest` runs the native
+batch configuration regression, including small budgets, case transitions and
+invalid/overflowing settings.
 
 The client closes/checks output payload files, then emits and flushes one JSON
 summary after each completed nprobe point, outside timing. There is no per-query

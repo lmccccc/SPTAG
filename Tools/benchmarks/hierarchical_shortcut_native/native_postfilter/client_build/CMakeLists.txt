@@ -24,20 +24,41 @@ if(NOT EXISTS "${WRAPPER_OBJECT}")
     message(FATAL_ERROR "Frozen corrected native wrapper object is required")
 endif()
 set_source_files_properties("${WRAPPER_OBJECT}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
-set(CLIENT_ROOT "${SPTAG_SOURCE_ROOT}/Tools/benchmarks/hierarchical_shortcut_native/native_postfilter")
-foreach(CLIENT IN ITEMS Bench OwnOnlyTest)
-    add_executable(native${CLIENT} "${CLIENT_ROOT}/${CLIENT}.cpp" "${WRAPPER_OBJECT}")
-    target_compile_features(native${CLIENT} PRIVATE cxx_std_17)
-    target_compile_definitions(native${CLIENT} PRIVATE NUMA TBB)
-    if(CLIENT_DIAGNOSTIC)
-        target_compile_definitions(native${CLIENT} PRIVATE SPTAG_QUERY_WORK_DIAGNOSTICS)
+file(STRINGS "${CORRECTED_CORE_DIR}/CMakeCache.txt" CORE_OUTPUT
+    REGEX "^SPTAG_OUTPUT_DIRECTORY:PATH=")
+if(CORE_OUTPUT)
+    string(REGEX REPLACE "^SPTAG_OUTPUT_DIRECTORY:PATH=" "" CORE_LIBRARY_DIR "${CORE_OUTPUT}")
+else()
+    set(CORE_LIBRARY_DIR "${CORRECTED_CORE_DIR}/bin")
+endif()
+foreach(LIBRARY IN ITEMS SPTAGLibStatic DistanceUtils RaBitQ2Lib zstd)
+    if(NOT EXISTS "${CORE_LIBRARY_DIR}/lib${LIBRARY}.a")
+        message(FATAL_ERROR "Frozen corrected core archive is required: ${CORE_LIBRARY_DIR}/lib${LIBRARY}.a")
     endif()
-    target_compile_options(native${CLIENT} PRIVATE -fno-omit-frame-pointer)
-    target_include_directories(native${CLIENT} PRIVATE "${SPTAG_SOURCE_ROOT}/AnnService" "${SPTAG_SOURCE_ROOT}/Wrappers")
-    target_link_libraries(native${CLIENT} PRIVATE
-        "${CORRECTED_CORE_DIR}/bin/libSPTAGLibStatic.a"
-        "${CORRECTED_CORE_DIR}/bin/libDistanceUtils.a"
-        "${CORRECTED_CORE_DIR}/bin/libRaBitQ2Lib.a"
-        "${CORRECTED_CORE_DIR}/bin/libzstd.a"
+endforeach()
+set(CLIENT_ROOT "${SPTAG_SOURCE_ROOT}/Tools/benchmarks/hierarchical_shortcut_native/native_postfilter")
+foreach(CLIENT IN ITEMS Bench OwnOnlyTest PostingBenchmarkConfigTest)
+    if(CLIENT STREQUAL "PostingBenchmarkConfigTest")
+        set(CLIENT_TARGET "${CLIENT}")
+        set(CLIENT_SOURCE "${SPTAG_SOURCE_ROOT}/Test/${CLIENT}.cpp")
+    else()
+        set(CLIENT_TARGET "native${CLIENT}")
+        set(CLIENT_SOURCE "${CLIENT_ROOT}/${CLIENT}.cpp")
+    endif()
+    add_executable(${CLIENT_TARGET} "${CLIENT_SOURCE}" "${WRAPPER_OBJECT}")
+    target_compile_features(${CLIENT_TARGET} PRIVATE cxx_std_17)
+    target_compile_definitions(${CLIENT_TARGET} PRIVATE NUMA TBB)
+    if(CLIENT_DIAGNOSTIC)
+        target_compile_definitions(${CLIENT_TARGET} PRIVATE SPTAG_QUERY_WORK_DIAGNOSTICS)
+    endif()
+    target_compile_options(${CLIENT_TARGET} PRIVATE -fno-omit-frame-pointer)
+    target_include_directories(${CLIENT_TARGET} PRIVATE "${SPTAG_SOURCE_ROOT}/AnnService" "${SPTAG_SOURCE_ROOT}/Wrappers")
+    target_link_libraries(${CLIENT_TARGET} PRIVATE
+        "${CORE_LIBRARY_DIR}/libSPTAGLibStatic.a"
+        "${CORE_LIBRARY_DIR}/libDistanceUtils.a"
+        "${CORE_LIBRARY_DIR}/libRaBitQ2Lib.a"
+        "${CORE_LIBRARY_DIR}/libzstd.a"
         ${Boost_LIBRARIES} OpenMP::OpenMP_CXX TBB::tbb ${NUMA_LIBRARY} m rt)
 endforeach()
+enable_testing()
+add_test(NAME NativePosting.BenchmarkConfig COMMAND PostingBenchmarkConfigTest)

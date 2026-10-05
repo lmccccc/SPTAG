@@ -9,6 +9,66 @@
 
 namespace SPTAG { namespace SPANN {
 
+template<class Candidates, class Allowed, class Distance, class Emit>
+bool SelectLimitedTagPostingCandidates(const Candidates& candidates, SizeType headCount,
+    int replicas, float rngFactor, const Allowed& allowed, const Distance& distance,
+    std::vector<SizeType>& selected, const Emit& emit)
+{
+    selected.clear();
+    for (int rank = 0; rank < candidates.GetResultNum() &&
+         selected.size() < static_cast<std::size_t>(replicas); ++rank) {
+        const auto* candidate = candidates.GetResult(rank);
+        if (candidate == nullptr || candidate->VID < 0) break;
+        if (candidate->VID >= headCount || !allowed(candidate->VID)) return false;
+        bool accepted = true;
+        for (auto prior : selected)
+            if (rngFactor * distance(candidate->VID, prior) <= candidate->Dist) {
+                accepted = false;
+                break;
+            }
+        if (!accepted) continue;
+        selected.push_back(candidate->VID);
+        emit(*candidate);
+    }
+    return true;
+}
+
+// Repeated labels occupy candidate positions, but the stored support remains a set.
+template<class TagAt>
+std::vector<std::uint32_t> SelectNearestLimitedLabels(std::uint32_t own, SizeType ownItem,
+    const std::vector<std::pair<float, SizeType>>& candidates, int slots, const TagAt& tagAt)
+{
+    if (slots <= 0 || own == LimitedTagSupport::EmptyTag)
+        throw std::invalid_argument("Invalid nearest limited-label slots or anchor");
+    std::vector<std::pair<float, SizeType>> nearest;
+    const auto capacity = static_cast<std::size_t>(slots - 1);
+    for (const auto& candidate : candidates) {
+        if (!std::isfinite(candidate.first) || candidate.second < 0)
+            throw std::invalid_argument("Invalid nearest limited-label candidate");
+        if (candidate.second == ownItem || capacity == 0) continue;
+        if (nearest.size() < capacity) {
+            nearest.push_back(candidate);
+            std::push_heap(nearest.begin(), nearest.end());
+        } else if (candidate < nearest.front()) {
+            std::pop_heap(nearest.begin(), nearest.end());
+            nearest.back() = candidate;
+            std::push_heap(nearest.begin(), nearest.end());
+        }
+    }
+    std::vector<std::uint32_t> tags{own};
+    for (const auto& candidate : nearest) {
+        const auto tag = tagAt(candidate.second);
+        if (tag == LimitedTagSupport::EmptyTag)
+            throw std::invalid_argument("Invalid nearest limited-label tag");
+        tags.push_back(tag);
+    }
+    std::sort(tags.begin(), tags.end());
+    tags.erase(std::unique(tags.begin(), tags.end()), tags.end());
+    const auto anchor = std::find(tags.begin(), tags.end(), own);
+    std::rotate(tags.begin(), anchor, anchor + 1);
+    return tags;
+}
+
 // Cuts retain a prefix of each head group; discarded scratch suffixes are not O.
 template <typename TEdge, typename TConsumer>
 bool VisitRetainedOriginalPostings(

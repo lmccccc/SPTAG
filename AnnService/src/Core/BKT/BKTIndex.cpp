@@ -331,7 +331,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
     const bool hasResultFilter = p_resultFilter || filterFunc;
     std::vector<std::pair<float, SizeType>> anchors;
     if (p_space.postingNavigation)
-        anchors.reserve((std::min)(8, p_space.postingAnchorCount));
+        anchors.reserve((std::min)(p_space.m_iMaxCheck, p_space.postingAnchorCount));
     const std::function<void(SizeType, float, bool)> observe = [&](SizeType id, float distance, bool match) {
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
         if (COMMON::g_graphAccessStats) {
@@ -795,13 +795,34 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                 resultSink = &supplemental;
                 std::sort(anchors.begin(), anchors.end());
                 std::vector<int> ids;
-                ids.reserve(anchors.size());
-                for (const auto& anchor : anchors) ids.push_back(anchor.second);
+                ids.reserve(p_space.postingAnchorCount);
+                if (p_space.postingNavigation->PreferResultAnchors()) {
+                    for (int i = 0; i < (std::min)(before, p_space.postingAnchorCount); ++i)
+                        ids.push_back(p_query.GetResult(i)->VID);
+                    for (const auto& anchor : anchors) {
+                        if (ids.size() == static_cast<std::size_t>(p_space.postingAnchorCount)) break;
+                        if (std::find(ids.begin(), ids.end(), anchor.second) == ids.end()) ids.push_back(anchor.second);
+                    }
+                } else
+                    for (const auto& anchor : anchors) ids.push_back(anchor.second);
                 p_space.postingNavigation->SetSearchCapacity(
                     (std::max)(p_space.m_iMaxCheck / 16, target));
                 p_space.postingNavigation->Expand(ids, [&](const std::uint32_t* members, int count) {
                     COMMON::PostingNavigation::RowResult row;
+                    // Fetch alias metadata ahead of use, never rejected members' vectors.
+                    constexpr int aliasPrefetchDistance = 16;
+                    const auto prefetchAlias = [&](int position) {
+                        const auto id = members[position];
+                        if (id < static_cast<std::uint32_t>(GetNumSamples()))
+                            _mm_prefetch(reinterpret_cast<const char*>(
+                                m_pGraph[static_cast<SizeType>(id)] + m_pGraph.m_iNeighborhoodSize - 1),
+                                _MM_HINT_T0);
+                    };
+                    for (int i = 0; i < (std::min)(count, aliasPrefetchDistance); ++i)
+                        prefetchAlias(i);
                     for (int i = 0; i < count; ++i) {
+                        if (count - i > aliasPrefetchDistance)
+                            prefetchAlias(i + aliasPrefetchDistance);
                         const SizeType id = static_cast<SizeType>(members[i]);
                         if (id < 0 || id >= GetNumSamples()) throw std::out_of_range("Invalid postgraph H1 member");
                         if (COMMON::g_graphAccessStats) ++COMMON::g_graphAccessStats->m_visitedChecks;
@@ -1693,7 +1714,8 @@ ErrorCode Index<T>::SearchIndexWithPostingNavigation(QueryResult& query,
     COMMON::PostingNavigation* postingNavigation, int maxCheck, bool searchDeleted,
     int anchorCount, int additionalMaxCheck) const
 {
-    if (anchorCount <= 0 || additionalMaxCheck < 0 ||
+    const int anchorLimit = anchorCount == 0 ? query.GetResultNum() : anchorCount;
+    if (anchorLimit <= 0 || additionalMaxCheck < 0 ||
         (maxCheck > 0 ? maxCheck : m_iMaxCheck) > (std::numeric_limits<int>::max)() - additionalMaxCheck) {
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid postgraph anchor count or additional budget.\n");
         return ErrorCode::FailedParseValue;
@@ -1705,7 +1727,7 @@ ErrorCode Index<T>::SearchIndexWithPostingNavigation(QueryResult& query,
     auto workspace = RentWorkSpace(query.GetResultNum(), nullptr, maxCheck > 0 ? maxCheck : m_iMaxCheck);
     workspace->matchPredicate = &predicate;
     workspace->postingNavigation = postingNavigation;
-    workspace->postingAnchorCount = anchorCount;
+    workspace->postingAnchorCount = anchorLimit;
     workspace->postingAdditionalMaxCheck = additionalMaxCheck;
     struct Clear {
         COMMON::WorkSpace& workspace;

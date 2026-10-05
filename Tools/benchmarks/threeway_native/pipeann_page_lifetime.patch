@@ -1,0 +1,73 @@
+--- a/src/search/pipe_search_common.h
++++ b/src/search/pipe_search_common.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ // Included by pipe_search.cpp and spec_filter_search.cpp which provide all necessary headers.
+ 
++#include <array>
+ #include <limits>
+ #include <type_traits>
+ #ifdef USE_URING
+@@ -64,10 +65,19 @@
+     auto &visited = *(query_buf->visited);
+     full_retset.reserve(l_pool * kExpandedNodesFactor);
+ 
+-    // Maps ids whose page has arrived to the parsed node. The candidate pool
++    // Maps ids whose page has arrived to its live storage. The candidate pool
+     // consults it (through the ready predicate below) to pick the next candidate
+     // to exact-rank and to skip re-reads.
+-    std::unordered_map<unsigned, DiskNode<T>> id_buf_map;
++    struct ReadyNode {
++      char *page;
++      unsigned loc;
++      size_t slot;
++      std::vector<char> retained_page;
++    };
++    std::unordered_map<unsigned, ReadyNode> id_buf_map;
++    constexpr unsigned no_ready_owner = std::numeric_limits<unsigned>::max();
++    std::array<unsigned, MAX_N_SECTOR_READS> ready_owner;
++    ready_owner.fill(no_ready_owner);
+     // Sized to the deepest plausible set of landed-but-unexpanded pages so the
+     // hot-loop inserts never rehash.
+     id_buf_map.reserve(MAX_N_SECTOR_READS);
+@@ -290,6 +300,13 @@
+ 
+       uint64_t &cur_buf_idx = query_buf->sector_idx;
+       auto buf = sector_scratch + cur_buf_idx * read_io_size;
++      if (ready_owner[cur_buf_idx] != no_ready_owner) {
++        // A landed low-priority node may outlive a full scratch-ring rotation.
++        auto &ready = id_buf_map.at(ready_owner[cur_buf_idx]);
++        ready.retained_page.assign(buf, buf + read_io_size);
++        ready.page = ready.retained_page.data();
++        ready_owner[cur_buf_idx] = no_ready_owner;
++      }
+       auto &req = query_buf->reqs[cur_buf_idx];
+       req = IORequest(static_cast<uint64_t>(pid) * SECTOR_LEN, read_io_size, buf, u_loc_offset(loc), meta_.max_node_len,
+                       sector_scratch);
+@@ -313,7 +330,9 @@
+       unsigned n_in = 0, n_out = 0;
+       while (!on_flight_ios.empty() && on_flight_ios.front().finished()) {
+         io_t &io = on_flight_ios.front();
+-        id_buf_map.insert(std::make_pair(io.nbr.id, node_from_page((char *) io.read_req->buf, io.loc)));
++        const size_t slot = io.read_req - query_buf->reqs;
++        id_buf_map.emplace(io.nbr.id, ReadyNode{(char *) io.read_req->buf, io.loc, slot, {}});
++        ready_owner[slot] = io.nbr.id;
+         if (insert_ctx != nullptr) {
+           insert_ctx->hint_pages.push_back(io.page_id);
+         }
+@@ -347,11 +366,14 @@
+       Neighbor *node = id_buf_map.empty() ? nullptr : pool.next_calc_nbr();
+       if (node != nullptr) {
+         auto it = id_buf_map.find(node->id);
+-        auto &[id, dnode] = *it;
++        auto &[id, ready] = *it;
++        auto dnode = node_from_page(ready.page, ready.loc);
+         if (compute_exact_dists_and_push(dnode, id)) {
+           node->is_member = true;
+         }
+         compute_and_push_nbrs(dnode);
++        if (ready_owner[ready.slot] == id)
++          ready_owner[ready.slot] = no_ready_owner;
+         id_buf_map.erase(it);
+       }
+       return (int) pool.frontier();

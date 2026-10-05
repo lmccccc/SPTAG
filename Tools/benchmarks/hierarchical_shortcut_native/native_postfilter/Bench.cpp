@@ -106,7 +106,7 @@ struct Config {
     Helper::IniReader ini;
     std::string index,queries,predicateFile,predicate,mode,valueType;
     bool phaseTiming=false;
-    int count,warmup,maxCheck,anchorCount,additionalMaxCheck,postingPageLimit;
+    int count,warmup,topk,maxCheck,anchorCount,additionalMaxCheck,postingPageLimit,navigationWidth;
     std::vector<int> probes;
     explicit Config(const char* path) {
         Require(ini.LoadIniFile(path)==ErrorCode::Success,"Cannot read native INI");
@@ -130,10 +130,13 @@ struct Config {
         for (const char* key : {"MaxCheck", "PostingAnchorCount", "PostingAdditionalMaxCheck"})
             Require(checked.SetParameter("BuildSSDIndex",key,Get("SearchSSDIndex",key).c_str())==ErrorCode::Success,
                 std::string("Invalid post-graph budget parameter ")+key);
-        Require(checked.m_maxCheck==2048 || checked.m_maxCheck==4096,"MaxCheck must be 2048 or 4096");
         maxCheck=checked.m_maxCheck;
         anchorCount=checked.m_postingAnchorCount;
         additionalMaxCheck=checked.m_postingAdditionalMaxCheck;
+        Require(checked.SetParameter("BuildSSDIndex","PostingNavigationWidth",
+            ini.GetParameter<std::string>("SearchSSDIndex","PostingNavigationWidth","0").c_str())==ErrorCode::Success,
+            "Invalid posting navigation width");
+        navigationWidth=checked.m_postingNavigationWidth;
         predicateFile=ini.GetParameter<std::string>("Benchmark","PredicateFile","");
         const auto queryCount=Get("Benchmark","MaxQueries"),warmupCount=Get("Benchmark","Warmup");
         Require((queryCount=="32" || queryCount=="1000" || queryCount=="all") &&
@@ -150,7 +153,7 @@ struct Config {
             saved.GetParameter<std::string>("BuildSSDIndex","Storage","")=="STATIC",
             "Benchmark supports a loaded, immutable STATIC SPANN/BKT snapshot only");
         for(auto p:std::vector<std::pair<std::string,std::string>>{
-            {"NumberOfThreads","1"},{"ResultNum","10"},
+            {"NumberOfThreads","1"},
             {"EnableHybridDistance","false"},{"DumpHeads","0"},
             {"LogPathStats","false"}})
             Require(Get("SearchSSDIndex",p.first)==p.second,"Fixed native protocol violated: "+p.first);
@@ -158,11 +161,15 @@ struct Config {
         const auto parsedPageLimit=std::from_chars(pageLimit.data(),pageLimit.data()+pageLimit.size(),postingPageLimit);
         Require(parsedPageLimit.ec==std::errc() && parsedPageLimit.ptr==pageLimit.data()+pageLimit.size() &&
             postingPageLimit>0,"SearchPostingPageLimit must be a positive integer");
-        Require(ini.GetParameter<int>("SearchSSDIndex","InternalResultNum",0)>=10,
+        const auto resultNum=Get("SearchSSDIndex","ResultNum");
+        const auto parsedResultNum=std::from_chars(resultNum.data(),resultNum.data()+resultNum.size(),topk);
+        Require(parsedResultNum.ec==std::errc() && parsedResultNum.ptr==resultNum.data()+resultNum.size() &&
+            topk>0,"ResultNum must be a positive native integer");
+        Require(ini.GetParameter<int>("SearchSSDIndex","InternalResultNum",0)>=topk,
             "Native nprobe must be at least topk");
         if(ini.DoesSectionExist("SearchSweep")) {
             Require(ini.GetParameters("SearchSweep").size()==1,"Only native SearchSweep.NProbe is supported");
-            probes=NativeNProbeSweep::Parse(Get("SearchSweep","NProbe"),10);
+            probes=NativeNProbeSweep::Parse(Get("SearchSweep","NProbe"),topk);
         } else {
             probes={ini.GetParameter<int>("SearchSSDIndex","InternalResultNum",0)};
         }
@@ -170,7 +177,7 @@ struct Config {
             "numberofthreads","hashtableexponent","maxcheck",
             "maxdistratio","searchpostingpagelimit","disablecrossedges",
             "logphasetime","logpathstats","dumpheads","enablehybriddistance","enablepostingnavigation",
-            "postinganchorcount","postingadditionalmaxcheck"};
+            "postinganchorcount","postingadditionalmaxcheck","postingnavigationwidth"};
         for(const auto& p:ini.GetParameters("SearchSSDIndex"))
             Require(keys.count(p.first),"Unsupported search parameter "+p.first);
         for(char** entry=environ;*entry;++entry) {
@@ -190,6 +197,7 @@ struct Config {
                 std::to_string(additionalMaxCheck).c_str(),"SearchSSDIndex");
         for(const auto& p:ini.GetParameters("SearchSSDIndex"))
             manager.SetSearchParam(p.first.c_str(),p.second.c_str(),"SearchSSDIndex");
+        manager.SetSearchParam("PostingNavigationWidth",std::to_string(navigationWidth).c_str(),"SearchSSDIndex");
     }
 };
 using Work=std::array<std::uint64_t,8>;
@@ -232,9 +240,8 @@ template<class T> Matrix<std::uint32_t> PrepareCase(Config& cfg,const Matrix<T>&
                 Require(predicates.data[std::size_t(i)*predicates.cols]<predicates.cols,"Invalid DNF row");
         return predicates;
 }
-template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_t>& predicates,
-    TenantIndexManager& manager,const CaseIdentity* identity=nullptr) {
-        const auto search=[&](int i) {
+template<class T> auto SearchOne(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_t>& predicates,
+    TenantIndexManager& manager,int i) {
             const ByteArray query(reinterpret_cast<std::uint8_t*>(queries.data.data()+i*queries.cols),
                 queries.cols*sizeof(T),false);
             std::uint32_t categorical[]={0x444e4633U,1,1,0,0,Cache::DNF_EQ,
@@ -247,19 +254,24 @@ template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_
                 words=row+1;length=row[0];
             }
             const ByteArray predicate(reinterpret_cast<std::uint8_t*>(words),length*sizeof(std::uint32_t),false);
-            return manager.SearchWithPredicate(query,0,10,predicate,cfg.predicate=="empty"?0:-1);
-        };
+            return manager.SearchWithPredicate(query,0,cfg.topk,predicate,cfg.predicate=="empty"?0:-1);
+}
+template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_t>& predicates,
+    TenantIndexManager& manager,const CaseIdentity* identity=nullptr,bool warmupPerPoint=true) {
+        const auto search=[&](int i) {return SearchOne(cfg,queries,predicates,manager,i);};
         for(int probe:cfg.probes) {
         manager.SetSearchParam("InternalResultNum",std::to_string(probe).c_str(),"SearchSSDIndex");
         const std::string output=identity?identity->output+"/nprobe_"+std::to_string(probe):
             (cfg.ini.DoesSectionExist("SearchSweep")?"nprobe_"+std::to_string(probe):".");
         if(output!=".") Require(std::filesystem::create_directory(output),"Probe output already exists");
-        for(int i=0;i<cfg.warmup;++i) Require(bool(search(i)),"Warmup query failed");
-        std::vector<std::int32_t> ids(cfg.count*10,-1);std::vector<float> distances(cfg.count*10,MaxDist);
+        if(warmupPerPoint)
+            for(int i=0;i<cfg.warmup;++i) Require(bool(search(i)),"Warmup query failed");
+        const auto resultCount=std::size_t(cfg.count)*cfg.topk;
+        std::vector<std::int32_t> ids(resultCount,-1);std::vector<float> distances(resultCount,MaxDist);
         std::vector<Work> work(cfg.count);
         std::vector<double> latency(cfg.count);
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
-        std::vector<std::array<std::uint64_t,57>> navigation(cfg.count);
+        std::vector<std::array<std::uint64_t,58>> navigation(cfg.count);
         std::vector<std::int32_t> graphIds(std::size_t(cfg.count)*probe,-1);
         std::vector<float> graphDistances(std::size_t(cfg.count)*probe,MaxDist);
 #endif
@@ -270,9 +282,13 @@ template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_
             COMMON::GraphAccessStats stats;
             COMMON::ScopedGraphAccessStats scope(&stats);
 #endif
-            const auto result=search(i);Require(bool(result),"Native query failed");
+            const auto result=search(i);
+            Require(bool(result) && result->GetResultNum()==cfg.topk,"Native query result capacity mismatch");
             work[i]=GetWork(result->GetScanned());
-            for(int k=0;k<10;++k) {ids[i*10+k]=result->GetResult(k)->VID;distances[i*10+k]=result->GetResult(k)->Dist;}
+            for(int k=0;k<cfg.topk;++k) {
+                const auto offset=std::size_t(i)*cfg.topk+k;
+                ids[offset]=result->GetResult(k)->VID;distances[offset]=result->GetResult(k)->Dist;
+            }
             latency[i]=std::chrono::duration<double,std::micro>(
                 std::chrono::steady_clock::now()-queryStart).count();
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
@@ -295,16 +311,19 @@ template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_
                 stats.m_upperPostings.completedRows,stats.m_upperPostings.representativeDistances,
                 stats.m_headBefore,stats.m_headAfter,stats.m_headTarget,stats.m_graphUnique,stats.m_graphMatches,
                 stats.m_anchorCount,stats.m_supplementReason,stats.m_graphLeaves,stats.m_supplementLeaves,
-                stats.m_graphDistances,stats.m_supplementDistances,stats.m_preservedHeads};
+                stats.m_graphDistances,stats.m_supplementDistances,stats.m_preservedHeads,
+                stats.m_navigationDistancePrunes};
             std::copy(stats.m_graphHeadIds.begin(),stats.m_graphHeadIds.end(),graphIds.begin()+std::size_t(i)*probe);
             std::copy(stats.m_graphHeadDistances.begin(),stats.m_graphHeadDistances.end(),graphDistances.begin()+std::size_t(i)*probe);
 #endif
         }
         const double elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
         for(int i=0;i<cfg.count;++i) {
-            const auto result=search(i);Require(bool(result) && work[i]==GetWork(result->GetScanned()),"Replay work differs");
-            for(int k=0;k<10;++k) Require(ids[i*10+k]==result->GetResult(k)->VID &&
-                distances[i*10+k]==result->GetResult(k)->Dist,"Replay result differs");
+            const auto result=search(i);
+            Require(bool(result) && result->GetResultNum()==cfg.topk &&
+                work[i]==GetWork(result->GetScanned()),"Replay work or result capacity differs");
+            for(int k=0;k<cfg.topk;++k) Require(ids[std::size_t(i)*cfg.topk+k]==result->GetResult(k)->VID &&
+                distances[std::size_t(i)*cfg.topk+k]==result->GetResult(k)->Dist,"Replay result differs");
         }
         Write(output+"/ids.i32",ids);Write(output+"/dist.f32",distances);
         Write(output+"/work.u64",work);Write(output+"/latency_us.f64",latency);
@@ -321,20 +340,24 @@ template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_
             return latency[static_cast<std::size_t>(std::ceil(quantile*latency.size()))-1];
         };
         std::cout<<std::setprecision(12)<<"{\"mode\":\""<<cfg.mode<<"\",\"queries\":"<<cfg.count
+                 <<",\"topk\":"<<cfg.topk
                  <<",\"value_type\":\""<<cfg.valueType<<"\""
                  <<",\"search_posting_page_limit\":"<<cfg.postingPageLimit
                  <<",\"nprobe\":"<<probe
                  <<",\"max_check\":"<<cfg.maxCheck
                  <<",\"posting_anchor_count\":"<<cfg.anchorCount
+                 <<",\"posting_anchor_limit\":"<<(cfg.anchorCount ? cfg.anchorCount : probe)
                  <<",\"posting_additional_max_check\":"<<cfg.additionalMaxCheck
+                 <<",\"posting_navigation_width\":"<<cfg.navigationWidth
                  <<",\"diagnostic\":"<<(diagnostic?"true":"false")
                  <<",\"phase_timing\":"<<(cfg.phaseTiming?"true":"false")
-                 <<",\"navigation_schema_version\":6,\"navigation_columns\":57"
+                 <<",\"navigation_schema_version\":7,\"navigation_columns\":58"
                  <<",\"mean_ms\":"<<elapsed*1000/cfg.count<<",\"qps\":"<<cfg.count/elapsed
                  <<",\"p50_us\":"<<percentile(.50)<<",\"p95_us\":"<<percentile(.95)
                  <<",\"p99_us\":"<<percentile(.99);
         if(identity) {
-            std::cout<<",\"event\":\"point\",\"warmup_queries\":"<<cfg.warmup
+            std::cout<<",\"event\":\"point\",\"warmup_queries\":"<<(warmupPerPoint?cfg.warmup:0)
+                <<",\"warmup_policy\":\""<<(warmupPerPoint?"per_point":"once")<<"\""
                 <<",\"measured_queries\":"<<cfg.count<<",\"replay_queries\":"<<cfg.count;
             WriteIdentity(*identity);
         }
@@ -367,9 +390,17 @@ std::string AbsoluteInput(const std::string& value) {
     Require(std::filesystem::path(value).is_absolute(),"Batch input paths must be absolute: "+value);
     return std::filesystem::canonical(value).string();
 }
+bool BatchWarmupOnce(Helper::IniReader& ini) {
+    const auto policy=ini.GetParameter<std::string>("Batch","WarmupPolicy","per_point");
+    Require(policy=="per_point" || policy=="once","Batch.WarmupPolicy must be per_point or once");
+    return policy=="once";
+}
 std::vector<std::unique_ptr<BatchCase>> ReadBatch(const char* path,Helper::IniReader& ini) {
-    Require(ini.GetParameters("Batch").size()==1 && ini.DoesParameterExist("Batch","CaseCount"),
-        "Batch requires only CaseCount");
+    const auto& settings=ini.GetParameters("Batch");
+    Require(settings.count("casecount") &&
+        settings.size()==1+settings.count("warmuppolicy"),
+        "Batch requires CaseCount and optional WarmupPolicy only");
+    BatchWarmupOnce(ini);
     const auto text=ini.GetParameter<std::string>("Batch","CaseCount","");
     int count=0;
     const auto parsed=std::from_chars(text.data(),text.data()+text.size(),count);
@@ -413,7 +444,8 @@ std::vector<std::unique_ptr<BatchCase>> ReadBatch(const char* path,Helper::IniRe
         if(cfg.predicate!="empty") cfg.predicateFile=AbsoluteInput(cfg.predicateFile);
         Require(!Within(output,cfg.index),"Batch output must not be inside the immutable index");
         const auto& search=cfg.ini.GetParameters("SearchSSDIndex");
-        Require(search.size()==completeKeys.size(),"Batch cases require complete SearchSSDIndex settings");
+        Require(search.size()==completeKeys.size()+search.count("postingnavigationwidth"),
+            "Batch cases require complete SearchSSDIndex settings");
         auto validated=VectorIndex::CreateInstance(IndexAlgoType::SPANN,
             cfg.valueType=="UInt8"?VectorValueType::UInt8:VectorValueType::Float);
         Require(bool(validated),"Cannot create native search-parameter validator");
@@ -422,6 +454,8 @@ std::vector<std::unique_ptr<BatchCase>> ReadBatch(const char* path,Helper::IniRe
             Require(validated->SetParameter(key.c_str(),search.at(key).c_str(),"SearchSSDIndex")==ErrorCode::Success,
                 "Invalid batch search setting "+key);
         }
+        Require(validated->SetParameter("PostingNavigationWidth",std::to_string(cfg.navigationWidth).c_str(),
+            "SearchSSDIndex")==ErrorCode::Success, "Invalid batch posting navigation width");
         Require(search.at("isexecute")=="true" && search.at("buildssdindex")=="false",
             "Batch requires isExecute=true and BuildSsdIndex=false");
         if(!cases.empty()) {
@@ -441,11 +475,13 @@ std::vector<std::unique_ptr<BatchCase>> ReadBatch(const char* path,Helper::IniRe
     }
     return cases;
 }
-template<class T> int RunBatch(std::vector<std::unique_ptr<BatchCase>>& cases,const std::string& dtype) {
+template<class T> int RunBatch(std::vector<std::unique_ptr<BatchCase>>& cases,const std::string& dtype,
+    bool warmupOnce=false) {
     auto& first=cases.front()->cfg;
     auto queries=ReadNpy<T>(first.queries,dtype);
     for(auto& item:cases) item->predicates=PrepareCase(item->cfg,queries);
     std::cout<<"{\"event\":\"batch_begin\",\"cases\":"<<cases.size()
+        <<",\"warmup_policy\":\""<<(warmupOnce?"once":"per_point")<<"\""
         <<",\"phase_timing\":"<<(first.phaseTiming?"true":"false")
         <<",\"value_type\":"<<JsonString(first.valueType)<<",\"index\":"<<JsonString(first.index)
         <<",\"queries\":"<<JsonString(first.queries)<<"}\n";
@@ -455,6 +491,22 @@ template<class T> int RunBatch(std::vector<std::unique_ptr<BatchCase>>& cases,co
     Require(manager.LoadAll(first.index.c_str()),"Cannot load immutable native index");
     std::cout<<"{\"event\":\"batch_loaded\",\"index_load_count\":1,\"query_corpus_load_count\":1}\n";
     FlushProgress();
+    std::uint64_t warmupTotal=0;
+    if(warmupOnce) {
+        manager.SetSearchParam("InternalResultNum",std::to_string(first.probes.front()).c_str(),"SearchSSDIndex");
+        std::cout<<"{\"event\":\"batch_warmup_begin\",\"queries\":"<<first.warmup
+            <<",\"nprobe\":"<<first.probes.front();
+        WriteIdentity(cases.front()->identity);
+        std::cout<<"}\n";
+        FlushProgress();
+        for(int i=0;i<first.warmup;++i) {
+            const auto result=SearchOne(first,queries,cases.front()->predicates,manager,i);
+            Require(bool(result) && result->GetResultNum()==first.topk,"Batch warmup query failed");
+        }
+        warmupTotal=first.warmup;
+        std::cout<<"{\"event\":\"batch_warmup_end\",\"completed_queries\":"<<warmupTotal<<"}\n";
+        FlushProgress();
+    }
     for(std::size_t i=0;i<cases.size();++i) {
         auto& item=*cases[i];
         if(i!=0) item.cfg.Apply(manager,&cases[i-1]->cfg);
@@ -465,7 +517,7 @@ template<class T> int RunBatch(std::vector<std::unique_ptr<BatchCase>>& cases,co
         std::cout<<",\"predicate\":"<<JsonString(item.cfg.predicate)
             <<",\"phase_timing\":"<<(item.cfg.phaseTiming?"true":"false")
             <<",\"predicate_file\":"<<JsonString(item.cfg.predicateFile)
-            <<",\"warmup_queries\":"<<item.cfg.warmup<<",\"measured_queries\":"<<item.cfg.count
+            <<",\"warmup_queries\":"<<(warmupOnce?0:item.cfg.warmup)<<",\"measured_queries\":"<<item.cfg.count
             <<",\"replay_queries\":"<<item.cfg.count<<",\"search_settings\":{";
         bool comma=false;
         for(const auto& setting:item.cfg.ini.GetParameters("SearchSSDIndex")) {
@@ -475,13 +527,15 @@ template<class T> int RunBatch(std::vector<std::unique_ptr<BatchCase>>& cases,co
         }
         std::cout<<"}}\n";
         FlushProgress();
-        RunCase(item.cfg,queries,item.predicates,manager,&item.identity);
+        RunCase(item.cfg,queries,item.predicates,manager,&item.identity,!warmupOnce);
+        if(!warmupOnce) warmupTotal+=std::uint64_t(item.cfg.warmup)*item.cfg.probes.size();
         std::cout<<"{\"event\":\"case_end\",\"completed_points\":"<<item.cfg.probes.size();
         WriteIdentity(item.identity);
         std::cout<<"}\n";
         FlushProgress();
     }
-    std::cout<<"{\"event\":\"batch_end\",\"completed_cases\":"<<cases.size()<<"}\n";
+    std::cout<<"{\"event\":\"batch_end\",\"completed_cases\":"<<cases.size()
+        <<",\"completed_warmup_queries\":"<<warmupTotal<<"}\n";
     FlushProgress();
     return 0;
 }
@@ -492,8 +546,9 @@ int main(int argc,char** argv) {
         Require(entry.LoadIniFile(argv[1])==ErrorCode::Success,"Cannot read native INI");
         if(entry.DoesSectionExist("Batch")) {
             auto cases=ReadBatch(argv[1],entry);
-            return cases.front()->cfg.valueType=="UInt8"?RunBatch<std::uint8_t>(cases,"|u1"):
-                RunBatch<float>(cases,"<f4");
+            const bool warmupOnce=BatchWarmupOnce(entry);
+            return cases.front()->cfg.valueType=="UInt8"?RunBatch<std::uint8_t>(cases,"|u1",warmupOnce):
+                RunBatch<float>(cases,"<f4",warmupOnce);
         }
         Config cfg(argv[1]);
         return cfg.valueType=="UInt8" ? RunBenchmark<std::uint8_t>(cfg,"|u1")

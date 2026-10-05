@@ -250,5 +250,15 @@ public:
         return predicate.MayMatch(pure ? layer.Pure(head) : &layer.tail[head], nullptr, m_widths,
             params.empty() ? nullptr : quant.data() + head * params.size() * Cache::NUM_QUANT_WORDS);
     }
+    void PrefetchUpper(std::size_t level, SizeType head, bool pure) const
+    {
+        const auto& layer = m_layers[level];
+        _mm_prefetch(reinterpret_cast<const char*>(pure ? layer.Pure(head) : &layer.tail[head]), _MM_HINT_T0);
+        if (!params.empty()) {
+            const auto& quant = pure ? layer.pureNumeric : layer.tailNumeric;
+            _mm_prefetch(reinterpret_cast<const char*>(
+                quant.data() + head * params.size() * Cache::NUM_QUANT_WORDS), _MM_HINT_T0);
+        }
+    }
 };
 }}

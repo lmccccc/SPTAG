@@ -98,6 +98,12 @@ python setup.py build_ext --inplace
   - `AnnService/inc/Core/Common/Dataset.h`
 
 ## Unified Spatial Query Pipeline (DO NOT REGRESS)
+The adjacent, full-domain catalogs described below remain the legacy/default
+layout when `HierarchyLabelSelectivity` is empty. Explicit upper-only sparse
+label reconstruction is described in the next subsection; its build-time
+admission policy intentionally supersedes the full-domain catalog topology,
+not the native H1-first search order or SSD/H1 immutability.
+
 Current attribute SPANN navigates the native H1 graph with result-only
 post-filtering. Spatial H2..H5 catalogs and signed CSR are auxiliary posting
 data, not independently searched upper ANN graphs. Attribute
@@ -113,10 +119,14 @@ Count actual valid H1 results C against the configured head-result capacity
 (nprobe, not final top10). If C is sufficient, perform no posting-owner,
 upper-signature, representative or CSR work. Otherwise at most one query-level
 supplement phase may fill the missing slots, without evicting original heads.
-`PostingAnchorCount=8` (positive) bounds nearest actually scored H1 anchors,
-including negatives and tree candidates promoted to native navigation.
+`PostingAnchorCount=0` is the default: resolve the anchor limit from the current
+head-result capacity (nprobe, not final top10), separately for every query.
+A positive value retains the explicit fixed limit for historical controls.
+Collect up to that many nearest actually scored H1 anchors, including negatives
+and tree candidates promoted to native navigation; use fewer if H1 scored fewer.
 Reuse their distances; do not scan the visited directory or re-score anchors.
-Merge/dedup stored owners across anchors. All discovered signature-admitted
+Merge/dedup stored owners across all selected anchors before consuming rows.
+All discovered signature-admitted
 H2+ postings share one query-to-representative-distance priority frontier.
 Each selected posting exposes its owners once; complete upper rows register
 children in that same frontier rather than eagerly draining lower levels.
@@ -125,6 +135,12 @@ owners once to reach matching siblings, without scoring their representatives
 or reading their CSR. A rejected child discovered by descending a selected
 upper row is cached but does not expose its other owners. This prevents
 negative-child fanout from turning pruning into eager upward exploration.
+Sparse terminal children whose immutable label is outside the query's admitted
+label union are excluded before query-state allocation or signature lookup.
+This exact exclusion need not be cached; it never applies to entry/owner
+promotion, which must still permit ascent through a rejected terminal.
+Prefetch sparse node descriptors before this label test rather than eagerly
+fetching signatures/numeric summaries for provably irrelevant terminal children.
 A cached rejection must still permit later entry/owner promotion; signature
 caching must not suppress that recovery. Pending admitted children remain
 reachable; every selected CSR row completes before checking the budget.
@@ -138,7 +154,20 @@ H2 convergence slots. Stop when the nearest pending representative is worse
 than that pool. This ANN convergence heuristic works even with underfilled results;
 it is not proof that unseen posting members cannot be closer. Never describe
 representative distance as a certified member lower bound. Original H1 heads
-remain protected, and no new INI knob or full-catalog query allocation is added.
+remain protected, with no full-catalog query allocation.
+`PostingNavigationWidth=0` preserves this legacy convergence policy. A positive
+native `[SearchSSDIndex] PostingNavigationWidth` additionally bounds navigation
+representative distances independently per logical tier, using that many nearest
+discovered navigation heads rather than H1 nprobe. This shared policy applies to
+both adjacent and sparse layouts; sparse physical storage level is not its tier.
+Before expanding a navigation row, discard a head strictly farther than its
+tier's current bound without reading its CSR or exposing its owners/children.
+Continue the shared frontier for other tiers. Equal distances remain eligible;
+the width defines a distance beam, not a hard row-count quota. Terminal rows
+retain their original convergence/work budgets. Width 8 is the initial explicit
+cutoff experiment, not a label-specific or recall-tuned constant. A nearby
+selected parent still exposes its complete child row; this is approximate ANN
+pruning, not a certified subtree bound. No index reconstruction is needed.
 `PostingAdditionalMaxCheck=0` is the nonnegative default. Original graph
 MaxCheck is unchanged; only supplementation can spend unused budget plus the
 explicit extra. Zero extra with an exhausted graph budget means no supplement.
@@ -193,6 +222,152 @@ assignment algorithm; never save, load or query them as runtime navigation.
 Legacy upper directories may supply vectors without loading their graph/tree.
 Graphless-H1 layouts require explicit migration to a new output directory,
 not an implicit rebuild or fallback to old upper ANN search.
+
+### Sparse label upper-only reconstruction
+
+Global-threshold reconstruction writes **V4 adjacent limited-label postings**. V1/V2/V3
+remain readable with their historical topology and query behavior described
+below; do not reinterpret or rewrite those artifacts.
+
+`[SelectHead] HierarchyLocalTarget` and `HierarchyLocalWindow`, both positive,
+instead select **V5 local admission**; do not combine them with
+`HierarchyLabelSelectivity`. They are immutable native build metadata, not
+query-time controls. The target counts matching H1 support heads; the window
+is an initial H1 spatial mass, enlarged by the source Ratio at each transition.
+Density windows are nested primary-ownership spatial regions. If a region
+exceeds the requested mass, scale its label count by requested/actual mass:
+coarse-region overshoot must not invent extra search capacity. Once a label
+stops, it cannot restart above the missing lower posting. This remains a
+capacity estimate, not an asserted distance/check budget or recall guarantee.
+
+V5 builds a label-unfiltered census from the preserved full-domain source.
+Each physical child contributes to exactly one canonical spatial owner;
+successive levels merge only adjacent summaries. Keep all support labels in
+the census, including labels stopped or not selected in runtime postings.
+Never sum replicated row lengths as distinct H1 mass. Only source H5
+representatives enter a small native binary BKT that groups coarse statistics
+into expanded windows; no per-label ANN or H1 vector neighborhood sweep is
+added. The primary owner is the first canonical owner, not a claimed nearest
+owner. Shared region masks apply per `(child physical representative,label)`,
+not globally per label or to all labels of a parent.
+
+V5 appends authenticated local addresses, label masks and actual window masses
+to the layered artifact. Coverage validation uses these local decisions.
+Serving releases this construction payload after authentication/validation,
+retaining only the actual H2 label domain and its fingerprint. Query activation
+must not consult old original-vector selectivity thresholds. H/O assignment,
+native replica limits, H1-first search and all immutable-source rules below
+remain unchanged. Census logs separate metadata transfers/merges from its small
+coarse-vector organization and from subsequent native H/O construction cost.
+
+Each V4 H(k+1) posting contains Hk IDs, never direct H1 IDs above H2.
+Admit a physical child only when it has at least one supported label whose
+original-vector selectivity is **strictly below** that transition's INI
+threshold. Filter its labels separately; dense labels cannot hitchhike.
+Count unique physical eligible children for the native shared Ratio and cap
+the resulting head count by the source tier. Never count incoming replicas or
+virtual label copies when selecting the next layer's physical heads.
+Representatives address the original H1 vector owner, without persisted vector
+copies. Each selected representative anchors one admitted label. Fill its base
+support from the nearest retained spatial candidate prefix, allowing repeated
+labels to occupy candidate positions; store the resulting distinct labels with
+the anchor first. This intentionally differs from H1's nearest-distinct-label
+selection. Reuse the source LimitedTagSlotsPerHead, LimitedTagMinHeadCount and
+EnableLimitedTagSupportExpansion. Native retained-O deficit expansion, if
+already enabled, retains its existing semantics; no new coverage repair or
+additional replica guarantee is introduced.
+
+Assign each canonical (physical child, admitted label) independently using
+the shared native H-posting ANN/RNG selector. HierarchyReplicaCount is a maximum,
+not an exact count; do not fill RNG-rejected replicas. A selected anchor's own
+logical item is represented by one explicit self-child, analogous to the
+implicit own record in H1. Only an empty constrained result gets the native
+exact-support fallback, and an unplaceable item is an explicit build failure.
+Multiple labels can increase references, not physical vectors. Per-label
+rows index only relevant children; selected OR rows are merged/deduplicated
+before shared frontier expansion or H1 consumption. Reverse owners deduplicate
+physical parent-child pairs. Sparse numeric masks remain conservative;
+query label support is the selected label set, never the union of all child
+labels. An H2 spatial entry preserves negative-anchor entry without a mixed
+global root. There is no query-time upper ANN or catalog scan.
+
+V4 authenticates label directories, strictly adjacent edges, original label
+admission, per-child/label coverage and replica caps, unique physical centers,
+source head-count caps and exact file size. H1/SSD and historical measurements
+remain immutable. Full selected label rows complete before checking the
+existing supplement budget. H1-first completion, protected results, OR sharing,
+native terminal convergence and per-tier navigation cutoff remain in force.
+
+#### Historical V1/V2/V3 reconstruction
+
+`rebuildsparselabelhierarchy -c NATIVE_INI` derives a new, read-only snapshot
+from a canonical five-level STATIC BKT source. `[RebuildHierarchy]` specifies
+absolute `SourceIndex` and new `OutputIndex`. Historical `[SelectHead]
+HierarchyLabelSelectivity=0.01,0.001,0.0001,0.00001` specifies decreasing
+maximum fractions for H2..H5: choose the highest eligible tier, with inclusive
+upper/exclusive lower boundaries and no terminal postings above 1%.
+This is a new build-admission parameter, not the retired signature-domain
+or query-selectivity controls. Normal full-index builders reject it explicitly.
+
+Terminal rows are label-pure lists of H1 heads whose H region supports that
+label, not just heads with that own label. Each sparse (label, H1-head) pair
+must remain covered; dense members do not get terminal rows. Representatives
+are sparse members and reuse the unchanged H1 vector owner. Extremely sparse
+labels have direct H1 terminal rows at higher tiers, not empty H2 placeholders.
+Spatial parent rows contain only these sparse descendants; an otherwise empty
+admission tier can still contain navigation parents.
+
+V3 constructs a native BKT over each label's supported H1 vectors, selecting
+unique centers from the largest remaining spatial subtrees up to its fixed
+terminal quota. Assign all supported heads with the existing native ANN/RNG
+construction helper inside that label's pool.
+Temporary assignment graphs use the source native BuildHead settings and the
+reconstruction INI's thread count; they are never persisted or queried at runtime.
+Source coarse addresses connect representatives and retain negative-anchor
+reachability, but determine neither terminal membership nor representative count.
+All direct terminal rows address H1 regardless of their logical tier. Their
+requested count is `max(1, ceil(supported_heads * Ratio))`, not a repeated
+`Ratio^(tier-1)` compression. Reserve source-tier capacity for spatial parents,
+then apportion any remaining quota shortage across labels while retaining at
+least one row per label; reject an impossible cap. References are capped by
+the source `HierarchyReplicaCount`. V2 and V3 authenticate exactly
+`min(HierarchyReplicaCount, label_postings)` distinct copies per supported head
+and unique label-local representatives; experimental V1/V2 remain readable
+with their original assignment and entry policies.
+Total postings per tier cannot exceed the corresponding source
+catalog size. This changes upper membership/replication, never H1/SSD replicas.
+No label-combination catalogs or runtime per-label ANN graph are constructed.
+
+V3 derives a packed reverse-owner CSR once from authenticated terminal rows:
+every H1 head exposes all postings that actually contain it, plus its original
+label-independent spatial entry. No per-query index scan or owner construction.
+Only after H1 completes, take the nearest existing H1 results first within
+`PostingAnchorCount`, then fill remaining anchor slots with already-scored
+spatial anchors. Zero-match queries retain negative anchors and spatial entry.
+No predicates are evaluated again to select anchors.
+Native H1 finishes first and at most one existing
+posting supplement uses the same shared distance frontier, touched-state
+allocator, convergence pool, full-row consumption and checked-leaf budget.
+Direct terminal rows at *any* tier populate the convergence pool; navigation
+parents do not. A single spatial root makes very rare tiers reachable through
+ordinary owner ascent. OR branches share native H1 deduplication. Dense-only,
+unanchored and unfiltered queries have no sparse supplementation.
+Label admission and terminal tier are build-time decisions; query execution
+only checks missing H1 slots, orders discovered postings by distance, merges
+OR candidates and enforces the original work budgets plus the optional shared
+navigation distance beam above. Do not
+introduce early graph-to-posting switching, graph resumption, an online
+yield controller, or eviction of protected H1 results.
+
+The new artifact authenticates support generation/content, H1 IDs, thresholds,
+shape, full supported-head coverage and exact file size. H1 graph, vectors,
+metadata, H/O posting payload and old experiment evidence remain immutable
+symlink targets. Reject mutation/export of these read-only snapshots rather
+than writing through those links. The explicitly authorized SIFT1B operation
+rebuilds only this resident upper structure, after native reconstruction and
+search regressions; it is not permission to rebuild H1/SSD or the dataset.
+Current SIFT1B remains scalar categorical data; arbitrary multi-label-vector
+storage is not implemented by this reconstruction.
 
 | Layer | What it builds | How to enable | Code |
 | ----- | -------------- | ------------- | ---- |
@@ -256,6 +431,9 @@ read by `Helper::IniReader` (the same loader the classic `IndexBuilder` uses) â€
 
 How the `.ini` maps to the engine (`Wrappers/src/SpannAttrBuilder.cpp` `-c` reader):
 - `[Base]/[Tags]/[Build]` â†’ data-layout args (Resolve: CLI flag > ini > default).
+  `[MultiTenant] InPlaceBuild=true` stages the native `[Base] IndexDirectory`
+  as the manager's output root. Each `tenant_<id>` must be new; construction
+  writes there directly without a `/tmp` posting copy or environment override.
   Vector IO uses native `VectorSetReader`/`ReaderOptions` and core DiskIO:
   `ValueType` is the element type, `VectorType=DEFAULT|TXT|XVEC` the container.
   DEFAULT validates its row/column header and exact file size, then optionally

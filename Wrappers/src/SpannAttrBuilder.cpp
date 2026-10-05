@@ -894,6 +894,13 @@ int Run(int argc, char** argv) {
     TenantIndexManager mgr(dim, "SPANN", valueType.c_str());
     mgr.SetSSDBuildParam("ColumnTypes", tagSchema.text.c_str());
     if (storageBackend != "FILEIO") mgr.SetStorageBackend(storageBackend.c_str());
+    if (ini && ini->DoesParameterExist("MultiTenant", "InPlaceBuild")) {
+        bool inPlace = false;
+        const auto value = ini->GetParameter<std::string>("MultiTenant", "InPlaceBuild", "");
+        if (!Helper::Convert::ConvertStringTo(value.c_str(), inPlace))
+            throw std::runtime_error("Invalid MultiTenant.InPlaceBuild");
+        if (inPlace) mgr.SetBuildParam("IndexDirectory", indexDir, "Base");
+    }
 
     // Native build sections are staged before BuildFromDataWithTags creates the
     // tenant index. TenantIndexManager applies them after its automatic defaults,

@@ -91,6 +91,14 @@ namespace SPTAG {
             std::string m_legacyTopVectorFolder = "SecondLevelHeadIndex";
             std::string m_secondLevelPostingFile;
             std::string m_secondLevelGenerationFingerprint;
+            std::string m_hierarchyLabelSelectivity;
+            int m_hierarchyLocalTarget;
+            int m_hierarchyLocalWindow;
+
+            bool HasSparseHierarchy() const
+            {
+                return !m_hierarchyLabelSelectivity.empty() || m_hierarchyLocalTarget || m_hierarchyLocalWindow;
+            }
 
             // Section 3: for build head
             bool m_buildHead;
@@ -101,6 +109,7 @@ namespace SPTAG {
             bool m_enablePostingNavigation;
             int m_postingAnchorCount;
             int m_postingAdditionalMaxCheck;
+            int m_postingNavigationWidth;
             bool m_enableSSD;
             bool m_buildSsdIndex;
             int m_iSSDNumberOfThreads;
@@ -505,7 +514,7 @@ namespace SPTAG {
                 if (Helper::StrUtils::StrEqualIgnoreCase(p_param, "PostingMinCandidates")) {
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
                         "PostingMinCandidates was removed, including when EnablePostingNavigation=false. "
-                        "Remove it from build/search/saved INIs; use PostingAnchorCount=8 and "
+                        "Remove it from build/search/saved INIs; use PostingAnchorCount=0 (nprobe anchors) and "
                         "PostingAdditionalMaxCheck=0 for post-graph completion. No floor policy is retained.\n");
                     return ErrorCode::FailedParseValue;
                 }
@@ -528,9 +537,12 @@ namespace SPTAG {
                     const bool anchor = Helper::StrUtils::StrEqualIgnoreCase(p_param, "PostingAnchorCount");
                     const bool additional = Helper::StrUtils::StrEqualIgnoreCase(p_param, "PostingAdditionalMaxCheck");
                     const bool maxCheck = Helper::StrUtils::StrEqualIgnoreCase(p_param, "MaxCheck");
-                    if (anchor || additional || maxCheck) {
+                    const bool navigationWidth = Helper::StrUtils::StrEqualIgnoreCase(p_param, "PostingNavigationWidth");
+                    if (anchor || additional || maxCheck || navigationWidth) {
                         int parsed = 0;
-                        if (!ParsePostingInteger(p_value, additional ? 0 : 1, parsed)) return invalid();
+                        if (!ParsePostingInteger(p_value, maxCheck ? 1 : 0, parsed))
+                            return invalid();
+                        if (navigationWidth && parsed == (std::numeric_limits<int>::max)()) return invalid();
                         const int base = maxCheck ? parsed : m_maxCheck;
                         const int extra = additional ? parsed : m_postingAdditionalMaxCheck;
                         if (base < 0 || extra < 0 || base > (std::numeric_limits<int>::max)() - extra)
