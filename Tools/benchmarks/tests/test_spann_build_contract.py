@@ -39,12 +39,20 @@ class NativePreflightContractTest(unittest.TestCase):
         self.assertEqual(config["buildssdindex"]["storage"], "STATIC")
         self.assertEqual(config["tags"]["columntypes"], "categorical,numeric")
         self.assertEqual(config["selecthead"]["hierarchyenabled"], "true")
+        self.assertEqual(config["selecthead"]["hierarchylevels"], "5")
+        self.assertEqual(config["selecthead"]["ratio"], "0.12")
+        self.assertNotIn("hierarchylocaltarget", config["selecthead"])
         self.assertEqual(config["build"]["buildsignatures"], "true")
         search = config["searchssdindex"]
         self.assertEqual(search["enablepostingnavigation"], "true")
-        self.assertEqual(search["maxcheck"], "2048")
+        self.assertEqual(search["maxcheck"], "8192")
+        self.assertEqual(search["internalresultnum"], "128")
+        self.assertEqual(search["resultnum"], "100")
         self.assertEqual(search["postingadditionalmaxcheck"], "2048")
-        self.assertEqual(search["postinganchorcount"], "8")
+        self.assertEqual(search["postinganchorcount"], "0")
+        self.assertEqual(search["postingnavigationwidth"], "8")
+        self.assertEqual(search["postingmatchratepercent"], "15")
+        self.assertEqual(search["postingmatchwindow"], "1024")
         self.assertEqual(search["disablecrossedges"], "true")
 
         removed_body = self.options.split("static bool IsRemovedParameter(", 1)[1].split(
@@ -61,6 +69,26 @@ class NativePreflightContractTest(unittest.TestCase):
         documented = configparser.ConfigParser(interpolation=None, comment_prefixes=(";",))
         documented.read_string(match.group(1))
         self.assertEqual(dict(documented["SearchSSDIndex"]), search)
+
+    def test_local_rebuild_recipe_is_separate_and_documented(self):
+        config = VALIDATOR.read_config(ROOT / "docs/LocalLabelHierarchy.ini")
+        self.assertEqual(set(config), {"rebuildhierarchy", "selecthead"})
+        self.assertEqual(config["selecthead"], {
+            "hierarchylocaltarget": "512", "hierarchylocalwindow": "4096", "numberofthreads": "8",
+        })
+        self.assertNotEqual(config["rebuildhierarchy"]["sourceindex"], config["rebuildhierarchy"]["outputindex"])
+        for value in config["rebuildhierarchy"].values():
+            self.assertTrue(Path(value).is_absolute())
+        text = (ROOT / "docs/GettingStart.md").read_text()
+        match = re.search(r"```ini\n(\[RebuildHierarchy\]\n.*?)\n```", text, re.DOTALL)
+        self.assertIsNotNone(match)
+        documented = configparser.ConfigParser(interpolation=None, comment_prefixes=(";",))
+        documented.read_string(match.group(1))
+        self.assertEqual({section.lower(): dict(documented[section]) for section in documented}, {
+            "default": {}, **config,
+        })
+        self.assertEqual(int(config["selecthead"]["hierarchylocaltarget"]) /
+                         int(config["selecthead"]["hierarchylocalwindow"]), .125)
 
     def test_every_native_removed_parameter_rejects_explicit_defaults(self):
         body = self.options.split("static bool IsRemovedParameter(", 1)[1].split(

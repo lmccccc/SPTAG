@@ -18,7 +18,7 @@ template<class Action> void Reject(const Action& action)
     try { action(); } catch (const std::exception&) { failed = true; }
     CHECK(failed);
 }
-static SPANN::LimitedTagSupport Support(int count = 8)
+static SPANN::LimitedTagSupport Support(int count = 8, bool bridge = false)
 {
     SPANN::LimitedTagSupport support;
     CHECK(support.Initialize(count, 2, 1, 0, 1, 123));
@@ -31,7 +31,7 @@ static SPANN::LimitedTagSupport Support(int count = 8)
         else if (head == 0) tags = {1,2};
         else if (head == 1 || head == 5) tags = {1};
         else if (head == 2 || head == 6) tags = {2};
-        else if (head == 3) tags = {3};
+        else if (head == 3) tags = bridge ? std::vector<std::uint32_t>{1,3} : std::vector<std::uint32_t>{3};
         else tags = {0};
         CHECK(support.SetHeadTags(head, tags) && support.SetHeadAttributes(head, tags.data(), 1));
     }
@@ -173,6 +173,10 @@ static void PersistenceTests(const std::filesystem::path& directory)
     validate(hierarchy);
     for (int invalid : {1,2,3}) Reject([&] { validate(Fixture(support, invalid)); });
     hierarchy.BuildOwners();
+    CHECK(hierarchy.HighestQueryTier({1,2,2}) == 5);
+    CHECK(hierarchy.HighestQueryTier({3}) == 4);
+    CHECK(hierarchy.HighestQueryTier({999}) == 1);
+    CHECK(hierarchy.HighestQueryTier({}) == 1);
     for (int head = 0; head < hierarchy.HeadCount(); ++head) {
         std::set<int> unique;
         for (int parent : hierarchy.Parents(0, head)) CHECK(unique.insert(parent).second);
@@ -196,6 +200,7 @@ static void PersistenceTests(const std::filesystem::path& directory)
     Hierarchy loaded;
     loaded.Load(path.string(), support, 42, hierarchy.Metadata().thresholds, 1, VectorValueType::Float);
     CHECK(loaded.Layered() && loaded.Fingerprint() == hierarchy.Fingerprint());
+    CHECK(loaded.HighestQueryTier({3}) == 4 && loaded.HighestQueryTier({999,2,3}) == 5);
     owners.clear();
     loaded.VisitUpperParents(2, [&](int id) { owners.push_back(id); });
     CHECK(owners == std::vector<int>{4});
@@ -273,6 +278,99 @@ static void QueryTests()
         }
     }
     std::cout << "PASS label-indexed child descent, OR dedup, zero-match anchors, numeric pruning and complete-row budgets\n";
+}
+static void ParentPruningTests(const std::filesystem::path& directory)
+{
+    const auto support = Support(8, true);
+    auto header = Fixture(support).Metadata();
+    header.thresholds = Hierarchy::ParseThresholds("0.01,0.00001,0.000005,0.000003");
+    Hierarchy hierarchy;
+    hierarchy.Initialize(header);
+    hierarchy.AddLayeredRow(0, 1, 2, {{1,{0,1,5}}, {2,{0,2,6}}});
+    hierarchy.AddLayeredRow(3, 3, 2, {{1,{3}}, {3,{3}}});
+    hierarchy.AddLayeredRow(0, 1, 3, {{1,{0,1}}, {2,{0}}});
+    hierarchy.AddLayeredRow(0, 1, 4, {{1,{2}}, {2,{2}}});
+    hierarchy.AddLayeredRow(0, 1, 5, {{1,{3}}, {2,{3}}});
+    for (int head = 0; head < 8; ++head) hierarchy.SetEntry(head, head == 3 ? 1 : 0);
+    hierarchy.Validate(support, 42, header.thresholds, 1, VectorValueType::Float);
+    Reject([&] { hierarchy.HighestQueryTier({3}); });
+    hierarchy.BuildOwners();
+    const auto fingerprint = hierarchy.Fingerprint();
+    const auto path = directory / "parent-pruning.bin";
+    hierarchy.Save(path.string());
+    hierarchy.Load(path.string(), support, 42, header.thresholds, 1, VectorValueType::Float);
+    CHECK(hierarchy.Fingerprint() == fingerprint && hierarchy.HighestQueryTier({3,3}) == 2);
+    CHECK(hierarchy.HasQueryLabel(3) && !hierarchy.HasQueryLabel(999));
+    BKT::Index<float> heads;
+    heads.InitializeHeadNodeMeta(8, 0, heads.GetHeadNodeHierWidths(), true);
+    hierarchy.Refresh(heads, {});
+    for (const auto& labels : std::vector<std::vector<std::uint32_t>>{
+            {}, {999}, {3}, {3,3,999}, {2}, {1,2,3}, {3,2,1,3}}) {
+        for (int width : {0,1,8}) for (int budget : {1,100}) {
+            std::vector<int> referenceScored, referenceRows;
+            std::vector<std::uint32_t> referenceMembers;
+            std::size_t referenceChecks = 0;
+            bool referenceConverged = false;
+            for (bool prune : {false,true}) {
+                SPANN::RoutingPredicate predicate(nullptr, labels.data(), labels.size(), {}, {});
+                std::size_t checks = 0;
+                const auto signature = [&](std::size_t, int id) {
+                    ++checks;
+                    return hierarchy.MayMatch(id, labels, predicate);
+                };
+                std::vector<int> scored, rows;
+                const auto distance = [&](std::size_t, int id) {
+                    scored.push_back(id);
+                    return float(10 - id);
+                };
+                const auto child = [&](std::size_t, int id) {
+                    return hierarchy.TerminalMayMatchLabels(id, labels);
+                };
+                std::vector<std::uint32_t> scratch, members;
+                const auto select = [&](std::size_t, int id) {
+                    rows.push_back(id);
+                    return hierarchy.SelectMembers(id, labels, scratch);
+                };
+                SPANN::SparsePostingParentFilter bound(hierarchy, labels);
+                const auto parent = [&](std::size_t level, int id) {
+                    return !prune || bound(level, id);
+                };
+                SPANN::HierarchyPostingQuery<Hierarchy, decltype(signature), decltype(distance), Hierarchy,
+                    SPANN::NoPostingPrefetch, SPANN::SparsePostingLayout, decltype(child), decltype(select),
+                    decltype(parent)> query(hierarchy, hierarchy, signature, distance, {}, width, child, select, parent);
+                query.SetSearchCapacity(32);
+                query.Expand({3,7,3}, [&](const std::uint32_t* ids, int count) {
+                    COMMON::PostingNavigation::RowResult row;
+                    members.insert(members.end(), ids, ids + count);
+                    row.degree = row.eligible = row.newCandidates = count;
+                    row.targetFilled = true;
+                    row.canContinue = members.size() < static_cast<unsigned>(budget);
+                    return row;
+                });
+                if (!prune) {
+                    referenceScored = scored; referenceRows = rows; referenceMembers = members;
+                    referenceChecks = checks; referenceConverged = query.Converged();
+                } else {
+                    CHECK(scored == referenceScored && rows == referenceRows && members == referenceMembers);
+                    CHECK(query.Converged() == referenceConverged && checks <= referenceChecks);
+                    if (hierarchy.HighestQueryTier(labels) <= 2) CHECK(checks < referenceChecks);
+                    if (labels == std::vector<std::uint32_t>{2})
+                        CHECK(std::find(scored.begin(), scored.end(), 4) != scored.end());
+                }
+            }
+        }
+    }
+    Hierarchy legacy;
+    auto historical = header; historical.version = 3; historical.assignment = 2;
+    legacy.Initialize(historical);
+    legacy.AddRow(0, 1, 2, {0});
+    const std::vector<std::uint32_t> labels{999};
+    SPANN::SparsePostingParentFilter historicalFilter(legacy, labels);
+    CHECK(historicalFilter(0, 0));
+    hierarchy.Initialize(header);
+    hierarchy.BuildOwners();
+    CHECK(!hierarchy.HasQueryLabel(3) && hierarchy.HighestQueryTier({1,2,3}) == 1);
+    std::cout << "PASS lazy exact parent pruning, OR maximum tier, rejected-entry ascent, result/order parity and domain reset\n";
 }
 template<class T> static void ConstructionTests(const std::filesystem::path& directory)
 {
@@ -462,8 +560,10 @@ static void NativeRebuildTest(const std::filesystem::path& directory, const char
         CHECK(index->SetParameter("HierarchyLocalTarget", "2049", "SelectHead") != ErrorCode::Success);
         CHECK(index->SetParameter("HierarchyLocalWindow", "32", "SearchSSDIndex") != ErrorCode::Success);
     }
-    std::uint64_t activations = 0;
-    for (int graphBudget : {1, count}) {
+    std::uint64_t activations = 0, overshoots = 0;
+    for (int headTarget : {16, count}) {
+      set("SearchSSDIndex", "InternalResultNum", std::to_string(headTarget));
+      for (int graphBudget : {1, count}) {
           set("SearchSSDIndex", "MaxCheck", std::to_string(graphBudget));
           for (const auto& queryTags : std::vector<std::vector<std::uint32_t>>{{1},{2},{1,2,1},{0},{}}) {
               for (int row : {0,1,20,21}) {
@@ -480,12 +580,14 @@ static void NativeRebuildTest(const std::filesystem::path& directory, const char
                   }
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
                   CHECK(stats.m_postingActivations <= 1);
-                  if (!queryTags.empty()) CHECK(stats.m_graphLeaves <= graphBudget);
+                  overshoots += stats.m_graphLeaves > static_cast<std::uint64_t>(graphBudget);
+                  if (stats.m_headBefore >= stats.m_headTarget) CHECK(stats.m_postingActivations == 0);
+                  if (stats.m_postingActivations) CHECK(stats.m_headBefore < stats.m_headTarget);
                   if (queryTags.empty() || (!local && queryTags.front() == 0)) CHECK(stats.m_postingActivations == 0);
                   CHECK(stats.m_preservedHeads == stats.m_headBefore);
                   if (graphBudget == 1) activations += stats.m_postingActivations;
 #endif
-                  // A one-leaf filtered search may exhaust its reachable posting frontier with no match.
+                  // A narrow native range may still exhaust its reachable frontier with no match.
                   if (graphBudget == count || queryTags.empty()) CHECK(results.GetResult(0)->VID >= 0);
                   std::set<int> found;
                   bool missing = false;
@@ -508,11 +610,13 @@ static void NativeRebuildTest(const std::filesystem::path& directory, const char
                   }
               }
           }
+      }
     }
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
-    CHECK(local ? activations > 0 : activations == 12);
+    CHECK(activations > 0 && overshoots > 0);
 #else
     (void)activations;
+    (void)overshoots;
 #endif
     CHECK(index->SaveIndex((directory / "forbidden-export").string()) != ErrorCode::Success);
     index.reset();
@@ -525,7 +629,7 @@ int main(int argc, char** argv)
     try {
         CHECK(std::filesystem::create_directory(directory));
         CHECK(argc == 2);
-        SelectionTests(); CensusTests(); PersistenceTests(directory); QueryTests();
+        SelectionTests(); CensusTests(); PersistenceTests(directory); QueryTests(); ParentPruningTests(directory);
         ConstructionTests<float>(directory); ConstructionTests<std::uint8_t>(directory);
         NativeRebuildTest(directory, argv[1]);
         NativeRebuildTest(directory, argv[1], true);

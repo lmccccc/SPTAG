@@ -107,6 +107,7 @@ struct Config {
     std::string index,queries,predicateFile,predicate,mode,valueType;
     bool phaseTiming=false;
     int count,warmup,topk,maxCheck,anchorCount,additionalMaxCheck,postingPageLimit,navigationWidth;
+    int matchRatePercent,matchWindow;
     std::vector<int> probes;
     explicit Config(const char* path) {
         Require(ini.LoadIniFile(path)==ErrorCode::Success,"Cannot read native INI");
@@ -137,6 +138,13 @@ struct Config {
             ini.GetParameter<std::string>("SearchSSDIndex","PostingNavigationWidth","0").c_str())==ErrorCode::Success,
             "Invalid posting navigation width");
         navigationWidth=checked.m_postingNavigationWidth;
+        for (const auto& setting : std::vector<std::pair<const char*, const char*>>{
+                {"PostingMatchRatePercent","0"},{"PostingMatchWindow","1024"}})
+            Require(checked.SetParameter("BuildSSDIndex",setting.first,
+                ini.GetParameter<std::string>("SearchSSDIndex",setting.first,setting.second).c_str())==ErrorCode::Success,
+                std::string("Invalid posting match-rate parameter ")+setting.first);
+        matchRatePercent=checked.m_postingMatchRatePercent;
+        matchWindow=checked.m_postingMatchWindow;
         predicateFile=ini.GetParameter<std::string>("Benchmark","PredicateFile","");
         const auto queryCount=Get("Benchmark","MaxQueries"),warmupCount=Get("Benchmark","Warmup");
         Require((queryCount=="32" || queryCount=="1000" || queryCount=="all") &&
@@ -177,7 +185,8 @@ struct Config {
             "numberofthreads","hashtableexponent","maxcheck",
             "maxdistratio","searchpostingpagelimit","disablecrossedges",
             "logphasetime","logpathstats","dumpheads","enablehybriddistance","enablepostingnavigation",
-            "postinganchorcount","postingadditionalmaxcheck","postingnavigationwidth"};
+            "postinganchorcount","postingadditionalmaxcheck","postingnavigationwidth",
+            "postingmatchratepercent","postingmatchwindow"};
         for(const auto& p:ini.GetParameters("SearchSSDIndex"))
             Require(keys.count(p.first),"Unsupported search parameter "+p.first);
         for(char** entry=environ;*entry;++entry) {
@@ -198,6 +207,8 @@ struct Config {
         for(const auto& p:ini.GetParameters("SearchSSDIndex"))
             manager.SetSearchParam(p.first.c_str(),p.second.c_str(),"SearchSSDIndex");
         manager.SetSearchParam("PostingNavigationWidth",std::to_string(navigationWidth).c_str(),"SearchSSDIndex");
+        manager.SetSearchParam("PostingMatchRatePercent",std::to_string(matchRatePercent).c_str(),"SearchSSDIndex");
+        manager.SetSearchParam("PostingMatchWindow",std::to_string(matchWindow).c_str(),"SearchSSDIndex");
     }
 };
 using Work=std::array<std::uint64_t,8>;
@@ -272,6 +283,7 @@ template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_
         std::vector<double> latency(cfg.count);
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
         std::vector<std::array<std::uint64_t,58>> navigation(cfg.count);
+        std::vector<std::array<std::uint64_t,6>> dispatch(cfg.count);
         std::vector<std::int32_t> graphIds(std::size_t(cfg.count)*probe,-1);
         std::vector<float> graphDistances(std::size_t(cfg.count)*probe,MaxDist);
 #endif
@@ -313,6 +325,8 @@ template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_
                 stats.m_anchorCount,stats.m_supplementReason,stats.m_graphLeaves,stats.m_supplementLeaves,
                 stats.m_graphDistances,stats.m_supplementDistances,stats.m_preservedHeads,
                 stats.m_navigationDistancePrunes};
+            dispatch[i]={stats.m_dispatchTriggered,stats.m_dispatchSamples,stats.m_dispatchMatches,
+                stats.m_dispatchWindows,stats.m_dispatchPendingPops,stats.m_dispatchDeferred};
             std::copy(stats.m_graphHeadIds.begin(),stats.m_graphHeadIds.end(),graphIds.begin()+std::size_t(i)*probe);
             std::copy(stats.m_graphHeadDistances.begin(),stats.m_graphHeadDistances.end(),graphDistances.begin()+std::size_t(i)*probe);
 #endif
@@ -329,6 +343,7 @@ template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_
         Write(output+"/work.u64",work);Write(output+"/latency_us.f64",latency);
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
         Write(output+"/navigation.u64",navigation);
+        Write(output+"/dispatch.u64",dispatch);
         Write(output+"/graph_ids.i32",graphIds);
         Write(output+"/graph_dist.f32",graphDistances);
         constexpr bool diagnostic=true;
@@ -348,7 +363,13 @@ template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_
                  <<",\"posting_anchor_count\":"<<cfg.anchorCount
                  <<",\"posting_anchor_limit\":"<<(cfg.anchorCount ? cfg.anchorCount : probe)
                  <<",\"posting_additional_max_check\":"<<cfg.additionalMaxCheck
+                 <<",\"graph_stop_policy\":\""<<(cfg.matchRatePercent ?
+                    "local-match-union-v2" : "upstream-adaptive-v1")<<"\""
+                 <<",\"posting_budget_policy\":\"unused-plus-preserved-extra-v2\""
                  <<",\"posting_navigation_width\":"<<cfg.navigationWidth
+                 <<",\"posting_match_rate_percent\":"<<cfg.matchRatePercent
+                 <<",\"posting_match_window\":"<<cfg.matchWindow
+                 <<",\"dispatch_schema_version\":2,\"dispatch_columns\":6"
                  <<",\"diagnostic\":"<<(diagnostic?"true":"false")
                  <<",\"phase_timing\":"<<(cfg.phaseTiming?"true":"false")
                  <<",\"navigation_schema_version\":7,\"navigation_columns\":58"
@@ -444,7 +465,8 @@ std::vector<std::unique_ptr<BatchCase>> ReadBatch(const char* path,Helper::IniRe
         if(cfg.predicate!="empty") cfg.predicateFile=AbsoluteInput(cfg.predicateFile);
         Require(!Within(output,cfg.index),"Batch output must not be inside the immutable index");
         const auto& search=cfg.ini.GetParameters("SearchSSDIndex");
-        Require(search.size()==completeKeys.size()+search.count("postingnavigationwidth"),
+        Require(search.size()==completeKeys.size()+search.count("postingnavigationwidth")+
+            search.count("postingmatchratepercent")+search.count("postingmatchwindow"),
             "Batch cases require complete SearchSSDIndex settings");
         auto validated=VectorIndex::CreateInstance(IndexAlgoType::SPANN,
             cfg.valueType=="UInt8"?VectorValueType::UInt8:VectorValueType::Float);
@@ -456,6 +478,10 @@ std::vector<std::unique_ptr<BatchCase>> ReadBatch(const char* path,Helper::IniRe
         }
         Require(validated->SetParameter("PostingNavigationWidth",std::to_string(cfg.navigationWidth).c_str(),
             "SearchSSDIndex")==ErrorCode::Success, "Invalid batch posting navigation width");
+        Require(validated->SetParameter("PostingMatchRatePercent",std::to_string(cfg.matchRatePercent).c_str(),
+            "SearchSSDIndex")==ErrorCode::Success &&
+            validated->SetParameter("PostingMatchWindow",std::to_string(cfg.matchWindow).c_str(),
+            "SearchSSDIndex")==ErrorCode::Success, "Invalid batch posting match-rate policy");
         Require(search.at("isexecute")=="true" && search.at("buildssdindex")=="false",
             "Batch requires isExecute=true and BuildSsdIndex=false");
         if(!cases.empty()) {

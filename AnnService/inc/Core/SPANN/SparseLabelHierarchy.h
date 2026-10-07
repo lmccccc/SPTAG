@@ -105,7 +105,17 @@ public:
     }
     bool HasQueryLabel(std::uint32_t tag) const
     {
-        return std::binary_search(m_queryLabels.begin(), m_queryLabels.end(), tag);
+        return std::binary_search(m_queryLabels[0].begin(), m_queryLabels[0].end(), tag);
+    }
+    int HighestQueryTier(const std::vector<std::uint32_t>& labels) const
+    {
+        Require(Layered() && !m_ownerOffsets.empty(), "Layered query label domains are not ready");
+        for (int tier = 5; tier >= 2; --tier)
+            for (auto tag : labels) {
+                const auto& domain = m_queryLabels[tier - 2];
+                if (std::binary_search(domain.begin(), domain.end(), tag)) return tier;
+            }
+        return 1;
     }
     void ReleaseLocalStatistics()
     {
@@ -127,7 +137,7 @@ public:
         m_signatures.clear();
         m_numeric.clear();
         m_localAdmission = LocalLabelAdmission{};
-        m_queryLabels.clear();
+        for (auto& labels : m_queryLabels) labels.clear();
     }
     std::uint32_t AddRow(std::uint32_t representative, std::uint32_t tag, int tier,
                          const std::vector<std::uint32_t>& members)
@@ -178,12 +188,13 @@ public:
         if (m_header.version < 3) return;
         Require(m_ownerOffsets.empty(), "Sparse owners have already been constructed");
         if (Layered()) {
-            for (int id = 0; id < Count(); ++id)
-                if (At(id).tier == 2)
-                    for (auto row = LabelsBegin(id); row != LabelsEnd(id); ++row) {
-                        const auto at = std::lower_bound(m_queryLabels.begin(), m_queryLabels.end(), row->tag);
-                        if (at == m_queryLabels.end() || *at != row->tag) m_queryLabels.insert(at, row->tag);
-                    }
+            for (int id = 0; id < Count(); ++id) {
+                auto& labels = m_queryLabels.at(At(id).tier - 2);
+                for (auto row = LabelsBegin(id); row != LabelsEnd(id); ++row) {
+                    const auto at = std::lower_bound(labels.begin(), labels.end(), row->tag);
+                    if (at == labels.end() || *at != row->tag) labels.insert(at, row->tag);
+                }
+            }
             BuildLayeredOwners();
             return;
         }
@@ -639,7 +650,23 @@ private:
     std::vector<std::uint64_t> m_numeric;
     std::size_t m_words = 0;
     LocalLabelAdmission m_localAdmission;
-    std::vector<std::uint32_t> m_queryLabels;
+    std::array<std::vector<std::uint32_t>, 4> m_queryLabels;
+};
+
+class SparsePostingParentFilter {
+    const SparseLabelHierarchy& m_hierarchy;
+    const std::vector<std::uint32_t>& m_labels;
+    int m_highestTier = -1;
+public:
+    SparsePostingParentFilter(const SparseLabelHierarchy& hierarchy, const std::vector<std::uint32_t>& labels)
+        : m_hierarchy(hierarchy), m_labels(labels) {}
+    bool operator()(std::size_t, int id)
+    {
+        if (!m_hierarchy.Layered()) return true;
+        // Resolve only after an H1 gap activates supplementation, never per graph visit.
+        if (m_highestTier < 0) m_highestTier = m_hierarchy.HighestQueryTier(m_labels);
+        return m_hierarchy.At(id).tier < static_cast<unsigned>(m_highestTier);
+    }
 };
 
 struct SparsePostingLayout {

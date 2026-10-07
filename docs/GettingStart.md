@@ -1,20 +1,25 @@
 ## **Quick start**
 
-### **Current adaptive SPANN: portable configuration**
+### **Current SPANN: local-label postings and match-rate ascent**
 
 For the current attribute-filtered implementation, start with the complete
 [native INI template](AdaptiveSpann.ini), not a historical SIFT experiment.
-It builds **one BKT H1 navigation graph** plus upper posting catalogs and enables
-the final adaptive, controlled-ascent supplementation. H2 and above are not
+It builds **one BKT H1 navigation graph** plus canonical spatial posting catalogs.
+Use [the upper-only V5 recipe](LocalLabelHierarchy.ini) to derive local-label
+postings without changing H1/SSD. Search opts into the union-safe
+`local-match-union-v2` policy. H2 and above are not
 separate query ANN graphs. The same index serves unfiltered, categorical,
 numeric and mixed-DNF queries; do not select another graph or multiply nprobe
 according to predicate selectivity.
 
 The template is a **starting configuration, not a universal performance optimum**:
-Float128/L2, two attribute columns, three hierarchy levels, eight build threads
-and one query thread are editable examples. Its `2048 + 2048` query budgets come
-from the current SIFT1B adaptive measurements, whose actual index used UInt8
-and five levels. Changing a dataset still requires recall/latency evaluation.
+Float128/L2, two attribute columns, five hierarchy levels, eight build threads
+and one query thread are editable examples. Search uses top100, nprobe128,
+MaxCheck8192, extra2048, width8 and a 15% observed-match trigger.
+The completed SIFT1B measurements use UInt8 vectors and a target128 V5 index.
+The new target512 construction recipe raises initial admission to 12.5% but
+has not yet supplied accepted SIFT1B performance results. Changing a dataset
+or rebuilding postings still requires recall/latency evaluation.
 All data/model/search settings belong in the native INI, not environment
 overrides or hard-coded client defaults.
 
@@ -34,7 +39,7 @@ line; do not use `#`, inline comments, shell variables or `~` in values.
 | `[Base] IndexDirectory`, `[BuildSSDIndex] TmpDir` | A new output root and a run-specific work directory. The bulk build uses tenant `0`; the root contains `manifest.txt` and `tenant_0/`. |
 | `[Tags] TagFile`, `ColumnTypes` | Row-aligned, headerless attributes and the type of **every original column**. Example: `numeric,categorical,numeric,categorical` preserves that order. |
 | `[BuildSSDIndex] LimitedTagColumn` | The zero-based **original** categorical key column; use `3` for the preceding example if the fourth column is the key. It is not the ordinal among categorical columns. |
-| `[SelectHead] Ratio`, `HierarchyLevels`, `HierarchyReplicaCount` | Spatial construction choices to size for the dataset and memory budget. `0 < Ratio < 1` applies at every level; `HierarchyLevels >= 2` includes H1. Three levels are an example, not a requirement. |
+| `[SelectHead] Ratio`, `HierarchyLevels`, `HierarchyReplicaCount` | Spatial construction choices to size for the dataset and memory budget. `0 < Ratio < 1` applies at every level; `HierarchyLevels >= 2` includes H1. This template uses five levels, required by the separate V5 reconstruction entrypoint. |
 | `[SelectHead]`, `[BuildHead]`, `[BuildSSDIndex] NumberOfThreads` | Construction parallelism for the target host. Query threads are a separate `[SearchSSDIndex]` setting. |
 
 For `VectorType=DEFAULT`, vectors are an `int32 N, int32 D` header followed by
@@ -94,7 +99,9 @@ attributes exactly to `[Tags] TagFile`, plus sibling `.npy`, `.counts.tsv` and
 The INI declares the regular-label cardinality, Zipf exponent, seeds and chunk
 size. The rare-label count retains the native coverage recipe based on
 `SelectHead.Ratio`, `LimitedTagSlotsPerHead` and search `InternalResultNum`;
-the standard `.12`, two slots and 96 heads produce 399 rare-label rows.
+the historical `.12`, two slots and 96 heads produced 399 rare-label rows.
+The current nprobe128 template derives its own count from those INI settings;
+do not relabel or regenerate an existing dataset to match the old count.
 The rare label is the regular-label cardinality (200 in the example).
 Very small smoke datasets need smaller cardinality and compatible coverage
 settings; invalid recipes fail rather than silently changing them.
@@ -126,7 +133,7 @@ not new native ANN parameters.
 The template covers unfiltered, broad/medium/rare categorical, tag169, numeric,
 and mixed-DNF cases. Labels and thresholds are explicit examples, not adaptive
 selection rules. `sel_01pct` is only a name: the manifest reports its **actual**
-eligible count and selectivity on your data. For the final five-scenario
+eligible count and selectivity on your data. For the historical five-scenario
 comparison, request exactly
 `unfilter,broad_tag,medium_tag,sel_01pct,mixed_dnf`; fixed campaign clients still
 enforce their own cohort/dimension/scenario contracts.
@@ -195,36 +202,103 @@ Retired `HierarchyInitialProbeRatio`, `HierarchyMaxCheck`,
 `HierarchyPrefetchMode`, `HeadNavigationMode` and `PostingMinCandidates` are
 also invalid fresh settings, even when supplied as false or zero.
 
-#### **Query settings and adaptive budgets**
+#### **Rebuild only local-label postings**
 
-Only three settings extend ordinary native SPANN search:
-`EnablePostingNavigation`, `PostingAnchorCount`, `PostingAdditionalMaxCheck`.
-The complete template's search section is deliberately small:
+V5 reconstruction takes a **canonical five-level spatial source**, not an
+already label-pruned V4/V5 index. Copy `docs/LocalLabelHierarchy.ini` and replace
+its two absolute tenant paths. Do not put these admission settings into the
+full-index `spannbuilder` recipe: that entrypoint rejects upper-only admission.
+The native rebuild preserves H1 graph/vectors, metadata and SSD payload through
+canonical read-only links, and writes a new upper artifact and native INI.
+
+```ini
+[RebuildHierarchy]
+SourceIndex=/absolute/path/to/new-index/tenant_0
+OutputIndex=/absolute/path/to/new-local-index/tenant_0
+
+[SelectHead]
+HierarchyLocalTarget=512
+HierarchyLocalWindow=4096
+NumberOfThreads=8
+```
+
+`Ratio=0.12`, replica limits and H/O construction choices are inherited from
+the source; they are not overrides accepted by the rebuild INI. Use 32 native
+construction threads on the SIFT1B host only after checking its resources.
+The generic template uses eight. Start with a fresh output parent:
+
+```bash
+cmake --build build --target rebuildsparselabelhierarchy --parallel 8
+mkdir /absolute/path/to/new-local-index
+Release/rebuildsparselabelhierarchy -c /absolute/path/to/my-rebuild.ini
+ln -s /absolute/path/to/new-index/manifest.txt /absolute/path/to/new-local-index/manifest.txt
+```
+
+Run the manifest-link command only after successful reconstruction. It makes
+the derived root usable with `TenantIndexManager::LoadAll`; direct native
+tenant loading uses `OutputIndex` itself. Preserve the canonical source because
+the derived index references it. Check `sparse-hierarchy-completion.json` and
+load the new index before benchmarking. Never overwrite the old output or
+switch a current-index pointer merely because a rebuild was launched.
+
+For each label and spatial scale, let `M` be the distinct physical H1-head
+mass of the selected region and `C` the heads whose support contains the label.
+The builder admits that label when `C * W < HierarchyLocalTarget * M`.
+The target window is `W = min(total_H1, ceil(4096 / Ratio^k))`, `k=0..3`.
+Statistics use nested canonical-primary-owner regions, not exact nearest-W
+neighborhoods; oversized regions are normalized by `W/M`. Equality stops,
+and admission cannot restart above a missing tier.
+
+| Destination | Target H1 window at Ratio0.12 | Target128 cutoff | Target512 cutoff |
+| --- | ---: | ---: | ---: |
+| H2 | 4096 | 3.125% | 12.5% |
+| H3 | 34134 | about 0.375% | about 1.5% |
+| H4 | 284445 | about 0.045% | about 0.18% |
+| H5 | 2370371 | about 0.0054% | about 0.0216% |
+
+Windows cap at total H1 population on small datasets. Each scale recomputes
+local support density. These cutoffs are neither original-record selectivity
+nor the online 15% trigger, and expected matching-head count is not a recall
+guarantee. Keep target128 for reproducing the completed six-scenario curves;
+target512 is the explicitly requested wider-admission experiment.
+
+#### **Query settings and observed-match ascent**
+
+Apply this search section to the selected, completed index. If using the new
+derived root, change `[Base] IndexDirectory` in the application search INI,
+not in a frozen source recipe. This is also the search section in
+`docs/AdaptiveSpann.ini`:
 
 ```ini
 [SearchSSDIndex]
 isExecute=true
 BuildSsdIndex=false
-InternalResultNum=96
+InternalResultNum=128
 NumberOfThreads=1
-ResultNum=10
-MaxCheck=2048
+ResultNum=100
+MaxCheck=8192
 MaxDistRatio=8
 SearchPostingPageLimit=3
 DisableCrossEdges=true
 EnablePostingNavigation=true
-PostingAnchorCount=8
+PostingAnchorCount=0
 PostingAdditionalMaxCheck=2048
+PostingNavigationWidth=8
+PostingMatchRatePercent=15
+PostingMatchWindow=1024
 ```
 
 | Search setting | Native library default | Template | Meaning |
 | --- | --- | --- | --- |
-| `InternalResultNum` | 64 | 96 | nprobe: requested H1 head-result capacity, not final top-k or an exact SSD read count. Effective capacity is at least the requested final top-k. |
-| `ResultNum` | 5 | 10 | Final top-k; an API client must pass this value to its search call. |
-| `MaxCheck` | 4096 | 2048 | Original H1 checked-leaf budget. It is not a count of every distance computation or all upper-catalog work. |
-| `EnablePostingNavigation` | false | true | Enable one supplementary phase **after** filtered H1 search, only when valid heads underfill the head-result capacity. |
-| `PostingAnchorCount` | 8 | 8 | Maximum nearest already-scored H1 anchors, including predicate negatives. Must be positive. |
+| `InternalResultNum` | 64 | 128 | nprobe: requested H1 head-result capacity, not final top-k or an exact SSD read count. Effective capacity is at least the requested final top-k. |
+| `ResultNum` | 5 | 100 | Final top-k; an API client must pass this value to its search call. |
+| `MaxCheck` | 4096 | 8192 | Native H1 nominal checked-leaf budget and convergence-pool input, not a hard edge cap or count of every distance computation. |
+| `EnablePostingNavigation` | false | true | Enable posting supplementation; the explicit match-rate setting below selects observed-match ascent instead of the legacy completion-first deficit policy. |
+| `PostingAnchorCount` | 0 | 0 | Zero uses the current head-result capacity. A positive value limits nearest already-scored H1 anchors, including predicate negatives. |
 | `PostingAdditionalMaxCheck` | 0 | 2048 | Nonnegative extra checked-leaf allowance for supplementation only; does not enlarge the graph phase. |
+| `PostingNavigationWidth` | 0 | 8 | Per-tier upper-navigation representative-distance beam; zero disables this extra pruning. It is not a terminal-H2 row-count limit. |
+| `PostingMatchRatePercent` | 0 | 15 | Integer 1..100 enables the observed H1-support match-rate trigger. Zero preserves the legacy policy; it does not mean a 0% active trigger. |
+| `PostingMatchWindow` | 1024 | 1024 | Positive count of fresh scored H1 candidates per nonoverlapping observation window. Incomplete windows never trigger. |
 | `SearchPostingPageLimit` | 3 | 3 | Physical-page cap on each selected H/O posting region. Zero means uncapped, not "no reads". |
 | `MaxDistRatio` | 10000 | 8 | Native distance-ratio cutoff for selected posting candidates; not a filter-selectivity controller. |
 | `NumberOfThreads` | 2 | 1 | Aliases native `SearchThreadNum`; separate from client concurrency and build threads (whose SSD thread default is 16). |
@@ -235,14 +309,30 @@ needed by this recipe; their disabled defaults need no extra search entries.
 
 **Enabling the flag alone is insufficient:** if graph work has reached
 `MaxCheck` and `PostingAdditionalMaxCheck=0`, supplementation does not start.
-Its ceiling is `MaxCheck + PostingAdditionalMaxCheck`; the sum must fit a
-signed native integer. A selected CSR row completes before the budget is
+Its ceiling is `max(MaxCheck, actual H1 checked leaves) + PostingAdditionalMaxCheck`,
+computed in 64 bits so native H1 overshoot does not consume the promised extra.
+The configured `MaxCheck + PostingAdditionalMaxCheck` must still fit the native
+parameter range. A selected CSR row completes before the budget is
 checked again, so full-row overshoot is possible.
 
-The current sequence is: finish native H1 result-only post-filter search;
-protect its admitted heads; use already-scored anchors to explore one global
-signature-pruned H2+ representative frontier; fill or replace only the
-originally missing slots. A failed signature skips representative/member
+The online policy counts each fresh scored H1 candidate once using its shared
+support/may-match result, including tree candidates. This is not the fraction
+of matching original records. A complete window latches the trigger when
+`matches * 100 < window * PostingMatchRatePercent`; equality continues H1.
+No global selectivity estimate, per-label query or pre-search MaxCheck
+adaptation is introduced.
+
+When every requested categorical label exists in the sparse posting domain,
+H1 may hand off at the next complete graph-row/tree-call boundary. If an OR
+branch lacks upper postings, the same latch instead waits for native
+union-filtered H1 completion, so that branch is not abandoned. Already-scored
+pending candidates are drained without new H1 expansion, then one posting
+phase competes in the same capacity-nprobe result heap, even if already full.
+It may replace earlier H1 candidates. With the policy off, native H1 completes
+first and the legacy supplement protects its heads and fills only a deficit.
+Unfiltered and nontriggered searches retain native behavior.
+
+A failed signature skips representative/member
 access. Within an admitted H2 row, fresh predicate-negative H1 members become
 terminal visited rejects without vector prefetch, distance or checked-leaf cost.
 Ordinary H1 graph negatives still serve as scored navigation bridges.
@@ -251,21 +341,43 @@ entry/owner promotion may still ascend once. No graph restart follows.
 
 Adaptive convergence derives, rather than configures, an H2 representative
 pool width `W = max(effective graph MaxCheck / 16, head-result capacity)`.
-For `MaxCheck=2048`, top-k 10 and nprobe 96, `W=128`; for nprobe 384, `W=384`.
+For `MaxCheck=8192`, top-k100 and nprobe128, `W=512`; raising nprobe to384
+still leaves `W=512`. With `MaxCheck=2048`, nprobe128 gives `W=128`.
 H3+ share expansion priority without occupying H2 pool slots. Once this pool
 is populated, a nearest pending representative worse than its boundary ends
 the supplementary phase. Filling the result heap alone does not stop it.
 Convergence can also stop **underfilled**: representative distance is an ANN
 heuristic, not a lower bound on all unseen members. There is no separate H2
-nprobe, convergence-window knob, selectivity multiplier or recall controller.
+nprobe, selectivity multiplier or recall controller. `PostingMatchWindow`
+counts trigger observations; it is not this convergence pool.
 
-Unfiltered BKT preserves native adaptive/soft stopping and can overshoot nominal
-`MaxCheck`; nonempty predicates use the separate hard graph cap and guarded
-tree refill. See [search budget boundaries](SearchBudgetBoundaries.md).
+Both filtered and unfiltered BKT preserve native adaptive/soft stopping and can
+overshoot nominal `MaxCheck`; filters affect result admission, not an additional
+hard graph cap or clipped tree refill. See [search budget boundaries](SearchBudgetBoundaries.md).
 Tune nprobe first on a fixed index, then examine graph work, supplementary work
 and SSD page limits separately. Do not rewrite construction settings or expand
 parameters by predicate selectivity in the client. Preserve sparse/empty results
 in recall accounting instead of silently dropping those queries.
+
+The completed SIFT1B top100 study used the following explicit parameter grid,
+not a runtime table that selects budgets from query selectivity:
+
+| Predicate | Actual record selectivity | MaxCheck | Measured nprobe values |
+| --- | ---: | ---: | --- |
+| tags 0..9, OR | 49.829% | 8192 | 512, 768, 1024 |
+| tags 0,5, OR | 19.848% | 8192 | 256, 512, 768 |
+| tags 1,10, OR | 10.053% | 8192 | 192, 384, 768 |
+| tags 3,22, OR | 4.993% | 8192 | 128, 192, 384 |
+| tag 16 | 1.001% | 2048 | 512, 768 |
+| tag 169 | 0.100% | 2048 | 512, 768 |
+
+All use three SSD pages, window1024, extra2048, width8, one query worker,
+1,000 queries and two rounds. Match rates5/15 are separate measured settings
+on the same target128 index. At the 5% predicate, rate15 improves recall but
+reduces QPS; it is not an across-the-board win. No target512 curve is claimed.
+Use a fresh resident process when changing MaxCheck: pooled native queues
+can retain a previous larger capacity. Do not infer equal-recall performance
+from line interpolation or report missing coverage as superiority.
 
 #### **Load and search from another program**
 
@@ -617,11 +729,15 @@ TailReplicaCount=0
 UnfilterTailBufferLength=0
 
 [SearchSSDIndex]
-InternalResultNum=96
-MaxCheck=2048
+InternalResultNum=128
+ResultNum=100
+MaxCheck=8192
 EnablePostingNavigation=true
-PostingAnchorCount=8
+PostingAnchorCount=0
 PostingAdditionalMaxCheck=2048
+PostingNavigationWidth=8
+PostingMatchRatePercent=15
+PostingMatchWindow=1024
 SearchPostingPageLimit=3
 
 ```
@@ -663,16 +779,19 @@ Filtered queries use H1 result-only post-filter: nonmatching ordinary nodes
 remain navigable, while matching heads enter the native result collector.
 Unfiltered queries retain native navigation. The native
 `[SearchSSDIndex] EnablePostingNavigation` flag defaults to `false`; current
-hierarchy recipes explicitly enable it. The current design completes the
-ordinary native graph phase first, preserving its native result collector.
-Only afterward may bounded signed-posting completion use anchors from that
-phase. There is no in-row density trigger or fresh-candidate floor.
-`PostingAnchorCount=8` is a positive integer and
+hierarchy recipes explicitly enable it. The explicit 15% match-rate policy
+uses complete windows of fresh scored H1 support observations. Full-domain
+queries can hand off early; partial-domain OR queries must finish native H1
+before supplementing. See the portable query section above for the complete
+union-safe contract. No pre-search local-selectivity estimate is used.
+`PostingAnchorCount=0` uses the current nprobe; a positive value imposes a limit.
 `PostingAdditionalMaxCheck` is a nonnegative integer, defaulting to zero.
 The current query example explicitly uses `2048` additional checked leaves.
 Zero shares only the remaining native budget; an exhausted H1 graph budget
-then prevents supplementation entirely. `MaxCheck` plus the additional
-budget must fit a native signed integer. Invalid values are rejected even
+then prevents supplementation entirely. The effective ceiling is
+`max(MaxCheck, actual H1 checks) + PostingAdditionalMaxCheck`, not a per-edge
+hard cap. The configured base-plus-extra sum must fit the native parameter
+range. Invalid values are rejected even
 when posting navigation is disabled.
 `PostingMinCandidates` is retired and rejected in build, search and saved
 INIs, including explicit zero and OFF configurations. Remove that key from
@@ -771,12 +890,13 @@ routing: both paths use the same spatial traversal and fixed budgets.
 Limited-tag mode sets `TailReplicaCount=0` because
 it does not append supplemental unfilter-tail replicas.
 
-Ordinary unfiltered BKT retains native adaptive/soft stopping: initial pivots,
-adjacency expansion and tree refill may overshoot nominal `MaxCheck`. Nonempty
-predicates instead use a hard graph checked-leaf cap, with bounded seed/refill
-calls; filtered underfilled queries may resume pending tree cells while budget
-remains. After graph completion, the current adaptive policy may supplement
-missing heads once, without restarting the graph or scanning all tag heads.
+Both filtered and unfiltered BKT retain native adaptive/soft stopping: initial
+pivots, adjacency expansion and tree refill may overshoot nominal `MaxCheck`.
+There is no filtered hard edge cap or empty-frontier reseeding override.
+With the online policy off, supplementation fills a post-H1 deficit. When the
+observed-match trigger is enabled, its union-safe handoff and competitive
+supplementation follow the portable contract above. Neither policy restarts
+the graph or scans all tag heads.
 Its representative convergence is not a recall guarantee. Sparse or
 budget-limited queries may return fewer than top-k, including zero; retain these
 queries in recall accounting. See [SearchBudgetBoundaries.md](SearchBudgetBoundaries.md)

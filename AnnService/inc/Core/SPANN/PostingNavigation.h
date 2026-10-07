@@ -96,6 +96,10 @@ struct NoPostingChildFilter {
 
 struct NoPostingRowSelection {};
 
+struct NoPostingParentFilter {
+    bool operator()(std::size_t, int) const { return true; }
+};
+
 struct AdjacentPostingLayout {
     template<class Owners>
     static std::size_t NavigationLevels(const Owners& owners) { return owners.Levels(); }
@@ -118,7 +122,8 @@ struct AdjacentPostingLayout {
 
 template<class Postings, class Signature, class Distance, class Owners = PostingOwners,
          class Prefetch = NoPostingPrefetch, class Layout = AdjacentPostingLayout,
-         class ChildFilter = NoPostingChildFilter, class RowSelection = NoPostingRowSelection>
+         class ChildFilter = NoPostingChildFilter, class RowSelection = NoPostingRowSelection,
+         class ParentFilter = NoPostingParentFilter>
 class HierarchyPostingQuery final : public COMMON::PostingNavigation
 {
     const Owners& m_owners;
@@ -128,6 +133,7 @@ class HierarchyPostingQuery final : public COMMON::PostingNavigation
     Prefetch m_prefetch;
     ChildFilter m_childMayMatch;
     RowSelection m_selectRow;
+    ParentFilter m_parentMayMatch;
     struct State {
         unsigned char signature = 0;
         bool discovered = false, expanded = false, ownersDiscovered = false;
@@ -240,6 +246,7 @@ class HierarchyPostingQuery final : public COMMON::PostingNavigation
     {
         if (state.ownersDiscovered) return;
         state.ownersDiscovered = true;
+        if (!m_parentMayMatch(level, id)) return;
         Layout::VisitParents(m_owners, level, id, [&](std::size_t parentLevel, int parent) {
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
             if (COMMON::g_graphAccessStats) {
@@ -371,9 +378,11 @@ class HierarchyPostingQuery final : public COMMON::PostingNavigation
 public:
     HierarchyPostingQuery(const Owners& owners, const Postings& postings,
                           Signature signature, Distance distance, Prefetch prefetch = {},
-                          int navigationWidth = 0, ChildFilter childMayMatch = {}, RowSelection selectRow = {})
+                          int navigationWidth = 0, ChildFilter childMayMatch = {}, RowSelection selectRow = {},
+                          ParentFilter parentMayMatch = {})
         : m_owners(owners), m_postings(postings), m_signature(signature), m_distance(distance),
           m_prefetch(prefetch), m_childMayMatch(childMayMatch), m_selectRow(selectRow),
+          m_parentMayMatch(parentMayMatch),
           m_navigationWidth(navigationWidth)
     {
         if (navigationWidth < 0 || navigationWidth == MaxSize)

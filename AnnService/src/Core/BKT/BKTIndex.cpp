@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "inc/Core/BKT/Index.h"
+#include "inc/Core/Common/PostingMatchRate.h"
 #include "inc/Core/ResultIterator.h"
 #include <chrono>
 
@@ -327,12 +328,15 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
         };
         computeDistance = &countedDistance;
     }
-    // Keep the native stopping heap independent of result membership.
     const bool hasResultFilter = p_resultFilter || filterFunc;
+    COMMON::PostingMatchRate matchRate(
+        p_space.postingNavigation ? p_space.postingMatchRatePercent : 0,
+        p_space.postingMatchWindow);
     std::vector<std::pair<float, SizeType>> anchors;
     if (p_space.postingNavigation)
         anchors.reserve((std::min)(p_space.m_iMaxCheck, p_space.postingAnchorCount));
     const std::function<void(SizeType, float, bool)> observe = [&](SizeType id, float distance, bool match) {
+        matchRate.Observe(match);
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
         if (COMMON::g_graphAccessStats) {
             ++COMMON::g_graphAccessStats->m_graphUnique;
@@ -351,14 +355,11 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
         }
     };
     if (p_space.postingNavigation) p_space.scoredCandidate = &observe;
-    std::unique_ptr<COMMON::QueryResultSet<T>> unfilteredResults;
     if (hasResultFilter)
     {
-        if (!p_resultFilter)
-            unfilteredResults = std::make_unique<COMMON::QueryResultSet<T>>(p_query);
         p_space.PrepareResultCheckStatus();
     }
-    auto& navigationResults = unfilteredResults ? *unfilteredResults : p_query;
+    auto& navigationResults = p_query;
     std::shared_lock<std::shared_timed_mutex> treeLock;
     std::vector<std::shared_lock<std::shared_timed_mutex>> crossTreeLocks;
     if constexpr (EnableCrossEdges)
@@ -384,11 +385,8 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
         treeStart = std::chrono::high_resolution_clock::now();
     }
     m_pTrees.InitSearchTrees(m_pSamples, *computeDistance, p_query, p_space);
-    if (!hasResultFilter || p_space.m_iNumberOfCheckedLeaves < p_space.m_iMaxCheck)
-        m_pTrees.SearchTrees(m_pSamples, *computeDistance, p_query, p_space,
-            hasResultFilter
-                ? (std::min)(p_space.m_iMaxCheck, m_iNumberOfInitialDynamicPivots)
-                : m_iNumberOfInitialDynamicPivots);
+    m_pTrees.SearchTrees(m_pSamples, *computeDistance, p_query, p_space,
+        m_iNumberOfInitialDynamicPivots);
     std::chrono::high_resolution_clock::time_point graphStart;
 
     if constexpr (EnableCrossEdges)
@@ -653,7 +651,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                 -treeNode.childStart;
             SizeType collapsedLocal =
                 p_representative;
-            bool navigationDone = !p_updateNavigation || bool(p_resultFilter);
+            bool navigationDone = !p_updateNavigation || hasResultFilter;
             bool admissionDone = !hasResultFilter;
             do
             {
@@ -746,6 +744,27 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                 treeNode.childEnd);
         };
     const auto finishSearch = [&]() {
+        if constexpr (!EnableCrossEdges) {
+            if (matchRate.Triggered()) {
+                // Already-scored pending heads must not disappear behind the shared visited set.
+                while (!p_space.m_NGQueue.empty()) {
+                    const auto candidate = p_space.m_NGQueue.pop();
+#ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
+                    if (COMMON::g_graphAccessStats) ++COMMON::g_graphAccessStats->m_dispatchPendingPops;
+#endif
+                    if (candidate.distance > p_query.worstDist()) continue;
+                    const SizeType id = candidate.node;
+                    const auto match = p_space.nodeCheckStatus.Match(id, *p_space.matchPredicate);
+                    knownMatchID = id; knownMatch = &match.second;
+                    if (m_pGraph[id][m_pGraph.m_iNeighborhoodSize - 1] < -1)
+                        admitCollapsedResults(0, this, nullptr, id,
+                            [&]() { return candidate.distance; }, false);
+                    else
+                        admitFilteredResult(id, this, id, id, [&]() { return candidate.distance; });
+                    knownMatch = nullptr;
+                }
+            }
+        }
         if constexpr (EnableCrossEdges)
         {
             if (p_crossStats != nullptr)
@@ -770,6 +789,11 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
         auto* phase = COMMON::g_graphAccessStats;
         if (phase) {
+            phase->m_dispatchTriggered = matchRate.Triggered();
+            phase->m_dispatchDeferred = matchRate.Triggered() && !p_space.postingAllowEarlyHandoff;
+            phase->m_dispatchSamples = matchRate.Samples();
+            phase->m_dispatchMatches = matchRate.Matches();
+            phase->m_dispatchWindows = matchRate.Windows();
             phase->m_headBefore = phase->m_headAfter = phase->m_preservedHeads = before;
             phase->m_headTarget = target;
             phase->m_graphLeaves = graphLeaves;
@@ -785,13 +809,21 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
         }
 #endif
         if (!p_space.postingNavigation) return;
-        unsigned reason = 1;
-        const int ceiling = p_space.m_iMaxCheck + p_space.postingAdditionalMaxCheck;
-        if (before < target) {
+        unsigned reason = matchRate.Enabled() && !matchRate.Triggered() ? 8 : 1;
+        const std::int64_t ceiling =
+            std::int64_t((std::max)(p_space.m_iMaxCheck, graphLeaves)) +
+            p_space.postingAdditionalMaxCheck;
+        if (matchRate.Enabled() ? matchRate.Triggered() : before < target) {
             if (graphLeaves >= ceiling) reason = 2;
             else if (anchors.empty()) reason = 3;
             else {
-                COMMON::QueryResultSet<T> supplemental(p_query.GetTarget(), target - before);
+                COMMON::QueryResultSet<T> supplemental(p_query.GetTarget(),
+                    matchRate.Triggered() ? target : target - before);
+                if (matchRate.Triggered()) {
+                    for (int i = 0; i < before; ++i)
+                        supplemental.AddPoint(p_query.GetResult(i)->VID, p_query.GetResult(i)->Dist);
+                    supplementFilled = before;
+                }
                 resultSink = &supplemental;
                 std::sort(anchors.begin(), anchors.end());
                 std::vector<int> ids;
@@ -879,12 +911,13 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
 #endif
                     }
                     row.canContinue = p_space.m_iNumberOfCheckedLeaves < ceiling;
-                    row.targetFilled = supplementFilled >= target - before;
+                    row.targetFilled = supplementFilled >= supplemental.GetResultNum();
                     return row;
                 });
                 supplemental.SortResult();
+                const int offset = matchRate.Triggered() ? 0 : before;
                 for (int i = 0; i < supplementFilled; ++i)
-                    *p_query.GetResult(before + i) = *supplemental.GetResult(i);
+                    *p_query.GetResult(offset + i) = *supplemental.GetResult(i);
                 std::sort(p_query.GetResult(0), p_query.GetResult(0) + target, COMMON::Compare);
                 resultSink = &p_query;
                 reason = p_space.m_iNumberOfCheckedLeaves >= ceiling ? 6 :
@@ -893,7 +926,9 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
         }
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
         if (phase) {
-            phase->m_headAfter = before + supplementFilled;
+            phase->m_headAfter = 0;
+            for (int i = 0; i < target; ++i)
+                phase->m_headAfter += p_query.GetResult(i)->VID >= 0 && p_query.GetResult(i)->Dist < MaxDist;
             phase->m_supplementReason = reason;
             phase->m_supplementLeaves = p_space.m_iNumberOfCheckedLeaves - graphLeaves;
             phase->m_supplementDistances = phase->m_distanceCalls - phase->m_graphDistances;
@@ -908,17 +943,11 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
 #endif
     };
 
-    while (true)
+    while (!p_space.m_NGQueue.empty())
     {
-        if (p_space.m_NGQueue.empty()) {
-            if (!hasResultFilter || p_query.worstDist() < MaxDist ||
-                p_space.m_iNumberOfCheckedLeaves >= p_space.m_iMaxCheck ||
-                p_space.m_SPTQueue.empty()) break;
-            m_pTrees.SearchTrees(m_pSamples, *computeDistance, p_query, p_space,
-                p_space.m_iNumberOfCheckedLeaves + (std::min)(
-                    p_space.m_iMaxCheck - p_space.m_iNumberOfCheckedLeaves,
-                    (std::max)(1, m_iNumberOfOtherDynamicPivots)));
-            if (p_space.m_NGQueue.empty()) continue;
+        if (matchRate.Triggered() && p_space.postingAllowEarlyHandoff) {
+            finishSearch();
+            return;
         }
         NodeDistPair gnode = p_space.m_NGQueue.pop();
         SizeType currentLocal = gnode.node;
@@ -980,7 +1009,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
             gnode.distance <= navigationResults.worstDist() || hybridCollapsed;
         if (checkNode < -1)
         {
-            if (navigationAdmits || (!p_resultFilter && hasResultFilter))
+            if (navigationAdmits)
             {
                 admitCollapsedResults(
                     currentNode, currentIndex,
@@ -991,14 +1020,14 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
         }
         else
         {
-            if (hasResultFilter && (navigationAdmits || !p_resultFilter))
+            if (hasResultFilter && navigationAdmits)
             {
                 admitFilteredResult(
                     gnode.node, currentIndex,
                     currentLocal, resultNode,
                     [&]() { return gnode.distance; });
             }
-            if (!p_resultFilter && navigationAdmits && notDeleted(
+            if (!hasResultFilter && navigationAdmits && notDeleted(
                          currentIndex->m_deletedID,
                          currentLocal))
             {
@@ -1026,11 +1055,6 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
             for (DimensionType edge = p_begin;
                  edge < p_end; ++edge)
             {
-                if (hasResultFilter && !auxiliary && p_space.m_iNumberOfCheckedLeaves >=
-                    p_space.m_iMaxCheck)
-                {
-                    return false;
-                }
                 const bool isCross =
                     EnableCrossEdges && p_crossEncoded;
                 if constexpr (EnableCrossEdges)
@@ -1185,74 +1209,6 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                     if (!match.second) ++COMMON::g_graphAccessStats->m_auxiliaryNegativeFirstVisits;
                 }
 #endif
-                if (p_space.matchPredicate) {
-                    knownMatchID = targetLocal;
-                    knownMatch = &match.second;
-                }
-                if (hasResultFilter)
-                {
-                    const DimensionType
-                        targetCheckPosition =
-                            targetIndex->m_pGraph
-                                .m_iNeighborhoodSize -
-                            1;
-                    const SizeType targetCheckNode =
-                        targetIndex->m_pGraph[
-                            targetLocal][
-                            targetCheckPosition];
-                    if (targetCheckNode < -1)
-                    {
-                        const std::vector<SizeType>*
-                            targetLocalToGlobal =
-                                nullptr;
-                        if constexpr (
-                            EnableCrossEdges)
-                        {
-                            targetLocalToGlobal =
-                                p_crossContext
-                                    ->m_nodes[
-                                        static_cast<
-                                            size_t>(
-                                            targetNode)]
-                                    .m_localToGlobal;
-                        }
-                        admitCollapsedResults(
-                            targetNode,
-                            targetIndex,
-                            targetLocalToGlobal,
-                            targetLocal,
-                            [&]() { return routeDistance; }, false);
-                    }
-                    else
-                    {
-                        SizeType targetResult =
-                            targetLocal;
-                        if constexpr (
-                            EnableCrossEdges)
-                        {
-                            const auto&
-                                targetContext =
-                                    p_crossContext
-                                        ->m_nodes[
-                                            static_cast<
-                                                size_t>(
-                                                targetNode)];
-                            targetResult =
-                                (*targetContext
-                                      .m_localToGlobal)[
-                                    static_cast<
-                                        size_t>(
-                                        targetLocal)];
-                        }
-                        admitFilteredResult(
-                            targetKey,
-                            targetIndex,
-                            targetLocal,
-                            targetResult,
-                            [&]() { return routeDistance; });
-                    }
-                }
-                knownMatch = nullptr;
                 if (p_space.m_Results.insert(
                         routeDistance))
                 {
@@ -1305,18 +1261,12 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
         }
         if (!(EnableCrossEdges &&
               p_crossContext->m_useHybridDistance) &&
-            (!hasResultFilter || p_space.m_iNumberOfCheckedLeaves < p_space.m_iMaxCheck) &&
             p_space.m_NGQueue.Top().distance >
                 p_space.m_SPTQueue.Top().distance)
         {
             m_pTrees.SearchTrees(m_pSamples, *computeDistance, p_query, p_space,
-                                 hasResultFilter
-                                     ? (std::min)(
-                                           p_space.m_iMaxCheck,
-                                           m_iNumberOfOtherDynamicPivots +
-                                               p_space.m_iNumberOfCheckedLeaves)
-                                     : m_iNumberOfOtherDynamicPivots +
-                                           p_space.m_iNumberOfCheckedLeaves);
+                                 m_iNumberOfOtherDynamicPivots +
+                                     p_space.m_iNumberOfCheckedLeaves);
         }
     }
     finishSearch();
@@ -1712,12 +1662,14 @@ template <typename T>
 ErrorCode Index<T>::SearchIndexWithPostingNavigation(QueryResult& query,
     const std::function<bool(SizeType)>& predicate,
     COMMON::PostingNavigation* postingNavigation, int maxCheck, bool searchDeleted,
-    int anchorCount, int additionalMaxCheck) const
+    int anchorCount, int additionalMaxCheck, int matchRatePercent, int matchWindow,
+    bool allowEarlyHandoff) const
 {
     const int anchorLimit = anchorCount == 0 ? query.GetResultNum() : anchorCount;
-    if (anchorLimit <= 0 || additionalMaxCheck < 0 ||
+    if (anchorLimit <= 0 || additionalMaxCheck < 0 || matchRatePercent < 0 ||
+        matchRatePercent > 100 || matchWindow <= 0 ||
         (maxCheck > 0 ? maxCheck : m_iMaxCheck) > (std::numeric_limits<int>::max)() - additionalMaxCheck) {
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid postgraph anchor count or additional budget.\n");
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid posting anchor count, budget or match-rate policy.\n");
         return ErrorCode::FailedParseValue;
     }
     if (!predicate)
@@ -1729,9 +1681,20 @@ ErrorCode Index<T>::SearchIndexWithPostingNavigation(QueryResult& query,
     workspace->postingNavigation = postingNavigation;
     workspace->postingAnchorCount = anchorLimit;
     workspace->postingAdditionalMaxCheck = additionalMaxCheck;
+    workspace->postingMatchRatePercent = matchRatePercent;
+    workspace->postingMatchWindow = matchWindow;
+    workspace->postingAllowEarlyHandoff = allowEarlyHandoff;
     struct Clear {
         COMMON::WorkSpace& workspace;
-        ~Clear() { workspace.matchPredicate = nullptr; workspace.postingNavigation = nullptr; workspace.scoredCandidate = nullptr; }
+        ~Clear() {
+            workspace.matchPredicate = nullptr;
+            workspace.postingNavigation = nullptr;
+            workspace.scoredCandidate = nullptr;
+            workspace.postingAdditionalMaxCheck = 0;
+            workspace.postingMatchRatePercent = 0;
+            workspace.postingMatchWindow = 1024;
+            workspace.postingAllowEarlyHandoff = true;
+        }
     };
     {
         Clear clear{*workspace};

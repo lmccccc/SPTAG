@@ -16,7 +16,8 @@ int main()
         std::ofstream(directory / "queries.npy") << "Not loaded by configuration validation\n";
         const auto config = [&](const char* name, const char* width, bool missing,
                                 const char* anchors="8", const char* maxCheck="2048",
-                                const char* topk="10", const char* probe="96", const char* sweep=nullptr) {
+                                const char* topk="10", const char* probe="96", const char* sweep=nullptr,
+                                const char* rate=nullptr, const char* window=nullptr) {
             std::ofstream file(directory / name);
             file << "[SearchSSDIndex]\nisExecute=true\nBuildSsdIndex=false\nInternalResultNum=" << probe <<
                 "\nNumberOfThreads=1\nHashTableExponent=4\nResultNum=" << topk << "\nMaxCheck=" << maxCheck << "\nMaxDistRatio=8\n"
@@ -25,6 +26,8 @@ int main()
                 << anchors << '\n';
             if (!missing) file << "PostingAdditionalMaxCheck=2048\n";
             if (width) file << "PostingNavigationWidth=" << width << '\n';
+            if (rate) file << "PostingMatchRatePercent=" << rate << '\n';
+            if (window) file << "PostingMatchWindow=" << window << '\n';
             if (sweep) file << "[SearchSweep]\nNProbe=" << sweep << '\n';
             file << "[Benchmark]\nIndex=" << (directory / "index").string() << "\nQueries="
                 << (directory / "queries.npy").string()
@@ -32,6 +35,9 @@ int main()
         };
         config("on.ini", "8", false);
         config("off.ini", nullptr, false);
+        config("rate.ini", "8", false, "0", "2048", "100", "192", nullptr, "15", "1024");
+        config("bad-rate.ini", "8", false, "0", "2048", "100", "192", nullptr, "101", "1024");
+        config("bad-window.ini", "8", false, "0", "2048", "100", "192", nullptr, "15", "0");
         config("invalid.ini", "-1", false);
         config("missing.ini", "8", true);
         config("nprobe.ini", "8", false, "0");
@@ -65,6 +71,10 @@ int main()
             cases[1]->cfg.navigationWidth==0 && cases[2]->cfg.navigationWidth==8,
             "Optional native cutoff or per-case default changed");
         const auto anchors = batch({"nprobe.ini","on.ini","nprobe.ini"});
+        const auto rates = batch({"rate.ini","off.ini","rate.ini"});
+        Require(rates[0]->cfg.matchRatePercent==15 && rates[0]->cfg.matchWindow==1024 &&
+                rates[1]->cfg.matchRatePercent==0 && rates[1]->cfg.matchWindow==1024 &&
+                rates[2]->cfg.matchRatePercent==15, "Batch match-rate defaults leaked across cases");
         Require(anchors.size()==3 && anchors[0]->cfg.anchorCount==0 &&
             anchors[1]->cfg.anchorCount==8 && anchors[2]->cfg.anchorCount==0,
             "Native automatic/fixed/automatic anchor mode changed");
@@ -99,7 +109,7 @@ int main()
             Require(wrapped.GetInternalIndex()->GetParameter("PostingAnchorCount",section)=="0",
                 "Wrapper accepted invalid anchors");
         }
-        for (const auto& name : {"invalid.ini", "missing.ini", "invalid-anchors.ini",
+        for (const auto& name : {"invalid.ini", "missing.ini", "invalid-anchors.ini", "bad-rate.ini", "bad-window.ini",
                                 "zero-budget.ini", "negative-budget.ini", "malformed-budget.ini", "overflow-budget.ini",
                                 "short-probe.ini", "short-sweep.ini", "invalid-topk0.ini", "invalid-topk-1.ini",
                                 "invalid-topk100x.ini", "invalid-topk2147483648.ini"}) {

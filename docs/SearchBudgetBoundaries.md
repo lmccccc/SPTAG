@@ -1,7 +1,7 @@
 # BKT query budget boundaries
 
-The project engine is not an unmodified Microsoft/SPTAG binary. Ordinary
-unfiltered search restores the stopping boundaries in upstream commit
+The project engine is not an unmodified Microsoft/SPTAG binary. Both filtered
+and unfiltered H1 search restore the stopping boundaries in upstream commit
 `2ac3ebcab562bc81cdb8c7c98b35ea72f2703c3b`: the distance pool remains
 `max(MaxCheck / 16, resultNum)`, initial pivots and tree refill are not clipped,
 and a live candidate worse than the result bound stops on either the adaptive
@@ -9,23 +9,21 @@ distance threshold or `checkedLeaves > MaxCheck`. An adjacency expansion,
 initial tree search, or refill can overshoot nominal MaxCheck. This is not a
 pure hard-cap search, and the distance-pool width is not replaced with nprobe.
 
-Filtered result admission keeps ordinary nonmatching graph bridges. A
-nonempty result or metadata predicate selects a separate hard checked-leaf
-cap with bounded tree seed/refill. Already scored candidates can still be
-admitted at the limit; no new ordinary edges or tree refills are scored then.
-Empty-frontier reseeding remains restricted to filtered, underfilled queries
-with available budget and pending tree cells. An empty predicate uses ordinary
-unfiltered semantics; an all-match callable remains a filtered request.
+Filtered result admission keeps ordinary nonmatching graph bridges and uses
+the matching result boundary, not an additional unfiltered-result heap.
+Nonempty predicates do not impose a per-edge hard cap, clip tree calls or
+reseed an empty graph frontier. An all-match predicate preserves ordinary
+unfiltered IDs, distances and checked-leaf work with equal workspace capacities.
 
 `SearchTrees` now processes a popped leaf, including its visited check, before
 testing the limit. It stops immediately at that leaf instead of expanding
 intervening internal cells and discarding the next popped leaf. Ordinary and
 iterator callers preserve upstream exact-limit entry behavior, which may
-process one fresh leaf even when entered at the limit. Filtered callers guard
-against exhausted entry. Checked leaves are not identical to all distance
+process one fresh leaf even when entered at the limit. Filtered callers retain
+that same boundary. Checked leaves are not identical to all distance
 callbacks: internal BKT routing centers retain their native accounting.
 
-Postgraph supplementation remains one separate phase after the graph phase,
+With `PostingMatchRatePercent=0`, supplementation remains one separate phase after the graph phase,
 only for an actual result deficit. Original heads are protected, anchors reuse
 scored distances, visited/match state is shared, and selected CSR rows complete
 before checking the supplemental budget. Discovered H2+ postings share one
@@ -59,6 +57,33 @@ members are not added to the unused graph frontier. This does not change the
 ordinary graph's negative bridge semantics or the zero-extra exhausted-budget
 entry rule. V9/176-byte records, precision, schemas and canonical catalogs are
 unchanged. Query-sized workspace initialization is intentionally retained.
+
+The opt-in `local-match-union-v2` policy sets `PostingMatchRatePercent` to an
+integer 1..100 and uses positive `PostingMatchWindow` (default1024).
+Count fresh scored H1 candidates, including tree candidates, using their cached
+support/may-match result. A complete nonoverlapping window latches when
+`matches * 100 < window * percent`. Equality and incomplete windows do not
+trigger. This is neither original-record selectivity nor result-heap fill.
+
+A sparse posting phase may replace H1 early only if every requested
+categorical label exists in its domain. Partial-domain OR queries defer a
+latched supplement until native union-filtered H1 completion. Handoff occurs
+at a graph-row/tree-call boundary, not through a new hard cap. Already-scored
+pending candidates are drained without graph expansion; one posting phase
+then competes with existing H1 heads in the same bounded nprobe heap.
+Unlike the legacy policy, these original heads can be replaced even when
+the heap was full. No graph resumption follows posting-side terminal rejects.
+
+For either policy, the checked-leaf ceiling is
+`max(MaxCheck, actual H1 checked leaves) + PostingAdditionalMaxCheck` in 64 bits.
+Native H1 overshoot does not consume the separately promised extra budget.
+Zero extra with exhausted H1 budget still prevents supplementation.
+`PostingAnchorCount=0` derives its limit from nprobe. A positive
+`PostingNavigationWidth` bounds navigation distances per upper tier separately
+from the terminal-H2 convergence pool; it is not a row quota.
+Exact per-tier label domains prevent ascent above the highest relevant tier.
+These controls do not adapt MaxCheck before a query. Unfiltered, policy-off
+and nontriggered searches retain the native stopping rules described above.
 
 `NativePosting.SearchBudgets` and its UBSan fixture exercise an actual serialized
 small BKT tree and native queues, including exact/over-limit entry, duplicate

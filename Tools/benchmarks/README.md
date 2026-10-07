@@ -1,5 +1,33 @@
 # Benchmark Scripts
 
+## Current portable parameters
+
+Start with [GettingStart.md](../../docs/GettingStart.md) and
+[`docs/AdaptiveSpann.ini`](../../docs/AdaptiveSpann.ini), rather than editing a
+frozen campaign. The current opt-in `local-match-union-v2` runtime uses observed
+H1 support windows: rate15/window1024, extra2048, navigation width8,
+anchor0 (derive from nprobe), and three SSD pages. The portable top100 example
+uses nprobe128/MaxCheck8192; the six-scenario measured grid is documented in
+GettingStart. Native MaxCheck remains explicit, with upstream soft stopping,
+not a per-edge filtered cap or a pre-search selectivity estimate.
+Partial-domain OR queries must finish native H1 before a latched supplement;
+complete-domain queries may hand off early. Policy zero retains the legacy
+completion-first behavior.
+
+[`docs/LocalLabelHierarchy.ini`](../../docs/LocalLabelHierarchy.ini) is the
+separate upper-only reconstruction recipe: target512/window4096, giving a
+12.5% initial local-support cutoff. The source `Ratio=0.12` is inherited,
+not changed. H1/SSD and prior indexes remain unchanged. The completed 1,000-query,
+two-round rate5/rate15 measurements still use target128. Wider admission is
+an experiment, not a published performance improvement or automatic index
+switch. Build admission and the 15% online trigger are different quantities.
+
+`nativeBench` identifies this runtime as `local-match-union-v2`, retaining
+navigation schema7 (58 columns) and dispatch schema2 (6 columns, with deferred
+OR handoff as the last field). Historical campaign readers may require their
+older pinned policy/schema: reproduce those with their recorded sources and
+binaries, not a newly built executable relabeled as the old client.
+
 ## SIFT1B three-algorithm comparison
 
 `run_sift1b_threeway.py` adds the original C++ Filtered-DiskANN categorical

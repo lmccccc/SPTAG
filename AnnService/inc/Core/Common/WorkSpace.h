@@ -409,6 +409,9 @@ namespace SPTAG
             bool lastNavigationMatch = false;
             int postingAnchorCount = 8;
             int postingAdditionalMaxCheck = 0;
+            int postingMatchRatePercent = 0;
+            int postingMatchWindow = 1024;
+            bool postingAllowEarlyHandoff = true;
             void ObserveScored(SizeType id, float distance) {
                 if (scoredCandidate) (*scoredCandidate)(id, distance, lastNavigationMatch);
             }

@@ -98,6 +98,40 @@ python setup.py build_ext --inplace
   - `AnnService/inc/Core/Common/Dataset.h`
 
 ## Unified Spatial Query Pipeline (DO NOT REGRESS)
+### Explicit online match-rate policy (2026-10-06)
+
+The `local-match-union-v2` correction to the user-authorized online policy is opt-in through native
+`SearchSSDIndex.PostingMatchRatePercent` (integer 1..100; zero retains the
+legacy/default policy below) and `PostingMatchWindow` (positive, default 1024).
+It supersedes completion-first/protected-head rules only when opted in.
+Count each fresh scored H1 navigation candidate once, including tree candidates,
+using the shared OR-union head-admission cache. This is support/may-match yield,
+not final-record truth or representative-own-label selectivity. Every complete
+nonoverlapping window compares `matches * 100 < window * percent`; equality
+continues H1, and incomplete windows cannot trigger. Never sample label-pure
+posting members, use global selectivity, result fill, or MaxCheck as a trigger.
+
+The first low-yield window latches supplementation. A sparse hierarchy may
+replace H1 early only when every requested categorical label is admitted to
+its posting domain. A mixed OR containing an H1-only label must instead finish
+the original union-filtered H1 search before supplementation, even after the
+rate latches. This is a coverage check, not a selectivity estimate or per-label
+search. Complete-domain queries retain handoff at a graph-row/tree-call boundary.
+Do not clip native tree calls or reintroduce a per-edge hard cap.
+Drain already-scored pending H1 candidates into the bounded matching heap,
+without expanding edges or recomputing distances, before entering posting.
+Posting candidates then compete with existing H1 heads in a capacity-nprobe
+heap even when full. The existing unused-plus-preserved-extra budget, complete
+rows, convergence, exact final filtering, and no-graph-resumption rule remain.
+Unfiltered, policy-off, and nontriggered searches retain upstream stopping.
+Diagnostic dispatch schema 2 appends `deferred` to the original five counters:
+a low-yield latch can be true while H1 continues to its native completion.
+The original worktree, registered source proofs, indexes and binaries are
+immutable controls; implement this policy in the isolated worktree's main
+AnnService sources, not generated benchmark code.
+
+### Legacy/default completion-first policy
+
 The adjacent, full-domain catalogs described below remain the legacy/default
 layout when `HierarchyLabelSelectivity` is empty. Explicit upper-only sparse
 label reconstruction is described in the next subsection; its build-time
@@ -169,8 +203,11 @@ cutoff experiment, not a label-specific or recall-tuned constant. A nearby
 selected parent still exposes its complete child row; this is approximate ANN
 pruning, not a certified subtree bound. No index reconstruction is needed.
 `PostingAdditionalMaxCheck=0` is the nonnegative default. Original graph
-MaxCheck is unchanged; only supplementation can spend unused budget plus the
-explicit extra. Zero extra with an exhausted graph budget means no supplement.
+MaxCheck retains upstream adaptive stopping, including nominal overshoot.
+Only supplementation can spend unused nominal graph budget plus the explicit
+extra; graph overshoot must not consume that extra. Its checked-leaf ceiling is
+`max(MaxCheck, actual completed H1 checks) + PostingAdditionalMaxCheck`, computed
+in 64 bits. Zero extra with an exhausted graph budget means no supplement.
 After graph completion, fresh auxiliary predicate negatives are cached as
 terminal visits and skipped without vector prefetch, distance or checked-leaf
 cost. A rejected collapsed representative still checks its aliases; its shared
@@ -193,15 +230,21 @@ touched IDs, not total catalog size; no full-layer allocation, clear or scan
 belongs in a query. Signature may-match is not exact predicate truth.
 Unfiltered queries retain native navigation.
 
-Ordinary unfiltered BKT search retains the pinned upstream adaptive stop:
+Both unfiltered and filtered BKT search retain the pinned upstream adaptive stop:
 the distance pool stays `max(MaxCheck / 16, resultNum)`, pivots/refills are
 unclipped, and the checked-leaf budget is tested on a live popped candidate
 worse than the result boundary. Nominal MaxCheck overshoot is intentional.
-Nonempty result/metadata predicates separately retain a hard graph checked-leaf
-cap and bounded tree calls, including when results remain underfilled.
-`SearchTrees` processes the popped leaf before checking its limit; filtered
-callers must not call it with an already-exhausted budget. Do not discard a
-popped leaf or expand internal cells past that post-leaf stopping point.
+Result and metadata predicates use the matching result boundary, not a separate
+unfiltered result heap. Ordinary graph candidates are admitted on native queue
+pop, not eagerly when their neighbor distance is computed; early admission
+changes the result boundary and therefore convergence. There is no filtered per-edge hard cap, clipped pivot
+call, special empty-frontier refill, or boundary-time graph/posting dispatcher.
+`SearchTrees` processes the popped leaf before checking its per-call pivot
+limit, including a call entered at that limit. Do not discard a popped leaf or
+expand internal cells past that post-leaf stopping point. A true predicate must
+preserve unfiltered IDs, distances and checked-leaf work on the same graph.
+The older filtered hard-cap policy and isolated OR dispatcher are archived
+experiments, not upstream semantics and not defaults to restore.
 Query-sized workspace initialization is a separate retained project optimization.
 
 Numeric/DNF H1 admission uses authenticated region signatures in both baseline
@@ -254,11 +297,20 @@ not globally per label or to all labels of a parent.
 V5 appends authenticated local addresses, label masks and actual window masses
 to the layered artifact. Coverage validation uses these local decisions.
 Serving releases this construction payload after authentication/validation,
-retaining only the actual H2 label domain and its fingerprint. Query activation
+retaining the actual per-tier label domains and the authenticated fingerprint. Query activation
 must not consult old original-vector selectivity thresholds. H/O assignment,
 native replica limits, H1-first search and all immutable-source rules below
 remain unchanged. Census logs separate metadata transfers/merges from its small
 coarse-vector organization and from subsequent native H/O construction cost.
+
+V4/V5 also derive small exact per-tier label domains while building reverse
+owners at load/construction time. On the first attempted owner ascent after
+activation, resolve the highest tier containing any requested auxiliary label.
+Do not expose owners above that tier: no admitted row there can affect the
+frontier or results. A rejected current node still ascends if any higher tier
+has a query label; current-node rejection is not an ancestor bound. This is
+exact label-domain pruning, not density estimation, a fill-based stop, or a
+new search parameter. Historical V1/V2/V3 and adjacent layouts are unchanged.
 
 Each V4 H(k+1) posting contains Hk IDs, never direct H1 IDs above H2.
 Admit a physical child only when it has at least one supported label whose

@@ -115,6 +115,15 @@ int main(int argc,char** argv) {
             CHECK(found);
         }
         std::cout<<"PASS false representative admits valid aliases; zero fresh matches still fill real slots; base heads preserved\n";
+        {
+            AliasRow online; online.representative=representative;
+            COMMON::QueryResultSet<float> refined(data.data(),4);
+            CHECK(loaded.SearchIndexWithPostingNavigation(refined,predicate,&online,
+                2,false,8,8,100,2)==ErrorCode::Success);
+            CHECK(online.calls==1 && online.row.targetFilled);
+            for(int i=0;i<4;++i) CHECK(refined.GetResult(i)->VID>=0 &&
+                refined.GetResult(i)->VID!=201 && predicate(refined.GetResult(i)->VID));
+        }
         for(bool deletedOnly:{false,true}) {
             AliasRow rejected;rejected.representative=representative;
             COMMON::QueryResultSet<float> empty(data.data(),4);

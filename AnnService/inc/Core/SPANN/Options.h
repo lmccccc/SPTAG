@@ -109,6 +109,8 @@ namespace SPTAG {
             bool m_enablePostingNavigation;
             int m_postingAnchorCount;
             int m_postingAdditionalMaxCheck;
+            int m_postingMatchRatePercent;
+            int m_postingMatchWindow;
             int m_postingNavigationWidth;
             bool m_enableSSD;
             bool m_buildSsdIndex;
@@ -538,10 +540,13 @@ namespace SPTAG {
                     const bool additional = Helper::StrUtils::StrEqualIgnoreCase(p_param, "PostingAdditionalMaxCheck");
                     const bool maxCheck = Helper::StrUtils::StrEqualIgnoreCase(p_param, "MaxCheck");
                     const bool navigationWidth = Helper::StrUtils::StrEqualIgnoreCase(p_param, "PostingNavigationWidth");
-                    if (anchor || additional || maxCheck || navigationWidth) {
+                    const bool matchRate = Helper::StrUtils::StrEqualIgnoreCase(p_param, "PostingMatchRatePercent");
+                    const bool matchWindow = Helper::StrUtils::StrEqualIgnoreCase(p_param, "PostingMatchWindow");
+                    if (anchor || additional || maxCheck || navigationWidth || matchRate || matchWindow) {
                         int parsed = 0;
-                        if (!ParsePostingInteger(p_value, maxCheck ? 1 : 0, parsed))
+                        if (!ParsePostingInteger(p_value, maxCheck || matchWindow ? 1 : 0, parsed))
                             return invalid();
+                        if (matchRate && parsed > 100) return invalid();
                         if (navigationWidth && parsed == (std::numeric_limits<int>::max)()) return invalid();
                         const int base = maxCheck ? parsed : m_maxCheck;
                         const int extra = additional ? parsed : m_postingAdditionalMaxCheck;

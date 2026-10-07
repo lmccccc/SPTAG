@@ -3,6 +3,8 @@
 #include "inc/Core/BKT/Index.h"
 #include <cstring>
 #include <iostream>
+#include <chrono>
+#include <filesystem>
 
 using namespace SPTAG;
 #define CHECK(x) do { if (!(x)) throw std::runtime_error("Search budget test line " + std::to_string(__LINE__)); } while (false)
@@ -61,7 +63,59 @@ void TreeQueueBoundary()
     std::cout << "PASS native tree queue: post-leaf boundary, exact/over-limit entry, duplicate leaf, no internal expansion or popped-leaf loss\n";
 }
 
-template<class T> void FilteredBoundaries()
+// Control flow from 5619bb1 BKTIndex.cpp:299-390, independent of Index::Search.
+template<class T>
+void UpstreamSearch(BKT::Index<T>& index, COMMON::BKTree& tree,
+    const COMMON::Dataset<T>& samples, COMMON::QueryResultSet<T>& query,
+    const std::function<bool(int)>& predicate, int budget, int pivots, bool searchDeleted)
+{
+    COMMON::WorkSpace space;
+    space.Initialize((std::max)(16, budget), 2);
+    space.Reset(budget, query.GetResultNum());
+    const std::function<float(const T*, const T*, DimensionType)> distance =
+        [&](const T* a, const T* b, DimensionType) { return index.ComputeDistance(a, b); };
+    const auto live = [&](int id) { return searchDeleted || index.ContainSample(id); };
+    auto& graph = index.GetMutableGraph();
+    const int last = graph.m_iNeighborhoodSize - 1;
+    tree.InitSearchTrees(samples, distance, query, space);
+    tree.SearchTrees(samples, distance, query, space, pivots);
+    while (!space.m_NGQueue.empty()) {
+        const auto current = space.m_NGQueue.pop();
+        int id = current.node;
+        const auto* edges = graph[id];
+        if (current.distance <= query.worstDist()) {
+            if (edges[last] < -1) {
+                const auto& group = tree[-2 - edges[last]];
+                int position = -group.childStart;
+                do {
+                    if (live(id) && predicate(id) && !query.AddPoint(id, current.distance)) break;
+                    if (position <= 0) break;
+                    id = tree[position].centerid;
+                } while (position++ < group.childEnd);
+            } else if (live(id) && predicate(id)) {
+                query.AddPoint(id, current.distance);
+            }
+        } else if (live(id) && (current.distance > space.m_Results.worst() ||
+                               space.m_iNumberOfCheckedLeaves > budget)) {
+            break;
+        }
+        for (int edge = 0; edge <= last; ++edge) {
+            const int neighbor = edges[edge];
+            if (neighbor < 0) break;
+            if (space.CheckAndSet(neighbor)) continue;
+            const float value = distance(query.GetQuantizedTarget(), samples[neighbor], samples.C());
+            ++space.m_iNumberOfCheckedLeaves;
+            if (space.m_Results.insert(value))
+                space.m_NGQueue.insert(NodeDistPair(neighbor, value));
+        }
+        if (space.m_NGQueue.Top().distance > space.m_SPTQueue.Top().distance)
+            tree.SearchTrees(samples, distance, query, space, 4 + space.m_iNumberOfCheckedLeaves);
+    }
+    query.SortResult();
+    query.SetScanned(space.m_iNumberOfCheckedLeaves);
+}
+
+template<class T> void UpstreamBoundaries()
 {
     BKT::Index<T> index;
     for (auto parameter : std::vector<std::pair<const char*, const char*>>{
@@ -83,42 +137,70 @@ template<class T> void FilteredBoundaries()
     }
     index.SetMetadata(new MemMetadataSet(metadata, offsets, 256));
     CHECK(index.DeleteIndex(254) == ErrorCode::Success);
+    const auto folder = std::filesystem::current_path() / ("upstream_budget_" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    CHECK(!std::filesystem::exists(folder));
+    CHECK(index.SaveIndex(folder.string()) == ErrorCode::Success);
+    COMMON::BKTree tree;
+    CHECK(tree.LoadTrees((folder / "tree.bin").string()) == ErrorCode::Success);
+    COMMON::Dataset<T> samples(256, 128, 256, 256, data.data(), true);
     using Result = COMMON::QueryResultSet<T>;
-    for (int budget : {1, 8, 49, 50, 51}) {
-        for (int mode : {0, 1, 2}) {
-            auto predicate = [mode](int id) {
-                return mode == 1 || (mode == 2 && id >= 250);
-            };
-            Result filtered(data.data(), 256), posting(data.data(), 256), metadata(data.data(), 256);
-            CHECK(index.SearchIndexWithResultFilter(filtered, predicate, budget) == ErrorCode::Success);
-            CHECK(index.SearchIndexWithPostingNavigation(posting, predicate, nullptr, budget) == ErrorCode::Success);
-            CHECK(index.SearchIndexWithFilter(metadata, [](const ByteArray&) { return false; }, budget) == ErrorCode::Success);
-            CHECK(filtered.GetScanned() <= budget && posting.GetScanned() <= budget &&
-                  metadata.GetScanned() <= budget);
-            for (int rank = 0; rank < 256; ++rank) {
-                const auto* a = filtered.GetResult(rank);
-                const auto* b = posting.GetResult(rank);
-                CHECK(a->VID == b->VID && a->Dist == b->Dist);
-                CHECK(a->VID < 0 || (a->VID != 254 && predicate(a->VID)));
+    const auto same = [](Result& a, Result& b) {
+        if (a.GetScanned() != b.GetScanned())
+            throw std::runtime_error("Upstream/current checked leaves differ: " +
+                std::to_string(a.GetScanned()) + "/" + std::to_string(b.GetScanned()));
+        for (int rank = 0; rank < a.GetResultNum(); ++rank)
+            CHECK(a.GetResult(rank)->VID == b.GetResult(rank)->VID &&
+                  a.GetResult(rank)->Dist == b.GetResult(rank)->Dist);
+    };
+    for (int pivots : {1, 50}) {
+        CHECK(index.SetParameter("NumberOfInitialDynamicPivots",
+            std::to_string(pivots).c_str()) == ErrorCode::Success);
+        for (int budget : {1, 8, 49, 50, 51}) {
+            for (bool searchDeleted : {false, true}) {
+                for (int queryId : {0, 127, 255}) {
+                    for (int capacity : {16, 256}) {
+                        for (int mode : {0, 1, 2, 3}) {
+                            const std::function<bool(int)> predicate = [mode](int id) {
+                                return mode == 1 || (mode == 2 && id >= 250) ||
+                                    (mode == 3 && id % 7 == 3);
+                            };
+                            const T* target = data.data() + queryId * 128;
+                            Result reference(target, capacity), filtered(target, capacity),
+                                posting(target, capacity), metadataResult(target, capacity);
+                            UpstreamSearch(index, tree, samples, reference, predicate, budget, pivots, searchDeleted);
+                            CHECK(index.SearchIndexWithResultFilter(filtered, predicate, budget, searchDeleted) == ErrorCode::Success);
+                            CHECK(index.SearchIndexWithPostingNavigation(posting, predicate, nullptr, budget, searchDeleted) == ErrorCode::Success);
+                            CHECK(index.SearchIndexWithFilter(metadataResult,
+                                [&](const ByteArray& bytes) { return predicate(bytes.Data()[0]); },
+                                budget, searchDeleted) == ErrorCode::Success);
+                            same(reference, filtered);
+                            same(reference, posting);
+                            same(reference, metadataResult);
+                            if (mode == 1) {
+                                Result ordinary(target, capacity), emptyPredicate(target, capacity);
+                                CHECK(index.SearchIndexWithMaxCheck(ordinary, budget, searchDeleted) == ErrorCode::Success);
+                                CHECK(index.SearchIndexWithResultFilter(emptyPredicate, {}, budget, searchDeleted) == ErrorCode::Success);
+                                same(reference, ordinary);
+                                same(reference, emptyPredicate);
+                                if (budget == 1) CHECK(ordinary.GetScanned() > budget);
+                            }
+                        }
+                    }
+                }
             }
         }
-        Result ordinary(data.data(), 256), emptyPredicate(data.data(), 256);
-        CHECK(index.SearchIndexWithMaxCheck(ordinary, budget) == ErrorCode::Success);
-        CHECK(index.SearchIndexWithResultFilter(emptyPredicate, {}, budget) == ErrorCode::Success);
-        CHECK(ordinary.GetScanned() == emptyPredicate.GetScanned());
-        if (budget == 1) CHECK(ordinary.GetScanned() > budget);
-        for (int rank = 0; rank < 256; ++rank)
-            CHECK(ordinary.GetResult(rank)->VID == emptyPredicate.GetResult(rank)->VID);
     }
-    std::cout << "PASS filtered cap, all/none/sparse predicates, aliases/deletion, empty-predicate ordinary overshoot; bytes=" << sizeof(T) << '\n';
+    std::filesystem::remove_all(folder);
+    std::cout << "PASS upstream control-flow oracle, exact IDs/distances/checks, all/none/sparse predicates, metadata, aliases/deletion and workspace reuse; bytes=" << sizeof(T) << '\n';
 }
 
 int main()
 {
     try {
         TreeQueueBoundary();
-        FilteredBoundaries<float>();
-        FilteredBoundaries<std::uint8_t>();
+        UpstreamBoundaries<float>();
+        UpstreamBoundaries<std::uint8_t>();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

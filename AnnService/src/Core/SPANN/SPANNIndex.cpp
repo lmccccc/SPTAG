@@ -6012,11 +6012,15 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                     };
                     HierarchyPostingQuery<SparseLabelHierarchy, decltype(mayMatch), decltype(distance),
                         SparseLabelHierarchy, decltype(prefetch), SparsePostingLayout, decltype(childMayMatch),
-                        decltype(selectRow)>
+                        decltype(selectRow), SparsePostingParentFilter>
                         posting(hierarchy, hierarchy, mayMatch, distance, prefetch,
-                            m_options.m_postingNavigationWidth, childMayMatch, selectRow);
+                            m_options.m_postingNavigationWidth, childMayMatch, selectRow,
+                            SparsePostingParentFilter(hierarchy, sparseLabels));
                     ret = bkt->SearchIndexWithPostingNavigation(*p_queryResults, headAdmission, &posting,
-                        m_options.m_maxCheck, false, m_options.m_postingAnchorCount, m_options.m_postingAdditionalMaxCheck);
+                        m_options.m_maxCheck, false, m_options.m_postingAnchorCount, m_options.m_postingAdditionalMaxCheck,
+                        m_options.m_postingMatchRatePercent, m_options.m_postingMatchWindow,
+                        // A posting-only phase cannot replace H1 for an absent OR label.
+                        sparseLabels.size() == limitedTagQueryValues.size());
                 } else {
                 Cache::PostingBitmask signature; signature.Clear();
                 bool signatureReady=false;
@@ -6053,7 +6057,8 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                     posting(*m_postingOwners,m_secondLevelPostings,mayMatch,distance,prefetch,
                         m_options.m_postingNavigationWidth);
                 ret=bkt->SearchIndexWithPostingNavigation(*p_queryResults,headAdmission,&posting,m_options.m_maxCheck,
-                    false,m_options.m_postingAnchorCount,m_options.m_postingAdditionalMaxCheck);
+                    false,m_options.m_postingAnchorCount,m_options.m_postingAdditionalMaxCheck,
+                    m_options.m_postingMatchRatePercent,m_options.m_postingMatchWindow);
                 }
             }
             if (ret != ErrorCode::Success) return ret;
