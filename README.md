@@ -106,13 +106,10 @@ Boost >= 1.67, TBB, NUMA and Linux AIO development libraries. The wrapper
 configuration also uses SWIG and Python development headers. SPDK, RocksDB and
 GPU support are not required for this path.
 
-Clone this branch without downloading Git LFS payloads, then initialize the
-pinned compression dependency:
+From the root of your local source checkout, initialize the pinned compression
+dependency and build the native tools. These commands do not download datasets.
 
 ```bash
-GIT_LFS_SKIP_SMUDGE=1 git clone --single-branch \
-  --branch feature/limited-tag-posting https://github.com/lmccccc/SPTAG.git LION
-cd LION
 git submodule update --init -- ThirdParty/zstd
 
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
