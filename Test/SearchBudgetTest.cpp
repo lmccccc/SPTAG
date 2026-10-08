@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 #include "inc/Core/BKT/Index.h"
+#include "inc/Core/SPANN/RetainedOriginalPostings.h"
 #include <cstring>
 #include <iostream>
 #include <chrono>
@@ -60,6 +61,20 @@ void TreeQueueBoundary()
     tree.SearchTrees(data, distance, query, duplicate, 1);
     CHECK(duplicate.m_iNumberOfCheckedLeaves == 1 && duplicate.m_NGQueue.empty());
     CHECK(duplicate.m_SPTQueue.size() == 1 && duplicate.m_SPTQueue.Top().node == 2);
+    for (int initial : {0, 1, 2}) {
+        COMMON::WorkSpace space;
+        space.Initialize(16, 2); space.Reset(1, 4);
+        space.m_bConstructionSearch = true;
+        space.m_iNumberOfCheckedLeaves = initial;
+        space.m_SPTQueue.insert(NodeDistPair(1, 0));
+        space.m_SPTQueue.insert(NodeDistPair(2, 1));
+        tree.SearchTrees(data, distance, query, space, 50);
+        CHECK(space.m_iNumberOfCheckedLeaves == (std::max)(1, initial));
+        CHECK(space.m_NGQueue.size() == (initial == 0 ? 1 : 0));
+        CHECK(space.m_SPTQueue.size() == (initial == 0 ? 1 : 2));
+        space.Reset(1, 4);
+        CHECK(!space.m_bConstructionSearch);
+    }
     std::cout << "PASS native tree queue: post-leaf boundary, exact/over-limit entry, duplicate leaf, no internal expansion or popped-leaf loss\n";
 }
 
@@ -168,6 +183,18 @@ template<class T> void UpstreamBoundaries()
                             const T* target = data.data() + queryId * 128;
                             Result reference(target, capacity), filtered(target, capacity),
                                 posting(target, capacity), metadataResult(target, capacity);
+                            Result construction(target, capacity);
+                            CHECK(index.SearchIndexForConstruction(construction, predicate, budget) == ErrorCode::Success);
+                            CHECK(construction.GetScanned() > 0 && construction.GetScanned() <= budget);
+                            for (int rank = 0; rank < capacity; ++rank) {
+                                const auto* result = construction.GetResult(rank);
+                                if (result->VID < 0) {
+                                    CHECK(result->VID == -1 && result->Dist == MaxDist);
+                                } else {
+                                    CHECK(index.ContainSample(result->VID) && predicate(result->VID));
+                                    CHECK(result->Dist == index.ComputeDistance(target, index.GetSample(result->VID)));
+                                }
+                            }
                             UpstreamSearch(index, tree, samples, reference, predicate, budget, pivots, searchDeleted);
                             CHECK(index.SearchIndexWithResultFilter(filtered, predicate, budget, searchDeleted) == ErrorCode::Success);
                             CHECK(index.SearchIndexWithPostingNavigation(posting, predicate, nullptr, budget, searchDeleted) == ErrorCode::Success);
@@ -195,12 +222,62 @@ template<class T> void UpstreamBoundaries()
     std::cout << "PASS upstream control-flow oracle, exact IDs/distances/checks, all/none/sparse predicates, metadata, aliases/deletion and workspace reuse; bytes=" << sizeof(T) << '\n';
 }
 
+void ConstructionCandidates()
+{
+    BKT::Index<float> index;
+    for (auto parameter : std::vector<std::pair<const char*, const char*>>{
+        {"DistCalcMethod", "L2"}, {"NumberOfThreads", "1"}, {"BKTKmeansK", "8"},
+        {"BKTLeafSize", "8"}, {"NeighborhoodSize", "32"}, {"TPTNumber", "1"},
+        {"RefineIterations", "1"}, {"MaxCheck", "32"}, {"NumberOfInitialDynamicPivots", "50"}})
+        CHECK(index.SetParameter(parameter.first, parameter.second) == ErrorCode::Success);
+    std::vector<float> data(4096 * 16);
+    for (int row = 0; row < 4096; ++row)
+        for (int col = 0; col < 16; ++col)
+            data[row * 16 + col] = float((row * 31 + col * 17) % 4093);
+    CHECK(index.BuildIndex(data.data(), 4096, 16) == ErrorCode::Success);
+    for (const char* bfs : {"0", "2"}) {
+        CHECK(index.SetParameter("EnableBfs", bfs) == ErrorCode::Success);
+        for (int matches : {4096, 256, 64, 16, 1, 0}) {
+            COMMON::QueryResultSet<float> query(data.data(), 64);
+            CHECK(index.SearchIndexForConstruction(query, [matches](int id) { return id < matches; }) == ErrorCode::Success);
+            CHECK(query.GetScanned() > 0 && query.GetScanned() <= 32);
+            for (int rank = 0; rank < 64; ++rank)
+                CHECK(query.GetResult(rank)->VID < matches);
+        }
+    }
+    using Work = Helper::BuildProgress::Work;
+    const std::vector<SizeType> supported{0, 1, 2, 3};
+    for (bool expanded : {false, true}) {
+        Work direct;
+        COMMON::QueryResultSet<float> all(data.data(), 4);
+        CHECK(SPANN::SearchLimitedTagPostingCandidates(index, supported, expanded, all,
+            [](auto&) { throw std::runtime_error("Small support must not search ANN"); return ErrorCode::Fail; },
+            direct) == ErrorCode::Success);
+        CHECK(direct.direct == 1 && direct.exactDistances == 4 && direct.checked == 0 && direct.fallbacks == 0);
+        for (int i = 0; i < 4; ++i) CHECK(all.GetResult(i)->VID == i);
+        Work fallback;
+        COMMON::QueryResultSet<float> empty(data.data(), 2);
+        CHECK(SPANN::SearchLimitedTagPostingCandidates(index, supported, expanded, empty,
+            [](auto& query) { query.SetScanned(1); return ErrorCode::Success; }, fallback) == ErrorCode::Success);
+        CHECK(fallback.direct == 0 && fallback.checked == 1 &&
+            fallback.fallbacks == 1 && fallback.exactDistances == 4);
+        CHECK(empty.GetResult(0)->VID == 0 && empty.GetResult(1)->VID == (expanded ? 1 : -1));
+        Work rejected;
+        CHECK(SPANN::SearchLimitedTagPostingCandidates(index, {}, expanded, empty,
+            [](auto&) { return ErrorCode::Success; }, rejected) == ErrorCode::Fail);
+    }
+    COMMON::QueryResultSet<float> invalid(data.data(), 64);
+    CHECK(index.SearchIndexForConstruction(invalid, {}, -1) == ErrorCode::FailedParseValue);
+    std::cout << "PASS 4096-node underfill capped at 32, BFS, tiny support direct path, exact fallback and missing-support failure\n";
+}
+
 int main()
 {
     try {
         TreeQueueBoundary();
         UpstreamBoundaries<float>();
         UpstreamBoundaries<std::uint8_t>();
+        ConstructionCandidates();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

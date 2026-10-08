@@ -2974,14 +2974,18 @@ ErrorCode Index<T>::RebuildSparseHierarchy(const Options& p_options, const std::
         auto hierarchy = BuildLayeredLabelHierarchy<T>(*m_index, m_limitedTagSupport,
             m_secondLevelCatalogs, *m_postingOwners, p_options, FingerprintFirstLevelHeadIDs(m_vectorTranslateMap),
             m_headParameters);
+        Helper::BuildProgress saveProgress("hierarchy-save");
         hierarchy.Save(p_file);
+        saveProgress.Finish();
         const auto fingerprint = hierarchy.Fingerprint();
+        Helper::BuildProgress reloadProgress("hierarchy-reload-and-authenticate");
         SparseLabelHierarchy verified;
         verified.Load(p_file, m_limitedTagSupport, FingerprintFirstLevelHeadIDs(m_vectorTranslateMap),
             SparseLabelHierarchy::AdmissionParameters(p_options),
             m_index->GetFeatureDim(), m_index->GetVectorValueType());
         verified.Refresh(*m_index, m_routingSignatures.params);
         SparseLabelHierarchy::Require(verified.Fingerprint() == fingerprint, "Sparse reconstruction reload mismatch");
+        reloadProgress.Finish();
         return ErrorCode::Success;
     } catch (const std::exception& error) {
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Sparse hierarchy reconstruction failed: %s\n", error.what());
@@ -5194,6 +5198,7 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
     if ((m_index = CreateInstance(algoType, valueType)) == nullptr)
         return ErrorCode::FailedParseValue;
 
+    m_headParameters.clear();
     std::string sections[] = {"Base", "SelectHead", "BuildHead", "BuildSSDIndex"};
     for (int i = 0; i < 4; i++)
     {
@@ -5210,6 +5215,9 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
                 continue; // Canonical keys win over deprecated aliases.
             const auto status = SetParameter(iter->first.c_str(), iter->second.c_str(), sections[i].c_str());
             if (status != ErrorCode::Success) return status;
+            // Loaded H1 receives runtime overrides later; retain its original construction recipe.
+            if (i == 2 && !Helper::StrUtils::StrEqualIgnoreCase(canonical, "isExecute"))
+                m_headParameters[canonical] = iter->second;
         }
     }
 

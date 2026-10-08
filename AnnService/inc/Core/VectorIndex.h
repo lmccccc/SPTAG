@@ -89,6 +89,16 @@ public:
         return ErrorCode::Undefined;
     }
 
+    // Offline placement only: stop fresh navigation work at the native budget.
+    virtual ErrorCode SearchIndexForConstruction(
+        QueryResult& p_query, std::function<bool(SizeType)> p_resultFilter,
+        int p_maxCheck = 0) const
+    {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+            "Bounded construction search is not supported by this index.\n");
+        return ErrorCode::Undefined;
+    }
+
     virtual ErrorCode SearchTree(QueryResult &p_query) const = 0;
 
     virtual ErrorCode RefineIndex(std::shared_ptr<VectorIndex>& p_newIndex) = 0;

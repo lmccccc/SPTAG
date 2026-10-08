@@ -1849,6 +1849,7 @@ namespace SPTAG
                 std::atomic<std::uint64_t>
                     exactFallbackDistanceChecks(0);
                 std::atomic<std::uint64_t> placementChecked(0);
+                Helper::BuildProgress placementProgress("H-posting-assignment", p_fullCount);
                 std::vector<std::thread> threads;
                 threads.reserve(
                     static_cast<size_t>(threadCount));
@@ -1876,35 +1877,36 @@ namespace SPTAG
                                 nextVector.fetch_add(1);
                             if (vectorID >= p_fullCount) return;
                             if (p_headVectorIDs.count(vectorID) != 0) {
+                                placementProgress.Advance();
                                 continue;
                             }
                             const std::uint32_t tag =
                                 keyTagAt(vectorID);
+                            const auto supported = supportHeadsByTag.find(tag);
+                            static const std::vector<SizeType> emptySupport;
+                            const auto& supportedHeads = supported == supportHeadsByTag.end()
+                                ? emptySupport : supported->second;
                             COMMON::QueryResultSet<ValueType> results(
                                 static_cast<const ValueType*>(
                                     p_fullVectors
                                         ->GetVector(vectorID)),
-                                (std::max)(
-                                    1,
-                                    p_opt
-                                        .m_internalResultNum));
+                                (std::max)(1, static_cast<int>(std::min<std::size_t>(
+                                    (std::max)(1, p_opt.m_internalResultNum), supportedHeads.size()))));
                             const auto filter =
                                 [&p_support, tag](SizeType p_head) {
                                 return p_support.Supports(
                                     p_head, tag);
                             };
-                            const ErrorCode status =
-                                m_headPlacementSearch
-                                ? m_headPlacementSearch(
-                                    static_cast<const ValueType*>(
-                                        p_fullVectors->GetVector(vectorID)),
-                                    (std::max)(
-                                        1,
-                                        p_opt.m_internalResultNum),
-                                    filter, results)
-                                : p_headIndex
-                                    ->SearchIndexWithResultFilter(
-                                        results, filter);
+                            Helper::BuildProgress::Work work;
+                            const ErrorCode status = SearchLimitedTagPostingCandidates(
+                                *p_headIndex, supportedHeads, p_opt.m_enableLimitedTagSupportExpansion,
+                                results, [&](COMMON::QueryResultSet<ValueType>& candidates) {
+                                    return m_headPlacementSearch
+                                        ? m_headPlacementSearch(
+                                            static_cast<const ValueType*>(p_fullVectors->GetVector(vectorID)),
+                                            candidates.GetResultNum(), filter, candidates)
+                                        : p_headIndex->SearchIndexForConstruction(candidates, filter);
+                                }, work);
                             if (status != ErrorCode::Success) {
                                 SizeType expected = MaxSize;
                                 if (failedVector.compare_exchange_strong(
@@ -1923,6 +1925,9 @@ namespace SPTAG
                                     (std::max)(
                                         0, results.GetScanned())),
                                 std::memory_order_relaxed);
+                            exactFallbacks.fetch_add(work.fallbacks, std::memory_order_relaxed);
+                            if (work.fallbacks)
+                                exactFallbackDistanceChecks.fetch_add(work.exactDistances, std::memory_order_relaxed);
 
                             const auto selectRNG =
                                 [&](COMMON::QueryResultSet<ValueType>& candidates) {
@@ -1940,28 +1945,7 @@ namespace SPTAG
                                             selectedEdges.push_back(edge);
                                         });
                                 };
-                            bool validCandidates = selectRNG(results);
-                            if (validCandidates && selectedEdges.empty()) {
-                                const auto supported = supportHeadsByTag.find(tag);
-                                COMMON::QueryResultSet<ValueType> fallback(
-                                    static_cast<const ValueType*>(p_fullVectors->GetVector(vectorID)),
-                                    p_opt.m_enableLimitedTagSupportExpansion
-                                        ? p_opt.m_internalResultNum : 1);
-                                if (supported != supportHeadsByTag.end()) {
-                                    for (SizeType head : supported->second) {
-                                        fallback.AddPoint(head, p_headIndex->ComputeDistance(
-                                            p_fullVectors->GetVector(vectorID),
-                                            p_headIndex->GetSample(head)));
-                                    }
-                                    exactFallbackDistanceChecks.fetch_add(
-                                        supported->second.size(), std::memory_order_relaxed);
-                                }
-                                fallback.SortResult();
-                                validCandidates = selectRNG(fallback);
-                                if (validCandidates && !selectedEdges.empty())
-                                    exactFallbacks.fetch_add(
-                                        1, std::memory_order_relaxed);
-                            }
+                                bool validCandidates = selectRNG(results);
                             if (!validCandidates || selectedEdges.empty()) {
                                 SizeType expected = MaxSize;
                                 if (failedVector.compare_exchange_strong(expected, vectorID)) {
@@ -1978,6 +1962,7 @@ namespace SPTAG
                                 emitted.end(),
                                 selectedEdges.begin(),
                                 selectedEdges.end());
+                            placementProgress.Advance(1, work);
                         }
                     });
                 }
@@ -2008,6 +1993,7 @@ namespace SPTAG
                         failedStatus.load());
                     return false;
                 }
+                placementProgress.Finish();
 
                 size_t selectionCount = 0;
                 for (const auto& emitted :

@@ -5,9 +5,50 @@
 #define _SPTAG_SPANN_RETAINEDORIGINALPOSTINGS_H_
 
 #include "LimitedTagSupport.h"
+#include "inc/Core/VectorIndex.h"
+#include "inc/Helper/BuildProgress.h"
 #include <cmath>
 
 namespace SPTAG { namespace SPANN {
+
+template<class T, class Search>
+ErrorCode SearchLimitedTagPostingCandidates(VectorIndex& index,
+    const std::vector<SizeType>& supported, bool expanded,
+    COMMON::QueryResultSet<T>& candidates, const Search& search, Helper::BuildProgress::Work& work)
+{
+    if (supported.empty() || candidates.GetResultNum() <= 0) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Limited-tag construction has no supported parents.\n");
+        return ErrorCode::Fail;
+    }
+    const auto exact = [&](COMMON::QueryResultSet<T>& results) {
+        for (auto head : supported) {
+            if (head < 0 || head >= index.GetNumSamples() || !index.ContainSample(head)) {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid limited-tag construction parent=%d.\n", head);
+                return ErrorCode::Fail;
+            }
+            results.AddPoint(head, index.ComputeDistance(candidates.GetTarget(), index.GetSample(head)));
+            ++work.exactDistances;
+        }
+        results.SortResult();
+        return ErrorCode::Success;
+    };
+    if (supported.size() <= static_cast<std::size_t>(candidates.GetResultNum())) {
+        ++work.direct;
+        return exact(candidates);
+    }
+    const auto status = search(candidates);
+    if (status != ErrorCode::Success) return status;
+    work.checked = work.maxChecked = (std::max)(0, candidates.GetScanned());
+    if (candidates.GetResult(0)->VID >= 0) return ErrorCode::Success;
+    ++work.fallbacks;
+    COMMON::QueryResultSet<T> fallback(
+        static_cast<const T*>(candidates.GetTarget()), expanded ? candidates.GetResultNum() : 1);
+    const auto fallbackStatus = exact(fallback);
+    if (fallbackStatus != ErrorCode::Success) return fallbackStatus;
+    for (int rank = 0; rank < fallback.GetResultNum(); ++rank)
+        *candidates.GetResult(rank) = *fallback.GetResult(rank);
+    return ErrorCode::Success;
+}
 
 template<class Candidates, class Allowed, class Distance, class Emit>
 bool SelectLimitedTagPostingCandidates(const Candidates& candidates, SizeType headCount,

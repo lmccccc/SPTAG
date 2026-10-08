@@ -342,6 +342,12 @@ namespace SPTAG
                 m_iNumberOfCheckedLeaves = 0;
                 m_iMaxCheck = maxCheck;
                 m_relaxedMono = false;
+                m_bConstructionSearch = false;
+            }
+
+            bool ConstructionBudgetExhausted() const
+            {
+                return m_bConstructionSearch && m_iNumberOfCheckedLeaves >= m_iMaxCheck;
             }
 
             void PrepareResultCheckStatus()
@@ -426,6 +432,7 @@ namespace SPTAG
             int m_iNumberOfCheckedLeaves = 0;
             int m_iMaxCheck = 8192;
             bool m_relaxedMono = false;
+            bool m_bConstructionSearch = false;
 
             // Prioriy queue used for neighborhood graph
             Heap<NodeDistPair> m_NGQueue;

@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 #include "inc/Core/SPANN/Index.h"
+#include "inc/Helper/BuildProgress.h"
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -91,8 +92,10 @@ int main(int argc, char** argv)
         Hierarchy::AdmissionParameters(settings);
         Hierarchy::Require(settings.m_iSelectHeadNumberOfThreads > 0, "Invalid native construction thread count");
         std::shared_ptr<VectorIndex> index;
+        Helper::BuildProgress loadProgress("source-load");
         Hierarchy::Require(VectorIndex::LoadIndex(source.string(), index) == ErrorCode::Success,
             "Cannot authenticate source SPANN index");
+        loadProgress.Finish();
         auto* spann = dynamic_cast<SPANN::ISPANNIndex*>(index.get());
         Hierarchy::Require(spann != nullptr, "Source is not SPANN");
         auto build = *spann->GetOptions();
@@ -115,8 +118,10 @@ int main(int argc, char** argv)
         }
         LinkUnchanged(source, target, replaced);
         fs::copy_file(fs::canonical(argv[2]), target / "rebuild-hierarchy.ini");
+        Helper::BuildProgress rebuildProgress("upper-reconstruction");
         Hierarchy::Require(spann->RebuildSparseHierarchy(build, (target / outputPosting).string()) == ErrorCode::Success,
             "Native sparse hierarchy build/reload failed");
+        rebuildProgress.Finish();
         {
             std::ifstream input(source / "indexloader.ini");
             std::ofstream output(target / "indexloader.ini");
@@ -157,6 +162,7 @@ int main(int argc, char** argv)
         report << "{\n  \"format\": \"sparse-label-hierarchy-v" << (build.m_hierarchyLocalTarget ? 5 : 4) << "\","
                << "\n  \"assignment\": \"adjacent-limited-label-native-h-posting-rng\",\n  \"source\": " << std::quoted(source.string())
                << ",\n  \"head_selection\": \"population-prioritized-native-bkt-over-unique-eligible-children\""
+               << ",\n  \"construction_search\": \"bounded-native-h-placement-v1\""
                << ",\n  \"label_selection\": \"anchor-plus-nearest-candidate-prefix-with-repeated-labels\""
                << ",\n  \"head_count\": \"per-level-physical-child-ratio-with-source-tier-caps\""
                << ",\n  \"replicas\": \"native-H-upper-limit-no-fill; selected-anchor-is-own-member\""

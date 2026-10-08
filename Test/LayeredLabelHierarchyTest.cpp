@@ -18,6 +18,57 @@ template<class Action> void Reject(const Action& action)
     try { action(); } catch (const std::exception&) { failed = true; }
     CHECK(failed);
 }
+static void ProgressTests()
+{
+    class Capture : public Helper::Logger {
+    public:
+        std::mutex mutex;
+        std::condition_variable changed;
+        std::string text;
+        void Logging(const char*, Helper::LogLevel, const char*, int, const char*, const char* format, ...) override {
+            char buffer[2048];
+            va_list args;
+            va_start(args, format);
+            const int length = vsnprintf(buffer, sizeof(buffer), format, args);
+            va_end(args);
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (length > 0 && length < static_cast<int>(sizeof(buffer))) text += buffer;
+            }
+            changed.notify_all();
+        }
+    };
+    auto capture = std::make_shared<Capture>();
+    struct Restore {
+        std::shared_ptr<Helper::Logger> logger = GetLoggerHolder().GetLogger();
+        ~Restore() { SetLogger(logger); }
+    } restore;
+    SetLogger(capture);
+    {
+        Helper::BuildProgress progress("fixture", 3, std::chrono::milliseconds(5));
+        Helper::BuildProgress::Work work;
+        work.checked = work.maxChecked = 7; work.direct = 1; work.exactDistances = 4;
+        progress.Advance(1, work);
+        {
+            std::unique_lock<std::mutex> lock(capture->mutex);
+            CHECK(capture->changed.wait_for(lock, std::chrono::seconds(5), [&] {
+                return capture->text.find("state=running done=1 total=3") != std::string::npos;
+            }));
+        }
+        progress.Advance(2);
+        progress.Finish();
+    }
+    {
+        Helper::BuildProgress incomplete("failed-fixture", 2);
+        incomplete.Advance();
+        Reject([&] { incomplete.Finish(); });
+    }
+    std::lock_guard<std::mutex> lock(capture->mutex);
+    CHECK(capture->text.find("stage=fixture state=complete done=3 total=3 percent=100.00") != std::string::npos);
+    CHECK(capture->text.find("checked=7 maxChecked=7 directQueries=1 exactFallbacks=0 exactDistances=4") != std::string::npos);
+    CHECK(capture->text.find("stage=failed-fixture state=incomplete done=1 total=2") != std::string::npos);
+    CHECK(capture->text.find("stage=failed-fixture state=complete") == std::string::npos);
+}
 static SPANN::LimitedTagSupport Support(int count = 8, bool bridge = false)
 {
     SPANN::LimitedTagSupport support;
@@ -513,6 +564,8 @@ static void NativeRebuildTest(const std::filesystem::path& directory, const char
     CHECK(spann);
     spann->SetVectorTags(tags.data(), count, 1);
     CHECK(index->BuildIndex(vectors, nullptr, true, false, false) == ErrorCode::Success);
+    set("BuildHead", "MaxCheck", "17");
+    set("BuildHead", "TPTNumber", "1");
     CHECK(index->SaveIndex(source.string()) == ErrorCode::Success);
     index.reset();
     const auto snapshot = [&]() {
@@ -540,10 +593,19 @@ static void NativeRebuildTest(const std::filesystem::path& directory, const char
             << "NumberOfThreads=1\n";
         CHECK(bool(out));
     }
+    int invocation = 0;
+    const auto nativeLog = directory / (local ? "local-rebuild.log" : "global-rebuild.log");
     const auto invoke = [&]() {
+        const bool capture = invocation++ == 0;
         const pid_t pid = fork();
         CHECK(pid >= 0);
         if (pid == 0) {
+            if (capture) {
+                FILE* stream = fopen(nativeLog.c_str(), "wx");
+                if (!stream || dup2(fileno(stream), STDOUT_FILENO) < 0 ||
+                    dup2(fileno(stream), STDERR_FILENO) < 0) _exit(126);
+                fclose(stream);
+            }
             execl(tool, tool, "-c", config.c_str(), static_cast<char*>(nullptr));
             _exit(127);
         }
@@ -552,6 +614,13 @@ static void NativeRebuildTest(const std::filesystem::path& directory, const char
         return WEXITSTATUS(status);
     };
     CHECK(invoke() == 0 && snapshot() == before);
+    {
+        std::ifstream input(nativeLog);
+        const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        CHECK(text.find("Layered H2 construction search: MaxCheck=17 ") != std::string::npos);
+        CHECK(text.find("stage=H2-H-assignment state=complete") != std::string::npos);
+        CHECK(text.find("stage=hierarchy-reload-and-authenticate state=complete") != std::string::npos);
+    }
     CHECK(fs::is_symlink(output / "HeadIndex/graph.bin"));
     CHECK(!fs::exists(output / "SPTAGSecondLevelHeadVectors.bin"));
     CHECK(invoke() != 0 && snapshot() == before);
@@ -629,7 +698,7 @@ int main(int argc, char** argv)
     try {
         CHECK(std::filesystem::create_directory(directory));
         CHECK(argc == 2);
-        SelectionTests(); CensusTests(); PersistenceTests(directory); QueryTests(); ParentPruningTests(directory);
+        ProgressTests(); SelectionTests(); CensusTests(); PersistenceTests(directory); QueryTests(); ParentPruningTests(directory);
         ConstructionTests<float>(directory); ConstructionTests<std::uint8_t>(directory);
         NativeRebuildTest(directory, argv[1]);
         NativeRebuildTest(directory, argv[1], true);

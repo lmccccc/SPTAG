@@ -969,6 +969,7 @@ break;
                     return fComputeDistance(p_query.GetQuantizedTarget(), data[id], data.C());
                 };
                 for (char i = 0; i < m_iTreeNumber; i++) {
+                    if (p_space.ConstructionBudgetExhausted()) return;
                     const BKTNode& node = m_pTreeRoots[m_pTreeStart[i]];
                     if (g_graphAccessStats != nullptr) ++g_graphAccessStats->m_treeNodeVisits;
                     if (node.childStart < 0) {
@@ -998,6 +999,7 @@ break;
                         for (int level = 1; level <= m_bfs; level++) {
                             p_next->Top().distance = 1e9;
                             while (!p_curr->empty()) {
+                                if (p_space.ConstructionBudgetExhausted()) return;
                                 NodeDistPair tmp = p_curr->pop();
                                 const BKTNode& tnode = m_pTreeRoots[tmp.node];
                                 if (g_graphAccessStats != nullptr) ++g_graphAccessStats->m_treeNodeVisits;
@@ -1009,6 +1011,7 @@ break;
                                         _mm_prefetch((const char*)(data[m_pTreeRoots[begin].centerid]), _MM_HINT_T0);
                                     }
                                     if (!p_space.CheckAndSet(tnode.centerid)) {
+                                        if (p_space.m_bConstructionSearch) ++p_space.m_iNumberOfCheckedLeaves;
                                         p_space.m_NGQueue.insert(NodeDistPair(tnode.centerid, tmp.distance));
                                         p_space.ObserveScored(tnode.centerid, tmp.distance);
                                     }
@@ -1052,6 +1055,7 @@ break;
                 };
                 while (!p_space.m_SPTQueue.empty())
                 {
+                    if (p_space.ConstructionBudgetExhausted()) return;
                     NodeDistPair bcell = p_space.m_SPTQueue.pop();
                     const BKTNode& tnode = m_pTreeRoots[bcell.node];
                     if (g_graphAccessStats != nullptr) ++g_graphAccessStats->m_treeNodeVisits;
@@ -1068,9 +1072,11 @@ break;
                             _mm_prefetch((const char*)(data[m_pTreeRoots[begin].centerid]), _MM_HINT_T0);
                         }
                         if (!p_space.CheckAndSet(tnode.centerid)) {
+                            if (p_space.m_bConstructionSearch) ++p_space.m_iNumberOfCheckedLeaves;
                             p_space.m_NGQueue.insert(NodeDistPair(tnode.centerid, bcell.distance));
                             p_space.ObserveScored(tnode.centerid, bcell.distance);
                         }
+                        if (p_space.ConstructionBudgetExhausted()) return;
                         for (SizeType begin = tnode.childStart; begin < tnode.childEnd; begin++) {
                             SizeType index = m_pTreeRoots[begin].centerid;
                             p_space.m_SPTQueue.insert(NodeDistPair(begin, distanceToSample(index)));

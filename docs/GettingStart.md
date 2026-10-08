@@ -241,6 +241,25 @@ the derived index references it. Check `sparse-hierarchy-completion.json` and
 load the new index before benchmarking. Never overwrite the old output or
 switch a current-index pointer merely because a rebuild was launched.
 
+The builder's H-placement search is explicitly bounded by the inherited
+`BuildHead.MaxCheck`; it no longer waits for a sparse 64-candidate heap to fill
+under online soft-stop rules. Small label-support sets are scored directly.
+Other labels retain native RNG and the empty-result exact-support fallback.
+This changes construction, not online search semantics or the admission ratio.
+Source loading retains the validated `BuildHead` recipe separately from H1's
+query-time overrides, so temporary graphs also inherit the saved tree, graph,
+refinement and hash settings instead of silently using BKT defaults.
+
+The native output emits `[BuildProgress]` at stage start, every 30 seconds and
+completion. O/H assignments and H1 spatial entries report `done`, `total`,
+`percent`, `itemsPerSecond` and `stageEtaSeconds`. ETA covers only that stage,
+not remaining tiers, saving or authentication. Non-countable stages report
+`total=0`, `percent=-1` and `stageEtaSeconds=-1` while still reporting elapsed
+time. H assignment also reports `checked`, `maxChecked`, `directQueries`,
+`exactFallbacks` and `exactDistances`; exact work is outside the ANN budget.
+An exception reports an incomplete stage, never a successful completion.
+The completion report records `construction_search=bounded-native-h-placement-v1`.
+
 For each label and spatial scale, let `M` be the distinct physical H1-head
 mass of the selected region and `C` the heads whose support contains the label.
 The builder admits that label when `C * W < HierarchyLocalTarget * M`.

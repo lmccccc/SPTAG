@@ -268,6 +268,28 @@ not an implicit rebuild or fallback to old upper ANN search.
 
 ### Sparse label upper-only reconstruction
 
+Offline H placement uses `SearchIndexForConstruction`, not the online filtered
+entrypoint. Its native index MaxCheck bounds fresh navigation admissions,
+including promoted tree centers; already-scored candidates may drain without
+more expansion. Tree routing distances and RNG/exact-support distances are
+separate work, not hidden inside that counter. Construction has a separate
+workspace cache and discards grown tables before reuse. None of these rules
+change online soft stopping, posting handoff or graph refinement.
+On source reload, retain validated BuildHead parameters independently of the
+loaded H1's runtime overrides. Temporary construction indexes must inherit
+that native recipe, not defaults or current query settings. Load-only legacy
+parameters and `isExecute` are excluded from the retained BKT recipe.
+Candidate capacity is capped by the actual label support count. A support set
+no larger than the requested candidate count is scored directly; otherwise
+only an empty ANN result uses the native exact-support fallback. RNG replica
+limits and no-fill behavior remain unchanged.
+`[BuildProgress]` logs report each stage at start, every 30 seconds and finish,
+with completed/total items and stage-only ETA where measurable. Zero total
+means unknown work size (`percent`/ETA are -1), not a completed build.
+Checked work, direct queries, fallback count and exact distances are separate.
+Completion markers and reload authentication, not a progress percentage, admit
+the new index to benchmarking.
+
 Global-threshold reconstruction writes **V4 adjacent limited-label postings**. V1/V2/V3
 remain readable with their historical topology and query behavior described
 below; do not reinterpret or rewrite those artifacts.

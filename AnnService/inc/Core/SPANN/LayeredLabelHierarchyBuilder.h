@@ -12,22 +12,28 @@
 namespace SPTAG { namespace SPANN {
 
 template<class Action>
-void BuildLayeredParallel(SizeType count, int threads, const Action& action)
+void BuildLayeredParallel(SizeType count, int threads, Helper::BuildProgress& progress, const Action& action)
 {
     std::atomic<bool> failed(false);
     std::exception_ptr error;
     std::mutex mutex;
-#pragma omp parallel for num_threads(threads) schedule(dynamic, 64)
-    for (SizeType id = 0; id < count; ++id) {
-        if (failed.load(std::memory_order_relaxed)) continue;
-        try { action(id); }
-        catch (const std::exception&) {
-            std::lock_guard<std::mutex> lock(mutex);
-            if (!error) error = std::current_exception();
-            failed.store(true, std::memory_order_relaxed);
+#pragma omp parallel for num_threads(threads) schedule(dynamic, 1)
+    for (std::int64_t begin = 0; begin < count; begin += 64) {
+        Helper::BuildProgress::Work work;
+        std::uint64_t completed = 0;
+        for (auto id = begin; id < (std::min)(begin + 64, std::int64_t(count)); ++id) {
+            if (failed.load(std::memory_order_relaxed)) break;
+            try { work.Add(action(static_cast<SizeType>(id))); ++completed; }
+            catch (const std::exception&) {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (!error) error = std::current_exception();
+                failed.store(true, std::memory_order_relaxed);
+            }
         }
+        progress.Advance(completed, work);
     }
     if (error) std::rethrow_exception(error);
+    progress.Finish();
 }
 
 template<class T>
@@ -64,18 +70,26 @@ SparseLabelHierarchy BuildLayeredLabelHierarchy(
     }
     Hierarchy result;
     result.Initialize(header);
-    if (result.Local())
+    if (result.Local()) {
+        Helper::BuildProgress progress("local-label-census");
         result.SetLocalAdmission(BuildLocalLabelCensus<T>(support, owners, *catalogs.back(), options));
+        progress.Finish();
+    }
     struct Lower {
         std::uint32_t id, physical, anchor;
         std::vector<std::uint32_t> labels;
     };
     struct Item { SizeType lower; std::uint32_t tag; };
     struct Edge { SizeType node, tonode; float distance; };
+    Helper::BuildProgress admissionProgress("H1-label-admission", support.TagHeads().size());
     std::vector<std::pair<SizeType, std::uint32_t>> pairs;
-    for (const auto& entry : support.TagHeads())
+    for (const auto& entry : support.TagHeads()) {
         for (auto head : entry.second)
             if (result.AdmitChild(support, head, entry.first, 2)) pairs.emplace_back(head, entry.first);
+        admissionProgress.Advance();
+    }
+    admissionProgress.Finish();
+    Helper::BuildProgress inputProgress("H1-sort-and-group");
     std::sort(pairs.begin(), pairs.end());
     require(std::adjacent_find(pairs.begin(), pairs.end()) == pairs.end(),
         "Duplicate H1 sparse head-label input");
@@ -88,9 +102,12 @@ SparseLabelHierarchy BuildLayeredLabelHierarchy(
         lower.back().labels.push_back(pair.second);
     }
     std::vector<std::pair<SizeType, std::uint32_t>>().swap(pairs);
+    inputProgress.Finish();
     const int threads = options.m_iSelectHeadNumberOfThreads;
     const int replicas = options.m_secondLevelReplicaCount;
     for (int tier = 2; tier <= 5; ++tier) {
+        const auto stage = "H" + std::to_string(tier) + "-";
+        Helper::BuildProgress selectionProgress(stage + "select-and-plan");
         for (auto& child : lower) {
             auto& tags = child.labels;
             tags.erase(std::remove_if(tags.begin(), tags.end(), [&](std::uint32_t tag) {
@@ -101,7 +118,7 @@ SparseLabelHierarchy BuildLayeredLabelHierarchy(
         }
         lower.erase(std::remove_if(lower.begin(), lower.end(),
             [](const Lower& child) { return child.labels.empty(); }), lower.end());
-        if (lower.empty()) break;
+        if (lower.empty()) { selectionProgress.Finish(); break; }
         require(lower.size() <= static_cast<std::size_t>(MaxSize), "Too many layered physical children");
         std::vector<SizeType> physical;
         for (const auto& child : lower) physical.push_back(child.physical);
@@ -142,6 +159,8 @@ SparseLabelHierarchy BuildLayeredLabelHierarchy(
             ownItems[upper] = itemOffsets[child] + static_cast<SizeType>(at - lower[child].labels.begin());
             itemOwner[ownItems[upper]] = upper;
         }
+        selectionProgress.Finish();
+        Helper::BuildProgress graphProgress(stage + "temporary-BKT");
         auto index = VectorIndex::CreateInstance(options.m_indexAlgoType, heads.GetVectorValueType());
         require(index != nullptr, "Cannot create layered native assignment index");
         for (const auto& parameter : headParameters)
@@ -155,12 +174,14 @@ SparseLabelHierarchy BuildLayeredLabelHierarchy(
                 index->SetParameter("NumberOfThreads", std::to_string(threads)) == ErrorCode::Success &&
                 index->BuildIndex(data[0], upperCount, heads.GetFeatureDim(), true, false) == ErrorCode::Success,
                 "Cannot build layered temporary native assignment graph");
+        graphProgress.Finish();
         const auto distance = [&](SizeType left, SizeType right) {
             return index->ComputeDistance(index->GetSample(left), index->GetSample(right));
         };
         const int candidates = std::min(upperCount, options.m_internalResultNum);
         std::vector<std::vector<std::pair<float, SizeType>>> original(lower.size());
-        BuildLayeredParallel(static_cast<SizeType>(lower.size()), threads, [&](SizeType child) {
+        Helper::BuildProgress originalProgress(stage + "O-assignment", lower.size());
+        BuildLayeredParallel(static_cast<SizeType>(lower.size()), threads, originalProgress, [&](SizeType child) {
             COMMON::QueryResultSet<T> query(static_cast<const T*>(heads.GetSample(lower[child].physical)), candidates);
             require(index->SearchIndex(query) == ErrorCode::Success, "Layered original posting search failed");
             std::vector<SizeType> chosen;
@@ -168,7 +189,11 @@ SparseLabelHierarchy BuildLayeredLabelHierarchy(
                 [](SizeType) { return true; }, distance, chosen, [&](const BasicResult& candidate) {
                     original[child].emplace_back(candidate.Dist, candidate.VID);
                 }) && !chosen.empty(), "Layered original posting has no native RNG assignment");
+            Helper::BuildProgress::Work work;
+            work.checked = work.maxChecked = query.GetScanned();
+            return work;
         });
+        Helper::BuildProgress supportProgress(stage + "retained-O-support");
         std::vector<Edge> originalEdges;
         std::vector<int> retained(upperCount, 0);
         for (SizeType item = 0; item < static_cast<SizeType>(items.size()); ++item) {
@@ -211,18 +236,32 @@ SparseLabelHierarchy BuildLayeredLabelHierarchy(
         if (!upperSupport.Finalize(&error))
             throw std::runtime_error("Layered native limited support invalid: " + error);
         std::vector<Edge>().swap(originalEdges);
+        supportProgress.Finish();
         std::vector<std::vector<SizeType>> assigned(items.size());
         std::atomic<std::uint64_t> fallbacks(0);
-        BuildLayeredParallel(static_cast<SizeType>(items.size()), threads, [&](SizeType item) {
+        Helper::BuildProgress constrainedProgress(stage + "H-assignment", items.size());
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+            "Layered H%d construction search: MaxCheck=%s candidates<=%d support-aware direct/exact work reported separately.\n",
+            tier, index->GetParameter("MaxCheck").c_str(), candidates);
+        BuildLayeredParallel(static_cast<SizeType>(items.size()), threads, constrainedProgress, [&](SizeType item) {
+            Helper::BuildProgress::Work work;
             if (itemOwner[item] >= 0) {
                 assigned[item].push_back(itemOwner[item]);
-                return;
+                return work;
             }
             const auto& value = items[item];
             const auto* sample = static_cast<const T*>(heads.GetSample(lower[value.lower].physical));
             const auto allowed = [&](SizeType parent) { return upperSupport.Supports(parent, value.tag); };
-            COMMON::QueryResultSet<T> query(sample, candidates);
-            require(index->SearchIndexWithResultFilter(query, allowed) == ErrorCode::Success,
+            const auto supported = upperSupport.TagHeads().find(value.tag);
+            require(supported != upperSupport.TagHeads().end() && !supported->second.empty(),
+                "Layered child-label has no supported parent");
+            COMMON::QueryResultSet<T> query(sample,
+                static_cast<int>(std::min<std::size_t>(candidates, supported->second.size())));
+            require(SearchLimitedTagPostingCandidates(*index, supported->second,
+                options.m_enableLimitedTagSupportExpansion, query,
+                [&](COMMON::QueryResultSet<T>& resultSet) {
+                    return index->SearchIndexForConstruction(resultSet, allowed);
+                }, work) == ErrorCode::Success,
                 "Layered constrained native posting search failed");
             std::vector<SizeType> chosen;
             const auto select = [&](const COMMON::QueryResultSet<T>& resultSet) {
@@ -232,18 +271,11 @@ SparseLabelHierarchy BuildLayeredLabelHierarchy(
                     });
             };
             require(select(query), "Invalid layered constrained candidate");
-            if (assigned[item].empty()) {
-                COMMON::QueryResultSet<T> fallback(sample, options.m_enableLimitedTagSupportExpansion ? candidates : 1);
-                const auto found = upperSupport.TagHeads().find(value.tag);
-                if (found != upperSupport.TagHeads().end())
-                    for (auto parent : found->second)
-                        fallback.AddPoint(parent, index->ComputeDistance(sample, index->GetSample(parent)));
-                fallback.SortResult();
-                require(select(fallback), "Invalid layered exact fallback candidate");
-                ++fallbacks;
-            }
+            fallbacks.fetch_add(work.fallbacks, std::memory_order_relaxed);
             require(!assigned[item].empty(), "Layered child-label has no posting, matching native H placement failure");
+            return work;
         });
+        Helper::BuildProgress rowsProgress(stage + "materialize-rows");
         std::vector<std::map<std::uint32_t, std::vector<std::uint32_t>>> rows(upperCount);
         std::uint64_t references = 0;
         for (SizeType item = 0; item < static_cast<SizeType>(items.size()); ++item)
@@ -266,12 +298,17 @@ SparseLabelHierarchy BuildLayeredLabelHierarchy(
             const auto id = result.AddLayeredRow(selected[upper], ownTags[upper], tier, labelRows);
             next.push_back({id, static_cast<std::uint32_t>(selected[upper]), ownTags[upper], std::move(tags)});
         }
+        rowsProgress.Finish();
         if (tier == 2) {
-            BuildLayeredParallel(heads.GetNumSamples(), threads, [&](SizeType head) {
+            Helper::BuildProgress entryProgress("H1-spatial-entries", heads.GetNumSamples());
+            BuildLayeredParallel(heads.GetNumSamples(), threads, entryProgress, [&](SizeType head) {
                 COMMON::QueryResultSet<T> query(static_cast<const T*>(heads.GetSample(head)), 1);
                 require(index->SearchIndex(query) == ErrorCode::Success && query.GetResult(0)->VID >= 0 &&
                     query.GetResult(0)->VID < upperCount, "Cannot assign layered H1 spatial entry");
                 result.SetEntry(head, first + query.GetResult(0)->VID);
+                Helper::BuildProgress::Work work;
+                work.checked = work.maxChecked = query.GetScanned();
+                return work;
             });
         }
         SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
@@ -282,8 +319,10 @@ SparseLabelHierarchy BuildLayeredLabelHierarchy(
             int(options.m_enableLimitedTagSupportExpansion), static_cast<unsigned long long>(fallbacks.load()));
         lower = std::move(next);
     }
+    Helper::BuildProgress validationProgress("hierarchy-validate-and-owners");
     result.Validate(support, headIDs, thresholds, heads.GetFeatureDim(), heads.GetVectorValueType());
     result.BuildOwners();
+    validationProgress.Finish();
     return result;
 }
 }}

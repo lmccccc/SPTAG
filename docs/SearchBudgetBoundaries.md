@@ -1,5 +1,25 @@
 # BKT query budget boundaries
 
+## Offline construction exception
+
+`SearchIndexForConstruction` is a separate BKT entrypoint for offline H-posting
+placement. It enforces the native index's MaxCheck on fresh graph/tree
+navigation admissions, including internal tree centers promoted to navigation.
+At the cap it drains already-scored candidates without more edges or tree
+refills. This is not a cap on internal routing distance calls, collapsed-alias
+checks, RNG distances, or explicit support-set exact scans.
+It uses a separate workspace cache; budget changes or grown visited/result
+tables cause replacement before reuse. Online queries and graph refinement
+never enable this policy.
+
+Both ordinary H construction and layered reconstruction cap candidate capacity
+by the label's actual supported-parent count. Small support sets that fit the
+candidate request are scored directly. Other labels use bounded ANN, with the
+existing exact-support fallback only on an empty result. RNG/no-replica-fill
+rules remain unchanged. Build progress reports checked and exact work separately.
+
+## Online query semantics
+
 The project engine is not an unmodified Microsoft/SPTAG binary. Both filtered
 and unfiltered H1 search restore the stopping boundaries in upstream commit
 `2ac3ebcab562bc81cdb8c7c98b35ea72f2703c3b`: the distance pool remains

@@ -1034,6 +1034,8 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                 navigationResults.AddPoint(resultNode, gnode.distance);
             }
         }
+        // Admit already-scored candidates, but do not expand/refill after the offline cap.
+        if (p_space.ConstructionBudgetExhausted()) continue;
         if (!navigationAdmits && notDeleted(
                      currentIndex->m_deletedID,
                      currentLocal) &&
@@ -1055,6 +1057,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
             for (DimensionType edge = p_begin;
                  edge < p_end; ++edge)
             {
+                if (p_space.ConstructionBudgetExhausted()) return false;
                 const bool isCross =
                     EnableCrossEdges && p_crossEncoded;
                 if constexpr (EnableCrossEdges)
@@ -1655,6 +1658,44 @@ ErrorCode Index<T>::SearchIndexWithResultFilter(
                        : m_pMetadata->GetMetadataCopy(result));
         }
     }
+    return ErrorCode::Success;
+}
+
+template <typename T>
+ErrorCode Index<T>::SearchIndexForConstruction(
+    QueryResult& query, std::function<bool(SizeType)> predicate, int maxCheck) const
+{
+    if (!m_bReady) return ErrorCode::EmptyIndex;
+    if (maxCheck < 0 || query.GetResultNum() <= 0 || query.GetTarget() == nullptr) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid bounded construction query.\n");
+        return ErrorCode::FailedParseValue;
+    }
+    if (maxCheck == 0) maxCheck = m_iMaxCheck;
+    if (maxCheck <= 0 || maxCheck > (std::numeric_limits<int>::max)() / 30) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid bounded construction MaxCheck=%d.\n", maxCheck);
+        return ErrorCode::FailedParseValue;
+    }
+    // Do not inherit online/refinement hash tables or their retained queue capacities.
+    static thread_local std::unique_ptr<COMMON::WorkSpace> cached;
+    auto space = std::move(cached);
+    if (!space || space->m_iMaxCheck != maxCheck ||
+        space->HashTableExponent() != m_iHashTableExp ||
+        (space->m_resultCheckInitialized &&
+         space->resultCheckStatus.HashTableExponent() != m_iHashTableExp)) {
+        space.reset(new COMMON::WorkSpace());
+        space->Initialize((std::max)(16, maxCheck), m_iHashTableExp);
+    }
+    space->Reset(maxCheck, query.GetResultNum());
+    space->m_bConstructionSearch = true;
+    SearchIndex(*static_cast<COMMON::QueryResultSet<T>*>(&query), *space,
+                false, true, nullptr, predicate);
+    space->m_bConstructionSearch = false;
+    cached = std::move(space);
+    if (query.WithMeta() && m_pMetadata)
+        for (int i = 0; i < query.GetResultNum(); ++i) {
+            const auto id = query.GetResult(i)->VID;
+            query.SetMetadata(i, id < 0 ? ByteArray::c_empty : m_pMetadata->GetMetadataCopy(id));
+        }
     return ErrorCode::Success;
 }
 
