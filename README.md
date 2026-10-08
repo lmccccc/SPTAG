@@ -1,6 +1,6 @@
 # LION
 
-**Label-limited Inverted Organization for Neighbor search**
+**Label-aware Inverted Organization for Neighbor search**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [Getting started](docs/GettingStart.md) |
@@ -9,7 +9,7 @@
 
 LION is a key-attribute-aware architecture for **disk-resident filtered
 approximate nearest neighbor search**. It combines spatially organized,
-label-limited postings on SSD with an in-memory head hierarchy and
+label-aware postings on SSD with an in-memory posting hierarchy and
 matching-rate-driven **Adaptive Expansion**. General postings retain an access
 path for unfiltered queries and predicates outside the designated key attribute.
 
@@ -20,42 +20,48 @@ exactly before a record can become a result**.
 
 ## Architecture
 
-[![LION architecture: BKT head sampling, label-limited and general SSD postings, an adjacent in-memory head hierarchy, and matching-rate-triggered query expansion.](docs/img/lion-architecture.png)](docs/img/lion-architecture.png)
+[![LION architecture: label-aware clustering, label-aware and general SSD postings, an adjacent in-memory posting hierarchy, and matching-rate-triggered query expansion.](docs/img/lion-architecture.png)](docs/img/lion-architecture.png)
 
-*Construction and query execution, rendered from the LION manuscript's
-architecture figure. Click the image for the full-resolution diagram.*
+*Label-aware clustering, the posting hierarchy, and query execution, adapted
+from the LION manuscript's architecture figure. Click the image for the
+full-resolution diagram.*
 
 | Mechanism | Role |
 | --- | --- |
-| **Label-limited postings** | Restrict each posting to a small selected set of key labels while retaining vector-local placement, reducing label mixing within an SSD read. |
-| **Locally admitted head hierarchy** | Organize additional routes to label-supporting heads where estimated local candidate capacity is insufficient. |
+| **Label-aware clustering** | Group nearby records into postings for selected key labels, retaining spatial locality while reducing label mixing within an SSD read. |
+| **Posting hierarchy** | Organize additional routes to label-supporting heads where estimated local candidate capacity is insufficient. |
 | **Adaptive Expansion** | Monitor matching yield during native head search and, when triggered, explore the hierarchy through one shared, budgeted frontier. |
 
-### Label-limited and general postings
+### Label-aware clustering
+
+Label-aware clustering combines spatial head selection, posting-label selection
+and label-compatible record assignment to construct label-aware postings.
+General postings retain a label-independent access path.
 
 Both layouts share the same H1 head identities, vectors, BKT and navigation
-graph. For each head, its label-limited **H region** and general **O region**
+graph. For each head, its label-aware **H region** and general **O region**
 occupy separately addressable parts of the SSD posting container. These H/O
 regions are distinct from the hierarchy levels H1 through H5.
 
 Head labels come from the head's own key label and nearby records retained by
 general posting placement. Support expansion can add labels with too few
-supporting heads; the base label limit is not a hard limit after expansion.
-Records enter only compatible label-limited postings, with native
+supporting heads, beyond the initial per-head selection.
+Records enter only compatible label-aware postings, with native
 relative-neighborhood (RNG) pruning and a replica upper bound.
 
 The general region keeps vector-oriented placement without the key-label
 constraint. Keeping both layouts costs additional payload storage, but does not
 require another base navigation graph or an ANN graph for every label.
 
-### Head hierarchy and local admission
+### Posting hierarchy and local admission
 
 H2 through H5 are **in-memory posting catalogs, not additional online ANN
 graphs**. H2 rows contain H1 IDs; every higher layer references only the
 immediately lower layer. Per-label rows and reverse-owner links support shared
 upward and downward exploration. Representatives refer to original H1 vectors.
 
-Construction decides whether a child-label pair continues upward using:
+During label-aware clustering, local admission decides whether a child-label
+pair continues upward using:
 
 ```text
 estimated supporting heads = local H1-support fraction * effective window
@@ -70,11 +76,12 @@ capacity estimate, not global label frequency or a query-time recall guarantee.
 
 The native upper-only builder reconstructs these catalogs into a new directory
 while preserving the source H1 and SSD payload. Temporary assignment graphs are
-used during construction and are not persisted as query navigation structures.
+used during label-aware clustering and are not persisted as query navigation
+structures.
 
 ### Query processing
 
-1. **Select the posting layout.** Use label-limited postings when every OR branch
+1. **Select the posting layout.** Use label-aware postings when every OR branch
    requires equality on the designated categorical key; otherwise use general
    postings. Other categorical and numeric conditions remain part of the exact
    predicate.
@@ -139,7 +146,7 @@ python3 Tools/benchmarks/validate_spann_hierarchy_config.py /absolute/path/to/da
 bash Tools/benchmarks/run_spann_attr_build.sh /absolute/path/to/dataset.ini
 ```
 
-To derive the locally admitted hierarchy from a canonical five-level source,
+To derive the locally admitted posting hierarchy from a canonical five-level source,
 use [`docs/LocalLabelHierarchy.ini`](docs/LocalLabelHierarchy.ini) and the
 [upper-only reconstruction instructions](docs/GettingStart.md#rebuild-only-local-label-postings).
 Use a fresh destination and preserve the source index: derived snapshots refer
@@ -156,7 +163,7 @@ workload; historical measurements do not establish performance for a new index.
 | --- | --- |
 | [Getting started](docs/GettingStart.md) | Native inputs, attribute/groundtruth preparation, building, reconstruction and search settings. |
 | [Native INI template](docs/AdaptiveSpann.ini) | Dataset-independent construction and query configuration. |
-| [Local hierarchy recipe](docs/LocalLabelHierarchy.ini) | Upper-only reconstruction without rebuilding H1/SSD. |
+| [Posting hierarchy recipe](docs/LocalLabelHierarchy.ini) | Upper-only reconstruction without rebuilding H1/SSD. |
 | [Benchmark guide](Tools/benchmarks/README.md) | Native benchmark clients, predicate inputs and experiment provenance. |
 | [Search-budget boundaries](docs/SearchBudgetBoundaries.md) | Online stopping, supplementary work and bounded construction semantics. |
 
