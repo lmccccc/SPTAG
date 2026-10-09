@@ -107,7 +107,8 @@ struct Config {
     std::string index,queries,predicateFile,predicate,mode,valueType;
     bool phaseTiming=false;
     int count,warmup,topk,maxCheck,anchorCount,additionalMaxCheck,postingPageLimit,navigationWidth;
-    int matchRatePercent,matchWindow;
+    double matchRatePercent;
+    int matchWindow;
     std::vector<int> probes;
     explicit Config(const char* path) {
         Require(ini.LoadIniFile(path)==ErrorCode::Success,"Cannot read native INI");
@@ -207,7 +208,8 @@ struct Config {
         for(const auto& p:ini.GetParameters("SearchSSDIndex"))
             manager.SetSearchParam(p.first.c_str(),p.second.c_str(),"SearchSSDIndex");
         manager.SetSearchParam("PostingNavigationWidth",std::to_string(navigationWidth).c_str(),"SearchSSDIndex");
-        manager.SetSearchParam("PostingMatchRatePercent",std::to_string(matchRatePercent).c_str(),"SearchSSDIndex");
+        manager.SetSearchParam("PostingMatchRatePercent",
+            ini.GetParameter<std::string>("SearchSSDIndex","PostingMatchRatePercent","0").c_str(),"SearchSSDIndex");
         manager.SetSearchParam("PostingMatchWindow",std::to_string(matchWindow).c_str(),"SearchSSDIndex");
     }
 };
@@ -367,7 +369,8 @@ template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_
                     "local-match-union-v2" : "upstream-adaptive-v1")<<"\""
                  <<",\"posting_budget_policy\":\"unused-plus-preserved-extra-v2\""
                  <<",\"posting_navigation_width\":"<<cfg.navigationWidth
-                 <<",\"posting_match_rate_percent\":"<<cfg.matchRatePercent
+                 <<",\"posting_match_rate_percent\":"<<std::setprecision(std::numeric_limits<double>::max_digits10)
+                 <<cfg.matchRatePercent<<std::setprecision(12)
                  <<",\"posting_match_window\":"<<cfg.matchWindow
                  <<",\"dispatch_schema_version\":2,\"dispatch_columns\":6"
                  <<",\"diagnostic\":"<<(diagnostic?"true":"false")
@@ -478,7 +481,8 @@ std::vector<std::unique_ptr<BatchCase>> ReadBatch(const char* path,Helper::IniRe
         }
         Require(validated->SetParameter("PostingNavigationWidth",std::to_string(cfg.navigationWidth).c_str(),
             "SearchSSDIndex")==ErrorCode::Success, "Invalid batch posting navigation width");
-        Require(validated->SetParameter("PostingMatchRatePercent",std::to_string(cfg.matchRatePercent).c_str(),
+        Require(validated->SetParameter("PostingMatchRatePercent",
+            cfg.ini.GetParameter<std::string>("SearchSSDIndex","PostingMatchRatePercent","0").c_str(),
             "SearchSSDIndex")==ErrorCode::Success &&
             validated->SetParameter("PostingMatchWindow",std::to_string(cfg.matchWindow).c_str(),
             "SearchSSDIndex")==ErrorCode::Success, "Invalid batch posting match-rate policy");

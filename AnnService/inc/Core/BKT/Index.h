@@ -235,7 +235,7 @@ namespace SPTAG
                 COMMON::PostingNavigation* postingNavigation = nullptr,
                 int maxCheck = 0, bool searchDeleted = false,
                 int anchorCount = 0, int additionalMaxCheck = 0,
-                int matchRatePercent = 0, int matchWindow = 1024,
+                double matchRatePercent = 0, int matchWindow = 1024,
                 bool allowEarlyHandoff = true) const;
 
             ErrorCode SearchIndexWithResultFilter(

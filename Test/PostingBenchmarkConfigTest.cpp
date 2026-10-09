@@ -36,6 +36,8 @@ int main()
         config("on.ini", "8", false);
         config("off.ini", nullptr, false);
         config("rate.ini", "8", false, "0", "2048", "100", "192", nullptr, "15", "1024");
+        config("fractional-rate.ini", "8", false, "0", "4096", "100", "192", nullptr, "12.5", "1024");
+        config("nan-rate.ini", "8", false, "0", "4096", "100", "192", nullptr, "nan", "1024");
         config("bad-rate.ini", "8", false, "0", "2048", "100", "192", nullptr, "101", "1024");
         config("bad-window.ini", "8", false, "0", "2048", "100", "192", nullptr, "15", "0");
         config("invalid.ini", "-1", false);
@@ -71,10 +73,11 @@ int main()
             cases[1]->cfg.navigationWidth==0 && cases[2]->cfg.navigationWidth==8,
             "Optional native cutoff or per-case default changed");
         const auto anchors = batch({"nprobe.ini","on.ini","nprobe.ini"});
-        const auto rates = batch({"rate.ini","off.ini","rate.ini"});
+        const auto rates = batch({"rate.ini","fractional-rate.ini","off.ini","rate.ini"});
         Require(rates[0]->cfg.matchRatePercent==15 && rates[0]->cfg.matchWindow==1024 &&
-                rates[1]->cfg.matchRatePercent==0 && rates[1]->cfg.matchWindow==1024 &&
-                rates[2]->cfg.matchRatePercent==15, "Batch match-rate defaults leaked across cases");
+                rates[1]->cfg.matchRatePercent==12.5 && rates[1]->cfg.maxCheck==4096 &&
+                rates[2]->cfg.matchRatePercent==0 && rates[2]->cfg.matchWindow==1024 &&
+                rates[3]->cfg.matchRatePercent==15, "Batch match-rate defaults leaked across cases");
         Require(anchors.size()==3 && anchors[0]->cfg.anchorCount==0 &&
             anchors[1]->cfg.anchorCount==8 && anchors[2]->cfg.anchorCount==0,
             "Native automatic/fixed/automatic anchor mode changed");
@@ -108,8 +111,11 @@ int main()
             wrapped.SetSearchParam("PostingAnchorCount","-1",section);
             Require(wrapped.GetInternalIndex()->GetParameter("PostingAnchorCount",section)=="0",
                 "Wrapper accepted invalid anchors");
+            wrapped.SetSearchParam("PostingMatchRatePercent","12.5",section);
+            Require(wrapped.GetInternalIndex()->GetParameter("PostingMatchRatePercent",section)=="12.5",
+                "Wrapper truncated fractional match-rate threshold");
         }
-        for (const auto& name : {"invalid.ini", "missing.ini", "invalid-anchors.ini", "bad-rate.ini", "bad-window.ini",
+        for (const auto& name : {"invalid.ini", "missing.ini", "invalid-anchors.ini", "bad-rate.ini", "nan-rate.ini", "bad-window.ini",
                                 "zero-budget.ini", "negative-budget.ini", "malformed-budget.ini", "overflow-budget.ini",
                                 "short-probe.ini", "short-sweep.ini", "invalid-topk0.ini", "invalid-topk-1.ini",
                                 "invalid-topk100x.ini", "invalid-topk2147483648.ini"}) {

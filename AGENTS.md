@@ -101,7 +101,7 @@ python setup.py build_ext --inplace
 ### Explicit online match-rate policy (2026-10-06)
 
 The `local-match-union-v2` correction to the user-authorized online policy is opt-in through native
-`SearchSSDIndex.PostingMatchRatePercent` (integer 1..100; zero retains the
+`SearchSSDIndex.PostingMatchRatePercent` (finite percentage in (0,100], including 12.5; zero retains the
 legacy/default policy below) and `PostingMatchWindow` (positive, default 1024).
 It supersedes completion-first/protected-head rules only when opted in.
 Count each fresh scored H1 navigation candidate once, including tree candidates,

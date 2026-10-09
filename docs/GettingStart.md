@@ -316,7 +316,7 @@ PostingMatchWindow=1024
 | `PostingAnchorCount` | 0 | 0 | Zero uses the current head-result capacity. A positive value limits nearest already-scored H1 anchors, including predicate negatives. |
 | `PostingAdditionalMaxCheck` | 0 | 2048 | Nonnegative extra checked-leaf allowance for supplementation only; does not enlarge the graph phase. |
 | `PostingNavigationWidth` | 0 | 8 | Per-tier upper-navigation representative-distance beam; zero disables this extra pruning. It is not a terminal-H2 row-count limit. |
-| `PostingMatchRatePercent` | 0 | 15 | Integer 1..100 enables the observed H1-support match-rate trigger. Zero preserves the legacy policy; it does not mean a 0% active trigger. |
+| `PostingMatchRatePercent` | 0 | 15 | A finite percentage in (0,100], including 12.5, enables the observed H1-support match-rate trigger. Zero preserves the legacy policy; it does not mean a 0% active trigger. |
 | `PostingMatchWindow` | 1024 | 1024 | Positive count of fresh scored H1 candidates per nonoverlapping observation window. Incomplete windows never trigger. |
 | `SearchPostingPageLimit` | 3 | 3 | Physical-page cap on each selected H/O posting region. Zero means uncapped, not "no reads". |
 | `MaxDistRatio` | 10000 | 8 | Native distance-ratio cutoff for selected posting candidates; not a filter-selectivity controller. |

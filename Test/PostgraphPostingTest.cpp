@@ -190,7 +190,7 @@ template<class T> void CheckMatchRate() {
                 COMMON::ScopedGraphAccessStats scope(&stats);
                 CHECK(index->SearchIndexWithPostingNavigation(result,[&](int id) {
                     ++predicates[id]; return selected(id);
-                },&rows,budget,false,8,8,100,2)==ErrorCode::Success);
+                },&rows,budget,false,8,8,50.5,2)==ErrorCode::Success);
             }
             CHECK(rows.calls==1 && rows.result.targetFilled==(capacity==1));
             CHECK(result.GetResult(0)->VID==230 && result.GetResult(0)->Dist==0);
@@ -234,7 +234,7 @@ template<class T> void CheckMatchRate() {
     }
     index->GetMutableGraph()[201][0]=-1;
     index->GetMutableGraph()[220][0]=-1;
-    for (int percent : {0,1,50,100}) {
+    for (double percent : {0.0,0.5,1.0,12.5,50.0,100.0}) {
         for (int window : {2,4096}) {
             Rows rows;
             COMMON::QueryResultSet<T> ordinary(data.data(),2), actual(data.data(),2);
@@ -257,7 +257,10 @@ template<class T> void CheckMatchRate() {
     CHECK(index->SearchIndexWithPostingNavigation(remaining,selected,&deleted,
         4096,false,8,8,100,2)==ErrorCode::Success);
     CHECK(deleted.calls==1 && remaining.GetResult(0)->VID==200);
-    for (auto invalid : std::vector<std::pair<int,int>>{{-1,2},{101,2},{1,0},{1,-1}})
+    for (auto invalid : std::vector<std::pair<double,int>>{
+            {-1,2},{100.01,2},{101,2},{1,0},{1,-1},
+            {std::numeric_limits<double>::infinity(),2},
+            {std::numeric_limits<double>::quiet_NaN(),2}})
         CHECK(index->SearchIndexWithPostingNavigation(none,selected,&deleted,4096,false,8,8,
             invalid.first,invalid.second)==ErrorCode::FailedParseValue);
     std::filesystem::remove_all(folder);
@@ -279,6 +282,24 @@ void CheckRateWindows() {
     COMMON::PostingMatchRate disabled(0,1);
     disabled.Observe(false);
     CHECK(!disabled.Triggered() && disabled.Samples()==0);
+    for (int matches : {127,128,129}) {
+        COMMON::PostingMatchRate fractional(12.5,1024);
+        for (int i=0;i<1023;++i) fractional.Observe(i<matches);
+        CHECK(!fractional.Triggered() && fractional.Windows()==0);
+        fractional.Observe(false);
+        CHECK(fractional.Triggered()==(matches<128) && fractional.Windows()==1);
+        CHECK(fractional.Matches()==static_cast<std::uint64_t>(matches));
+        if (!fractional.Triggered()) {
+            for (int i=0;i<1024;++i) fractional.Observe(false);
+            CHECK(fractional.Triggered() && fractional.Windows()==2);
+        }
+    }
+    for (int percent=0;percent<=100;++percent)
+        for (int matches=0;matches<=128;++matches) {
+            COMMON::PostingMatchRate integerCompatible(percent,128);
+            for (int i=0;i<128;++i) integerCompatible.Observe(i<matches);
+            CHECK(integerCompatible.Triggered()==(percent>0 && matches*100<128*percent));
+        }
 }
 template<class T> void CheckNProbeAnchors() {
     BKT::Index<T> index;
@@ -364,11 +385,24 @@ int main() {
             CHECK(configured->SetParameter("PostingNavigationWidth","0",section)==ErrorCode::Success);
             for (const char* key : {"PostingMatchRatePercent","PostingMatchWindow"}) {
                 CHECK(configured->SetParameter(key,"25",section)==ErrorCode::Success);
-                for (const char* invalid : {"-1","2147483648","0.5"," 1","1 ","+1","","bad"})
+                for (const char* invalid : {"-1","2147483648"," 1","1 ","+1","","bad"})
                     CHECK(configured->SetParameter(key,invalid,section)==ErrorCode::FailedParseValue);
                 CHECK(configured->GetParameter(key,section)=="25");
             }
             CHECK(configured->SetParameter("PostingMatchRatePercent","101",section)==ErrorCode::FailedParseValue);
+            CHECK(configured->SetParameter("PostingMatchRatePercent","12.5",section)==ErrorCode::Success);
+            CHECK(configured->GetParameter("PostingMatchRatePercent",section)=="12.5");
+            for (const char* invalid : {"nan","inf","1e309","12.5x","12.5.0","100.01","0x1p0"}) {
+                CHECK(configured->SetParameter("PostingMatchRatePercent",invalid,section)==ErrorCode::FailedParseValue);
+                CHECK(configured->GetParameter("PostingMatchRatePercent",section)=="12.5");
+            }
+            for (const char* fractional : {"0.5","0.0000001","12.500000000001"}) {
+                CHECK(configured->SetParameter("PostingMatchRatePercent",fractional,section)==ErrorCode::Success);
+                const auto serialized=configured->GetParameter("PostingMatchRatePercent",section);
+                CHECK(std::stod(serialized)==std::stod(fractional));
+                CHECK(configured->SetParameter("PostingMatchRatePercent",serialized.c_str(),section)==ErrorCode::Success);
+            }
+            CHECK(configured->SetParameter("PostingMatchWindow","0.5",section)==ErrorCode::FailedParseValue);
             CHECK(configured->SetParameter("PostingMatchWindow","0",section)==ErrorCode::FailedParseValue);
             CHECK(configured->SetParameter("PostingMatchRatePercent","0",section)==ErrorCode::Success);
         }

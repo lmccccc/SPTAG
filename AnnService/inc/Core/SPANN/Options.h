@@ -14,6 +14,7 @@
 #include <cmath>
 #include <sstream>
 #include <limits>
+#include <iomanip>
 
 namespace SPTAG {
     namespace SPANN {
@@ -109,7 +110,7 @@ namespace SPTAG {
             bool m_enablePostingNavigation;
             int m_postingAnchorCount;
             int m_postingAdditionalMaxCheck;
-            int m_postingMatchRatePercent;
+            double m_postingMatchRatePercent;
             int m_postingMatchWindow;
             int m_postingNavigationWidth;
             bool m_enableSSD;
@@ -542,11 +543,19 @@ namespace SPTAG {
                     const bool navigationWidth = Helper::StrUtils::StrEqualIgnoreCase(p_param, "PostingNavigationWidth");
                     const bool matchRate = Helper::StrUtils::StrEqualIgnoreCase(p_param, "PostingMatchRatePercent");
                     const bool matchWindow = Helper::StrUtils::StrEqualIgnoreCase(p_param, "PostingMatchWindow");
-                    if (anchor || additional || maxCheck || navigationWidth || matchRate || matchWindow) {
+                    if (matchRate) {
+                        const std::string value(p_value);
+                        double parsed = 0;
+                        if (value.empty() || value.front() < '0' || value.front() > '9' ||
+                            value.find_first_not_of("0123456789.eE+-") != std::string::npos ||
+                            !Helper::Convert::ConvertStringTo<double>(p_value, parsed) ||
+                            !std::isfinite(parsed) || parsed < 0 || parsed > 100)
+                            return invalid();
+                    }
+                    if (anchor || additional || maxCheck || navigationWidth || matchWindow) {
                         int parsed = 0;
                         if (!ParsePostingInteger(p_value, maxCheck || matchWindow ? 1 : 0, parsed))
                             return invalid();
-                        if (matchRate && parsed > 100) return invalid();
                         if (navigationWidth && parsed == (std::numeric_limits<int>::max)()) return invalid();
                         const int base = maxCheck ? parsed : m_maxCheck;
                         const int extra = additional ? parsed : m_postingAdditionalMaxCheck;
@@ -695,6 +704,12 @@ namespace SPTAG {
                     ;
                 }
                 else if (Helper::StrUtils::StrEqualIgnoreCase(p_section, "BuildSSDIndex")) {
+                    if (Helper::StrUtils::StrEqualIgnoreCase(p_param, "PostingMatchRatePercent")) {
+                        std::ostringstream value;
+                        value << std::setprecision(std::numeric_limits<double>::max_digits10)
+                              << m_postingMatchRatePercent;
+                        return value.str();
+                    }
 #define DefineSSDParameter(VarName, VarType, DefaultValue, RepresentStr) \
         if (Helper::StrUtils::StrEqualIgnoreCase(p_param, RepresentStr)) \
         { \

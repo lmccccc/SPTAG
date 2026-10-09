@@ -1703,11 +1703,11 @@ template <typename T>
 ErrorCode Index<T>::SearchIndexWithPostingNavigation(QueryResult& query,
     const std::function<bool(SizeType)>& predicate,
     COMMON::PostingNavigation* postingNavigation, int maxCheck, bool searchDeleted,
-    int anchorCount, int additionalMaxCheck, int matchRatePercent, int matchWindow,
+    int anchorCount, int additionalMaxCheck, double matchRatePercent, int matchWindow,
     bool allowEarlyHandoff) const
 {
     const int anchorLimit = anchorCount == 0 ? query.GetResultNum() : anchorCount;
-    if (anchorLimit <= 0 || additionalMaxCheck < 0 || matchRatePercent < 0 ||
+    if (anchorLimit <= 0 || additionalMaxCheck < 0 || !std::isfinite(matchRatePercent) || matchRatePercent < 0 ||
         matchRatePercent > 100 || matchWindow <= 0 ||
         (maxCheck > 0 ? maxCheck : m_iMaxCheck) > (std::numeric_limits<int>::max)() - additionalMaxCheck) {
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid posting anchor count, budget or match-rate policy.\n");

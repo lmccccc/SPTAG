@@ -78,12 +78,15 @@ ordinary graph's negative bridge semantics or the zero-extra exhausted-budget
 entry rule. V9/176-byte records, precision, schemas and canonical catalogs are
 unchanged. Query-sized workspace initialization is intentionally retained.
 
-The opt-in `local-match-union-v2` policy sets `PostingMatchRatePercent` to an
-integer 1..100 and uses positive `PostingMatchWindow` (default1024).
+The opt-in `local-match-union-v2` policy sets `PostingMatchRatePercent` to a
+finite percentage in (0,100], including fractional values such as 12.5, and
+uses positive `PostingMatchWindow` (default1024).
 Count fresh scored H1 candidates, including tree candidates, using their cached
 support/may-match result. A complete nonoverlapping window latches when
 `matches * 100 < window * percent`. Equality and incomplete windows do not
 trigger. This is neither original-record selectivity nor result-heap fill.
+At 12.5% with a 1024-candidate window, 127 matches trigger and 128 do not.
+The query threshold is explicit; it is not inferred from construction metadata.
 
 A sparse posting phase may replace H1 early only if every requested
 categorical label exists in its domain. Partial-domain OR queries defer a

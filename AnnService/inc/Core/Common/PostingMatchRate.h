@@ -10,7 +10,7 @@ namespace SPTAG { namespace COMMON {
 class PostingMatchRate
 {
 public:
-    PostingMatchRate(int percent, int window) : m_percent(percent), m_window(window) {}
+    PostingMatchRate(double percent, int window) : m_percent(percent), m_window(window) {}
     bool Enabled() const { return m_percent > 0; }
     bool Triggered() const { return m_triggered; }
     std::uint64_t Samples() const { return m_samples; }
@@ -31,7 +31,8 @@ public:
     }
 
 private:
-    int m_percent, m_window;
+    double m_percent;
+    int m_window;
     int m_count = 0;
     std::uint64_t m_samples = 0, m_matches = 0, m_lastMatches = 0, m_windows = 0;
     bool m_triggered = false;
