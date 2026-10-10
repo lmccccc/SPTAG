@@ -95,10 +95,13 @@ namespace SPTAG {
             std::string m_hierarchyLabelSelectivity;
             int m_hierarchyLocalTarget;
             int m_hierarchyLocalWindow;
+            int m_hierarchyTargetPostingSize;
+            int m_hierarchySizingSampleHeads;
 
             bool HasSparseHierarchy() const
             {
-                return !m_hierarchyLabelSelectivity.empty() || m_hierarchyLocalTarget || m_hierarchyLocalWindow;
+                return !m_hierarchyLabelSelectivity.empty() || m_hierarchyLocalTarget || m_hierarchyLocalWindow ||
+                    m_hierarchyTargetPostingSize || m_hierarchySizingSampleHeads;
             }
 
             // Section 3: for build head
@@ -536,6 +539,12 @@ namespace SPTAG {
                         "Unknown or invalid native parameter [%s] %s=%s.\n", p_section, p_param, p_value);
                     return ErrorCode::FailedParseValue;
                 };
+                if (Helper::StrUtils::StrEqualIgnoreCase(p_param, "HierarchyTargetPostingSize") ||
+                    Helper::StrUtils::StrEqualIgnoreCase(p_param, "HierarchySizingSampleHeads")) {
+                    int value = -1;
+                    if (!Helper::StrUtils::StrEqualIgnoreCase(p_section, "SelectHead") ||
+                        !Helper::Convert::ConvertStringTo(p_value, value) || value < 0) return invalid();
+                }
                 if (Helper::StrUtils::StrEqualIgnoreCase(p_section, "BuildSSDIndex")) {
                     const bool anchor = Helper::StrUtils::StrEqualIgnoreCase(p_param, "PostingAnchorCount");
                     const bool additional = Helper::StrUtils::StrEqualIgnoreCase(p_param, "PostingAdditionalMaxCheck");

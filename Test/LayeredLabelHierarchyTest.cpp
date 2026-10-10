@@ -154,6 +154,82 @@ static void SelectionTests()
     CHECK(!Hierarchy::Admitted(support, 1, equal, 5));
     std::cout << "PASS repeated candidate labels, anchor-first support, strict original selectivity and unchanged H RNG/no-fill\n";
 }
+static void SizingTests()
+{
+    using Sizing = SPANN::SampledHierarchySizing;
+    SPANN::Options options;
+    Sizing::ValidateOptions(options);
+    CHECK(options.SetParameter("SelectHead", "HierarchyTargetPostingSize", "128") == ErrorCode::Success);
+    Reject([&] { Sizing::ValidateOptions(options); });
+    CHECK(options.SetParameter("SelectHead", "HierarchySizingSampleHeads", "64") == ErrorCode::Success);
+    Reject([&] { Sizing::ValidateOptions(options); });
+    options.m_hierarchyLocalTarget = 512; options.m_hierarchyLocalWindow = 4096;
+    Sizing::ValidateOptions(options);
+    CHECK(options.SetParameter("SearchSSDIndex", "HierarchyTargetPostingSize", "1") != ErrorCode::Success);
+    CHECK(options.SetParameter("SelectHead", "HierarchySizingSampleHeads", "-1") != ErrorCode::Success);
+    Sizing::Trial trial;
+    trial.heads = 100; trial.pairs = 150; trial.parents = 10; trial.rows = 20;
+    trial.references = 300; trial.sampleHash = 1; trial.estimatedReferences = 3000;
+    CHECK(Sizing::Plan(1000, 1000, 100, trial) == 15);
+    trial.rows = 30;
+    CHECK(Sizing::Plan(1000, 1000, 100, trial) == 10);
+    trial.estimatedReferences = 6000;
+    CHECK(Sizing::Plan(1000, 1000, 100, trial) == 20);
+    CHECK(Sizing::Plan(1000, 7, 100, trial) == 7);
+    CHECK(Sizing::Plan(1000, 1000, 100000, trial) == 1);
+    Reject([&] { Sizing::Plan(1000, 1000, 0, trial); });
+    Reject([&] { Sizing::Plan(1000, 0, 100, trial); });
+    trial.estimatedReferences = std::numeric_limits<double>::infinity();
+    Reject([&] { Sizing::Plan(1000, 1000, 100, trial); });
+    for (int population : {1,2,17,257,1000000}) for (int budget : {1,2,16,128}) {
+        const auto ids = Sizing::Sample(population, budget, 2);
+        CHECK(ids.size() == static_cast<std::size_t>(std::min(population, budget)));
+        CHECK(std::is_sorted(ids.begin(), ids.end()) &&
+            std::adjacent_find(ids.begin(), ids.end()) == ids.end());
+        CHECK(ids.front() >= 0 && ids.back() < population && ids == Sizing::Sample(population, budget, 2));
+    }
+    CHECK(Sizing::Sample(10000, 128, 2) != Sizing::Sample(10000, 128, 3));
+    {
+        constexpr int population = 120040156, budget = 262144, rare = 87;
+        const std::vector<std::uint32_t> common{1}, rareTags{1,200};
+        const auto labels = [&](SizeType id) -> const std::vector<std::uint32_t>& {
+            return id < rare ? rareTags : common;
+        };
+        const auto uniform = Sizing::Sample(population, budget, 2);
+        CHECK(std::count_if(uniform.begin(), uniform.end(), [&](int id) { return id < rare; }) < 16);
+        const auto covered = Sizing::SampleCovered(population, budget, 2,
+            {{1,population},{200,rare}}, labels);
+        CHECK(covered.size() == budget && std::is_sorted(covered.begin(), covered.end()) &&
+            std::adjacent_find(covered.begin(), covered.end()) == covered.end());
+        CHECK(std::count_if(covered.begin(), covered.end(), [&](int id) { return id < rare; }) >= 16);
+        CHECK(covered.back() < population);
+    }
+    {
+        const std::vector<std::vector<std::uint32_t>> labels{{1,2},{1,3},{1},{1},{1},{1}};
+        const auto at = [&](SizeType id) -> const std::vector<std::uint32_t>& { return labels.at(id); };
+        CHECK(Sizing::SampleCovered(6, 6, 2, {{1,6},{2,1},{3,1}}, at) == Sizing::Sample(6,6,2));
+        Reject([&] { Sizing::SampleCovered(6, 1, 2, {{1,6},{2,1},{3,1}}, at); });
+    }
+    Reject([&] { Sizing::Sample(0, 10, 2); });
+    Reject([&] { Sizing::Sample(10, 0, 2); });
+    Sizing sizing;
+    sizing.target = 100; sizing.sampleHeads = 100;
+    auto& tier = sizing.tiers[0];
+    tier.children = 1000; tier.pairs = 1500; tier.parents = 15;
+    tier.rows = 30; tier.references = 3000; tier.trials = 1;
+    trial.rows = 20; trial.estimatedReferences = 3000;
+    tier.pilot[0] = trial;
+    sizing.Validate({100,100,100,100}, 4);
+    sizing.version = 1;
+    sizing.Validate({100,100,100,100}, 4);
+    sizing.version = 2;
+    ++tier.parents;
+    Reject([&] { sizing.Validate({100,100,100,100}, 4); });
+    --tier.parents;
+    tier.pilot[1] = trial;
+    Reject([&] { sizing.Validate({100,100,100,100}, 4); });
+    std::cout << "PASS sampled count formula, label-row denominator, caps, validation and bounded unique sampling\n";
+}
 static void CensusTests()
 {
     const auto support = Support();
@@ -236,15 +312,21 @@ static void PersistenceTests(const std::filesystem::path& directory)
     hierarchy.VisitUpperParents(0, [&](int id) { owners.push_back(id); });
     CHECK(owners == std::vector<int>{2});
     CHECK(hierarchy.FindLabel(0, 2) && !hierarchy.FindLabel(0, 3));
-    std::vector<std::uint32_t> scratch;
+    std::vector<std::uint32_t> scratch{999};
     auto row = hierarchy.SelectMembers(0, {2}, scratch);
     CHECK((std::vector<std::uint32_t>(row.first, row.second) == std::vector<std::uint32_t>{0,2,6}));
+    CHECK(scratch.empty() && row.first == hierarchy.Begin(*hierarchy.FindLabel(0, 2)) &&
+          row.second == hierarchy.End(*hierarchy.FindLabel(0, 2)));
+    const auto singleton = row;
     row = hierarchy.SelectMembers(0, {1,2,2}, scratch);
     CHECK((std::vector<std::uint32_t>(row.first, row.second) == std::vector<std::uint32_t>{0,1,2,5,6}));
     row = hierarchy.SelectMembers(2, {1,2}, scratch);
     CHECK(row.second - row.first == 1 && *row.first == 0);
     row = hierarchy.SelectMembers(0, {999}, scratch);
+    CHECK(row.first == row.second && scratch.empty());
+    row = hierarchy.SelectMembers(0, {}, scratch);
     CHECK(row.first == row.second);
+    CHECK((std::vector<std::uint32_t>(singleton.first, singleton.second) == std::vector<std::uint32_t>{0,2,6}));
     const auto path = directory / "layered.bin";
     hierarchy.Save(path.string());
     Reject([&] { hierarchy.Save(path.string()); });
@@ -511,6 +593,44 @@ template<class T> static void ConstructionTests(const std::filesystem::path& dir
     }
     Reject([&] { localLoaded.Load(corrupt.string(), support, 42, Hierarchy::AdmissionParameters(options),
         dimension, heads->GetVectorValueType()); });
+    options.m_hierarchyTargetPostingSize = 16;
+    options.m_hierarchySizingSampleHeads = count;
+    const auto sampled = build();
+    CHECK(sampled.Sampled() && sampled.Local() && sampled.Metadata().thresholds == local.Metadata().thresholds);
+    sampled.ValidateSizingOptions(options);
+    const auto& first = sampled.Sizing().tiers[0];
+    CHECK(first.children == count && first.pairs == 2 * count - 1 &&
+        first.parents < 128 && first.references >= first.pairs && first.references <= first.pairs * 2);
+    CHECK(first.trials >= 1 && first.trials <= 2 && first.pilot[0].heads == count);
+    const auto sampledPath = directory / ("sampled-" + std::to_string(sizeof(T)) + ".bin");
+    sampled.Save(sampledPath.string());
+    Hierarchy sampledLoaded;
+    sampledLoaded.Load(sampledPath.string(), support, 42, Hierarchy::AdmissionParameters(options),
+        dimension, heads->GetVectorValueType());
+    sampledLoaded.ValidateSizingOptions(options);
+    CHECK(sampledLoaded.Fingerprint() == sampled.Fingerprint());
+    sampledLoaded.ReleaseLocalStatistics();
+    CHECK(sampledLoaded.Fingerprint() == sampled.Fingerprint());
+    Reject([&] { sampledLoaded.SetSizing(sampled.Sizing()); });
+    ++options.m_hierarchyTargetPostingSize;
+    Reject([&] { sampledLoaded.ValidateSizingOptions(options); });
+    --options.m_hierarchyTargetPostingSize;
+    const auto sampledCorrupt = directory / ("bad-sampled-" + std::to_string(sizeof(T)) + ".bin");
+    std::filesystem::copy_file(sampledPath, sampledCorrupt);
+    {
+        std::fstream out(sampledCorrupt, std::ios::binary | std::ios::in | std::ios::out);
+        out.seekp(-1, std::ios::end); out.put(1);
+    }
+    Reject([&] { sampledLoaded.Load(sampledCorrupt.string(), support, 42, Hierarchy::AdmissionParameters(options),
+        dimension, heads->GetVectorValueType()); });
+    options.m_hierarchySizingSampleHeads = 1;
+    Reject(build);
+    options.m_hierarchySizingSampleHeads = count;
+    options.m_hierarchyLocalTarget = 1; options.m_hierarchyLocalWindow = count;
+    const auto emptySampled = build();
+    CHECK(emptySampled.Sampled() && emptySampled.Count() == 0);
+    emptySampled.ValidateSizingOptions(options);
+    options.m_hierarchyTargetPostingSize = 0; options.m_hierarchySizingSampleHeads = 0;
     options.m_hierarchyLocalTarget = 0;
     Reject(build);
     options.m_hierarchyLocalWindow = 0;
@@ -520,11 +640,12 @@ template<class T> static void ConstructionTests(const std::filesystem::path& dir
     Reject(build);
     std::cout << "PASS native layered build, two-label logical replication, fixed physical quotas and empty admission\n";
 }
-static void NativeRebuildTest(const std::filesystem::path& directory, const char* tool, bool local = false)
+static void NativeRebuildTest(const std::filesystem::path& directory, const char* tool,
+                              bool local = false, bool sampled = false)
 {
     namespace fs = std::filesystem;
-    const auto source = directory / (local ? "native-local-source" : "native-source");
-    const auto output = directory / (local ? "native-local-layered" : "native-layered");
+    const auto source = directory / (sampled ? "native-sampled-source" : local ? "native-local-source" : "native-source");
+    const auto output = directory / (sampled ? "native-sampled-layered" : local ? "native-local-layered" : "native-layered");
     CHECK(fs::create_directory(source));
     constexpr int count = 4096, dimension = 8;
     auto bytes = ByteArray::Alloc(sizeof(float) * count * dimension);
@@ -590,11 +711,12 @@ static void NativeRebuildTest(const std::filesystem::path& directory, const char
             << "\n[SelectHead]\n"
             << (local ? "HierarchyLocalTarget=2048\nHierarchyLocalWindow=16\n" :
                 "HierarchyLabelSelectivity=0.5,0.4,0.3,0.2\n")
+            << (sampled ? "HierarchyTargetPostingSize=16\nHierarchySizingSampleHeads=128\n" : "")
             << "NumberOfThreads=1\n";
         CHECK(bool(out));
     }
     int invocation = 0;
-    const auto nativeLog = directory / (local ? "local-rebuild.log" : "global-rebuild.log");
+    const auto nativeLog = directory / (sampled ? "sampled-rebuild.log" : local ? "local-rebuild.log" : "global-rebuild.log");
     const auto invoke = [&]() {
         const bool capture = invocation++ == 0;
         const pid_t pid = fork();
@@ -620,6 +742,14 @@ static void NativeRebuildTest(const std::filesystem::path& directory, const char
         CHECK(text.find("Layered H2 construction search: MaxCheck=17 ") != std::string::npos);
         CHECK(text.find("stage=H2-H-assignment state=complete") != std::string::npos);
         CHECK(text.find("stage=hierarchy-reload-and-authenticate state=complete") != std::string::npos);
+        if (sampled) {
+            CHECK(text.find("stage=H2-sizing1-O-assignment state=complete") != std::string::npos);
+            CHECK(text.find("Sizing H2 actualParents=") != std::string::npos);
+            std::ifstream completion(output / "sparse-hierarchy-completion.json");
+            const std::string report((std::istreambuf_iterator<char>(completion)), std::istreambuf_iterator<char>());
+            CHECK(report.find("sparse-label-hierarchy-v6") != std::string::npos &&
+                report.find("\"sample_head_limit\": 128") != std::string::npos);
+        }
     }
     CHECK(fs::is_symlink(output / "HeadIndex/graph.bin"));
     CHECK(!fs::exists(output / "SPTAGSecondLevelHeadVectors.bin"));
@@ -629,35 +759,63 @@ static void NativeRebuildTest(const std::filesystem::path& directory, const char
         CHECK(index->SetParameter("HierarchyLocalTarget", "2049", "SelectHead") != ErrorCode::Success);
         CHECK(index->SetParameter("HierarchyLocalWindow", "32", "SearchSSDIndex") != ErrorCode::Success);
     }
+    if (sampled) {
+        CHECK(index->SetParameter("HierarchyTargetPostingSize", "17", "SelectHead") != ErrorCode::Success);
+        CHECK(index->SetParameter("HierarchySizingSampleHeads", "0", "SelectHead") != ErrorCode::Success);
+    }
     std::uint64_t activations = 0, overshoots = 0;
     for (int headTarget : {16, count}) {
       set("SearchSSDIndex", "InternalResultNum", std::to_string(headTarget));
       for (int graphBudget : {1, count}) {
           set("SearchSSDIndex", "MaxCheck", std::to_string(graphBudget));
-          for (const auto& queryTags : std::vector<std::vector<std::uint32_t>>{{1},{2},{1,2,1},{0},{}}) {
+          for (const auto& queryTags : std::vector<std::vector<std::uint32_t>>{{1},{2},{1,2,1},{0},{999},{}}) {
               for (int row : {0,1,20,21}) {
+                for (int resultCount : {1, 10}) {
+                  const bool missingLabel = !queryTags.empty() && queryTags.front() == 999;
                   VectorIndex::ThreadLocalSearchContext context;
                   context.m_queryTags = queryTags;
                   context.m_limitedTagMembershipEligible = !queryTags.empty();
                   context.m_limitedTagQueryValues = queryTags;
                   VectorIndex::ThreadLocalSearchContextGuard guard(std::move(context));
-                  COMMON::QueryResultSet<float> results(data + row * dimension, 10);
+                  COMMON::QueryResultSet<float> results(data + row * dimension, resultCount);
                   COMMON::GraphAccessStats stats;
                   {
                       COMMON::ScopedGraphAccessStats capture(&stats);
                       CHECK(index->SearchIndex(results) == ErrorCode::Success);
+                  }
+                  const auto compactWork = VectorIndex::GetThreadLocalPostingScanStats();
+                  COMMON::QueryResultSet<float> wide(data + row * dimension, headTarget);
+                  CHECK(index->SearchIndex(wide) == ErrorCode::Success);
+                  const auto wideWork = VectorIndex::GetThreadLocalPostingScanStats();
+                  if (resultCount == 1) {
+                      COMMON::QueryResultSet<float> empty(data + row * dimension, 0);
+                      CHECK(index->SearchIndex(empty) == ErrorCode::Success);
+                      CHECK(empty.GetScanned() == wide.GetScanned());
+                  }
+                  CHECK(results.GetScanned() == wide.GetScanned() &&
+                        compactWork.m_readPostings == wideWork.m_readPostings &&
+                        compactWork.m_scannedVectors == wideWork.m_scannedVectors &&
+                        compactWork.m_matchedVectors == wideWork.m_matchedVectors &&
+                        compactWork.m_dedupSkippedVectors == wideWork.m_dedupSkippedVectors &&
+                        compactWork.m_postingPageReads == wideWork.m_postingPageReads &&
+                        compactWork.m_postingLogicalBytes == wideWork.m_postingLogicalBytes &&
+                        compactWork.m_postingPhysicalBytes == wideWork.m_postingPhysicalBytes);
+                  for (int rank = 0; rank < results.GetResultNum(); ++rank) {
+                      CHECK(results.GetResult(rank)->VID == wide.GetResult(rank)->VID &&
+                            results.GetResult(rank)->Dist == wide.GetResult(rank)->Dist);
                   }
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
                   CHECK(stats.m_postingActivations <= 1);
                   overshoots += stats.m_graphLeaves > static_cast<std::uint64_t>(graphBudget);
                   if (stats.m_headBefore >= stats.m_headTarget) CHECK(stats.m_postingActivations == 0);
                   if (stats.m_postingActivations) CHECK(stats.m_headBefore < stats.m_headTarget);
-                  if (queryTags.empty() || (!local && queryTags.front() == 0)) CHECK(stats.m_postingActivations == 0);
+                  if (queryTags.empty() || missingLabel || (!local && queryTags.front() == 0)) CHECK(stats.m_postingActivations == 0);
                   CHECK(stats.m_preservedHeads == stats.m_headBefore);
                   if (graphBudget == 1) activations += stats.m_postingActivations;
 #endif
                   // A narrow native range may still exhaust its reachable frontier with no match.
-                  if (graphBudget == count || queryTags.empty()) CHECK(results.GetResult(0)->VID >= 0);
+                  if (missingLabel) CHECK(results.GetResult(0)->VID == -1);
+                  else if (graphBudget == count || queryTags.empty()) CHECK(results.GetResult(0)->VID >= 0);
                   std::set<int> found;
                   bool missing = false;
                   for (int rank = 0; rank < results.GetResultNum(); ++rank) {
@@ -677,6 +835,7 @@ static void NativeRebuildTest(const std::filesystem::path& directory, const char
                       }
                       CHECK(std::abs(exact - result->Dist) <= std::max(1.0, exact * 1e-6));
                   }
+                }
               }
           }
       }
@@ -698,10 +857,11 @@ int main(int argc, char** argv)
     try {
         CHECK(std::filesystem::create_directory(directory));
         CHECK(argc == 2);
-        ProgressTests(); SelectionTests(); CensusTests(); PersistenceTests(directory); QueryTests(); ParentPruningTests(directory);
+        ProgressTests(); SelectionTests(); SizingTests(); CensusTests(); PersistenceTests(directory); QueryTests(); ParentPruningTests(directory);
         ConstructionTests<float>(directory); ConstructionTests<std::uint8_t>(directory);
         NativeRebuildTest(directory, argv[1]);
         NativeRebuildTest(directory, argv[1], true);
+        NativeRebuildTest(directory, argv[1], true, true);
         std::filesystem::remove_all(directory);
         return 0;
     } catch (const std::exception& error) {

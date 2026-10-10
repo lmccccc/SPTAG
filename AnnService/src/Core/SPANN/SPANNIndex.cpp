@@ -2983,6 +2983,7 @@ ErrorCode Index<T>::RebuildSparseHierarchy(const Options& p_options, const std::
         verified.Load(p_file, m_limitedTagSupport, FingerprintFirstLevelHeadIDs(m_vectorTranslateMap),
             SparseLabelHierarchy::AdmissionParameters(p_options),
             m_index->GetFeatureDim(), m_index->GetVectorValueType());
+        verified.ValidateSizingOptions(p_options);
         verified.Refresh(*m_index, m_routingSignatures.params);
         SparseLabelHierarchy::Require(verified.Fingerprint() == fingerprint, "Sparse reconstruction reload mismatch");
         reloadProgress.Finish();
@@ -3813,6 +3814,7 @@ ErrorCode Index<T>::LoadSecondLevelIndex(
                 m_limitedTagSupport, FingerprintFirstLevelHeadIDs(m_vectorTranslateMap),
                 SparseLabelHierarchy::AdmissionParameters(m_options),
                 m_index->GetFeatureDim(), m_index->GetVectorValueType());
+            hierarchy->ValidateSizingOptions(m_options);
             hierarchy->ReleaseLocalStatistics();
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
                 "Loaded %d sparse label postings; direct H1 representatives, no legacy upper catalogs.\n",
@@ -6437,7 +6439,22 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             }
         }
 
-        p_queryResults->Reverse();
+        if (p_queryResults != &p_query && p_query.GetResultNum() > 0 &&
+            m_options.m_storage == Storage::STATIC &&
+            !p_queryResults->HasQuantizedTarget() &&
+            Helper::StrUtils::StrEqualIgnoreCase(m_options.m_postingQuantizer.c_str(), "None")) {
+            // Posting selection is complete; the raw static scan only needs final top-k.
+            auto* finalResults = static_cast<COMMON::QueryResultSet<T>*>(&p_query);
+            finalResults->Reset();
+            finalResults->SetScanned(p_queryResults->GetScanned());
+            for (int rank = 0; rank < p_queryResults->GetResultNum(); ++rank) {
+                const auto* head = p_queryResults->GetResult(rank);
+                if (head->VID >= 0) finalResults->AddPoint(head->VID, head->Dist);
+            }
+            p_queryResults = finalResults;
+        } else {
+            p_queryResults->Reverse();
+        }
         if (dumpHeadsLimit > 0) {
             std::string s = "HEADDUMP:";
             s.reserve(workSpace->m_postingIDs.size() * 8 + 16);
@@ -9031,13 +9048,15 @@ template <typename T> ErrorCode Index<T>::SetParameter(const char *p_param, cons
         return m_options.SetParameter(p_section, p_param, p_value);
     p_param = Options::CanonicalParameter(p_section, p_param);
     if (Helper::StrUtils::StrEqualIgnoreCase(p_param, "HierarchyLocalTarget") ||
-        Helper::StrUtils::StrEqualIgnoreCase(p_param, "HierarchyLocalWindow")) {
+        Helper::StrUtils::StrEqualIgnoreCase(p_param, "HierarchyLocalWindow") ||
+        Helper::StrUtils::StrEqualIgnoreCase(p_param, "HierarchyTargetPostingSize") ||
+        Helper::StrUtils::StrEqualIgnoreCase(p_param, "HierarchySizingSampleHeads")) {
         int value = -1;
         if (!Helper::StrUtils::StrEqualIgnoreCase(p_section, "SelectHead") ||
             !Helper::Convert::ConvertStringTo(p_value, value) || value < 0 ||
             (m_bReady && m_options.GetParameter("SelectHead", p_param) != p_value)) {
             SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
-                "Local admission settings are nonnegative immutable [SelectHead] metadata.\n");
+                "Local admission and sampled sizing settings are nonnegative immutable [SelectHead] metadata.\n");
             return ErrorCode::FailedParseValue;
         }
     }

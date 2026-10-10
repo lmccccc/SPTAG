@@ -77,6 +77,8 @@ DefineSelectHeadParameter(m_secondLevelGenerationFingerprint, std::string, std::
 DefineSelectHeadParameter(m_hierarchyLabelSelectivity, std::string, std::string(), "HierarchyLabelSelectivity")
 DefineSelectHeadParameter(m_hierarchyLocalTarget, int, 0, "HierarchyLocalTarget")
 DefineSelectHeadParameter(m_hierarchyLocalWindow, int, 0, "HierarchyLocalWindow")
+DefineSelectHeadParameter(m_hierarchyTargetPostingSize, int, 0, "HierarchyTargetPostingSize")
+DefineSelectHeadParameter(m_hierarchySizingSampleHeads, int, 0, "HierarchySizingSampleHeads")
 #endif
 
 #ifdef DefineBuildHeadParameter

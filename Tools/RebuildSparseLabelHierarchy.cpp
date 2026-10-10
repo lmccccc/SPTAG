@@ -42,6 +42,41 @@ static void LinkUnchanged(const fs::path& source, const fs::path& target,
     }
 }
 
+static void WriteSizing(std::ostream& report, const fs::path& path)
+{
+    std::ifstream input(path, std::ios::binary);
+    Hierarchy::Header header;
+    SPANN::SampledHierarchySizing sizing;
+    input.read(reinterpret_cast<char*>(&header), sizeof(header));
+    input.seekg(-static_cast<std::streamoff>(sizeof(sizing)), std::ios::end);
+    input.read(reinterpret_cast<char*>(&sizing), sizeof(sizing));
+    Hierarchy::Require(bool(input) && header.version == 6, "Cannot read authenticated sizing report");
+    sizing.Validate(header.caps, header.replicas);
+    report << ",\n  \"sizing\": {\"estimator_version\": " << sizing.version
+           << ", \"target_label_row_size\": " << sizing.target
+           << ", \"sample_head_limit\": " << sizing.sampleHeads << ", \"tiers\": [";
+    for (std::size_t level = 0; level < sizing.tiers.size(); ++level) {
+        const auto& tier = sizing.tiers[level];
+        if (level) report << ',';
+        report << "\n    {\"tier\": " << level + 2 << ", \"physical_children\": " << tier.children
+               << ", \"logical_child_labels\": " << tier.pairs << ", \"parents\": " << tier.parents
+               << ", \"label_rows\": " << tier.rows << ", \"references\": " << tier.references
+               << ", \"mean_label_row\": " << (tier.rows ? double(tier.references) / tier.rows : 0)
+               << ", \"ratio\": " << (tier.children ? double(tier.parents) / tier.children : 0)
+               << ", \"trials\": [";
+        for (std::size_t pass = 0; pass < tier.trials; ++pass) {
+            const auto& trial = tier.pilot[pass];
+            if (pass) report << ',';
+            report << "{\"heads\": " << trial.heads << ", \"pairs\": " << trial.pairs
+                   << ", \"parents\": " << trial.parents << ", \"rows\": " << trial.rows
+                   << ", \"references\": " << trial.references << ", \"sample_hash\": " << trial.sampleHash
+                   << ", \"estimated_references\": " << trial.estimatedReferences << '}';
+        }
+        report << "]}";
+    }
+    report << "\n  ]}";
+}
+
 int main(int argc, char** argv)
 {
     if (argc != 3 || std::string(argv[1]) != "-c") {
@@ -77,14 +112,17 @@ int main(int argc, char** argv)
         Hierarchy::Require(original.GetParameter<int>("SelectHead", "HierarchyLevels", 0) == 5 &&
             original.GetParameter("SelectHead", "HierarchyLabelSelectivity", std::string()).empty() &&
             original.GetParameter<int>("SelectHead", "HierarchyLocalTarget", 0) == 0 &&
-            original.GetParameter<int>("SelectHead", "HierarchyLocalWindow", 0) == 0,
+            original.GetParameter<int>("SelectHead", "HierarchyLocalWindow", 0) == 0 &&
+            original.GetParameter<int>("SelectHead", "HierarchyTargetPostingSize", 0) == 0 &&
+            original.GetParameter<int>("SelectHead", "HierarchySizingSampleHeads", 0) == 0,
             "Source must be the canonical five-level spatial hierarchy");
         SPANN::Options settings;
         for (const auto& parameter : config.GetParameters("SelectHead")) {
             const auto key = Lower(parameter.first);
             Hierarchy::Require(key == "hierarchylabelselectivity" || key == "numberofthreads" ||
-                key == "hierarchylocaltarget" || key == "hierarchylocalwindow",
-                "Rebuild INI may change only selectivity admission and native construction threads");
+                key == "hierarchylocaltarget" || key == "hierarchylocalwindow" ||
+                key == "hierarchytargetpostingsize" || key == "hierarchysizingsampleheads",
+                "Rebuild INI may change only admission, sampled upper sizing and native construction threads");
             Hierarchy::Require(settings.SetParameter("SelectHead", parameter.first.c_str(), parameter.second.c_str()) ==
                 ErrorCode::Success, "Invalid native reconstruction parameter");
         }
@@ -102,6 +140,8 @@ int main(int argc, char** argv)
         build.m_hierarchyLabelSelectivity = settings.m_hierarchyLabelSelectivity;
         build.m_hierarchyLocalTarget = settings.m_hierarchyLocalTarget;
         build.m_hierarchyLocalWindow = settings.m_hierarchyLocalWindow;
+        build.m_hierarchyTargetPostingSize = settings.m_hierarchyTargetPostingSize;
+        build.m_hierarchySizingSampleHeads = settings.m_hierarchySizingSampleHeads;
         build.m_iSelectHeadNumberOfThreads = settings.m_iSelectHeadNumberOfThreads;
         const auto loaded = std::chrono::steady_clock::now();
         const std::string outputPosting = "sparse_label_hierarchy.bin";
@@ -135,6 +175,8 @@ int main(int argc, char** argv)
                         output << "HierarchyLabelSelectivity=" << build.m_hierarchyLabelSelectivity
                                << "\nHierarchyLocalTarget=" << build.m_hierarchyLocalTarget
                                << "\nHierarchyLocalWindow=" << build.m_hierarchyLocalWindow
+                               << "\nHierarchyTargetPostingSize=" << build.m_hierarchyTargetPostingSize
+                               << "\nHierarchySizingSampleHeads=" << build.m_hierarchySizingSampleHeads
                                << "\nHierarchyPostingFile=" << outputPosting
                                << "\nHierarchyGenerationFingerprint=\nNumberOfThreads="
                                << build.m_iSelectHeadNumberOfThreads << '\n';
@@ -146,7 +188,8 @@ int main(int argc, char** argv)
                 const auto key = equals == std::string::npos ? "" : Lower(line.substr(0, equals));
                 if (section == "selecthead" && (key == "hierarchylabelselectivity" || key == "hierarchypostingfile" ||
                     key == "hierarchygenerationfingerprint" || key == "numberofthreads" ||
-                    key == "hierarchylocaltarget" || key == "hierarchylocalwindow")) continue;
+                    key == "hierarchylocaltarget" || key == "hierarchylocalwindow" ||
+                    key == "hierarchytargetpostingsize" || key == "hierarchysizingsampleheads")) continue;
                 if (section == "base" && key == "indexdirectory") {
                     output << "IndexDirectory=" << target.string() << '\n';
                     ++rebound;
@@ -159,12 +202,16 @@ int main(int argc, char** argv)
         rusage usage{};
         Hierarchy::Require(getrusage(RUSAGE_SELF, &usage) == 0, "Cannot measure native reconstruction RSS");
         std::ofstream report(target / "sparse-hierarchy-completion.json");
-        report << "{\n  \"format\": \"sparse-label-hierarchy-v" << (build.m_hierarchyLocalTarget ? 5 : 4) << "\","
+        report << std::setprecision(17);
+        report << "{\n  \"format\": \"sparse-label-hierarchy-v"
+               << (build.m_hierarchyTargetPostingSize ? 6 : build.m_hierarchyLocalTarget ? 5 : 4) << "\","
                << "\n  \"assignment\": \"adjacent-limited-label-native-h-posting-rng\",\n  \"source\": " << std::quoted(source.string())
                << ",\n  \"head_selection\": \"population-prioritized-native-bkt-over-unique-eligible-children\""
                << ",\n  \"construction_search\": \"bounded-native-h-placement-v1\""
                << ",\n  \"label_selection\": \"anchor-plus-nearest-candidate-prefix-with-repeated-labels\""
-               << ",\n  \"head_count\": \"per-level-physical-child-ratio-with-source-tier-caps\""
+               << ",\n  \"head_count\": " << std::quoted(build.m_hierarchyTargetPostingSize ?
+                   "sampled-native-O-H-label-row-sizing-v1-with-source-tier-caps" :
+                   "per-level-physical-child-ratio-with-source-tier-caps")
                << ",\n  \"replicas\": \"native-H-upper-limit-no-fill; selected-anchor-is-own-member\""
                << ",\n  \"entries\": \"adjacent-reverse-owners-plus-H2-spatial-fallback\""
                << ",\n  \"base_label_slots\": " << build.m_limitedTagSlotsPerHead
@@ -178,7 +225,9 @@ int main(int argc, char** argv)
                << ",\n  \"posting_bytes\": " << fs::file_size(target / outputPosting)
                << ",\n  \"source_load_seconds\": " << std::chrono::duration<double>(loaded - begin).count()
                << ",\n  \"build_seconds\": " << std::chrono::duration<double>(std::chrono::steady_clock::now() - loaded).count()
-               << ",\n  \"peak_rss_kib\": " << usage.ru_maxrss << "\n}\n";
+               << ",\n  \"peak_rss_kib\": " << usage.ru_maxrss;
+        if (build.m_hierarchyTargetPostingSize) WriteSizing(report, target / outputPosting);
+        report << "\n}\n";
         report.close();
         Hierarchy::Require(bool(report), "Cannot persist sparse hierarchy completion");
         std::cout << "Upper-only sparse hierarchy created at " << target << '\n';

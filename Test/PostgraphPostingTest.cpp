@@ -8,6 +8,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <random>
 using namespace SPTAG;
 #define CHECK(x) do { if (!(x)) throw std::runtime_error("Postgraph test line "+std::to_string(__LINE__)+": " #x); } while(false)
 struct Rows : COMMON::PostingNavigation {
@@ -194,7 +195,7 @@ template<class T> void CheckMatchRate() {
             }
             CHECK(rows.calls==1 && rows.result.targetFilled==(capacity==1));
             CHECK(result.GetResult(0)->VID==230 && result.GetResult(0)->Dist==0);
-            CHECK(predicates[201]==2); // Scored once, then native pop admission; posting reuses its cache.
+            CHECK(predicates[201]==1);
             CHECK(predicates[200]==1 && predicates[230]==1 && predicates[202]==1);
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
             CHECK(stats.m_dispatchTriggered==1 && stats.m_dispatchSamples==2);
@@ -300,6 +301,79 @@ void CheckRateWindows() {
             for (int i=0;i<128;++i) integerCompatible.Observe(i<matches);
             CHECK(integerCompatible.Triggered()==(percent>0 && matches*100<128*percent));
         }
+}
+
+void CheckCachedMatches() {
+    COMMON::NavigationVisited visited;
+    bool match = true;
+    CHECK(!visited.TryGetMatch(17, match) && match);
+    visited.Init(2, 0);
+    for (int id = 0; id < 4096; ++id) {
+        match = true;
+        CHECK(!visited.TryGetMatch(id, match) && match);
+        int calls = 0;
+        const auto result = visited.Match(id, [&](int value) { ++calls; return value % 2 == 0; });
+        CHECK(!result.first && result.second == (id % 2 == 0) && calls == 1);
+    }
+    for (int id = 0; id < 4096; ++id) {
+        CHECK(visited.TryGetMatch(id, match) && match == (id % 2 == 0));
+        CHECK(visited.ContainsMatch(id));
+        const auto result = visited.Match(id, [](int) -> bool {
+            throw std::runtime_error("Cached predicate was evaluated again");
+        });
+        CHECK(result.first && result.second == match);
+    }
+    CHECK(!visited.TryGetMatch(4096, match));
+    CHECK(!visited.Match(MaxSize - 1, [](int) { return true; }).first);
+    CHECK(visited.TryGetMatch(MaxSize - 1, match) && match);
+    visited.clear();
+    CHECK(!visited.TryGetMatch(0, match) && !visited.TryGetMatch(MaxSize - 1, match));
+    CHECK(!visited.Match(0, [](int) { return false; }).first);
+    CHECK(visited.TryGetMatch(0, match) && !match);
+}
+
+void CheckAnchorSelection() {
+    using Candidate = std::pair<float, int>;
+    for (int limit : {0, 1, 2, 8, 48, 96, 192, 384, 768, 1024, 8192}) {
+        for (int order = 0; order < 4; ++order) {
+            COMMON::PostingAnchorCandidates selected(limit, 16);
+            std::vector<Candidate> reference;
+            std::mt19937 random(41);
+            for (int i = 0; i < 4096; ++i) {
+                const float distance = order == 0 ? float(i) : order == 1 ? float(4096-i) :
+                    order == 2 ? float(i % 7) : float(random() % 1024);
+                const Candidate candidate(distance, 4095-i);
+                selected.Add(candidate.second, candidate.first);
+                if (reference.size() < static_cast<std::size_t>(limit)) {
+                    reference.push_back(candidate);
+                    std::push_heap(reference.begin(), reference.end());
+                } else if (!reference.empty() && candidate < reference.front()) {
+                    std::pop_heap(reference.begin(), reference.end());
+                    reference.back() = candidate;
+                    std::push_heap(reference.begin(), reference.end());
+                }
+                CHECK(selected.Size() == reference.size());
+                if (i < 12 || i % (limit + 1) == 0 || i == 4095) {
+                    auto snapshot = selected;
+                    auto expected = reference;
+                    std::sort(expected.begin(), expected.end());
+                    CHECK(snapshot.Sorted() == expected);
+                }
+            }
+            selected.Add(5000, std::numeric_limits<float>::infinity());
+            selected.Add(5001, -std::numeric_limits<float>::infinity());
+            selected.Add(5002, std::numeric_limits<float>::quiet_NaN());
+            std::sort(reference.begin(), reference.end());
+            CHECK(selected.Sorted() == reference);
+            selected.Add(5003, -1);
+            if (limit) {
+                reference.emplace_back(-1, 5003);
+                std::sort(reference.begin(), reference.end());
+                if (reference.size() > static_cast<std::size_t>(limit)) reference.resize(limit);
+            }
+            CHECK(selected.Sorted() == reference);
+        }
+    }
 }
 template<class T> void CheckNProbeAnchors() {
     BKT::Index<T> index;
@@ -415,6 +489,8 @@ int main() {
         CheckPhases<float>(); CheckPhases<std::uint8_t>();
         CheckNProbeAnchors<float>(); CheckNProbeAnchors<std::uint8_t>();
         CheckRateWindows();
+        CheckCachedMatches();
+        CheckAnchorSelection();
         CheckMatchRate<float>(); CheckMatchRate<std::uint8_t>();
     }
     catch(const std::exception& e) { std::cerr<<e.what()<<'\n';return 1; }

@@ -151,6 +151,9 @@ use [`docs/LocalLabelHierarchy.ini`](docs/LocalLabelHierarchy.ini) and the
 [upper-only reconstruction instructions](docs/GettingStart.md#rebuild-only-local-label-postings).
 Use a fresh destination and preserve the source index: derived snapshots refer
 to its immutable H1 and SSD files.
+For opt-in, bounded O/H sampling that sizes upper centers toward a target
+single-label posting mean, see [sampled hierarchy sizing](docs/SampledHierarchySizing.md).
+This preserves local admission and writes a new V6 snapshot.
 
 The current templates use `HierarchyLocalTarget=512`,
 `HierarchyLocalWindow=4096` and a 15% observed-match trigger with a 1024-candidate

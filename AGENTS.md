@@ -126,6 +126,10 @@ rows, convergence, exact final filtering, and no-graph-resumption rule remain.
 Unfiltered, policy-off, and nontriggered searches retain upstream stopping.
 Diagnostic dispatch schema 2 appends `deferred` to the original five counters:
 a low-yield latch can be true while H1 continues to its native completion.
+Reuse cached navigation matches at result admission without marking uncached
+aliases visited. Anchor buffering must retain exact nearest distance/ID pairs
+with O(anchor-limit) memory; full window statistics and trigger decisions remain
+unchanged, including when no supplementation occurs.
 The original worktree, registered source proofs, indexes and binaries are
 immutable controls; implement this policy in the isolated worktree's main
 AnnService sources, not generated benchmark code.
@@ -267,6 +271,20 @@ Graphless-H1 layouts require explicit migration to a new output directory,
 not an implicit rebuild or fallback to old upper ANN search.
 
 ### Sparse label upper-only reconstruction
+
+Opt-in V6 sampled sizing is documented in `docs/SampledHierarchySizing.md`.
+`HierarchyTargetPostingSize` and `HierarchySizingSampleHeads` belong only to
+immutable `[SelectHead]` metadata and require local admission. Zero/zero keeps
+the V4/V5 physical-ratio recipe. V6 uses bounded native O/H pilots to estimate
+copies and nonempty label rows, then selects unique physical centers with the
+source tier cap. Never feed the effective sampled ratio back into the local
+census, count logical replicas as physical candidates, silently omit unsampled
+labels, or claim the requested mean row size is guaranteed.
+Estimator version 2 retains a uniform core and covers at least min(16,population)
+children per admitted label within the same physical sample budget. The repair
+reads only existing label metadata; no extra lower ANN or vector-distance pass.
+Replica estimates retain exact full-label population weights. Version 1 remains
+readable, and enrichment is not an unbiased full-layer density claim.
 
 Offline H placement uses `SearchIndexForConstruction`, not the online filtered
 entrypoint. Its native index MaxCheck bounds fresh navigation admissions,

@@ -1959,6 +1959,11 @@ V4 against historical curves as though its construction policy were identical.
 
 #### V5 local capacity admission
 
+For the opt-in V6 extension that keeps this admission policy but estimates
+upper center counts with bounded native O/H pilots, see
+[`docs/SampledHierarchySizing.md`](../../docs/SampledHierarchySizing.md).
+The source Ratio still controls census windows, not the sampled center count.
+
 Replace the four global fractions with these mutually exclusive native settings:
 
 ```ini

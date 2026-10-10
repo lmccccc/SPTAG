@@ -332,9 +332,8 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
     COMMON::PostingMatchRate matchRate(
         p_space.postingNavigation ? p_space.postingMatchRatePercent : 0,
         p_space.postingMatchWindow);
-    std::vector<std::pair<float, SizeType>> anchors;
-    if (p_space.postingNavigation)
-        anchors.reserve((std::min)(p_space.m_iMaxCheck, p_space.postingAnchorCount));
+    COMMON::PostingAnchorCandidates anchors(
+        p_space.postingNavigation ? p_space.postingAnchorCount : 0, p_space.m_iMaxCheck);
     const std::function<void(SizeType, float, bool)> observe = [&](SizeType id, float distance, bool match) {
         matchRate.Observe(match);
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
@@ -343,16 +342,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
             COMMON::g_graphAccessStats->m_graphMatches += match;
         }
 #endif
-        if (!std::isfinite(distance)) return;
-        const std::pair<float, SizeType> candidate(distance, id);
-        if (anchors.size() < static_cast<std::size_t>(p_space.postingAnchorCount)) {
-            anchors.push_back(candidate);
-            std::push_heap(anchors.begin(), anchors.end());
-        } else if (!anchors.empty() && candidate < anchors.front()) {
-            std::pop_heap(anchors.begin(), anchors.end());
-            anchors.back() = candidate;
-            std::push_heap(anchors.begin(), anchors.end());
-        }
+        anchors.Add(id, distance);
     };
     if (p_space.postingNavigation) p_space.scoredCandidate = &observe;
     if (hasResultFilter)
@@ -603,13 +593,18 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                 p_space.CheckResultAndSet(p_key)) {
                 return false;
             }
+            bool matches = true;
+            if (p_resultFilter) {
+                if (knownMatch && p_result == knownMatchID) matches = *knownMatch;
+                else if (!p_space.matchPredicate ||
+                         !p_space.nodeCheckStatus.TryGetMatch(p_result, matches)) {
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
-            if (p_resultFilter && !(knownMatch && p_result == knownMatchID) &&
-                COMMON::g_graphAccessStats)
-                ++COMMON::g_graphAccessStats->m_predicateCalls;
+                    if (COMMON::g_graphAccessStats) ++COMMON::g_graphAccessStats->m_predicateCalls;
 #endif
-            if ((!p_resultFilter ||
-                    (knownMatch && p_result == knownMatchID ? *knownMatch : p_resultFilter(p_result))) &&
+                    matches = p_resultFilter(p_result);
+                }
+            }
+            if (matches &&
                 notDeleted(
                     p_index->m_deletedID, p_local) &&
                 checkFilter(
@@ -798,7 +793,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
             phase->m_headTarget = target;
             phase->m_graphLeaves = graphLeaves;
             phase->m_graphDistances = phase->m_distanceCalls;
-            phase->m_anchorCount = anchors.size();
+            phase->m_anchorCount = anchors.Size();
             COMMON::ScopedGraphAccessStats excludeObserverAllocations(nullptr);
             phase->m_graphHeadIds.reserve(before);
             phase->m_graphHeadDistances.reserve(before);
@@ -815,7 +810,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
             p_space.postingAdditionalMaxCheck;
         if (matchRate.Enabled() ? matchRate.Triggered() : before < target) {
             if (graphLeaves >= ceiling) reason = 2;
-            else if (anchors.empty()) reason = 3;
+            else if (anchors.Empty()) reason = 3;
             else {
                 COMMON::QueryResultSet<T> supplemental(p_query.GetTarget(),
                     matchRate.Triggered() ? target : target - before);
@@ -825,18 +820,18 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                     supplementFilled = before;
                 }
                 resultSink = &supplemental;
-                std::sort(anchors.begin(), anchors.end());
+                const auto& selectedAnchors = anchors.Sorted();
                 std::vector<int> ids;
                 ids.reserve(p_space.postingAnchorCount);
                 if (p_space.postingNavigation->PreferResultAnchors()) {
                     for (int i = 0; i < (std::min)(before, p_space.postingAnchorCount); ++i)
                         ids.push_back(p_query.GetResult(i)->VID);
-                    for (const auto& anchor : anchors) {
+                    for (const auto& anchor : selectedAnchors) {
                         if (ids.size() == static_cast<std::size_t>(p_space.postingAnchorCount)) break;
                         if (std::find(ids.begin(), ids.end(), anchor.second) == ids.end()) ids.push_back(anchor.second);
                     }
                 } else
-                    for (const auto& anchor : anchors) ids.push_back(anchor.second);
+                    for (const auto& anchor : selectedAnchors) ids.push_back(anchor.second);
                 p_space.postingNavigation->SetSearchCapacity(
                     (std::max)(p_space.m_iMaxCheck / 16, target));
                 p_space.postingNavigation->Expand(ids, [&](const std::uint32_t* members, int count) {

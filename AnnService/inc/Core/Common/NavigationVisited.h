@@ -41,16 +41,22 @@ class NavigationVisited : public OptHashPosVector
         }
     }
 public:
-    bool ContainsMatch(SizeType id) const
+    bool TryGetMatch(SizeType id, bool& match) const
     {
         if (id < 0 || id == MaxSize) throw std::out_of_range("Invalid physical navigation ID");
         if (!m_hashTable) return false;
         const auto key = static_cast<std::uint32_t>(id) + 1U;
         auto* data = reinterpret_cast<std::uint32_t*>(m_hashTable.get());
         auto* slot = Find(data, m_poolSize, key);
-        if (slot) return *slot != 0;
-        slot = Find(data + m_poolSize + 1, m_poolSize, key);
-        return slot && *slot != 0;
+        if (!slot) slot = Find(data + m_poolSize + 1, m_poolSize, key);
+        if (!slot || !*slot) return false;
+        match = (*slot & flag) != 0;
+        return true;
+    }
+    bool ContainsMatch(SizeType id) const
+    {
+        bool match;
+        return TryGetMatch(id, match);
     }
     template<class Predicate>
     std::pair<bool, bool> Match(SizeType id, const Predicate& predicate)

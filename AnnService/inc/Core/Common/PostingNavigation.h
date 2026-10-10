@@ -2,12 +2,54 @@
 // Licensed under the MIT License.
 
 #pragma once
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace SPTAG { namespace COMMON {
+class PostingAnchorCandidates
+{
+    using Candidate = std::pair<float, int>;
+    std::size_t m_limit;
+    std::vector<Candidate> m_candidates;
+    Candidate m_bound;
+
+    void Compact() {
+        if (m_candidates.size() > m_limit) {
+            std::nth_element(m_candidates.begin(), m_candidates.begin() + m_limit, m_candidates.end());
+            m_candidates.resize(m_limit);
+            m_bound = *std::max_element(m_candidates.begin(), m_candidates.end());
+        }
+    }
+public:
+    PostingAnchorCandidates(int limit, int reserve) : m_limit(limit) {
+        if (limit < 0 || reserve < 0 || m_limit > m_candidates.max_size() / 2)
+            throw std::invalid_argument("Invalid posting anchor capacity");
+        m_candidates.reserve((std::min)(2 * m_limit, static_cast<std::size_t>(reserve)));
+    }
+    void Add(int id, float distance) {
+        if (!m_limit || !std::isfinite(distance)) return;
+        const Candidate candidate(distance, id);
+        if (m_candidates.size() >= m_limit && !(candidate < m_bound)) return;
+        m_candidates.push_back(candidate);
+        if (m_candidates.size() == m_limit)
+            m_bound = *std::max_element(m_candidates.begin(), m_candidates.end());
+        else if (m_candidates.size() == 2 * m_limit)
+            Compact();
+    }
+    std::size_t Size() const { return (std::min)(m_limit, m_candidates.size()); }
+    bool Empty() const { return m_candidates.empty(); }
+    const std::vector<Candidate>& Sorted() {
+        Compact();
+        std::sort(m_candidates.begin(), m_candidates.end());
+        return m_candidates;
+    }
+};
+
 class PostingNavigation
 {
 public:

@@ -2646,7 +2646,6 @@ namespace SPTAG
                     return SearchIndexPipePQ(p_exWorkSpace, p_queryResults, p_index, p_stats, truth, found);
                 }
                 const uint32_t postingListCount = static_cast<uint32_t>(p_exWorkSpace->m_postingIDs.size());
-                p_exWorkSpace->m_postingReadRanges.resize(postingListCount);
 
                 COMMON::QueryResultSet<ValueType>& queryResults = *((COMMON::QueryResultSet<ValueType>*)&p_queryResults);
  
@@ -2663,6 +2662,30 @@ namespace SPTAG
                     ? std::chrono::high_resolution_clock::now()
                     : std::chrono::high_resolution_clock::time_point{};
 
+#if defined(ASYNC_READ) && defined(BATCH_READ)
+                const auto processCompletedPosting = [&](Helper::AsyncReadRequest& request) {
+                    const auto scanStart = profilePhases
+                        ? std::chrono::high_resolution_clock::now()
+                        : std::chrono::high_resolution_clock::time_point{};
+                    const int staticPostingSlot = static_cast<int>(
+                        &request - p_exWorkSpace->m_diskRequests.data());
+                    char* buffer = reinterpret_cast<char*>(
+                        p_exWorkSpace->m_pageBuffers[staticPostingSlot].GetBuffer());
+                    ListInfo* listInfo = static_cast<ListInfo*>(request.m_payload);
+                    char* p_postingListFullData = buffer + listInfo->pageOffset;
+                    if (m_enableDataCompression)
+                    {
+                        DecompressPosting();
+                    }
+                    ProcessPosting();
+                    if (profilePhases) {
+                        scanMicros.fetch_add(
+                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::high_resolution_clock::now() - scanStart).count(),
+                            std::memory_order_relaxed);
+                    }
+                };
+#endif
 #if defined(ASYNC_READ) && !defined(BATCH_READ)
                 int unprocessed = 0;
 #endif
@@ -2678,9 +2701,7 @@ namespace SPTAG
                     Helper::DiskIO* indexFile = GetPostingIndexFile(p_exWorkSpace, fileid);
 #endif
 
-                    auto& readRange = p_exWorkSpace->m_postingReadRanges[pi];
-                    readRange = BuildStaticPostingReadRange(
-                        p_exWorkSpace, curPostingID, listInfo);
+                    const auto& readRange = p_exWorkSpace->m_postingReadRanges[pi];
                     const int readPageCount = readRange.m_readPageCount;
                     diskRead += readPageCount;
                     diskIO += 1;
@@ -2704,31 +2725,9 @@ namespace SPTAG
                     request.m_success = false;
 
 #ifdef BATCH_READ // async batch read
-                    request.m_callback = [&p_exWorkSpace, &queryResults, &p_index, &request, &listElements,
-                                          &collectPostingContributionStats, &scanMicros,
-                                          profilePhases, this](bool success)
+                    request.m_callback = [&processCompletedPosting, &request](bool success)
                     {
-                        if (!success) return;
-                        const auto scanStart = profilePhases
-                            ? std::chrono::high_resolution_clock::now()
-                            : std::chrono::high_resolution_clock::time_point{};
-                        const int staticPostingSlot = static_cast<int>(
-                            &request - p_exWorkSpace->m_diskRequests.data());
-                        char* buffer = reinterpret_cast<char*>(
-                            p_exWorkSpace->m_pageBuffers[staticPostingSlot].GetBuffer());
-                        ListInfo* listInfo = static_cast<ListInfo*>(request.m_payload);
-                        char* p_postingListFullData = buffer + listInfo->pageOffset;
-                        if (m_enableDataCompression)
-                        {
-                            DecompressPosting();
-                        }
-                        ProcessPosting();
-                        if (profilePhases) {
-                            scanMicros.fetch_add(
-                                std::chrono::duration_cast<std::chrono::microseconds>(
-                                    std::chrono::high_resolution_clock::now() - scanStart).count(),
-                                std::memory_order_relaxed);
-                        }
+                        if (success) processCompletedPosting(request);
                     };
 #else // async read
                     request.m_callback = [&p_exWorkSpace, &request](bool success)
@@ -2918,7 +2917,6 @@ namespace SPTAG
                 if (prepared != ErrorCode::Success) return prepared;
                 if (p_exWorkSpace->m_postingIDs.empty()) return ErrorCode::Success;
                 const uint32_t postingListCount = static_cast<uint32_t>(p_exWorkSpace->m_postingIDs.size());
-                p_exWorkSpace->m_postingReadRanges.resize(postingListCount);
 
                 int diskRead = 0;
                 int diskIO = 0;
@@ -2939,9 +2937,7 @@ namespace SPTAG
                     Helper::DiskIO* indexFile = GetPostingIndexFile(p_exWorkSpace, fileid);
 #endif
 
-                    auto& readRange = p_exWorkSpace->m_postingReadRanges[pi];
-                    readRange = BuildStaticPostingReadRange(
-                        p_exWorkSpace, curPostingID, listInfo);
+                    const auto& readRange = p_exWorkSpace->m_postingReadRanges[pi];
                     const int readPageCount = readRange.m_readPageCount;
                     diskRead += readPageCount;
                     diskIO += 1;

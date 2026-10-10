@@ -57,7 +57,7 @@ SparseLabelHierarchy BuildLayeredLabelHierarchy(
         options.m_enableLimitedTagSupportExpansion == support.HasExpansion(),
         "Layered reconstruction requires canonical H1 and unchanged native limited-tag settings");
     Hierarchy::Header header;
-    header.version = options.m_hierarchyLocalTarget ? 5 : 4;
+    header.version = options.m_hierarchyTargetPostingSize ? 6 : options.m_hierarchyLocalTarget ? 5 : 4;
     header.assignment = header.version - 1;
     header.heads = heads.GetNumSamples(); header.headIDs = headIDs;
     header.support = support.ContentFingerprint(); header.thresholds = thresholds;
@@ -81,6 +81,12 @@ SparseLabelHierarchy BuildLayeredLabelHierarchy(
     };
     struct Item { SizeType lower; std::uint32_t tag; };
     struct Edge { SizeType node, tonode; float distance; };
+    struct Level {
+        std::vector<SizeType> selected;
+        std::vector<std::map<std::uint32_t, std::vector<std::uint32_t>>> rows;
+        std::shared_ptr<VectorIndex> index;
+        std::uint64_t pairs = 0, references = 0, labelRows = 0;
+    };
     Helper::BuildProgress admissionProgress("H1-label-admission", support.TagHeads().size());
     std::vector<std::pair<SizeType, std::uint32_t>> pairs;
     for (const auto& entry : support.TagHeads()) {
@@ -105,28 +111,15 @@ SparseLabelHierarchy BuildLayeredLabelHierarchy(
     inputProgress.Finish();
     const int threads = options.m_iSelectHeadNumberOfThreads;
     const int replicas = options.m_secondLevelReplicaCount;
-    for (int tier = 2; tier <= 5; ++tier) {
-        const auto stage = "H" + std::to_string(tier) + "-";
+    const auto buildLevel = [&](const std::vector<Lower>& lower, SizeType upperCount,
+                               int tier, const std::string& stage) {
         Helper::BuildProgress selectionProgress(stage + "select-and-plan");
-        for (auto& child : lower) {
-            auto& tags = child.labels;
-            tags.erase(std::remove_if(tags.begin(), tags.end(), [&](std::uint32_t tag) {
-                return !result.AdmitChild(support, child.physical, tag, tier);
-            }), tags.end());
-            if (!tags.empty() && !std::binary_search(tags.begin(), tags.end(), child.anchor))
-                child.anchor = tags.front();
-        }
-        lower.erase(std::remove_if(lower.begin(), lower.end(),
-            [](const Lower& child) { return child.labels.empty(); }), lower.end());
-        if (lower.empty()) { selectionProgress.Finish(); break; }
         require(lower.size() <= static_cast<std::size_t>(MaxSize), "Too many layered physical children");
         std::vector<SizeType> physical;
         for (const auto& child : lower) physical.push_back(child.physical);
         require(std::is_sorted(physical.begin(), physical.end()) &&
             std::adjacent_find(physical.begin(), physical.end()) == physical.end(),
             "Layered physical inputs must be unique, not previous replica edges");
-        const auto upperCount = static_cast<SizeType>(std::min<double>(header.caps[tier - 2],
-            std::max(1.0, std::ceil(lower.size() * options.m_ratio))));
         const auto selected = SelectSparseRepresentatives<T>(heads, physical, upperCount, options);
         std::vector<SizeType> selectedLower;
         for (auto head : selected)
@@ -283,27 +276,165 @@ SparseLabelHierarchy BuildLayeredLabelHierarchy(
                 rows[parent][items[item].tag].push_back(lower[items[item].lower].id);
                 ++references;
             }
+        std::uint64_t labelRows = 0;
+        for (auto& parent : rows) {
+            labelRows += parent.size();
+            for (auto& row : parent) {
+                std::sort(row.second.begin(), row.second.end());
+                require(std::adjacent_find(row.second.begin(), row.second.end()) == row.second.end(),
+                    "Duplicate layered child-label assignment");
+            }
+        }
+        rowsProgress.Finish();
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+            "Layered %sphysicalChildren=%zu logicalChildLabels=%zu heads=%d references=%llu labelRows=%llu "
+            "replicaLimit=%d baseSlots=%d expansion=%d exactFallbacks=%llu (no replica fill).\n",
+            stage.c_str(), lower.size(), items.size(), upperCount,
+            static_cast<unsigned long long>(references), static_cast<unsigned long long>(labelRows),
+            replicas, support.SlotsPerHead(), int(options.m_enableLimitedTagSupportExpansion),
+            static_cast<unsigned long long>(fallbacks.load()));
+        return Level{selected, std::move(rows), std::move(index), items.size(), references, labelRows};
+    };
+
+    SampledHierarchySizing sizing;
+    sizing.target = options.m_hierarchyTargetPostingSize;
+    sizing.sampleHeads = options.m_hierarchySizingSampleHeads;
+    for (int tier = 2; tier <= 5; ++tier) {
+        const auto stage = "H" + std::to_string(tier) + "-";
+        Helper::BuildProgress admission(stage + "admission");
+        for (auto& child : lower) {
+            auto& tags = child.labels;
+            tags.erase(std::remove_if(tags.begin(), tags.end(), [&](std::uint32_t tag) {
+                return !result.AdmitChild(support, child.physical, tag, tier);
+            }), tags.end());
+            if (!tags.empty() && !std::binary_search(tags.begin(), tags.end(), child.anchor))
+                child.anchor = tags.front();
+        }
+        lower.erase(std::remove_if(lower.begin(), lower.end(),
+            [](const Lower& child) { return child.labels.empty(); }), lower.end());
+        admission.Finish();
+        if (lower.empty()) break;
+        require(lower.size() <= static_cast<std::size_t>(MaxSize), "Too many layered physical children");
+        SizeType upperCount = static_cast<SizeType>(std::min<double>(header.caps[tier - 2],
+            std::max(1.0, std::ceil(lower.size() * options.m_ratio))));
+        Level built;
+        bool reused = false;
+        if (result.Sampled()) {
+            Helper::BuildProgress sampleProgress(stage + "sizing-sample");
+            auto& record = sizing.tiers[tier - 2];
+            record.children = lower.size();
+            std::map<std::uint32_t, std::uint64_t> populations, sampledPopulations;
+            for (const auto& child : lower) for (auto tag : child.labels) ++populations[tag];
+            for (const auto& entry : populations) record.pairs += entry.second;
+            require(record.pairs <= MaxSize, "Layered logical head-label input exceeds native IDs");
+            const auto sampleIDs = SampledHierarchySizing::SampleCovered(
+                static_cast<SizeType>(lower.size()), options.m_hierarchySizingSampleHeads, tier, populations,
+                [&](SizeType child) -> const std::vector<std::uint32_t>& { return lower[child].labels; });
+            std::vector<Lower> sample;
+            sample.reserve(sampleIDs.size());
+            auto sampleHash = SecondLevelHeadPostings::BeginIDFingerprint();
+            for (auto id : sampleIDs) {
+                sample.push_back(lower[id]);
+                sampleHash = SecondLevelHeadPostings::AddContentFingerprint(
+                    sampleHash, &lower[id].physical, sizeof(lower[id].physical));
+                for (auto tag : lower[id].labels) ++sampledPopulations[tag];
+            }
+            for (const auto& entry : populations) {
+                if (!sampledPopulations.count(entry.first)) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                        "Sizing H%d sample misses admitted label %u (%llu children); increase HierarchySizingSampleHeads.\n",
+                        tier, entry.first, static_cast<unsigned long long>(entry.second));
+                    throw std::runtime_error("Sizing sample must represent every admitted label; no silent rare-label estimate");
+                }
+            }
+            sampleProgress.Finish();
+            for (int pass = 0; pass < 2; ++pass) {
+                const auto pilotCount = static_cast<SizeType>(std::max<long double>(1,
+                    std::ceil(static_cast<long double>(sample.size()) * upperCount / lower.size())));
+                auto pilot = buildLevel(sample, pilotCount, tier, stage + "sizing" + std::to_string(pass + 1) + "-");
+                auto& trial = record.pilot[pass];
+                trial.heads = sample.size(); trial.pairs = pilot.pairs; trial.parents = pilotCount;
+                trial.references = pilot.references; trial.rows = pilot.labelRows; trial.sampleHash = sampleHash;
+                std::map<std::uint32_t, std::pair<std::uint64_t, std::uint64_t>> byLabel;
+                for (const auto& parent : pilot.rows) for (const auto& row : parent) {
+                    auto& counts = byLabel[row.first];
+                    ++counts.first; counts.second += row.second.size();
+                }
+                for (const auto& entry : populations) {
+                    const auto& measured = byLabel.at(entry.first);
+                    const double replicasPerPair = double(measured.second) / sampledPopulations.at(entry.first);
+                    trial.estimatedReferences += entry.second * replicasPerPair;
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                        "Sizing H%d trial=%d label=%u population=%llu samplePairs=%llu rows=%llu references=%llu replicas=%.6f.\n",
+                        tier, pass + 1, entry.first, static_cast<unsigned long long>(entry.second),
+                        static_cast<unsigned long long>(sampledPopulations.at(entry.first)),
+                        static_cast<unsigned long long>(measured.first),
+                        static_cast<unsigned long long>(measured.second), replicasPerPair);
+                }
+                const auto planned = SampledHierarchySizing::Plan(
+                    lower.size(), header.caps[tier - 2], sizing.target, trial);
+                ++record.trials;
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                    "Sizing H%d trial=%d sampleHeads=%zu sampleParents=%d sampleRows=%llu sampleReferences=%llu "
+                    "estimatedReferences=%.6f target=%llu proposedParents=%d ratio=%.9f sourceRatio=%.9f cap=%u.\n",
+                    tier, pass + 1, sample.size(), pilotCount,
+                    static_cast<unsigned long long>(trial.rows), static_cast<unsigned long long>(trial.references),
+                    trial.estimatedReferences, static_cast<unsigned long long>(sizing.target), planned,
+                    double(planned) / lower.size(), options.m_ratio, header.caps[tier - 2]);
+                const bool stable = planned == upperCount;
+                upperCount = planned;
+                if (sample.size() == lower.size() && planned == pilotCount) {
+                    built = std::move(pilot);
+                    reused = true;
+                    break;
+                }
+                if (stable) break;
+            }
+        }
+        if (!reused) built = buildLevel(lower, upperCount, tier, stage);
+        if (result.Sampled()) {
+            auto& record = sizing.tiers[tier - 2];
+            record.parents = upperCount; record.rows = built.labelRows; record.references = built.references;
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                "Sizing H%d actualParents=%d actualRows=%llu actualReferences=%llu meanRow=%.6f target=%llu reusedPilot=%d.\n",
+                tier, upperCount, static_cast<unsigned long long>(record.rows),
+                static_cast<unsigned long long>(record.references), double(record.references) / record.rows,
+                static_cast<unsigned long long>(sizing.target), int(reused));
+            std::map<std::uint32_t, std::pair<std::uint64_t, std::uint64_t>> byLabel;
+            for (const auto& parent : built.rows) for (const auto& row : parent) {
+                auto& counts = byLabel[row.first];
+                ++counts.first; counts.second += row.second.size();
+            }
+            for (const auto& entry : byLabel)
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                    "Sizing H%d actualLabel=%u rows=%llu references=%llu meanRow=%.6f.\n",
+                    tier, entry.first, static_cast<unsigned long long>(entry.second.first),
+                    static_cast<unsigned long long>(entry.second.second),
+                    double(entry.second.second) / entry.second.first);
+        }
+        Helper::BuildProgress rowsProgress(stage + "publish-rows");
         std::vector<Lower> next;
         const int first = result.Count();
         for (SizeType upper = 0; upper < upperCount; ++upper) {
             std::vector<std::pair<std::uint32_t, std::vector<std::uint32_t>>> labelRows;
             std::vector<std::uint32_t> tags;
-            for (auto& row : rows[upper]) {
-                std::sort(row.second.begin(), row.second.end());
-                require(std::adjacent_find(row.second.begin(), row.second.end()) == row.second.end(),
-                    "Duplicate layered child-label assignment");
+            for (auto& row : built.rows[upper]) {
                 tags.push_back(row.first);
                 labelRows.emplace_back(row.first, std::move(row.second));
             }
-            const auto id = result.AddLayeredRow(selected[upper], ownTags[upper], tier, labelRows);
-            next.push_back({id, static_cast<std::uint32_t>(selected[upper]), ownTags[upper], std::move(tags)});
+            const auto physical = static_cast<std::uint32_t>(built.selected[upper]);
+            const auto child = std::lower_bound(lower.begin(), lower.end(), physical,
+                [](const Lower& value, std::uint32_t id) { return value.physical < id; });
+            require(child != lower.end() && child->physical == physical, "Missing selected physical child");
+            const auto id = result.AddLayeredRow(physical, child->anchor, tier, labelRows);
+            next.push_back({id, physical, child->anchor, std::move(tags)});
         }
         rowsProgress.Finish();
         if (tier == 2) {
             Helper::BuildProgress entryProgress("H1-spatial-entries", heads.GetNumSamples());
             BuildLayeredParallel(heads.GetNumSamples(), threads, entryProgress, [&](SizeType head) {
                 COMMON::QueryResultSet<T> query(static_cast<const T*>(heads.GetSample(head)), 1);
-                require(index->SearchIndex(query) == ErrorCode::Success && query.GetResult(0)->VID >= 0 &&
+                require(built.index->SearchIndex(query) == ErrorCode::Success && query.GetResult(0)->VID >= 0 &&
                     query.GetResult(0)->VID < upperCount, "Cannot assign layered H1 spatial entry");
                 result.SetEntry(head, first + query.GetResult(0)->VID);
                 Helper::BuildProgress::Work work;
@@ -311,14 +442,9 @@ SparseLabelHierarchy BuildLayeredLabelHierarchy(
                 return work;
             });
         }
-        SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
-            "Layered H%d: physicalChildren=%zu logicalChildLabels=%zu heads=%d cap=%u references=%llu "
-            "replicaLimit=%d baseSlots=%d expansion=%d exactFallbacks=%llu (no replica fill).\n",
-            tier, lower.size(), items.size(), upperCount, header.caps[tier - 2],
-            static_cast<unsigned long long>(references), replicas, support.SlotsPerHead(),
-            int(options.m_enableLimitedTagSupportExpansion), static_cast<unsigned long long>(fallbacks.load()));
         lower = std::move(next);
     }
+    if (result.Sampled()) result.SetSizing(sizing);
     Helper::BuildProgress validationProgress("hierarchy-validate-and-owners");
     result.Validate(support, headIDs, thresholds, heads.GetFeatureDim(), heads.GetVectorValueType());
     result.BuildOwners();

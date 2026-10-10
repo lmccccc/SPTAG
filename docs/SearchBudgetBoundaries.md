@@ -88,6 +88,13 @@ trigger. This is neither original-record selectivity nor result-heap fill.
 At 12.5% with a 1024-candidate window, 127 matches trigger and 128 do not.
 The query threshold is explicit; it is not inferred from construction metadata.
 
+H1 result admission reuses an existing navigation match without changing visited
+state; uncached collapsed aliases still evaluate their predicate normally.
+The nearest scored anchors are retained with a buffer bounded by twice the
+anchor limit and exact batched selection, using the original distance/ID tie
+order. Sorting is deferred until supplementation actually needs the anchors.
+Full window match counts, handoff points and graph/result/SSD budgets are unchanged.
+
 A sparse posting phase may replace H1 early only if every requested
 categorical label exists in its domain. Partial-domain OR queries defer a
 latched supplement until native union-filtered H1 completion. Handoff occurs
@@ -107,6 +114,27 @@ from the terminal-H2 convergence pool; it is not a row quota.
 Exact per-tier label domains prevent ascent above the highest relevant tier.
 These controls do not adapt MaxCheck before a query. Unfiltered, policy-off
 and nontriggered searches retain the native stopping rules described above.
+
+## Static result collection
+
+Raw, unquantized STATIC searches retain nprobe throughout H1 and hierarchy
+navigation and finish selecting SSD postings before collecting final results.
+Only then do they seed the caller's top-k heap from all eligible selected head
+records. SSD scans keep the same posting IDs, page limits, exact predicates,
+deduplication and distance/ID tie ordering; nprobe is not the final heap size.
+Quantized targets, posting codecs and dynamic storage retain their existing path.
+
+A singleton layered label row is borrowed directly from authenticated sorted,
+unique CSR storage. Multi-label queries still merge and deduplicate their union.
+Static request setup reuses prepared read ranges and shares one query-scoped
+scan closure through small per-request callbacks. All callbacks finish before
+their query context expires; neither completion ordering nor failure propagation
+is changed.
+
+`NativePosting.LayeredLabels` compares top-1/top-10 against a full head-capacity
+result heap at fixed nprobe, including singleton, OR, unfiltered and absent-label
+queries. IDs, distances and SSD work must match. Zero-capacity queries retain
+their legacy path, and empty posting selections retain the head checked count.
 
 `NativePosting.SearchBudgets` and its UBSan fixture exercise an actual serialized
 small BKT tree and native queues, including exact/over-limit entry, duplicate

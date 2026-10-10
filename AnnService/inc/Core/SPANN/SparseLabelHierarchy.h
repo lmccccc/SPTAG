@@ -5,6 +5,7 @@
 #include "inc/Core/SPANN/PostingNavigation.h"
 #include "inc/Core/SPANN/RoutingSignatures.h"
 #include "inc/Core/SPANN/LocalLabelAdmission.h"
+#include "inc/Core/SPANN/SampledHierarchySizing.h"
 #include "inc/Core/SPANN/Options.h"
 #include <array>
 #include <fstream>
@@ -81,6 +82,7 @@ public:
     }
     static Thresholds AdmissionParameters(const Options& options)
     {
+        SampledHierarchySizing::ValidateOptions(options);
         if (!options.m_hierarchyLocalTarget && !options.m_hierarchyLocalWindow)
             return ParseThresholds(options.m_hierarchyLabelSelectivity);
         if (!options.m_hierarchyLabelSelectivity.empty() || options.m_hierarchyLocalTarget <= 0 ||
@@ -89,7 +91,22 @@ public:
             throw std::invalid_argument("Local admission requires positive HierarchyLocalTarget/Window, native Ratio, and no global thresholds");
         return {double(options.m_hierarchyLocalTarget), double(options.m_hierarchyLocalWindow), options.m_ratio, 0};
     }
-    bool Local() const { return m_header.version == 5; }
+    bool Local() const { return m_header.version >= 5; }
+    bool Sampled() const { return m_header.version == 6; }
+    const SampledHierarchySizing& Sizing() const { return m_sizing; }
+    void SetSizing(const SampledHierarchySizing& sizing)
+    {
+        Require(Sampled() && m_ownerOffsets.empty(), "Cannot change immutable sampled sizing metadata");
+        m_sizing = sizing;
+    }
+    void ValidateSizingOptions(const Options& options) const
+    {
+        SampledHierarchySizing::ValidateOptions(options);
+        Require(Sampled() == bool(options.m_hierarchyTargetPostingSize) &&
+            (!Sampled() || (m_sizing.target == static_cast<unsigned>(options.m_hierarchyTargetPostingSize) &&
+                m_sizing.sampleHeads == static_cast<unsigned>(options.m_hierarchySizingSampleHeads))),
+            "Sampled sizing settings do not match the authenticated hierarchy");
+    }
     bool Layered() const { return m_header.version >= 4; }
     void SetLocalAdmission(LocalLabelAdmission policy)
     {
@@ -137,6 +154,7 @@ public:
         m_signatures.clear();
         m_numeric.clear();
         m_localAdmission = LocalLabelAdmission{};
+        m_sizing = SampledHierarchySizing{};
         for (auto& labels : m_queryLabels) labels.clear();
     }
     std::uint32_t AddRow(std::uint32_t representative, std::uint32_t tag, int tier,
@@ -246,6 +264,11 @@ public:
     {
         if (!Layered()) return {Begin(id), End(id)};
         scratch.clear();
+        if (labels.size() == 1) {
+            if (const auto* row = FindLabel(id, labels.front()))
+                return {Begin(*row), End(*row)};
+            return {Begin(id), Begin(id)};
+        }
         for (auto tag : labels)
             if (const auto* row = FindLabel(id, tag))
                 scratch.insert(scratch.end(), Begin(*row), End(*row));
@@ -294,7 +317,7 @@ public:
                   const Thresholds& thresholds, DimensionType dimension, VectorValueType type) const
     {
         Require(m_header.heads == static_cast<std::uint32_t>(support.HeadCount()) &&
-            m_header.version >= 1 && m_header.version <= 5 && m_header.assignment == m_header.version - 1 &&
+            m_header.version >= 1 && m_header.version <= 6 && m_header.assignment == m_header.version - 1 &&
             m_header.heads == m_entries.size() && m_header.headIDs == headIDs &&
             m_header.support == support.ContentFingerprint() && support.HasTagVectorCounts() &&
             m_header.thresholds == thresholds && m_header.dimension == static_cast<std::uint32_t>(dimension) &&
@@ -310,6 +333,7 @@ public:
                 m_localAdmission.Validate(m_header.heads);
             }
             ValidateLayered(support);
+            if (Sampled()) m_sizing.Validate(m_header.caps, m_header.replicas);
             return;
         }
         std::array<std::uint64_t, 4> counts{};
@@ -459,6 +483,7 @@ public:
             const auto policyHash = m_localAdmission.Hash();
             hash = SecondLevelHeadPostings::AddContentFingerprint(hash, &policyHash, sizeof(policyHash));
         }
+        if (Sampled()) hash = SecondLevelHeadPostings::AddContentFingerprint(hash, &m_sizing, sizeof(m_sizing));
         return hash;
     }
     void Save(const std::string& path) const
@@ -478,6 +503,7 @@ public:
         if (Layered())
             out.write(reinterpret_cast<const char*>(m_labelRows.data()), m_labelRows.size() * sizeof(LabelRow));
         if (Local()) m_localAdmission.Save(out);
+        if (Sampled()) out.write(reinterpret_cast<const char*>(&m_sizing), sizeof(m_sizing));
         out.close();
         Require(bool(out), "Cannot persist sparse hierarchy");
     }
@@ -491,7 +517,7 @@ public:
         Header header;
         in.read(reinterpret_cast<char*>(&header), sizeof(header));
         Require(bool(in) && bytes >= std::streamoff(sizeof(Header)) &&
-            header.magic == Header{}.magic && header.version >= 1 && header.version <= 5 &&
+            header.magic == Header{}.magic && header.version >= 1 && header.version <= 6 &&
             header.bytes == sizeof(Header) && header.assignment == header.version - 1 &&
             (header.version >= 4 ? header.reserved2 <= static_cast<std::uint64_t>(MaxSize) &&
                 header.reserved2 <= static_cast<std::uint64_t>(bytes) / sizeof(LabelRow) : !header.reserved2) &&
@@ -506,7 +532,7 @@ public:
         const auto bodyBytes = sizeof(Header) + std::uint64_t(header.heads) * sizeof(int) +
             std::uint64_t(header.nodes) * sizeof(Node) + header.members * sizeof(std::uint32_t) +
             header.reserved2 * sizeof(LabelRow);
-        Require(header.version == 5 || bodyBytes == static_cast<std::uint64_t>(bytes),
+        Require(header.version >= 5 || bodyBytes == static_cast<std::uint64_t>(bytes),
             "Trailing historical sparse hierarchy bytes");
         Initialize(header);
         m_nodes.resize(header.nodes);
@@ -518,7 +544,10 @@ public:
             m_labelRows.resize(header.reserved2);
             in.read(reinterpret_cast<char*>(m_labelRows.data()), m_labelRows.size() * sizeof(LabelRow));
         }
-        if (Local()) m_localAdmission.Load(in, static_cast<std::uint64_t>(bytes) - bodyBytes, header.heads);
+        const auto sizingBytes = Sampled() ? sizeof(m_sizing) : 0;
+        Require(static_cast<std::uint64_t>(bytes) - bodyBytes >= sizingBytes, "Truncated sampled sizing metadata");
+        if (Local()) m_localAdmission.Load(in, static_cast<std::uint64_t>(bytes) - bodyBytes - sizingBytes, header.heads);
+        if (Sampled()) in.read(reinterpret_cast<char*>(&m_sizing), sizeof(m_sizing));
         Require(bool(in) && Fingerprint() == header.fingerprint, "Sparse hierarchy authentication failed");
         Validate(support, headIDs, thresholds, dimension, type);
         BuildOwners();
@@ -560,6 +589,7 @@ private:
     void ValidateLayered(const LimitedTagSupport& support) const
     {
         std::array<std::uint64_t, 4> counts{};
+        std::array<std::uint64_t, 4> rowCounts{}, referenceCounts{};
         std::uint64_t memberOffset = 0, labelOffset = 0;
         int previousTier = 2;
         std::array<std::unordered_map<std::uint64_t, std::uint32_t>, 4> copies;
@@ -581,6 +611,8 @@ private:
                 "Layered physical representative was duplicated for labels");
             previousTier = node.tier;
             ++counts[node.tier - 2];
+            rowCounts[node.tier - 2] += node.reserved;
+            referenceCounts[node.tier - 2] += node.size;
             std::uint32_t previousTag = None;
             bool anchorPresent = false;
             for (auto row = LabelsBegin(id); row != LabelsEnd(id); ++row) {
@@ -619,10 +651,17 @@ private:
             "Unreferenced layered members or label rows");
         for (int tier = 2; tier <= 5; ++tier) {
             Require(counts[tier - 2] <= m_header.caps[tier - 2], "Layered posting count exceeds source tier cap");
+            std::vector<bool> eligible(Sampled() ? (tier == 2 ? m_header.heads : m_nodes.size()) : 0, false);
+            std::uint64_t pairs = 0, distinct = 0;
             const auto covered = [&](std::uint32_t child, std::uint32_t tag) {
-                if (AdmitChild(support, tier == 2 ? child : At(child).representative, tag, tier))
+                if (AdmitChild(support, tier == 2 ? child : At(child).representative, tag, tier)) {
                     Require(copies[tier - 2].count(key(child, tag)) != 0,
                         "Layered assignment omitted an admitted child-label pair");
+                    if (Sampled()) {
+                        if (!eligible[child]) { eligible[child] = true; ++distinct; }
+                        ++pairs;
+                    }
+                }
             };
             if (tier == 2) {
                 for (const auto& entry : support.TagHeads())
@@ -631,6 +670,13 @@ private:
                 for (int id = 0; id < Count(); ++id)
                     if (At(id).tier + 1 == static_cast<unsigned>(tier))
                         for (auto row = LabelsBegin(id); row != LabelsEnd(id); ++row) covered(id, row->tag);
+            }
+            if (Sampled()) {
+                const auto& sizing = m_sizing.tiers[tier - 2];
+                Require(sizing.children == distinct && sizing.pairs == pairs &&
+                    sizing.parents == counts[tier - 2] && sizing.rows == rowCounts[tier - 2] &&
+                    sizing.references == referenceCounts[tier - 2],
+                    "Sampled sizing audit disagrees with actual layered coverage or rows");
             }
         }
         for (int entry : m_entries)
@@ -650,6 +696,7 @@ private:
     std::vector<std::uint64_t> m_numeric;
     std::size_t m_words = 0;
     LocalLabelAdmission m_localAdmission;
+    SampledHierarchySizing m_sizing;
     std::array<std::vector<std::uint32_t>, 4> m_queryLabels;
 };
 
