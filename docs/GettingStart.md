@@ -15,11 +15,17 @@ according to predicate selectivity.
 The template is a **starting configuration, not a universal performance optimum**:
 Float128/L2, two attribute columns, five hierarchy levels, eight build threads
 and one query thread are editable examples. Search uses top100, nprobe128,
-MaxCheck8192, extra2048, width8 and a 15% observed-match trigger.
-The completed SIFT1B measurements use UInt8 vectors and a target128 V5 index.
-The new target512 construction recipe raises initial admission to 12.5% but
-has not yet supplied accepted SIFT1B performance results. Changing a dataset
-or rebuilding postings still requires recall/latency evaluation.
+MaxCheck16324, extra2048, width128 and a 12.5% observed-match trigger.
+For SIFT1B, set `ValueType=UInt8`, `Dim=128`, `DistCalcMethod=L2` and use the
+actual row-aligned input paths and attribute schema. The accepted target512 V5
+index now has complete six-scenario Recall@100 curves, including separate
+width32/128 sweeps. The template chooses width128 as a starting point, not a
+universal winner; nprobe128 is not a high-recall recommendation. See the
+[measured configuration family](#sift1b-measured-configuration-and-tuning-range).
+Target128 results remain historical ablations. Experimental
+[sampled V6 sizing](SampledHierarchySizing.md) has no accepted SIFT1B recall/QPS
+results as of 2026-10-10. Changing a dataset or rebuilding postings still
+requires recall/latency evaluation.
 All data/model/search settings belong in the native INI, not environment
 overrides or hard-coded client defaults.
 
@@ -223,9 +229,10 @@ NumberOfThreads=8
 ```
 
 `Ratio=0.12`, replica limits and H/O construction choices are inherited from
-the source; they are not overrides accepted by the rebuild INI. Use 32 native
-construction threads on the SIFT1B host only after checking its resources.
-The generic template uses eight. Start with a fresh output parent:
+the source; they are not overrides accepted by the rebuild INI. Choose native
+construction threads and CPU/NUMA placement after checking host resources;
+the generic template uses eight, not a SIFT1B-wide hardware requirement.
+Start with a fresh output parent:
 
 ```bash
 cmake --build build --target rebuildsparselabelhierarchy --parallel 8
@@ -277,9 +284,37 @@ and admission cannot restart above a missing tier.
 
 Windows cap at total H1 population on small datasets. Each scale recomputes
 local support density. These cutoffs are neither original-record selectivity
-nor the online 15% trigger, and expected matching-head count is not a recall
-guarantee. Keep target128 for reproducing the completed six-scenario curves;
-target512 is the explicitly requested wider-admission experiment.
+nor the online 12.5% trigger: even equal percentages refer to different
+populations and stages. Expected matching-head count is not a recall guarantee.
+Target512/window4096 is the current measured SIFT1B reconstruction recipe;
+target128 is retained for reproducing the earlier ablation curves.
+
+#### **Experimental sampled upper sizing (V6)**
+
+This is an optional construction experiment, **not the measured V5 performance
+recommendation**. In a fresh copy of the V5 rebuild INI, keep
+`HierarchyLocalTarget=512` and `HierarchyLocalWindow=4096`, choose a new
+`OutputIndex`, and add both keys to its existing `[SelectHead]` section:
+
+```ini
+[SelectHead]
+HierarchyTargetPostingSize=128
+HierarchySizingSampleHeads=262144
+```
+
+Both keys default to zero and remain absent from the recommended V5 recipe.
+They are immutable upper-only build settings, not search overlays or full-index
+`spannbuilder` settings. Bounded O/H pilots estimate the physical center count
+from actual child-label populations and replication, with rare-label coverage
+inside the same sample budget. H1/SSD and the source Ratio used by the admission
+census remain unchanged. The target is a mean nonempty single-label row size,
+not a per-row guarantee or a promise of faster construction/search.
+
+As of 2026-10-10, SIFT1B sampled construction is in progress and has no accepted
+Recall@100/QPS curve. SIFT1M structural validation is not a SIFT1B performance
+result. Keep V5 for the measured baseline and require completion, reload
+authentication and new query measurements before promoting V6. See
+[sampled sizing details](SampledHierarchySizing.md).
 
 #### **Query settings and observed-match ascent**
 
@@ -295,15 +330,15 @@ BuildSsdIndex=false
 InternalResultNum=128
 NumberOfThreads=1
 ResultNum=100
-MaxCheck=8192
+MaxCheck=16324
 MaxDistRatio=8
 SearchPostingPageLimit=3
 DisableCrossEdges=true
 EnablePostingNavigation=true
 PostingAnchorCount=0
 PostingAdditionalMaxCheck=2048
-PostingNavigationWidth=8
-PostingMatchRatePercent=15
+PostingNavigationWidth=128
+PostingMatchRatePercent=12.5
 PostingMatchWindow=1024
 ```
 
@@ -311,12 +346,12 @@ PostingMatchWindow=1024
 | --- | --- | --- | --- |
 | `InternalResultNum` | 64 | 128 | nprobe: requested H1 head-result capacity, not final top-k or an exact SSD read count. Effective capacity is at least the requested final top-k. |
 | `ResultNum` | 5 | 100 | Final top-k; an API client must pass this value to its search call. |
-| `MaxCheck` | 4096 | 8192 | Native H1 nominal checked-leaf budget and convergence-pool input, not a hard edge cap or count of every distance computation. |
+| `MaxCheck` | 4096 | 16324 | Native H1 nominal checked-leaf budget and convergence-pool input, not a hard edge cap or count of every distance computation. |
 | `EnablePostingNavigation` | false | true | Enable posting supplementation; the explicit match-rate setting below selects observed-match ascent instead of the legacy completion-first deficit policy. |
 | `PostingAnchorCount` | 0 | 0 | Zero uses the current head-result capacity. A positive value limits nearest already-scored H1 anchors, including predicate negatives. |
 | `PostingAdditionalMaxCheck` | 0 | 2048 | Nonnegative extra checked-leaf allowance for supplementation only; does not enlarge the graph phase. |
-| `PostingNavigationWidth` | 0 | 8 | Per-tier upper-navigation representative-distance beam; zero disables this extra pruning. It is not a terminal-H2 row-count limit. |
-| `PostingMatchRatePercent` | 0 | 15 | A finite percentage in (0,100], including 12.5, enables the observed H1-support match-rate trigger. Zero preserves the legacy policy; it does not mean a 0% active trigger. |
+| `PostingNavigationWidth` | 0 | 128 | Per-tier upper-navigation representative-distance beam; width32 is a measured alternative. Zero disables this extra pruning. It is not a terminal-H2 row-count limit. |
+| `PostingMatchRatePercent` | 0 | 12.5 | A finite percentage in (0,100] enables the observed H1-support match-rate trigger. Zero preserves the legacy policy; it does not mean a 0% active trigger. |
 | `PostingMatchWindow` | 1024 | 1024 | Positive count of fresh scored H1 candidates per nonoverlapping observation window. Incomplete windows never trigger. |
 | `SearchPostingPageLimit` | 3 | 3 | Physical-page cap on each selected H/O posting region. Zero means uncapped, not "no reads". |
 | `MaxDistRatio` | 10000 | 8 | Native distance-ratio cutoff for selected posting candidates; not a filter-selectivity controller. |
@@ -360,8 +395,8 @@ entry/owner promotion may still ascend once. No graph restart follows.
 
 Adaptive convergence derives, rather than configures, an H2 representative
 pool width `W = max(effective graph MaxCheck / 16, head-result capacity)`.
-For `MaxCheck=8192`, top-k100 and nprobe128, `W=512`; raising nprobe to384
-still leaves `W=512`. With `MaxCheck=2048`, nprobe128 gives `W=128`.
+For `MaxCheck=16324`, top-k100 and nprobe128, `W=1020`; raising nprobe to512
+still leaves `W=1020`. At nprobe1024/1536, `W=1024/1536`.
 H3+ share expansion priority without occupying H2 pool slots. Once this pool
 is populated, a nearest pending representative worse than its boundary ends
 the supplementary phase. Filling the result heap alone does not stop it.
@@ -378,25 +413,61 @@ and SSD page limits separately. Do not rewrite construction settings or expand
 parameters by predicate selectivity in the client. Preserve sparse/empty results
 in recall accounting instead of silently dropping those queries.
 
-The completed SIFT1B top100 study used the following explicit parameter grid,
-not a runtime table that selects budgets from query selectivity:
+<a id="sift1b-measured-configuration-and-tuning-range"></a>
 
-| Predicate | Actual record selectivity | MaxCheck | Measured nprobe values |
-| --- | ---: | ---: | --- |
-| tags 0..9, OR | 49.829% | 8192 | 512, 768, 1024 |
-| tags 0,5, OR | 19.848% | 8192 | 256, 512, 768 |
-| tags 1,10, OR | 10.053% | 8192 | 192, 384, 768 |
-| tags 3,22, OR | 4.993% | 8192 | 128, 192, 384 |
-| tag 16 | 1.001% | 2048 | 512, 768 |
-| tag 169 | 0.100% | 2048 | 512, 768 |
+#### **SIFT1B measured configuration and tuning range**
 
-All use three SSD pages, window1024, extra2048, width8, one query worker,
-1,000 queries and two rounds. Match rates5/15 are separate measured settings
-on the same target128 index. At the 5% predicate, rate15 improves recall but
-reduces QPS; it is not an across-the-board win. No target512 curve is claimed.
-Use a fresh resident process when changing MaxCheck: pooled native queues
-can retain a previous larger capacity. Do not infer equal-recall performance
-from line interpolation or report missing coverage as superiority.
+The completed 2026-10-10 width sweep uses the accepted **UInt8/128D, L2,
+target512/window4096 V5 index** and the H1-hotpath client. Search fixes
+`MaxCheck=16324`, match rate12.5%, window1024, extra2048 and three SSD pages.
+Widths32 and128 are separate fixed-configuration curves. Start with the
+width128 search section above, then sweep nprobe against the required recall
+and measured cost; do not treat that example or a tuned envelope as one
+universally optimal configuration.
+
+The discrete candidate nprobe set is:
+
+```text
+100,128,160,192,256,384,512,640,768,1024,1280,1536,2048,3072,4096,6144,8192
+```
+
+Each range below selects only members of that set. These are **offline measured
+settings**, not a runtime lookup table that changes budgets by query selectivity.
+
+| Predicate | Actual record selectivity | Measured nprobe range | Points per width |
+| --- | ---: | ---: | ---: |
+| tags 0..9, OR | 49.829% | 192--6144 | 13 |
+| tags 0,5, OR | 19.848% | 100--4096 | 15 |
+| tags 1,10, OR | 10.053% | 100--4096 | 15 |
+| tags 3,22, OR | 4.993% | 100--4096 | 15 |
+| tag 16 | 1.001% | 100--8192 | 17 |
+| tag 169 | 0.100% | 100--8192 | 17 |
+
+There are 184 formal points across the two widths: 180 new points and four
+preserved sel01 observations. Each uses 1,000 queries, Recall@100, one query
+worker and one ordinary round with exact native replay. Instrumented 32-query
+screens are not performance points. The QPS floor of3 is an experiment cost
+policy, not a search-engine limit; forecasts and excluded candidates are not
+measurements. Do not extrapolate an unmeasured high-recall endpoint.
+
+The newer STATIC-hotpath client has a separate **0.1%-only** 27-point ablation:
+nprobe512/1024/1536, width128/256/512 and extra2048/16384/49152. Those timings
+do not replace the six-scenario H1-hotpath measurements. Larger upper budgets
+are not the new default; keep each point's actual client, index, parameters
+and repetition count. Earlier target128/rate5/15 and target512/rate15 results
+remain separately identified historical curves.
+
+Runs were serial and noninterleaved on shared hardware, so cache/order effects
+are not isolated. Some widths return identical neighbors/work with different
+observed QPS; this alone is not causal evidence that width is faster.
+SPTAG uses buffered I/O and once-per-resident-process warmup; existing baselines
+use direct I/O and per-point warmup. Preserve these protocol differences.
+Reuse one resident load for a fixed-MaxCheck nprobe/width sweep. When changing
+MaxCheck, a fresh process avoids retaining a larger pooled queue capacity.
+Published best-observed main curves are explicit cross-configuration/version
+Pareto envelopes; complete fixed-configuration curves remain ablations.
+Do not interpolate performance claims or rerun an existing baseline merely
+to replot these results.
 
 #### **Load and search from another program**
 
@@ -748,20 +819,28 @@ TailReplicaCount=0
 UnfilterTailBufferLength=0
 
 [SearchSSDIndex]
+isExecute=true
+BuildSsdIndex=false
 InternalResultNum=128
+NumberOfThreads=1
 ResultNum=100
-MaxCheck=8192
+MaxCheck=16324
+MaxDistRatio=8
+DisableCrossEdges=true
 EnablePostingNavigation=true
 PostingAnchorCount=0
 PostingAdditionalMaxCheck=2048
-PostingNavigationWidth=8
-PostingMatchRatePercent=15
+PostingNavigationWidth=128
+PostingMatchRatePercent=12.5
 PostingMatchWindow=1024
 SearchPostingPageLimit=3
 
 ```
 
-`Ratio` is the only selection ratio: every level uses `.12` relative to its input.
+The canonical source and fixed-ratio V5 recipe use the same `Ratio=.12`
+relative to each layer's eligible physical input. Experimental V6 instead
+estimates upper-only center counts; it does not change the H1 ratio or the
+Ratio used by the admission census. Do not introduce per-tier ratio overrides.
 Attribute partition settings (`ACLCols`, `HierLevelWidths`,
 `PivotForceNodeCount`, `PerVectorTagsFile`, and `PerTagBKT`) have been removed
 and are rejected. `NumericCols` and bulk `StaticACLTagCols` are also removed;
@@ -788,8 +867,10 @@ The production SIFT1B recipe enables `ParallelBKTBuild=true` so sibling BKT
 nodes are processed concurrently instead of serializing the long recursive
 H1 selection. This increases temporary memory because each concurrent node
 owns k-means workspace; confirm host headroom before launch.
-The expected layer sizes are approximately 120M / 14.4M / 1.728M / 207.36K / 24.88K;
-BKT selection determines the actual counts. H1 retains the query graph;
+The expected canonical-source layer sizes are approximately
+120M / 14.4M / 1.728M / 207.36K / 24.88K; BKT selection determines the actual
+counts. These are not promised sizes for label-pruned V5 or sampled V6.
+H1 retains the query graph;
 H2..H5 retain representative vectors and signed CSR. Native temporary ANN
 indexes use the original `[BuildHead]` settings for CSR assignment and are
 then released, not saved or loaded as query graphs. This SIFT1B recipe selects
@@ -798,7 +879,7 @@ Filtered queries use H1 result-only post-filter: nonmatching ordinary nodes
 remain navigable, while matching heads enter the native result collector.
 Unfiltered queries retain native navigation. The native
 `[SearchSSDIndex] EnablePostingNavigation` flag defaults to `false`; current
-hierarchy recipes explicitly enable it. The explicit 15% match-rate policy
+hierarchy recipes explicitly enable it. The explicit 12.5% match-rate policy
 uses complete windows of fresh scored H1 support observations. Full-domain
 queries can hand off early; partial-domain OR queries must finish native H1
 before supplementing. See the portable query section above for the complete

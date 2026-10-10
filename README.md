@@ -156,8 +156,11 @@ single-label posting mean, see [sampled hierarchy sizing](docs/SampledHierarchyS
 This preserves local admission and writes a new V6 snapshot.
 
 The current templates use `HierarchyLocalTarget=512`,
-`HierarchyLocalWindow=4096` and a 15% observed-match trigger with a 1024-candidate
-window. These are **starting configurations, not a universal optimum**.
+`HierarchyLocalWindow=4096` and a 12.5% observed-match trigger with a 1024-candidate
+window. The query example uses `MaxCheck=16324`, navigation width128 and extra2048;
+nprobe128 is an initial tuning point, not a high-recall guarantee. See the
+[measured SIFT1B configuration family](docs/GettingStart.md#sift1b-measured-configuration-and-tuning-range).
+These are **starting configurations, not a universal optimum**.
 Construction admission and query expansion are separate controls. Evaluate
 recall, latency, storage and build cost for the actual dataset and predicate
 workload; historical measurements do not establish performance for a new index.

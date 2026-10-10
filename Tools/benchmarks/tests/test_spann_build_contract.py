@@ -45,13 +45,13 @@ class NativePreflightContractTest(unittest.TestCase):
         self.assertEqual(config["build"]["buildsignatures"], "true")
         search = config["searchssdindex"]
         self.assertEqual(search["enablepostingnavigation"], "true")
-        self.assertEqual(search["maxcheck"], "8192")
+        self.assertEqual(search["maxcheck"], "16324")
         self.assertEqual(search["internalresultnum"], "128")
         self.assertEqual(search["resultnum"], "100")
         self.assertEqual(search["postingadditionalmaxcheck"], "2048")
         self.assertEqual(search["postinganchorcount"], "0")
-        self.assertEqual(search["postingnavigationwidth"], "8")
-        self.assertEqual(search["postingmatchratepercent"], "15")
+        self.assertEqual(search["postingnavigationwidth"], "128")
+        self.assertEqual(search["postingmatchratepercent"], "12.5")
         self.assertEqual(search["postingmatchwindow"], "1024")
         self.assertEqual(search["disablecrossedges"], "true")
 
@@ -69,6 +69,35 @@ class NativePreflightContractTest(unittest.TestCase):
         documented = configparser.ConfigParser(interpolation=None, comment_prefixes=(";",))
         documented.read_string(match.group(1))
         self.assertEqual(dict(documented["SearchSSDIndex"]), search)
+
+    def test_sift1b_recommendation_matches_portable_search_and_separates_v6(self):
+        text = (ROOT / "docs/GettingStart.md").read_text()
+        section = text.split("#### **SIFT1B construction details (dataset-specific)**", 1)[1]
+        match = re.search(r"```ini\n(.*?)\n```", section, re.DOTALL)
+        self.assertIsNotNone(match)
+        documented = configparser.ConfigParser(interpolation=None, comment_prefixes=(";",))
+        documented.read_string(match.group(1))
+        portable = VALIDATOR.read_config(ROOT / "docs/AdaptiveSpann.ini")
+        self.assertEqual(dict(documented["SearchSSDIndex"]), portable["searchssdindex"])
+        self.assertIn('id="sift1b-measured-configuration-and-tuning-range"', text)
+        self.assertIn("184 formal points", text)
+        self.assertIn("H1-hotpath client", text)
+        self.assertIn("0.1%-only", text)
+        self.assertIn("not the measured V5 performance", text)
+        self.assertNotIn("No target512 curve is claimed", text)
+        self.assertNotIn("has not yet supplied accepted SIFT1B performance results", text)
+        experimental = text.split("#### **Experimental sampled upper sizing (V6)**", 1)[1]
+        sampled = re.search(r"```ini\n(.*?)\n```", experimental, re.DOTALL)
+        self.assertIsNotNone(sampled)
+        config = configparser.ConfigParser(interpolation=None, comment_prefixes=(";",))
+        config.read_string(sampled.group(1))
+        self.assertEqual(dict(config["SelectHead"]), {
+            "hierarchytargetpostingsize": "128", "hierarchysizingsampleheads": "262144",
+        })
+        local = VALIDATOR.read_config(ROOT / "docs/LocalLabelHierarchy.ini")
+        for key in config["SelectHead"]:
+            self.assertNotIn(key, portable["selecthead"])
+            self.assertNotIn(key, local["selecthead"])
 
     def test_local_rebuild_recipe_is_separate_and_documented(self):
         config = VALIDATOR.read_config(ROOT / "docs/LocalLabelHierarchy.ini")
