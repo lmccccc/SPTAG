@@ -273,6 +273,11 @@ def predicate_mask(config, scenario, attributes, ids):
     tag = attributes[ids, config.section("Dataset").getint("CategoricalColumn")]
     if kind == "categorical":
         return tag == section.getint("Tag")
+    if kind == "categorical_or":
+        labels = [int(value) for value in config.csv(f"Scenario.{scenario}", "Tags")]
+        require(labels and len(set(labels)) == len(labels) and all(0 <= value < 2**32 for value in labels),
+                "Categorical OR requires distinct uint32 labels")
+        return np.isin(tag, labels)
     require(kind == "mixed_dnf", "Unsupported native predicate")
     numeric = attributes[ids, config.section("Dataset").getint("NumericColumn")]
     return ((tag == section.getint("RareTag")) |
@@ -881,6 +886,10 @@ def resolved_key(config, engine, phase, row):
 
 
 def native_short_results(config, engine):
+    if engine == "Filtered_DiskANN":
+        section = config.section("DiskANN")
+        return (section.get("SearchMode") == "categorical-or-shared-beam-v1" and
+                section.getboolean("AllowShortResults", fallback=False))
     return engine == "PipeANN" and config.section("PipeANN").getboolean("AllowShortResults", fallback=False)
 
 

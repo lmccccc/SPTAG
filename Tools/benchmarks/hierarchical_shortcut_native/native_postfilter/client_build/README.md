@@ -29,8 +29,10 @@ Truncation, trailing bytes, unsupported dtype/order/version and extra dimensions
 fail explicitly. `[SearchSSDIndex] SearchPostingPageLimit` is a required positive
 integer, not fixed to 15. Other native budgets and protocol controls are unchanged.
 
-Point JSON adds `value_type` and `search_posting_page_limit`. Existing navigation
-schema 6 / 57 columns and result/distance/work payload formats remain unchanged.
+Point JSON includes `value_type` and `search_posting_page_limit`. The current
+client reports navigation schema 7 / 58 columns and dispatch schema 2 / 6
+columns; historical typed-client fixtures below used schema 6 / 57 columns.
+Result/distance/work payload formats remain unchanged.
 Warmup, timing boundaries and deterministic replay remain the same. Query bytes
 are `128 * sizeof(T)`, and the tenant manager uses the declared native type.
 
@@ -88,7 +90,8 @@ on an unloaded temporary index before any data load; the existing public tenant
 manager setters apply complete settings to the loaded manager between cases.
 `isExecute=true` and `BuildSsdIndex=false` are required. HashTableExponent and
 DisableCrossEdges must remain invariant across cases, as do the existing fixed
-single-query-thread/top-10/no-hybrid controls. Phase logging has the separate
+single-query-thread/no-hybrid controls. `ResultNum` explicitly selects positive
+top-k, and every nprobe must be at least top-k. Phase logging has the separate
 explicit diagnostic opt-in below; other logging remains disabled.
 When increasing MaxCheck and decreasing the extra budget, the declared extra
 is applied first to avoid a transient base-plus-extra integer overflow.
@@ -120,6 +123,11 @@ The caller supplies the balanced scenario/variant schedule, including reversed
 repetitions. Ordinary and diagnostic schedules run in separate processes using
 their respective binaries. Inputs must remain immutable throughout execution.
 Do not splice historical fresh-process throughput into a load-once campaign.
+
+For portable log/capture validation, complete-repetition aggregation and stable
+append-only result JSON, use the
+[repository publication workflow](../../../results/README.md). It runs these
+native batch INIs unchanged and never admits diagnostic QPS as ordinary data.
 
 ### Reuse validation and retained memory history
 

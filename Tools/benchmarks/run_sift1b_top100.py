@@ -74,7 +74,7 @@ def validate_exact(ids, distances, base, queries, attrs, tag, topk):
     require(all(len(set(row[row >= 0])) == int(mask.sum()) for row, mask in zip(ids, valid)),
             "Duplicate returned IDs")
     if tag is not None:
-        require(np.all(attrs[ids[valid], 0] == tag), "Returned ID violates the original label")
+        require(np.all(np.isin(attrs[ids[valid], 0], tag)), "Returned ID violates the original label predicate")
     require(np.all(np.isfinite(distances[valid])), "Nonfinite returned distance")
     for start in range(0, len(queries), 64):
         rows, ranks = np.nonzero(valid[start:start + 64])
@@ -407,8 +407,14 @@ def analyze_spann(config, proof):
             ids = np.fromfile(folder / "ids.i32", dtype="<i4").reshape(1000, 100)
             distances = np.fromfile(folder / "dist.f32", dtype="<f4").reshape(1000, 100)
             definition = config.section("Scenario." + case["scenario"])
-            require(definition["Kind"] in ("unfilter", "categorical"), "Unsupported top100 predicate")
-            tag = None if definition["Kind"] == "unfilter" else definition.getint("Tag")
+            require(definition["Kind"] in ("unfilter", "categorical", "categorical_or"),
+                    "Unsupported top100 predicate")
+            if definition["Kind"] == "categorical_or":
+                tag = tuple(int(value) for value in config.csv("Scenario." + case["scenario"], "Tags"))
+                require(tag and len(set(tag)) == len(tag) and all(0 <= value < 2**32 for value in tag),
+                        "Categorical OR requires distinct uint32 labels")
+            else:
+                tag = None if definition["Kind"] == "unfilter" else definition.getint("Tag")
             require(tag is not None or definition["Kind"] == "unfilter", "Missing categorical tag")
             valid = validate_exact(ids, distances, base, queries, attrs, tag, 100)
             require(np.all(distances[~valid] == np.finfo(np.float32).max / np.float32(10)),

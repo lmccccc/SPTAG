@@ -48,6 +48,26 @@ class ThreewayControllerTest(unittest.TestCase):
                          config.affinity("throughput"))
         self.assertEqual([0.9, 0.95], config.targets())
 
+    def test_or_predicate_and_explicit_diskann_short_result_opt_in(self):
+        self.parser["Scenario.broad_tag"].update(Kind="categorical_or", Tags="1,3")
+        self.save()
+        attributes = np.array([[1, 0], [2, 0], [3, 0]], dtype=np.uint32)
+        np.testing.assert_array_equal(
+            runner.predicate_mask(self.config, "broad_tag", attributes, np.arange(3)),
+            [True, False, True])
+        for invalid in ("1,1", "-1,3", "1,4294967296"):
+            self.parser["Scenario.broad_tag"]["Tags"] = invalid
+            self.save()
+            with self.assertRaises(ValueError):
+                runner.predicate_mask(self.config, "broad_tag", attributes, np.arange(3))
+        self.assertFalse(runner.native_short_results(self.config, "Filtered_DiskANN"))
+        self.parser["DiskANN"].update(SearchMode="categorical-or-shared-beam-v1", AllowShortResults="true")
+        self.save()
+        self.assertTrue(runner.native_short_results(self.config, "Filtered_DiskANN"))
+        self.parser["DiskANN"]["SearchMode"] = "categorical"
+        self.save()
+        self.assertFalse(runner.native_short_results(self.config, "Filtered_DiskANN"))
+
     def test_reject_changed_search_policy_and_too_short_duration(self):
         self.parser["SearchSSDIndex"]["MaxCheck"] = "1024"
         self.save()

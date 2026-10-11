@@ -57,6 +57,16 @@ class Top100ValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "squared L2"):
             self.validate(distances=wrong)
 
+    def test_exact_or_validation_accepts_union_not_unrelated_labels(self):
+        self.attrs[:, 0] = np.arange(len(self.attrs)) % 2
+        valid = runner.validate_exact(self.ids, self.distances, self.base, self.queries,
+                                      self.attrs, [0, 1], 100)
+        self.assertTrue(valid.all())
+        self.attrs[2, 0] = 2
+        with self.assertRaisesRegex(ValueError, "label"):
+            runner.validate_exact(self.ids, self.distances, self.base, self.queries,
+                                  self.attrs, [0, 1], 100)
+
     def test_pareto_frontiers_pool_profiles_not_scenarios(self):
         points = []
         for engine, scenario, setting, recall, qps in (

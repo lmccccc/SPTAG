@@ -1,0 +1,8 @@
+[
+  {"study":"main","variant":"default","scenario":"sel50","topk":100,"cohort_queries":1000,"phase":"single","threads":1,"expected_repeats":2},
+  {"study":"main","variant":"default","scenario":"sel20","topk":100,"cohort_queries":1000,"phase":"single","threads":1,"expected_repeats":2},
+  {"study":"main","variant":"default","scenario":"sel10","topk":100,"cohort_queries":1000,"phase":"single","threads":1,"expected_repeats":2},
+  {"study":"main","variant":"default","scenario":"sel5","topk":100,"cohort_queries":1000,"phase":"single","threads":1,"expected_repeats":2},
+  {"study":"main","variant":"default","scenario":"sel1","topk":100,"cohort_queries":1000,"phase":"single","threads":1,"expected_repeats":2},
+  {"study":"main","variant":"default","scenario":"sel01","topk":100,"cohort_queries":1000,"phase":"single","threads":1,"expected_repeats":2}
+]
