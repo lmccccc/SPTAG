@@ -7,6 +7,13 @@ directories, or downloaded datasets. The registry preserves the existing
 **schema 1** event/history/current formats, including exact-index retirement.
 Native log and binary payload formats are not changed.
 
+For offline SSD posting-label composition (conditional means, 100-bin
+distributions and separate H/O statistics), use
+[`SSD_LABEL_DISTRIBUTION.md`](SSD_LABEL_DISTRIBUTION.md). It documents the
+standalone read-only scanner, portable report export and publication into the
+same `tables` registry. Generated statistics and index/data files are not
+included in the repository.
+
 The executable runner currently supports **UInt8, squared L2, dimension 128,
 one query worker**, arbitrary positive top-k, and the schema-2 output of
 `generate_spann_predicate_groundtruth.py`. Empty, categorical, OR, AND and

@@ -9,6 +9,11 @@ validation, repeated-point aggregation, append-only `history.jsonl` and atomic
 single-physical-index selection/retirement. No session-state files or paper
 checkout are required. Historical recipes below retain their original bindings.
 
+[`results/SSD_LABEL_DISTRIBUTION.md`](results/SSD_LABEL_DISTRIBUTION.md) covers
+exact per-label proportions inside SSD postings: a read-only full scan,
+conditional means/distributions, H/O breakdown and export to the unified JSON.
+Only tools and instructions are tracked, not generated distributions or indexes.
+
 ## Current portable parameters
 
 Start with [GettingStart.md](../../docs/GettingStart.md) and
