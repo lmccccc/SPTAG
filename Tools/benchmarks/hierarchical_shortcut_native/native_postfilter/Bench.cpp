@@ -3,6 +3,7 @@
 #include "inc/Core/SPANN/Options.h"
 #include "inc/Helper/SimpleIniReader.h"
 #include "inc/Core/Common/GraphAccessStats.h"
+#include "inc/Core/Common/QueryStepTiming.h"
 #include "../../NativeNProbeSweep.h"
 #include <array>
 #include <charconv>
@@ -106,6 +107,7 @@ struct Config {
     Helper::IniReader ini;
     std::string index,queries,predicateFile,predicate,mode,valueType;
     bool phaseTiming=false;
+    bool stepTiming=false;
     int count,warmup,topk,maxCheck,anchorCount,additionalMaxCheck,postingPageLimit,navigationWidth;
     double matchRatePercent;
     int matchWindow;
@@ -119,6 +121,13 @@ struct Config {
         const auto phase=ini.GetParameter<std::string>("Benchmark","PhaseTiming","false");
         Require(phase=="true" || phase=="false","Benchmark.PhaseTiming must be true or false");
         phaseTiming=phase=="true";
+        const auto steps=ini.GetParameter<std::string>("Benchmark","StepTiming","false");
+        Require(steps=="true" || steps=="false","Benchmark.StepTiming must be true or false");
+        stepTiming=steps=="true";
+#ifndef SPTAG_QUERY_STEP_TIMING
+        Require(!stepTiming,"StepTiming requires SPTAG_QUERY_STEP_TIMING=ON");
+#endif
+        Require(!stepTiming || !phaseTiming,"StepTiming and legacy PhaseTiming must be separate");
         Require(Get("SearchSSDIndex","LogPhaseTime")==phase,
             "LogPhaseTime must match explicit Benchmark.PhaseTiming (default false)");
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
@@ -161,6 +170,10 @@ struct Config {
             saved.GetParameter<std::string>("Base","IndexAlgoType","")=="BKT" &&
             saved.GetParameter<std::string>("BuildSSDIndex","Storage","")=="STATIC",
             "Benchmark supports a loaded, immutable STATIC SPANN/BKT snapshot only");
+#ifdef SPTAG_QUERY_STEP_TIMING
+        Require(saved.GetParameter<std::string>("BuildSSDIndex","PostingQuantizer","None")=="None",
+            "Step timing currently supports raw STATIC postings, not quantized/rerank paths");
+#endif
         for(auto p:std::vector<std::pair<std::string,std::string>>{
             {"NumberOfThreads","1"},
             {"EnableHybridDistance","false"},{"DumpHeads","0"},
@@ -270,7 +283,8 @@ template<class T> auto SearchOne(Config& cfg,Matrix<T>& queries,Matrix<std::uint
             return manager.SearchWithPredicate(query,0,cfg.topk,predicate,cfg.predicate=="empty"?0:-1);
 }
 template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_t>& predicates,
-    TenantIndexManager& manager,const CaseIdentity* identity=nullptr,bool warmupPerPoint=true) {
+    TenantIndexManager& manager,const CaseIdentity* identity=nullptr,bool warmupPerPoint=true,
+    const std::string& warmupPolicy="") {
         const auto search=[&](int i) {return SearchOne(cfg,queries,predicates,manager,i);};
         for(int probe:cfg.probes) {
         manager.SetSearchParam("InternalResultNum",std::to_string(probe).c_str(),"SearchSSDIndex");
@@ -283,6 +297,7 @@ template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_
         std::vector<std::int32_t> ids(resultCount,-1);std::vector<float> distances(resultCount,MaxDist);
         std::vector<Work> work(cfg.count);
         std::vector<double> latency(cfg.count);
+        std::vector<COMMON::StepTiming::Values> steps(cfg.stepTiming?cfg.count:0);
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
         std::vector<std::array<std::uint64_t,58>> navigation(cfg.count);
         std::vector<std::array<std::uint64_t,6>> dispatch(cfg.count);
@@ -292,6 +307,7 @@ template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_
         const auto start=std::chrono::steady_clock::now();
         for(int i=0;i<cfg.count;++i) {
             const auto queryStart=std::chrono::steady_clock::now();
+            COMMON::StepTiming::Query stepQuery(cfg.stepTiming);
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
             COMMON::GraphAccessStats stats;
             COMMON::ScopedGraphAccessStats scope(&stats);
@@ -303,6 +319,7 @@ template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_
                 const auto offset=std::size_t(i)*cfg.topk+k;
                 ids[offset]=result->GetResult(k)->VID;distances[offset]=result->GetResult(k)->Dist;
             }
+            if(cfg.stepTiming) steps[i]=stepQuery.Finish();
             latency[i]=std::chrono::duration<double,std::micro>(
                 std::chrono::steady_clock::now()-queryStart).count();
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
@@ -343,6 +360,7 @@ template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_
         }
         Write(output+"/ids.i32",ids);Write(output+"/dist.f32",distances);
         Write(output+"/work.u64",work);Write(output+"/latency_us.f64",latency);
+        if(cfg.stepTiming) Write(output+"/steps.ns.u64",steps);
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
         Write(output+"/navigation.u64",navigation);
         Write(output+"/dispatch.u64",dispatch);
@@ -350,7 +368,12 @@ template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_
         Write(output+"/graph_dist.f32",graphDistances);
         constexpr bool diagnostic=true;
 #else
-        constexpr bool diagnostic=false;
+        constexpr bool diagnostic=
+#ifdef SPTAG_QUERY_STEP_TIMING
+            true;
+#else
+            false;
+#endif
 #endif
         std::sort(latency.begin(),latency.end());
         const auto percentile=[&](double quantile) {
@@ -374,14 +397,17 @@ template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_
                  <<",\"posting_match_window\":"<<cfg.matchWindow
                  <<",\"dispatch_schema_version\":2,\"dispatch_columns\":6"
                  <<",\"diagnostic\":"<<(diagnostic?"true":"false")
-                 <<",\"phase_timing\":"<<(cfg.phaseTiming?"true":"false")
+                 <<",\"phase_timing\":"<<((cfg.phaseTiming||cfg.stepTiming)?"true":"false")
+                 <<",\"step_timing\":"<<(cfg.stepTiming?"true":"false")
+                 <<",\"step_timing_schema_version\":1,\"step_timing_columns\":"<<COMMON::StepTiming::Count
                  <<",\"navigation_schema_version\":7,\"navigation_columns\":58"
                  <<",\"mean_ms\":"<<elapsed*1000/cfg.count<<",\"qps\":"<<cfg.count/elapsed
                  <<",\"p50_us\":"<<percentile(.50)<<",\"p95_us\":"<<percentile(.95)
                  <<",\"p99_us\":"<<percentile(.99);
         if(identity) {
             std::cout<<",\"event\":\"point\",\"warmup_queries\":"<<(warmupPerPoint?cfg.warmup:0)
-                <<",\"warmup_policy\":\""<<(warmupPerPoint?"per_point":"once")<<"\""
+                <<",\"warmup_policy\":"<<JsonString(warmupPolicy.empty()?
+                    (warmupPerPoint?"per_point":"once"):warmupPolicy)
                 <<",\"measured_queries\":"<<cfg.count<<",\"replay_queries\":"<<cfg.count;
             WriteIdentity(*identity);
         }
@@ -416,7 +442,8 @@ std::string AbsoluteInput(const std::string& value) {
 }
 bool BatchWarmupOnce(Helper::IniReader& ini) {
     const auto policy=ini.GetParameter<std::string>("Batch","WarmupPolicy","per_point");
-    Require(policy=="per_point" || policy=="once","Batch.WarmupPolicy must be per_point or once");
+    Require(policy=="per_point" || policy=="once" || policy=="once_per_predicate",
+        "Batch.WarmupPolicy must be per_point, once or once_per_predicate");
     return policy=="once";
 }
 std::vector<std::unique_ptr<BatchCase>> ReadBatch(const char* path,Helper::IniReader& ini) {
@@ -506,12 +533,12 @@ std::vector<std::unique_ptr<BatchCase>> ReadBatch(const char* path,Helper::IniRe
     return cases;
 }
 template<class T> int RunBatch(std::vector<std::unique_ptr<BatchCase>>& cases,const std::string& dtype,
-    bool warmupOnce=false) {
+    bool warmupOnce=false,bool warmupPerPredicate=false) {
     auto& first=cases.front()->cfg;
     auto queries=ReadNpy<T>(first.queries,dtype);
     for(auto& item:cases) item->predicates=PrepareCase(item->cfg,queries);
     std::cout<<"{\"event\":\"batch_begin\",\"cases\":"<<cases.size()
-        <<",\"warmup_policy\":\""<<(warmupOnce?"once":"per_point")<<"\""
+        <<",\"warmup_policy\":\""<<(warmupPerPredicate?"once_per_predicate":warmupOnce?"once":"per_point")<<"\""
         <<",\"phase_timing\":"<<(first.phaseTiming?"true":"false")
         <<",\"value_type\":"<<JsonString(first.valueType)<<",\"index\":"<<JsonString(first.index)
         <<",\"queries\":"<<JsonString(first.queries)<<"}\n";
@@ -537,17 +564,32 @@ template<class T> int RunBatch(std::vector<std::unique_ptr<BatchCase>>& cases,co
         std::cout<<"{\"event\":\"batch_warmup_end\",\"completed_queries\":"<<warmupTotal<<"}\n";
         FlushProgress();
     }
+    std::set<std::string> warmedPredicates;
     for(std::size_t i=0;i<cases.size();++i) {
         auto& item=*cases[i];
         if(i!=0) item.cfg.Apply(manager,&cases[i-1]->cfg);
+        const auto warmupGroup=item.cfg.predicate+"\n"+item.cfg.predicateFile;
+        if(warmupPerPredicate && warmedPredicates.insert(warmupGroup).second) {
+            manager.SetSearchParam("InternalResultNum",std::to_string(item.cfg.probes.front()).c_str(),"SearchSSDIndex");
+            std::cout<<"{\"event\":\"scenario_warmup_begin\",\"queries\":"<<item.cfg.warmup;
+            WriteIdentity(item.identity);
+            std::cout<<",\"warmup_group\":"<<JsonString(warmupGroup)<<"}\n";
+            FlushProgress();
+            for(int q=0;q<item.cfg.warmup;++q)
+                Require(bool(SearchOne(item.cfg,queries,item.predicates,manager,q)),"Scenario warmup query failed");
+            warmupTotal+=item.cfg.warmup;
+            std::cout<<"{\"event\":\"scenario_warmup_end\",\"completed_queries\":"<<item.cfg.warmup<<"}\n";
+            FlushProgress();
+        }
         Require(std::filesystem::weakly_canonical(item.identity.output)==item.identity.output &&
             std::filesystem::create_directories(item.identity.output),"Batch output collision at case start");
         std::cout<<"{\"event\":\"case_begin\"";
         WriteIdentity(item.identity);
         std::cout<<",\"predicate\":"<<JsonString(item.cfg.predicate)
-            <<",\"phase_timing\":"<<(item.cfg.phaseTiming?"true":"false")
+            <<",\"phase_timing\":"<<((item.cfg.phaseTiming||item.cfg.stepTiming)?"true":"false")
+            <<",\"step_timing\":"<<(item.cfg.stepTiming?"true":"false")
             <<",\"predicate_file\":"<<JsonString(item.cfg.predicateFile)
-            <<",\"warmup_queries\":"<<(warmupOnce?0:item.cfg.warmup)<<",\"measured_queries\":"<<item.cfg.count
+            <<",\"warmup_queries\":"<<((warmupOnce||warmupPerPredicate)?0:item.cfg.warmup)<<",\"measured_queries\":"<<item.cfg.count
             <<",\"replay_queries\":"<<item.cfg.count<<",\"search_settings\":{";
         bool comma=false;
         for(const auto& setting:item.cfg.ini.GetParameters("SearchSSDIndex")) {
@@ -557,8 +599,9 @@ template<class T> int RunBatch(std::vector<std::unique_ptr<BatchCase>>& cases,co
         }
         std::cout<<"}}\n";
         FlushProgress();
-        RunCase(item.cfg,queries,item.predicates,manager,&item.identity,!warmupOnce);
-        if(!warmupOnce) warmupTotal+=std::uint64_t(item.cfg.warmup)*item.cfg.probes.size();
+        RunCase(item.cfg,queries,item.predicates,manager,&item.identity,!(warmupOnce||warmupPerPredicate),
+            warmupPerPredicate?"once_per_predicate":"");
+        if(!warmupOnce && !warmupPerPredicate) warmupTotal+=std::uint64_t(item.cfg.warmup)*item.cfg.probes.size();
         std::cout<<"{\"event\":\"case_end\",\"completed_points\":"<<item.cfg.probes.size();
         WriteIdentity(item.identity);
         std::cout<<"}\n";
@@ -577,8 +620,9 @@ int main(int argc,char** argv) {
         if(entry.DoesSectionExist("Batch")) {
             auto cases=ReadBatch(argv[1],entry);
             const bool warmupOnce=BatchWarmupOnce(entry);
-            return cases.front()->cfg.valueType=="UInt8"?RunBatch<std::uint8_t>(cases,"|u1",warmupOnce):
-                RunBatch<float>(cases,"<f4",warmupOnce);
+            const bool perPredicate=entry.GetParameter<std::string>("Batch","WarmupPolicy","per_point")=="once_per_predicate";
+            return cases.front()->cfg.valueType=="UInt8"?RunBatch<std::uint8_t>(cases,"|u1",warmupOnce,perPredicate):
+                RunBatch<float>(cases,"<f4",warmupOnce,perPredicate);
         }
         Config cfg(argv[1]);
         return cfg.valueType=="UInt8" ? RunBenchmark<std::uint8_t>(cfg,"|u1")

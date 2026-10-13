@@ -8,6 +8,7 @@
 #include "inc/Helper/AsyncFileReader.h"
 #include "IExtraSearcher.h"
 #include "inc/Core/Common/TruthSet.h"
+#include "inc/Core/Common/QueryStepTiming.h"
 #include "inc/Core/SPANN/HybridCandidateSelector.h"
 #include "inc/Core/SPANN/HybridDistance.h"
 #include "inc/Core/SPANN/HybridRoutingStats.h"
@@ -121,6 +122,7 @@ namespace SPTAG
         };
 
 #define DecompressPosting(){\
+        SPTAG_STEP_SCOPE(Decompress); \
         p_postingListFullData = (char*)p_exWorkSpace->m_decompressBuffer.GetBuffer(); \
         if (listInfo->listEleCount != 0) { \
             std::size_t sizePostingListFullData;\
@@ -156,6 +158,7 @@ namespace SPTAG
 
 #define ProcessPosting() \
         { \
+        SPTAG_STEP_SCOPE(Scan); \
         bool postingMatched = false; \
         bool postingContributedUnique = false; \
         for (int staticScanRange = 0; staticScanRange < 2; ++staticScanRange) { \
@@ -170,20 +173,20 @@ namespace SPTAG
             const char* record = p_postingListFullData + offsetVectorID;\
             int vectorID;\
             std::memcpy(&vectorID, record, sizeof(vectorID));\
-            if (p_exWorkSpace->m_deduper.CheckAndSet(vectorID)) { \
+            if (SPTAG_STEP_CALL(FilterDedup, p_exWorkSpace->m_deduper.CheckAndSet(vectorID))) { \
                 ++p_exWorkSpace->m_postingProbeStats.m_dedupSkippedVectors; \
                 listElements--; continue; \
             } \
-            if (!this->StaticRecordMatchesFilter(p_exWorkSpace, record)) { listElements--; continue; } \
+            if (!SPTAG_STEP_CALL(FilterDedup, this->StaticRecordMatchesFilter(p_exWorkSpace, record))) { listElements--; continue; } \
             postingMatched = true; \
             ++p_exWorkSpace->m_postingProbeStats.m_matchedVectors; \
             if (collectPostingContributionStats) { \
                 postingContributedUnique = true; \
                 ++p_exWorkSpace->m_postingProbeStats.m_uniqueMatchedVectors; \
             } \
-            (this->*m_parseEncoding)(p_index, listInfo, (ValueType*)(p_postingListFullData + offsetVector));\
-            auto distance2leaf = p_index->ComputeDistance(queryResults.GetQuantizedTarget(), p_postingListFullData + offsetVector); \
-            queryResults.AddPoint(vectorID, distance2leaf); \
+            SPTAG_STEP_CALL(Distance, (this->*m_parseEncoding)(p_index, listInfo, (ValueType*)(p_postingListFullData + offsetVector)));\
+            auto distance2leaf = SPTAG_STEP_CALL(Distance, p_index->ComputeDistance(queryResults.GetQuantizedTarget(), p_postingListFullData + offsetVector)); \
+            SPTAG_STEP_CALL(TopK, queryResults.AddPoint(vectorID, distance2leaf)); \
         } \
         } \
         if (postingMatched) ++p_exWorkSpace->m_postingProbeStats.m_matchedPostings; \

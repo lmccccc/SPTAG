@@ -3,6 +3,11 @@ project(NativeTypedBenchmarkClient LANGUAGES CXX)
 set(SPTAG_SOURCE_ROOT "" CACHE PATH "Client/header source snapshot")
 set(CORRECTED_CORE_DIR "" CACHE PATH "Existing corrected native core build, never rebuilt here")
 option(CLIENT_DIAGNOSTIC "Match the diagnostic core ABI" OFF)
+file(STRINGS "${CORRECTED_CORE_DIR}/CMakeCache.txt" CORE_STEP_TIMING
+    REGEX "^SPTAG_QUERY_STEP_TIMING:BOOL=")
+if(CORE_STEP_TIMING STREQUAL "SPTAG_QUERY_STEP_TIMING:BOOL=ON")
+    message(FATAL_ERROR "Use the matching nativeBench target for step-timing cores, not the frozen client-only builder")
+endif()
 file(STRINGS "${CORRECTED_CORE_DIR}/CMakeCache.txt" CORE_DIAGNOSTIC
     REGEX "^SPTAG_QUERY_WORK_DIAGNOSTICS:BOOL=")
 if(CLIENT_DIAGNOSTIC)

@@ -95,7 +95,8 @@ def load_plan(path):
         profile = read_config(ini)
         bench, search = profile["benchmark"], profile["searchssdindex"]
         require(bench["valuetype"] == "UInt8", "Portable capture validator currently requires UInt8")
-        require(bench.get("phasetiming", "false") == "false" and search["logphasetime"] == "false"
+        require(bench.get("phasetiming", "false") == "false" and bench.get("steptiming", "false") == "false"
+                and search["logphasetime"] == "false"
                 and search["logpathstats"] == "false" and search["dumpheads"] == "0",
                 "Diagnostics are not ordinary performance measurements")
         require(search["numberofthreads"] == "1" and search["buildssdindex"] == "false"

@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "inc/Core/SPANN/Index.h"
+#include "inc/Core/Common/QueryStepTiming.h"
 #include "inc/Core/BKT/Index.h"
 #include "inc/Core/KDT/Index.h"
 #include "inc/Helper/VectorSetReaders/MemoryReader.h"
@@ -5700,6 +5701,7 @@ ErrorCode Index<T>::SaveIndexData(const std::vector<std::shared_ptr<Helper::Disk
 
 template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool p_searchDeleted) const
 {
+    SPTAG_STEP_SCOPE(HeadPrepare);
     if (!m_bReady)
         return ErrorCode::EmptyIndex;
 
@@ -6093,6 +6095,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
     }
 
     const int phaseHeadScanned = s_phaseTime ? p_queryResults->GetScanned() : 0;
+    SPTAG_STEP_SCOPE(PostingPrepare);
     auto _phT1 = s_phaseTime ? std::chrono::high_resolution_clock::now()
                              : std::chrono::high_resolution_clock::time_point{};
 
@@ -6466,6 +6469,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             fflush(stderr);
         }
         ret = m_extraSearcher->SearchIndex(workSpace.get(), *p_queryResults, m_index, _phExtraStatsPtr);
+        SPTAG_STEP_SCOPE(Finalize);
         SPTAG::VectorIndex::SetThreadLocalPostingScanStats(
             workSpace->m_postingProbeStats.m_readPostings,
             workSpace->m_postingProbeStats.m_matchedPostings,
@@ -6489,6 +6493,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         p_queryResults->SortResult();
     }
 
+    SPTAG_STEP_SCOPE(Finalize);
     if (s_phaseTime) {
         auto _phT2 = std::chrono::high_resolution_clock::now();
         double graphTotalMs = std::chrono::duration<double, std::milli>(_phT1 - _phT0).count();

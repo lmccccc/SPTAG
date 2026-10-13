@@ -44,6 +44,12 @@ int main()
         config("missing.ini", "8", true);
         config("nprobe.ini", "8", false, "0");
         config("invalid-anchors.ini", "8", false, "-1");
+        for (const char* name : {"steps.ini", "bad-steps.ini", "mixed-timers.ini"}) {
+            config(name, "8", false);
+            std::ofstream file(directory / name, std::ios::app);
+            file << "StepTiming=" << (std::string(name) == "bad-steps.ini" ? "yes" : "true") << '\n';
+            if (std::string(name) == "mixed-timers.ini") file << "PhaseTiming=true\n";
+        }
         for (const char* budget : {"1","512","1024","4096"})
             config(("budget"+std::string(budget)+".ini").c_str(), "8", false, "0", budget);
         config("zero-budget.ini", "8", false, "0", "0");
@@ -92,7 +98,16 @@ int main()
             results[2]->cfg.topk==10 && results[1]->cfg.probes==std::vector<int>({100,192,384}),
             "Native result capacity or top100 sweep was replaced by a benchmark constant");
         Require(batch({"on.ini","top100.ini"},"once").size()==2 &&
-            batch({"on.ini"},"per_point").size()==1,"Explicit batch warmup policy rejected");
+            batch({"on.ini"},"per_point").size()==1 &&
+            batch({"on.ini","off.ini"},"once_per_predicate").size()==2,"Explicit batch warmup policy rejected");
+#ifdef SPTAG_QUERY_STEP_TIMING
+        const auto steps = batch({"steps.ini", "off.ini"}, "once_per_predicate");
+        Require(steps[0]->cfg.stepTiming && !steps[1]->cfg.stepTiming, "Paired step controls rejected");
+#else
+        bool stepsRejected = false;
+        try { batch({"steps.ini"}); } catch (const std::runtime_error&) { stepsRejected = true; }
+        Require(stepsRejected, "Ordinary client accepted step timing");
+#endif
         for(const char* policy:{"per_case","true",""}) {
             bool rejected=false;
             try {batch({"on.ini"},policy);} catch(const std::runtime_error&) {rejected=true;}
@@ -118,7 +133,7 @@ int main()
         for (const auto& name : {"invalid.ini", "missing.ini", "invalid-anchors.ini", "bad-rate.ini", "nan-rate.ini", "bad-window.ini",
                                 "zero-budget.ini", "negative-budget.ini", "malformed-budget.ini", "overflow-budget.ini",
                                 "short-probe.ini", "short-sweep.ini", "invalid-topk0.ini", "invalid-topk-1.ini",
-                                "invalid-topk100x.ini", "invalid-topk2147483648.ini"}) {
+                                "invalid-topk100x.ini", "invalid-topk2147483648.ini", "bad-steps.ini", "mixed-timers.ini"}) {
             bool rejected=false;
             try { batch({name}); }
             catch (const std::runtime_error&) { rejected=true; }

@@ -14,6 +14,13 @@ standalone read-only scanner, portable report export and publication into the
 same `tables` registry. Generated statistics and index/data files are not
 included in the repository.
 
+For the fastest observed recall >= 90% single-worker point in each of the six
+SIFT1B scenarios, use [`R90_TIMING.md`](R90_TIMING.md). It provides matched
+ordinary/timing builds, three paired clock-off/on repetitions, scenario-once
+full-cohort warmup, exclusive application-stage accounting and diagnostic-table
+publication without replacing formal QPS. It requires exact accepted portable
+reference experiments, not relabelled historical measurements.
+
 The executable runner currently supports **UInt8, squared L2, dimension 128,
 one query worker**, arbitrary positive top-k, and the schema-2 output of
 `generate_spann_predicate_groundtruth.py`. Empty, categorical, OR, AND and

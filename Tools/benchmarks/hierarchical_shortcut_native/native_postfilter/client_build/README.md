@@ -8,6 +8,13 @@ Archive paths follow that cache's `SPTAG_OUTPUT_DIRECTORY`, or the legacy
 `CORRECTED_CORE_DIR/bin` layout when the key is absent. Missing archives fail
 configuration; no core artifact is copied over or rebuilt.
 
+Step-timing cores are deliberately rejected by this client-only builder.
+Use the same-source, fresh ordinary/timing `nativeBench` builds documented in
+the [R90 step-timing pipeline](../../../results/R90_TIMING.md), which also covers
+`Benchmark.StepTiming` and `Batch.WarmupPolicy=once_per_predicate`. Timing builds
+mark clock-on and clock-off points diagnostic; they cannot replace ordinary
+performance observations. The existing `once`/`per_point` behavior is unchanged.
+
 ```sh
 cmake -S CLIENT_BUILD_SOURCE -B NEW_CLIENT_BUILD \
   -DCMAKE_BUILD_TYPE=Release \

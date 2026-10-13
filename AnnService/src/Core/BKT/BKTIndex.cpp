@@ -3,6 +3,7 @@
 
 #include "inc/Core/BKT/Index.h"
 #include "inc/Core/Common/PostingMatchRate.h"
+#include "inc/Core/Common/QueryStepTiming.h"
 #include "inc/Core/ResultIterator.h"
 #include <chrono>
 
@@ -318,6 +319,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                       CrossGraphSearchStats* p_crossStats,
                       std::function<bool(SizeType)> p_resultFilter) const
 {
+    SPTAG_STEP_SCOPE(H1);
     std::function<float(const T*, const T*, DimensionType)> countedDistance;
     const auto* computeDistance = &m_fComputeDistance;
     if (auto* accesses = COMMON::g_graphAccessStats)
@@ -776,6 +778,7 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
 #ifndef SPTAG_QUERY_WORK_DIAGNOSTICS
         if (!p_space.postingNavigation) return;
 #endif
+        SPTAG_STEP_SCOPE(Hierarchy);
         int before = 0;
         const int target = p_query.GetResultNum();
         for (int i = 0; i < target; ++i)

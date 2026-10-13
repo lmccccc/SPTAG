@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "inc/Helper/AsyncFileReader.h"
+#include "inc/Core/Common/QueryStepTiming.h"
 
 namespace SPTAG
 {
@@ -66,6 +67,7 @@ struct timespec AIOTimeout
 };
 bool BatchReadFileAsync(std::vector<std::shared_ptr<Helper::DiskIO>> &handlers, AsyncReadRequest *readRequests, int num)
 {
+    SPTAG_STEP_SCOPE(AIOPrepare);
     std::vector<struct iocb> myiocbs(num);
     std::vector<std::vector<struct iocb *>> iocbs(handlers.size());
     std::vector<int> submitted(handlers.size(), 0);
@@ -113,6 +115,7 @@ bool BatchReadFileAsync(std::vector<std::shared_ptr<Helper::DiskIO>> &handlers, 
         auto* handler = static_cast<AsyncFileIO*>(diskHandler.get());
         if (handler->UsesSharedAIOPool())
         {
+            SPTAG_STEP_SCOPE(AIOLock);
             sharedContextLock = std::unique_lock<std::mutex>(
                 SharedAIOPool::Instance().GetContextMutex(iocp));
             break;
@@ -127,8 +130,9 @@ bool BatchReadFileAsync(std::vector<std::shared_ptr<Helper::DiskIO>> &handlers, 
                 if (submitted[i] < iocbs[i].size())
                 {
                     AsyncFileIO *handler = (AsyncFileIO *)(handlers[i].get());
-                    int s = syscall(__NR_io_submit, handler->GetIOCP(iocp), iocbs[i].size() - submitted[i],
-                                    iocbs[i].data() + submitted[i]);
+                    int s = SPTAG_STEP_CALL(AIOSubmit,
+                        syscall(__NR_io_submit, handler->GetIOCP(iocp), iocbs[i].size() - submitted[i],
+                                iocbs[i].data() + submitted[i]));
                     if (s > 0)
                     {
                         submitted[i] += s;
@@ -153,8 +157,9 @@ bool BatchReadFileAsync(std::vector<std::shared_ptr<Helper::DiskIO>> &handlers, 
             {
                 int wait = submitted[i] - done[i];
                 AsyncFileIO *handler = (AsyncFileIO *)(handlers[i].get());
-                auto d = syscall(__NR_io_getevents, handler->GetIOCP(iocp), wait, wait, events.data() + totalDone,
-                                 &AIOTimeout);
+                auto d = SPTAG_STEP_CALL(AIOWait,
+                    syscall(__NR_io_getevents, handler->GetIOCP(iocp), wait, wait, events.data() + totalDone,
+                            &AIOTimeout));
                 if (d > 0)
                 {
                     done[i] += d;
