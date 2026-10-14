@@ -17,17 +17,19 @@ int main()
         const auto config = [&](const char* name, const char* width, bool missing,
                                 const char* anchors="8", const char* maxCheck="2048",
                                 const char* topk="10", const char* probe="96", const char* sweep=nullptr,
-                                const char* rate=nullptr, const char* window=nullptr) {
+                                const char* rate=nullptr, const char* window=nullptr,
+                                const char* global=nullptr, const char* navigation="true") {
             std::ofstream file(directory / name);
             file << "[SearchSSDIndex]\nisExecute=true\nBuildSsdIndex=false\nInternalResultNum=" << probe <<
                 "\nNumberOfThreads=1\nHashTableExponent=4\nResultNum=" << topk << "\nMaxCheck=" << maxCheck << "\nMaxDistRatio=8\n"
                 "SearchPostingPageLimit=3\nDisableCrossEdges=true\nLogPhaseTime=false\nLogPathStats=false\n"
-                "DumpHeads=0\nEnableHybridDistance=false\nEnablePostingNavigation=true\nPostingAnchorCount="
+                "DumpHeads=0\nEnableHybridDistance=false\nEnablePostingNavigation=" << navigation << "\nPostingAnchorCount="
                 << anchors << '\n';
             if (!missing) file << "PostingAdditionalMaxCheck=2048\n";
             if (width) file << "PostingNavigationWidth=" << width << '\n';
             if (rate) file << "PostingMatchRatePercent=" << rate << '\n';
             if (window) file << "PostingMatchWindow=" << window << '\n';
+            if (global) file << "GlobalPostingSearch=" << global << '\n';
             if (sweep) file << "[SearchSweep]\nNProbe=" << sweep << '\n';
             file << "[Benchmark]\nIndex=" << (directory / "index").string() << "\nQueries="
                 << (directory / "queries.npy").string()
@@ -44,6 +46,9 @@ int main()
         config("missing.ini", "8", true);
         config("nprobe.ini", "8", false, "0");
         config("invalid-anchors.ini", "8", false, "-1");
+        config("global.ini", "0", false, "0", "2048", "10", "96", nullptr, "0", "1024", "true", "false");
+        config("global-conflict.ini", "0", false, "0", "2048", "10", "96", nullptr, "0", "1024", "true");
+        config("global-invalid.ini", "0", false, "0", "2048", "10", "96", nullptr, "0", "1024", "yes", "false");
         for (const char* name : {"steps.ini", "bad-steps.ini", "mixed-timers.ini"}) {
             config(name, "8", false);
             std::ofstream file(directory / name, std::ios::app);
@@ -79,6 +84,10 @@ int main()
             cases[1]->cfg.navigationWidth==0 && cases[2]->cfg.navigationWidth==8,
             "Optional native cutoff or per-case default changed");
         const auto anchors = batch({"nprobe.ini","on.ini","nprobe.ini"});
+        const auto globalCases = batch({"global.ini","off.ini","global.ini"});
+        Require(globalCases[0]->cfg.globalPostingSearch && globalCases[0]->cfg.mode=="global" &&
+            !globalCases[1]->cfg.globalPostingSearch && globalCases[1]->cfg.mode=="posting" &&
+            globalCases[2]->cfg.globalPostingSearch, "Global posting mode/default changed");
         const auto rates = batch({"rate.ini","fractional-rate.ini","off.ini","rate.ini"});
         Require(rates[0]->cfg.matchRatePercent==15 && rates[0]->cfg.matchWindow==1024 &&
                 rates[1]->cfg.matchRatePercent==12.5 && rates[1]->cfg.maxCheck==4096 &&
@@ -99,6 +108,7 @@ int main()
             "Native result capacity or top100 sweep was replaced by a benchmark constant");
         Require(batch({"on.ini","top100.ini"},"once").size()==2 &&
             batch({"on.ini"},"per_point").size()==1 &&
+            batch({"global.ini","on.ini"},"once_per_mode_predicate").size()==2 &&
             batch({"on.ini","off.ini"},"once_per_predicate").size()==2,"Explicit batch warmup policy rejected");
 #ifdef SPTAG_QUERY_STEP_TIMING
         const auto steps = batch({"steps.ini", "off.ini"}, "once_per_predicate");
@@ -129,11 +139,17 @@ int main()
             wrapped.SetSearchParam("PostingMatchRatePercent","12.5",section);
             Require(wrapped.GetInternalIndex()->GetParameter("PostingMatchRatePercent",section)=="12.5",
                 "Wrapper truncated fractional match-rate threshold");
+            for (const char* value : {"true", "false"}) {
+                wrapped.SetSearchParam("GlobalPostingSearch",value,section);
+                Require(wrapped.GetInternalIndex()->GetParameter("GlobalPostingSearch",section)==value,
+                    "Wrapper did not forward global posting mode");
+            }
         }
         for (const auto& name : {"invalid.ini", "missing.ini", "invalid-anchors.ini", "bad-rate.ini", "nan-rate.ini", "bad-window.ini",
                                 "zero-budget.ini", "negative-budget.ini", "malformed-budget.ini", "overflow-budget.ini",
                                 "short-probe.ini", "short-sweep.ini", "invalid-topk0.ini", "invalid-topk-1.ini",
-                                "invalid-topk100x.ini", "invalid-topk2147483648.ini", "bad-steps.ini", "mixed-timers.ini"}) {
+                                "invalid-topk100x.ini", "invalid-topk2147483648.ini", "bad-steps.ini", "mixed-timers.ini",
+                                "global-conflict.ini", "global-invalid.ini"}) {
             bool rejected=false;
             try { batch({name}); }
             catch (const std::runtime_error&) { rejected=true; }

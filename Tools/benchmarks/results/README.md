@@ -133,6 +133,59 @@ with a higher revision; do not edit `current.json`. The runner executes the
 registered batch unchanged. It does not rebuild an index, generate a replacement
 search algorithm, add hidden query settings or tune based on measured recall.
 
+## Global / limited / hierarchical posting ablations
+
+For automatic pilot selection, complete-cohort three-repeat measurement,
+six-panel plots and independent JSON publication, use
+[`posting_ablation.py`](posting_ablation.py) with
+[`examples/posting-ablation.ini`](examples/posting-ablation.ini).
+[`POSTING_ABLATION.md`](POSTING_ABLATION.md) documents the portable
+prepare/run/publish commands, reference INIs, resource checks and failure retries.
+
+`SearchSSDIndex.GlobalPostingSearch=true` is an explicit, default-off ablation
+for a loaded raw STATIC H/O index. It requires `EnablePostingNavigation=false`.
+H1 selects heads by distance without predicate result admission, the scanner
+reads only the global O suffix without posting-signature pruning, and exact
+record/own-head filtering remains mandatory. This models the original SPANN
+search structure with final filtering; it is **not an upstream SPANN rebuild**.
+It shares the same head representatives, graph, persisted H/O file, O alignment,
+page cap and native distance/scan implementation with the limited control.
+Do not disable the immutable `EnableLimitedTagPosting` build flag to select O.
+
+| Mode | GlobalPostingSearch | EnablePostingNavigation | H1 admission / SSD region |
+| --- | --- | --- | --- |
+| Global | true | false | Distance only / O |
+| Limited | false | false | Native label support and signatures / H when eligible |
+| Full | false | true | Native label support plus hierarchical supplement / H when eligible |
+
+The global-to-limited comparison measures the **label-aware posting path**,
+including head admission, not exclusively the physical SSD arrangement.
+Limited-to-full isolates hierarchy only when other settings and the native
+client agree. Hierarchy files can remain loaded but are not traversed by the
+disabled modes; this is not a resident-memory saving measurement.
+Keep all defaults, historical indexes and accepted observations unchanged.
+The native client resets the optional global flag between batch cases and
+records `mode=global` plus `global_posting_search=true` in each global point.
+
+Use `WarmupPolicy=once_per_mode_predicate` to share a single resident index
+across the three modes: each (global/graph/posting mode, predicate) receives
+one complete query-cohort warmup, then three fixed-cohort
+repetitions of every declared nprobe, with no minimum time floor. Loading,
+warmup, replay and validation are outside ordinary QPS. Use a separate ablation
+study and explicit client/version provenance rather than replacing main curves.
+Do not pool multiple MaxCheck configurations into a fixed-configuration curve.
+Separate resident processes can instead use `once_per_predicate`. Existing
+`once`, `per_point` and `once_per_predicate` behavior is unchanged.
+
+Register the three modes as distinct complete native INIs per scenario in one
+experiment (same binary/index and one study/variant, with only the two mode
+switches differing). Give every INI all three repetitions. After `run` accepts
+the captures, `Rscript Tools/benchmarks/results/plot_posting_ablation.R /absolute/run`
+uses the existing ggplot2/jsonlite plotting environment to write six-panel
+PNG/PDF curves, an 80-100% zoom, repeat ranges and a CSV under a fresh `plots/`.
+It requires 1,000 queries, Recall@100 and identical non-mode controls; it
+does not plot small-cohort pilots or substitute historical clients.
+
 ## Stable files and acceptance rules
 
 | File | Contract |

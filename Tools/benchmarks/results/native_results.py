@@ -27,7 +27,7 @@ FORMAT = 1
 SEARCH_NAMES = {name.lower(): name for name in (
     "isExecute BuildSsdIndex InternalResultNum ResultNum NumberOfThreads HashTableExponent "
     "MaxCheck MaxDistRatio SearchPostingPageLimit DisableCrossEdges LogPhaseTime LogPathStats "
-    "DumpHeads EnableHybridDistance EnablePostingNavigation PostingAnchorCount "
+    "DumpHeads EnableHybridDistance EnablePostingNavigation GlobalPostingSearch PostingAnchorCount "
     "PostingAdditionalMaxCheck PostingNavigationWidth PostingMatchRatePercent PostingMatchWindow").split()}
 
 
@@ -73,7 +73,9 @@ def load_plan(path):
             "Batch must explicitly declare CaseCount and WarmupPolicy")
     count = int(registration["batch"]["casecount"])
     require(1 <= count <= 10000, "Invalid batch case count")
-    require(registration["batch"]["warmuppolicy"] in ("once", "per_point"), "Invalid warmup policy")
+    require(registration["batch"]["warmuppolicy"] in ("once", "per_point", "once_per_predicate",
+                                                    "once_per_mode_predicate"),
+            "Invalid warmup policy")
     names = [f"case{i}" for i in range(1, count + 1)]
     require(set(registration) == {"batch", *names}, "Unexpected/missing batch sections")
     require(set(config) == {"experiment", *names}, "Every native case needs experiment metadata")
@@ -94,6 +96,11 @@ def load_plan(path):
                     and output != c["output"] for c in cases), "Overlapping case outputs")
         profile = read_config(ini)
         bench, search = profile["benchmark"], profile["searchssdindex"]
+        require(search.get("globalpostingsearch", "false") in ("true", "false"),
+                "GlobalPostingSearch must be true or false")
+        require(search.get("globalpostingsearch", "false") != "true" or
+                search["enablepostingnavigation"] == "false",
+                "GlobalPostingSearch requires EnablePostingNavigation=false")
         require(bench["valuetype"] == "UInt8", "Portable capture validator currently requires UInt8")
         require(bench.get("phasetiming", "false") == "false" and bench.get("steptiming", "false") == "false"
                 and search["logphasetime"] == "false"
@@ -273,21 +280,31 @@ def validate_log(plan, inputs):
     if plan["warmup_policy"] == "once":
         take("batch_warmup_begin", dict(queries=count, nprobe=plan["cases"][0]["probes"][0]))
         take("batch_warmup_end", dict(completed_queries=count))
-    rows = []
+    rows, warmed = [], set()
+    per_point = plan["warmup_policy"] == "per_point"
     for case in plan["cases"]:
         binding = dict(case_id=case["case_id"], config=str(case["config"]), output_directory=str(case["output"]))
         search, bench = case["profile"]["searchssdindex"], case["profile"]["benchmark"]
+        mode = ("global" if search.get("globalpostingsearch", "false") == "true" else
+                "posting" if search["enablepostingnavigation"] == "true" else "graph")
+        warmup_group = bench["predicate"] + "\n" + bench.get("predicatefile", "")
+        if plan["warmup_policy"] == "once_per_mode_predicate":
+            warmup_group = mode + "\n" + warmup_group
+        if plan["warmup_policy"] in ("once_per_predicate", "once_per_mode_predicate") and warmup_group not in warmed:
+            take("scenario_warmup_begin", dict(**binding, queries=count, warmup_group=warmup_group))
+            take("scenario_warmup_end", dict(completed_queries=count))
+            warmed.add(warmup_group)
         take("case_begin", dict(**binding, predicate=bench["predicate"],
                                predicate_file=bench.get("predicatefile", ""), phase_timing=False,
                                measured_queries=count, replay_queries=count,
-                               warmup_queries=0 if plan["warmup_policy"] == "once" else count,
+                               warmup_queries=count if per_point else 0,
                                search_settings=search))
         for probe in case["probes"]:
             point = take("point", dict(**binding, nprobe=probe, queries=count, topk=topk,
                                       value_type="UInt8", diagnostic=False, phase_timing=False,
                                       measured_queries=count, replay_queries=count,
                                       warmup_policy=plan["warmup_policy"],
-                                      warmup_queries=0 if plan["warmup_policy"] == "once" else count))
+                                      warmup_queries=count if per_point else 0))
             for field, key in (("max_check", "maxcheck"), ("posting_anchor_count", "postinganchorcount"),
                                ("posting_additional_max_check", "postingadditionalmaxcheck"),
                                ("posting_navigation_width", "postingnavigationwidth"),
@@ -296,7 +313,9 @@ def validate_log(plan, inputs):
                                ("posting_match_rate_percent", "postingmatchratepercent")):
                 require(key in search and point[field] == float(search[key]),
                         f"Effective native control differs from explicit INI: {field}")
-            require(point["mode"] == ("posting" if search["enablepostingnavigation"] == "true" else "graph"),
+            global_posting = search.get("globalpostingsearch", "false") == "true"
+            require(point["mode"] == mode and
+                    point.get("global_posting_search", False) == global_posting,
                     "Native navigation mode mismatch")
             for key in ("qps", "mean_ms", "p50_us", "p95_us", "p99_us"):
                 store.finite(point[key], key, positive=True)
@@ -320,7 +339,8 @@ def validate_log(plan, inputs):
                                              (directory / name for name in
                                               ("ids.i32", "dist.f32", "work.u64", "latency_us.f64"))}))
         take("case_end", dict(**binding, completed_points=len(case["probes"])))
-    warmups = count if plan["warmup_policy"] == "once" else count * sum(len(c["probes"]) for c in plan["cases"])
+    warmups = (count * len(warmed) if plan["warmup_policy"] in ("once_per_predicate", "once_per_mode_predicate") else
+               count if plan["warmup_policy"] == "once" else count * sum(len(c["probes"]) for c in plan["cases"]))
     take("batch_end", dict(completed_cases=len(plan["cases"]), completed_warmup_queries=warmups))
     require(position == len(events), "Unexpected native lifecycle events after batch completion")
     return rows
@@ -433,7 +453,7 @@ def run(config):
         raise
 
 
-def publish(config, directory):
+def accepted_events(config):
     plan = load_plan(config)
     root = plan["root"]
     require(not (root / "failure.json").exists(), "A failed experiment cannot be published")
@@ -453,7 +473,11 @@ def publish(config, directory):
     require(rows == read_json(root / "single_raw.json"), "Raw measurements no longer reproduce")
     events = normalize(plan, inputs, rows, complete["completed_at"])
     require(events == read_json(root / "events.json"), "Normalized measurements no longer reproduce")
-    current = store.update(directory, events)
+    return events
+
+
+def publish(config, directory):
+    current = store.update(directory, accepted_events(config))
     print(json.dumps(dict(current=str(directory / "current.json"), events=current["history"]["records"],
                           points=len(current["points"]))))
     return current

@@ -5759,7 +5759,17 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         m_extraSearcher != nullptr &&
         m_extraSearcher
             ->LimitedTagPostingRegionsReady();
+    if (m_options.m_globalPostingSearch &&
+        (m_options.m_enablePostingNavigation || !limitedTagRegionsReady ||
+         m_options.m_storage != Storage::STATIC || m_options.m_enableHybridDistance ||
+         m_pQuantizer ||
+         !Helper::StrUtils::StrEqualIgnoreCase(m_options.m_postingQuantizer.c_str(), "None"))) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+            "GlobalPostingSearch requires raw STATIC H/O postings and EnablePostingNavigation=false.\n");
+        return ErrorCode::FailedParseValue;
+    }
     const bool useLimitedTagMembership =
+        !m_options.m_globalPostingSearch &&
         limitedTagRegionsReady &&
         hasExactFilter && limitedTagMembershipEligible;
     const auto limitedSupportMatchesPredicate =
@@ -5806,7 +5816,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
             "Routing metadata changed; signatures are conservative unknown until RefreshRoutingSignatures().\n");
     const RoutingPredicate routingPredicate(queryDNF, queryTags, numQueryTags,
         m_options.Schema().numeric, m_routingSignatures.params);
-    if (hasExactFilter) {
+    if (hasExactFilter && !m_options.m_globalPostingSearch) {
         headAdmission = [&](SizeType head) {
             return (!useLimitedTagMembership || limitedSupportMatchesPredicate(head)) &&
                 (!routingReady || m_routingSignatures.HeadMayMatch(
@@ -6202,7 +6212,9 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
         // route. The full route may match only in the tail, while legacy flat
         // tags are column-agnostic and cannot safely use a column-specific mask.
         workSpace->m_postingFilter =
-            scanGlobalTailForFilter &&
+            m_options.m_globalPostingSearch
+                ? kEmptyPostingFilter
+                : (scanGlobalTailForFilter &&
                     tailPostingFilter &&
                     !(limitedTagRegionsReady &&
                       m_options.m_storage !=
@@ -6210,7 +6222,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 ? tailPostingFilter
                 : (useLimitedTagMembership
                        ? headAdmission
-                       : postingFilter);
+                       : postingFilter));
         // Propagate inline tag filter (for per-vector exact tag check in posting scan)
         workSpace->m_queryTags = queryTags;
         workSpace->m_numQueryTags = numQueryTags;

@@ -108,6 +108,7 @@ struct Config {
     std::string index,queries,predicateFile,predicate,mode,valueType;
     bool phaseTiming=false;
     bool stepTiming=false;
+    bool globalPostingSearch=false;
     int count,warmup,topk,maxCheck,anchorCount,additionalMaxCheck,postingPageLimit,navigationWidth;
     double matchRatePercent;
     int matchWindow;
@@ -134,6 +135,12 @@ struct Config {
         Require(!phaseTiming,"PhaseTiming requires the normal core, not work-counter instrumentation");
 #endif
         mode=ini.GetParameter<bool>("SearchSSDIndex","EnablePostingNavigation",false) ? "posting" : "graph";
+        const auto global=ini.GetParameter<std::string>("SearchSSDIndex","GlobalPostingSearch","false");
+        Require(global=="true" || global=="false","GlobalPostingSearch must be true or false");
+        globalPostingSearch=global=="true";
+        Require(!globalPostingSearch || mode=="graph",
+            "GlobalPostingSearch requires EnablePostingNavigation=false");
+        if(globalPostingSearch) mode="global";
         Require(!ini.DoesParameterExist("SearchSSDIndex","PostingMinCandidates") &&
             !ini.DoesParameterExist("BuildSSDIndex","PostingMinCandidates"),
             "PostingMinCandidates was removed even when OFF; migrate to PostingAnchorCount and PostingAdditionalMaxCheck");
@@ -200,7 +207,7 @@ struct Config {
             "maxdistratio","searchpostingpagelimit","disablecrossedges",
             "logphasetime","logpathstats","dumpheads","enablehybriddistance","enablepostingnavigation",
             "postinganchorcount","postingadditionalmaxcheck","postingnavigationwidth",
-            "postingmatchratepercent","postingmatchwindow"};
+            "postingmatchratepercent","postingmatchwindow","globalpostingsearch"};
         for(const auto& p:ini.GetParameters("SearchSSDIndex"))
             Require(keys.count(p.first),"Unsupported search parameter "+p.first);
         for(char** entry=environ;*entry;++entry) {
@@ -224,6 +231,7 @@ struct Config {
         manager.SetSearchParam("PostingMatchRatePercent",
             ini.GetParameter<std::string>("SearchSSDIndex","PostingMatchRatePercent","0").c_str(),"SearchSSDIndex");
         manager.SetSearchParam("PostingMatchWindow",std::to_string(matchWindow).c_str(),"SearchSSDIndex");
+        manager.SetSearchParam("GlobalPostingSearch",globalPostingSearch?"true":"false","SearchSSDIndex");
     }
 };
 using Work=std::array<std::uint64_t,8>;
@@ -384,11 +392,12 @@ template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_
                  <<",\"value_type\":\""<<cfg.valueType<<"\""
                  <<",\"search_posting_page_limit\":"<<cfg.postingPageLimit
                  <<",\"nprobe\":"<<probe
+                 <<",\"global_posting_search\":"<<(cfg.globalPostingSearch?"true":"false")
                  <<",\"max_check\":"<<cfg.maxCheck
                  <<",\"posting_anchor_count\":"<<cfg.anchorCount
                  <<",\"posting_anchor_limit\":"<<(cfg.anchorCount ? cfg.anchorCount : probe)
                  <<",\"posting_additional_max_check\":"<<cfg.additionalMaxCheck
-                 <<",\"graph_stop_policy\":\""<<(cfg.matchRatePercent ?
+                 <<",\"graph_stop_policy\":\""<<(cfg.mode=="posting" && cfg.matchRatePercent ?
                     "local-match-union-v2" : "upstream-adaptive-v1")<<"\""
                  <<",\"posting_budget_policy\":\"unused-plus-preserved-extra-v2\""
                  <<",\"posting_navigation_width\":"<<cfg.navigationWidth
@@ -442,8 +451,9 @@ std::string AbsoluteInput(const std::string& value) {
 }
 bool BatchWarmupOnce(Helper::IniReader& ini) {
     const auto policy=ini.GetParameter<std::string>("Batch","WarmupPolicy","per_point");
-    Require(policy=="per_point" || policy=="once" || policy=="once_per_predicate",
-        "Batch.WarmupPolicy must be per_point, once or once_per_predicate");
+    Require(policy=="per_point" || policy=="once" || policy=="once_per_predicate" ||
+        policy=="once_per_mode_predicate",
+        "Batch.WarmupPolicy must be per_point, once, once_per_predicate or once_per_mode_predicate");
     return policy=="once";
 }
 std::vector<std::unique_ptr<BatchCase>> ReadBatch(const char* path,Helper::IniReader& ini) {
@@ -496,7 +506,8 @@ std::vector<std::unique_ptr<BatchCase>> ReadBatch(const char* path,Helper::IniRe
         Require(!Within(output,cfg.index),"Batch output must not be inside the immutable index");
         const auto& search=cfg.ini.GetParameters("SearchSSDIndex");
         Require(search.size()==completeKeys.size()+search.count("postingnavigationwidth")+
-            search.count("postingmatchratepercent")+search.count("postingmatchwindow"),
+            search.count("postingmatchratepercent")+search.count("postingmatchwindow")+
+            search.count("globalpostingsearch"),
             "Batch cases require complete SearchSSDIndex settings");
         auto validated=VectorIndex::CreateInstance(IndexAlgoType::SPANN,
             cfg.valueType=="UInt8"?VectorValueType::UInt8:VectorValueType::Float);
@@ -533,12 +544,13 @@ std::vector<std::unique_ptr<BatchCase>> ReadBatch(const char* path,Helper::IniRe
     return cases;
 }
 template<class T> int RunBatch(std::vector<std::unique_ptr<BatchCase>>& cases,const std::string& dtype,
-    bool warmupOnce=false,bool warmupPerPredicate=false) {
+    bool warmupOnce=false,bool warmupPerPredicate=false,bool warmupPerMode=false) {
     auto& first=cases.front()->cfg;
     auto queries=ReadNpy<T>(first.queries,dtype);
     for(auto& item:cases) item->predicates=PrepareCase(item->cfg,queries);
     std::cout<<"{\"event\":\"batch_begin\",\"cases\":"<<cases.size()
-        <<",\"warmup_policy\":\""<<(warmupPerPredicate?"once_per_predicate":warmupOnce?"once":"per_point")<<"\""
+        <<",\"warmup_policy\":\""<<(warmupPerMode?"once_per_mode_predicate":
+            warmupPerPredicate?"once_per_predicate":warmupOnce?"once":"per_point")<<"\""
         <<",\"phase_timing\":"<<(first.phaseTiming?"true":"false")
         <<",\"value_type\":"<<JsonString(first.valueType)<<",\"index\":"<<JsonString(first.index)
         <<",\"queries\":"<<JsonString(first.queries)<<"}\n";
@@ -568,8 +580,8 @@ template<class T> int RunBatch(std::vector<std::unique_ptr<BatchCase>>& cases,co
     for(std::size_t i=0;i<cases.size();++i) {
         auto& item=*cases[i];
         if(i!=0) item.cfg.Apply(manager,&cases[i-1]->cfg);
-        const auto warmupGroup=item.cfg.predicate+"\n"+item.cfg.predicateFile;
-        if(warmupPerPredicate && warmedPredicates.insert(warmupGroup).second) {
+        const auto warmupGroup=(warmupPerMode?item.cfg.mode+"\n":"")+item.cfg.predicate+"\n"+item.cfg.predicateFile;
+        if((warmupPerPredicate||warmupPerMode) && warmedPredicates.insert(warmupGroup).second) {
             manager.SetSearchParam("InternalResultNum",std::to_string(item.cfg.probes.front()).c_str(),"SearchSSDIndex");
             std::cout<<"{\"event\":\"scenario_warmup_begin\",\"queries\":"<<item.cfg.warmup;
             WriteIdentity(item.identity);
@@ -589,7 +601,7 @@ template<class T> int RunBatch(std::vector<std::unique_ptr<BatchCase>>& cases,co
             <<",\"phase_timing\":"<<((item.cfg.phaseTiming||item.cfg.stepTiming)?"true":"false")
             <<",\"step_timing\":"<<(item.cfg.stepTiming?"true":"false")
             <<",\"predicate_file\":"<<JsonString(item.cfg.predicateFile)
-            <<",\"warmup_queries\":"<<((warmupOnce||warmupPerPredicate)?0:item.cfg.warmup)<<",\"measured_queries\":"<<item.cfg.count
+            <<",\"warmup_queries\":"<<((warmupOnce||warmupPerPredicate||warmupPerMode)?0:item.cfg.warmup)<<",\"measured_queries\":"<<item.cfg.count
             <<",\"replay_queries\":"<<item.cfg.count<<",\"search_settings\":{";
         bool comma=false;
         for(const auto& setting:item.cfg.ini.GetParameters("SearchSSDIndex")) {
@@ -599,9 +611,10 @@ template<class T> int RunBatch(std::vector<std::unique_ptr<BatchCase>>& cases,co
         }
         std::cout<<"}}\n";
         FlushProgress();
-        RunCase(item.cfg,queries,item.predicates,manager,&item.identity,!(warmupOnce||warmupPerPredicate),
-            warmupPerPredicate?"once_per_predicate":"");
-        if(!warmupOnce && !warmupPerPredicate) warmupTotal+=std::uint64_t(item.cfg.warmup)*item.cfg.probes.size();
+        RunCase(item.cfg,queries,item.predicates,manager,&item.identity,!(warmupOnce||warmupPerPredicate||warmupPerMode),
+            warmupPerMode?"once_per_mode_predicate":warmupPerPredicate?"once_per_predicate":"");
+        if(!warmupOnce && !warmupPerPredicate && !warmupPerMode)
+            warmupTotal+=std::uint64_t(item.cfg.warmup)*item.cfg.probes.size();
         std::cout<<"{\"event\":\"case_end\",\"completed_points\":"<<item.cfg.probes.size();
         WriteIdentity(item.identity);
         std::cout<<"}\n";
@@ -621,8 +634,9 @@ int main(int argc,char** argv) {
             auto cases=ReadBatch(argv[1],entry);
             const bool warmupOnce=BatchWarmupOnce(entry);
             const bool perPredicate=entry.GetParameter<std::string>("Batch","WarmupPolicy","per_point")=="once_per_predicate";
-            return cases.front()->cfg.valueType=="UInt8"?RunBatch<std::uint8_t>(cases,"|u1",warmupOnce,perPredicate):
-                RunBatch<float>(cases,"<f4",warmupOnce,perPredicate);
+            const bool perMode=entry.GetParameter<std::string>("Batch","WarmupPolicy","per_point")=="once_per_mode_predicate";
+            return cases.front()->cfg.valueType=="UInt8"?RunBatch<std::uint8_t>(cases,"|u1",warmupOnce,perPredicate,perMode):
+                RunBatch<float>(cases,"<f4",warmupOnce,perPredicate,perMode);
         }
         Config cfg(argv[1]);
         return cfg.valueType=="UInt8" ? RunBenchmark<std::uint8_t>(cfg,"|u1")

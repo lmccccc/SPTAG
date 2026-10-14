@@ -122,14 +122,27 @@ class NativeResultsTest(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
         plan = runner.load_plan(self.experiment)
         events = [
-            dict(event="batch_begin", cases=6, warmup_policy="once", phase_timing=False,
+            dict(event="batch_begin", cases=6, warmup_policy=plan["warmup_policy"], phase_timing=False,
                  value_type="UInt8", index=str(self.index), queries=self.workload["queries"]),
-            dict(event="batch_loaded", index_load_count=1, query_corpus_load_count=1),
-            dict(event="batch_warmup_begin", queries=32, nprobe=4),
-            dict(event="batch_warmup_end", completed_queries=32)]
+            dict(event="batch_loaded", index_load_count=1, query_corpus_load_count=1)]
+        if plan["warmup_policy"] == "once":
+            events.extend([dict(event="batch_warmup_begin", queries=32, nprobe=4),
+                           dict(event="batch_warmup_end", completed_queries=32)])
+        warmed = set()
         for case in plan["cases"]:
             binding = dict(case_id=case["case_id"], config=str(case["config"]), output_directory=str(case["output"]))
             bench = case["profile"]["benchmark"]
+            search = case["profile"]["searchssdindex"]
+            warmup_group = bench["predicate"] + "\n" + bench["predicatefile"]
+            if plan["warmup_policy"] == "once_per_mode_predicate":
+                mode = ("global" if search.get("globalpostingsearch", "false")=="true" else
+                        "posting" if search["enablepostingnavigation"]=="true" else "graph")
+                warmup_group = mode + "\n" + warmup_group
+            if plan["warmup_policy"] in ("once_per_predicate", "once_per_mode_predicate") and warmup_group not in warmed:
+                events.extend([dict(event="scenario_warmup_begin", **binding, queries=32,
+                                    warmup_group=warmup_group),
+                               dict(event="scenario_warmup_end", completed_queries=32)])
+                warmed.add(warmup_group)
             events.append(dict(event="case_begin", **binding, predicate=bench["predicate"],
                 predicate_file=bench["predicatefile"], phase_timing=False, measured_queries=32,
                 replay_queries=32, warmup_queries=0, search_settings=case["profile"]["searchssdindex"]))
@@ -142,9 +155,12 @@ class NativeResultsTest(unittest.TestCase):
                 distances.astype("<f4").tofile(directory / "dist.f32")
                 np.zeros((32, 8), dtype="<u8").tofile(directory / "work.u64")
                 np.full(32, 10000, dtype="<f8").tofile(directory / "latency_us.f64")
-                events.append(dict(event="point", **binding, mode="posting", nprobe=probe,
+                global_posting = search.get("globalpostingsearch", "false") == "true"
+                events.append(dict(event="point", **binding,
+                    mode="global" if global_posting else "posting" if search["enablepostingnavigation"]=="true" else "graph",
+                    global_posting_search=global_posting, nprobe=probe,
                     queries=32, topk=3, value_type="UInt8", diagnostic=False, phase_timing=False,
-                    measured_queries=32, replay_queries=32, warmup_policy="once", warmup_queries=0,
+                    measured_queries=32, replay_queries=32, warmup_policy=plan["warmup_policy"], warmup_queries=0,
                     max_check=32, posting_anchor_count=0, posting_additional_max_check=8,
                     posting_navigation_width=8, posting_match_window=1024,
                     search_posting_page_limit=3, posting_match_rate_percent=12.5,
@@ -152,7 +168,8 @@ class NativeResultsTest(unittest.TestCase):
                     graph_stop_policy="local-match-union-v2", posting_budget_policy="unused-plus-preserved-extra-v2",
                     navigation_schema_version=7, navigation_columns=58, dispatch_schema_version=2, dispatch_columns=6))
             events.append(dict(event="case_end", **binding, completed_points=2))
-        events.append(dict(event="batch_end", completed_cases=6, completed_warmup_queries=32))
+        events.append(dict(event="batch_end", completed_cases=6,
+                           completed_warmup_queries=32 * len(warmed) if warmed else 32))
         if self.corrupt:
             self.corrupt(events)
         log = kwargs["stdout"]
@@ -187,6 +204,54 @@ class NativeResultsTest(unittest.TestCase):
         self.assertEqual(len(current["points"]), 6)
         with self.assertRaisesRegex(ValueError, "fresh"):
             self.execute()
+
+    def test_global_mode_and_scenario_once_warmup(self):
+        batch = runner.read_config(self.batch)
+        batch["batch"]["warmuppolicy"] = "once_per_predicate"
+        write_ini(self.batch, batch)
+        for scenario in self.workload["scenarios"]:
+            path = self.root / f"{scenario}.ini"
+            config = runner.read_config(path)
+            config["searchssdindex"].update(globalpostingsearch="true", enablepostingnavigation="false")
+            write_ini(path, config)
+        self.execute()
+        rows = runner.read_json(self.run_root / "single_raw.json")
+        self.assertEqual(len(rows), 12)
+        self.assertTrue(all(r["mode"] == "global" and r["warmup_queries"] == 0 for r in rows))
+        events = runner.read_json(self.run_root / "events.json")
+        self.assertTrue(all(json.loads(e["point"]["parameters"])["GlobalPostingSearch"] == "true"
+                            for e in events))
+
+    def test_missing_scenario_warmup_rejected(self):
+        batch = runner.read_config(self.batch)
+        batch["batch"]["warmuppolicy"] = "once_per_predicate"
+        write_ini(self.batch, batch)
+        self.corrupt = lambda events: events.pop(next(i for i,e in enumerate(events)
+                                                     if e["event"] == "scenario_warmup_end"))
+        with self.assertRaisesRegex(ValueError, "scenario_warmup_end"):
+            self.execute()
+
+    def test_mode_predicate_warmup(self):
+        batch = runner.read_config(self.batch)
+        batch["batch"]["warmuppolicy"] = "once_per_mode_predicate"
+        write_ini(self.batch, batch)
+        self.execute()
+        self.assertEqual(len(runner.read_json(self.run_root / "events.json")), 6)
+
+    def test_global_mode_log_mismatch_rejected(self):
+        def corrupt(events):
+            next(e for e in events if e["event"] == "point")["global_posting_search"] = True
+        self.corrupt = corrupt
+        with self.assertRaisesRegex(ValueError, "navigation mode"):
+            self.execute()
+
+    def test_global_mode_cannot_enable_hierarchy(self):
+        path = self.root / "scalar.ini"
+        config = runner.read_config(path)
+        config["searchssdindex"]["globalpostingsearch"] = "true"
+        write_ini(path, config)
+        with self.assertRaisesRegex(ValueError, "requires EnablePostingNavigation=false"):
+            runner.load_plan(self.experiment)
 
     def test_catalog_initialization_pins_index_and_emits_views(self):
         runner.initialize(self.experiment, self.registry)
