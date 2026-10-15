@@ -19,17 +19,15 @@ native, store = campaign.native, campaign.store
 write_ini = native_fixtures.write_ini
 
 
-def pilot_events(probes):
+def reference_events(plan):
     events = []
-    for scenario in campaign.SCENARIOS:
+    for template in plan["templates"]:
         for mode in campaign.MODES:
-            for probe in probes:
-                event = fixtures.measurement(scenario=scenario)
-                event.update(study=campaign.STUDY + "-pilot", variant=campaign.VARIANT)
-                event["point"].update(cohort_queries=32, repeats=1, search_value=probe,
-                    parameters=json.dumps(dict(GlobalPostingSearch=str(mode == "global").lower(),
-                                               EnablePostingNavigation=str(mode == "full").lower())))
-                events.append(event)
+            for probe in template["probes"]:
+                parameters = dict(template["parameters"], GlobalPostingSearch=str(mode == "global").lower(),
+                    EnablePostingNavigation=str(mode == "full").lower(), WarmupPolicy="once_per_mode_predicate")
+                events.append(dict(point=dict(scenario=template["scenario"], search_value=probe,
+                                              parameters=json.dumps(parameters))))
     return events
 
 
@@ -94,12 +92,25 @@ class PostingAblationTest(unittest.TestCase):
         write_ini(fixture.experiment, sections)
         write_ini(fixture.batch, batch)
         self.policy = {"Ablation": dict(Directory=str(self.root), DataDirectory=str(fixture.registry),
-            ReferenceExperiment=str(fixture.experiment), PilotNProbe="100,128", NProbeGrid="100,128",
-            PilotTargetRecall=".97", MinimumMaxNProbe="128", MinimumAvailableMemoryGiB="1",
+            ReferenceExperiment=str(fixture.experiment), MinimumAvailableMemoryGiB="1",
             MinimumFreeDiskGiB="1", MinimumAIOEvents="1")}
         write_ini(self.config, self.policy)
         self.fail_phase = None
         self.real_subprocess = subprocess.run
+
+    def add_reference_profile(self):
+        profile = native.read_config(self.fixture.root / "sel50.ini")
+        profile["searchssdindex"]["maxcheck"] = "2048"
+        profile["searchsweep"]["nprobe"] = "448"
+        path = self.fixture.root / "sel50-other.ini"
+        write_ini(path, profile)
+        batch = native.read_config(self.fixture.batch)
+        batch["batch"]["casecount"] = "7"
+        batch["case7"] = dict(config=str(path), outputdirectory=str(self.fixture.run_root / "Case7"))
+        write_ini(self.fixture.batch, batch)
+        reference = native.read_config(self.fixture.experiment)
+        reference["case7"] = dict(scenario="sel50", repetition="1")
+        write_ini(self.fixture.experiment, reference)
 
     def prepare(self):
         with patch.object(campaign, "PLOT_SELECTIVITY", self.labels), \
@@ -147,7 +158,8 @@ class PostingAblationTest(unittest.TestCase):
                 events.append(dict(event="point", **binding, mode=mode, global_posting_search=global_posting,
                     nprobe=probe, queries=count, topk=topk, value_type="UInt8", diagnostic=False, phase_timing=False,
                     measured_queries=count, replay_queries=count, warmup_policy=plan["warmup_policy"], warmup_queries=0,
-                    max_check=32, posting_anchor_count=0, posting_additional_max_check=8, posting_navigation_width=8,
+                    max_check=int(search["maxcheck"]), posting_anchor_count=0, posting_additional_max_check=8,
+                    posting_navigation_width=int(search["postingnavigationwidth"]),
                     posting_match_window=1024, search_posting_page_limit=3, posting_match_rate_percent=12.5,
                     qps=100, mean_ms=10, p50_us=10000, p95_us=10000, p99_us=10000,
                     graph_stop_policy="local-match-union-v2" if mode == "posting" else "upstream-adaptive-v1",
@@ -163,60 +175,65 @@ class PostingAblationTest(unittest.TestCase):
                 patch.object(campaign.subprocess, "run", side_effect=self.process), redirect_stdout(io.StringIO()):
             campaign.run(self.root)
 
-    def test_prepare_matched_controls_full_warmups_and_truth_subset(self):
+    def test_prepare_changes_only_mode_flags_and_keeps_every_original_probe(self):
+        self.add_reference_profile()
+        original = native.read_config(self.fixture.root / "sel50.ini")
+        original["searchsweep"]["nprobe"] = "160,100"
+        write_ini(self.fixture.root / "sel50.ini", original)
         plan = self.prepare()
-        pilot = native.load_plan(self.root / "pilot-configs/experiment.ini")
-        self.assertEqual(len(pilot["cases"]), 18)
-        self.assertEqual(pilot["warmup_policy"], "once_per_mode_predicate")
-        self.assertEqual(native.load_inputs(pilot)["queries"].shape, (32, 128))
-        for scenario in campaign.SCENARIOS:
-            profiles = [case["profile"] for case in pilot["cases"] if case["scenario"] == scenario]
-            for profile in profiles:
-                self.assertEqual(profile["benchmark"]["warmup"], "32")
-                search = dict(profile["searchssdindex"])
-                search.pop("globalpostingsearch")
-                search.pop("enablepostingnavigation")
-                expected = dict(profiles[0]["searchssdindex"])
-                expected.pop("globalpostingsearch")
-                expected.pop("enablepostingnavigation")
-                self.assertEqual(search, expected)
-        config = campaign.write_experiment(plan, "measurement",
-            {f"{s}/{m}": [100, 128] for s in campaign.SCENARIOS for m in campaign.MODES})
+        self.assertEqual(plan["reference_points"], 13)
+        self.assertEqual(plan["full_points"], 39)
+        self.assertFalse((self.root / "pilot-truth").exists())
+        self.assertFalse((self.root / "pilot-configs").exists())
+        self.assertFalse((self.root / "grid-selection.json").exists())
+        for template in plan["templates"]:
+            for mode in campaign.MODES:
+                profile = native.read_config(self.root / "measurement-configs" / f"{template['id']}-{mode}.ini")
+                expected = native.read_config(template["config"])
+                for key in campaign.MODE_KEYS:
+                    profile["searchssdindex"].pop(key)
+                    expected["searchssdindex"].pop(key, None)
+                self.assertEqual(profile, expected)
+        config = self.root / "measurement-configs/experiment.ini"
         formal = native.load_plan(config)
-        self.assertEqual(len(formal["cases"]), 54)
+        self.assertEqual(len(formal["cases"]), 63)
+        self.assertEqual(formal["warmup_policy"], "once_per_mode_predicate")
         self.assertTrue(all(case["profile"]["benchmark"]["warmup"] == "1000" for case in formal["cases"]))
-        forward = [case["config"] for case in formal["cases"][:18]]
-        self.assertEqual(list(reversed(forward)), [case["config"] for case in formal["cases"][18:36]])
+        self.assertEqual(formal["cases"][0]["probes"], [160, 100])
+        forward = [case["config"] for case in formal["cases"][:21]]
+        self.assertEqual(list(reversed(forward)), [case["config"] for case in formal["cases"][21:42]])
         self.assertEqual(native.load_inputs(formal)["queries"].shape, (1000, 128))
         with self.assertRaisesRegex(ValueError, "fresh"):
             self.prepare()
 
-    def test_pilot_cap_and_incomplete_or_wrong_cohort_rejection(self):
+    def test_reference_grid_rejects_added_omitted_duplicate_and_changed_points(self):
         plan = self.prepare()
-        plan.update(pilot_probes=[100, 512, 2048, 8192, 16384],
-                    grid=[100, 128, 256, 512, 1024, 2048, 8192, 16384], minimum_max_nprobe=512)
-        events = pilot_events(plan["pilot_probes"])
-        selection = campaign.choose_grids(plan, events)
-        self.assertEqual(selection["full_points"], 18 * len(plan["grid"]))
-        self.assertTrue(all(not c["pilot_target_reached"] for c in selection["coverage"].values()))
-        for event in events:
-            if event["point"]["search_value"] == 512:
-                event["point"]["recall"] = .98
-        self.assertTrue(all(probes == [100, 128, 256, 512]
-                            for probes in campaign.choose_grids(plan, events)["grids"].values()))
-        with self.assertRaisesRegex(ValueError, "Incomplete pilot grid"):
-            campaign.choose_grids(plan, events[:-1])
-        events[0]["point"]["cohort_queries"] = 1000
-        with self.assertRaisesRegex(ValueError, "32-query"):
-            campaign.choose_grids(plan, events)
+        events = reference_events(plan)
+        campaign.verify_reference_points(plan, events)
+        for changed in (events[:-1], events + [events[0]]):
+            with self.assertRaisesRegex(ValueError, "every reference parameter point"):
+                campaign.verify_reference_points(plan, changed)
+        events[0]["point"]["search_value"] = 16384
+        with self.assertRaisesRegex(ValueError, "every reference parameter point"):
+            campaign.verify_reference_points(plan, events)
+        events = reference_events(plan)
+        parameters = json.loads(events[0]["point"]["parameters"])
+        parameters["MaxCheck"] = "8192"
+        events[0]["point"]["parameters"] = json.dumps(parameters)
+        with self.assertRaisesRegex(ValueError, "every reference parameter point"):
+            campaign.verify_reference_points(plan, events)
 
-    def test_input_selectivity_grid_and_output_overlap_guards(self):
+    def test_input_selectivity_removed_tuning_keys_and_output_overlap_guards(self):
         with self.assertRaisesRegex(ValueError, "selectivities"):
             campaign.load_config(self.config)
         with patch.object(campaign, "PLOT_SELECTIVITY", self.labels):
-            for value in ("128,100", "100,100", "99,100", "100,nan"):
-                with self.assertRaises(ValueError):
-                    campaign.probe_grid(value)
+            for key, value in (("PilotNProbe", "100,16384"), ("NProbeGrid", "100,16384"),
+                               ("PilotTargetRecall", ".97"), ("MinimumMaxNProbe", "512")):
+                invalid = copy.deepcopy(self.policy)
+                invalid["Ablation"][key] = value
+                write_ini(self.config, invalid)
+                with self.assertRaisesRegex(ValueError, "declare exactly"):
+                    campaign.load_config(self.config)
             self.policy["Ablation"]["Directory"] = str(self.fixture.index / "bad")
             write_ini(self.config, self.policy)
             with self.assertRaisesRegex(ValueError, "overlap"):
@@ -248,18 +265,19 @@ class PostingAblationTest(unittest.TestCase):
 
     def test_failed_native_batch_never_publishes_or_restarts(self):
         self.prepare()
-        self.fail_phase = "pilot"
+        self.fail_phase = "measurement"
         with self.assertRaisesRegex(ValueError, "exit 7"):
             self.execute()
         self.assertTrue((self.root / "failure.json").exists())
         self.assertFalse((self.fixture.registry / "history.jsonl").exists())
         with self.assertRaisesRegex(ValueError, "Fresh-only"):
             self.execute()
-        with redirect_stdout(io.StringIO()), self.assertRaises(FileNotFoundError):
+        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "failed experiment"):
             campaign.publish(self.root)
         self.assertTrue((self.root / "publication-failure.json").exists())
 
     def test_real_acceptance_plots_and_idempotent_main_preservation(self):
+        self.add_reference_profile()
         self.prepare()
         catalog = fixtures.catalog()
         catalog["catalog"]["experiment_views"] = dict(main_selection="observed-pareto-envelope",
@@ -273,15 +291,17 @@ class PostingAblationTest(unittest.TestCase):
         after = native.read_json(self.fixture.registry / "current.json")
         self.assertEqual(before["experiments"]["main"], after["experiments"]["main"])
         self.assertTrue(all(point in after["points"] for point in before["points"]))
-        self.assertEqual(len(after["points"]), 37)
-        self.assertEqual(native.read_json(self.root / "measurement/plots/metadata.json")["points"], 36)
+        self.assertEqual(len(after["points"]), 40)
+        metadata = native.read_json(self.root / "measurement/plots/metadata.json")
+        self.assertEqual(metadata["points"], 39)
+        self.assertEqual(metadata["control_groups"], 2)
         events = native.accepted_events(self.root / "measurement-configs/experiment.ini")
         self.assertEqual({event["point"]["repeats"] for event in events}, {3})
         history = (self.fixture.registry / "history.jsonl").read_bytes()
         with redirect_stdout(io.StringIO()):
             campaign.publish(self.root)
         self.assertEqual(history, (self.fixture.registry / "history.jsonl").read_bytes())
-        with (self.root / "measurement-configs/sel50-global.ini").open("a") as stream:
+        with (self.root / "measurement-configs/p000-sel50-global.ini").open("a") as stream:
             stream.write("\n")
         with redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "Frozen artifact"):
             campaign.publish(self.root)

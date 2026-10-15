@@ -9,6 +9,12 @@ apply: global-to-limited changes H1 admission as well as SSD region, while
 limited-to-full changes hierarchy activation. This is not a rebuilt upstream
 SPANN baseline, an SSD-byte-only isolation, or a resident-memory experiment.
 
+**Reuse the previous parameter table exactly.** The controller changes only
+`GlobalPostingSearch` and `EnablePostingNavigation` in each native profile.
+There is no pilot, R90 selection, target-recall rule, new nprobe grid, automatic
+expansion or automatic truncation. Slow original points remain original points;
+changing their coverage requires a separately agreed experiment.
+
 ## Local prerequisites
 
 Use the Python/Linux/native dependencies in [README.md](README.md), plus
@@ -31,42 +37,39 @@ SIFT1B attribute workload (49.829%, 19.848%, 10.053%, 4.993%, 1.001%, 0.100%).
 Preparation rejects truth whose exact selectivities round to different labels;
 it never relabels another attribute distribution as this experiment.
 
-Create the six native INIs, `batch.ini` and `experiment.ini` using the
-[existing examples](examples/experiment.ini) and README input bindings.
+Supply the original native INIs, `batch.ini` and `experiment.ini`.
+The [existing examples](examples/experiment.ini) show the format and input
+bindings; their illustrative values are not a replacement for an existing
+experiment's approved parameter table.
 `ReferenceExperiment` is only a **configuration template**: it need not have
 been run or published. It must pass the ordinary native input checks and
-specify exactly one distinct configuration per scenario, with
+cover the six scenarios, with
 `EnablePostingNavigation=true` and `GlobalPostingSearch=false` or omitted.
-Existing repeated cases may refer to that same configuration.
+Every original configuration and its original `SearchSweep.NProbe` belong in
+the reference. Multiple MaxCheck/width/rate configurations per scenario are
+supported and retained separately. Existing repeated cases may refer to the
+same configuration; identical parameter points under different configuration
+files are rejected rather than silently duplicated.
 Set `Binary` to the freshly built `nativeBench`; use unique index/client
 identifiers for the actual local artifacts, available CPU/memory nodes, and
-an adequate whole-batch `TimeoutSeconds` (the local campaign uses 172800).
+an explicitly agreed whole-batch `TimeoutSeconds`.
 Do not reuse another host's physical-index identifier.
 
-Choose and freeze all non-mode controls explicitly. To reproduce the current
-campaign's controls, change these fields in copies of `examples/native.ini`:
-
-| Scenarios | MaxCheck | PostingMatchRatePercent | PostingNavigationWidth |
-| --- | --- | --- | --- |
-| sel50, sel1, sel01 | 16324 | 12.5 | 8 |
-| sel20, sel10 | 16324 | 12.5 | 32 |
-| sel5 | 2048 | 15 | 8 |
-
-The remaining native example settings already match: one worker,
-HashTableExponent=4, MaxDistRatio=8, SearchPostingPageLimit=3,
-PostingAnchorCount=0, PostingAdditionalMaxCheck=2048 and PostingMatchWindow=1024.
-The controller inherits those controls unchanged, even when inactive in a mode.
-It replaces only the two mode flags, the nprobe sweep, query/warmup counts and
-truth-subset bindings. It does not choose MaxCheck/width from past QPS results.
+The source cohort and warmup must already cover all 1,000 queries. Each generated
+native profile must equal its original profile after removing just the two mode
+flags: even the original nprobe order, initial InternalResultNum, inactive
+posting controls, diagnostic flags and input bindings are preserved.
+Preparing and publishing both verify that constraint. The full method is
+remeasured with the same ablation executable, not spliced from historical QPS.
 
 ## Prepare and execute
 
 Copy [examples/posting-ablation.ini](examples/posting-ablation.ini) outside the
 checkout. Replace the three absolute paths, select resource reserves for the
-local machine, and retain or explicitly revise the pilot/grid policy.
+local machine, and bind the complete original reference experiment.
 Campaign output must be fresh and separate from the reference output, registry,
 index and protected inputs. `DataDirectory` may be a new registry or an
-existing compatible one; do **not** initialize it with a pilot experiment.
+existing compatible one.
 
 ```sh
 python3 -B Tools/benchmarks/results/posting_ablation.py prepare \
@@ -75,34 +78,33 @@ python3 -B Tools/benchmarks/results/posting_ablation.py run \
   --directory /absolute/posting-ablation-run1
 ```
 
-Preparation validates full truth, creates an authenticated first-32-query
-subset, writes all 18 pilot profiles, and freezes input/configuration/source
-identities. The binary has a full digest; large immutable data/index files use
+Preparation validates full truth, writes the three exact mode copies of each
+original profile, and freezes input/configuration/source identities.
+`plan.json` records each reference configuration, all original probes and both
+reference/ablation point counts. The binary has a full digest; large immutable data/index files use
 the documented identity guards, not a repeated 1B-vector scan. Source binding
 records preparation-time bytes, not an independent compiler attestation.
 Keep the source checkout, binaries, dependencies, INIs and index unchanged until
 publication. Git commit/push without changing those file bytes is safe.
 
-The default pilot has 90 points, one repetition, and is **never published**.
-For each scenario/mode, select the smallest pilot nprobe reaching 0.97 recall,
-with a minimum cap of 512. If none reaches the target, retain 16384 and record
-`pilot_target_reached=false`; a small-cohort cap is not a guarantee of full-cohort
-recall. Run all declared grid values through that cap on the complete cohort,
-with three repetitions and reversed case order in repetition 2.
+For N distinct original parameter points, there are exactly 3N ablation points
+and 9N measured point-repetitions: three modes, each measured three times.
+Repetition 2 reverses profile order, without changing any profile's probe order.
 
-Each phase loads the index once. Each mode/predicate receives one full
-phase-cohort warmup (32 pilot queries or **1,000 formal queries**), not a partial
-warmup before each point. A completed cohort advances immediately to the next
+The index loads once. Each mode/predicate receives one full **1,000-query**
+warmup, shared across that mode's configurations and repetitions, not a partial
+warmup before each point. A completed measured cohort advances to replay and the next
 nprobe; there is no 30-second minimum. Load, warmup, replay, payload writes and
-validation are outside QPS. Memory/disk/AIO reserves are checked before each phase.
+validation are outside QPS. The existing native client performs a separate
+1,000-query deterministic replay per point; this is not an additional warmup.
+Memory/disk/AIO reserves are checked before execution. Reusing an original
+parameter does not guarantee similar runtime after disabling hierarchy.
 
 ## Outputs, publication and failures
 
-`status.json` reports the current phase. `pilot/native.log` and
-`measurement/native.log` preserve native progress. `grid-selection.json`
-records all 18 selected caps, target-reached flags and the accepted pilot hash.
-The full grid and generated INIs are frozen again before measurement.
-Both phases reuse `native_results.py`'s exact predicate/distance/capture,
+`status.json` reports the current phase and `measurement/native.log` preserves
+native progress. The complete grid and generated INIs are frozen at preparation;
+there is no runtime grid selection. Execution reuses `native_results.py`'s exact predicate/distance/capture,
 repetition, lifecycle, executable and index checks.
 
 After acceptance, `run` automatically creates:
@@ -110,7 +112,9 @@ After acceptance, `run` automatically creates:
 - `measurement/plots/posting_ablation_recall_qps.{png,pdf}` and the
   corresponding `_80_100` zoom files.
 - `measurement/plots/recall_qps.csv` and `metadata.json`, retaining every
-  measured point, QPS median and repeat range.
+  measured point, QPS median and repeat range. Separate lines retain each
+  original control configuration; MaxCheck/width/rate configurations are not
+  pooled into a single fixed-configuration curve. CSV includes complete controls.
 - `publication-receipt.json` and sealed campaign `completion.json`.
 
 Formal events append under `study=ablation-posting-path`,
@@ -138,3 +142,8 @@ move that directory to a named backup outside `measurement/plots` before retry;
 the plotter intentionally refuses to overwrite artifacts. Repair a stale
 registry with the existing `update_results.py refresh` command first.
 Successful re-publication is idempotent and verifies the campaign output seal.
+
+The earlier adaptive-pilot configuration is superseded. `PilotNProbe`,
+`NProbeGrid`, `PilotTargetRecall` and `MinimumMaxNProbe` are rejected, not ignored.
+Use a fresh schema-2 exact-reference campaign; do not mutate or relabel an
+existing adaptive run or publish its partial captures as the corrected experiment.

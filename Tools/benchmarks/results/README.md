@@ -135,7 +135,7 @@ search algorithm, add hidden query settings or tune based on measured recall.
 
 ## Global / limited / hierarchical posting ablations
 
-For automatic pilot selection, complete-cohort three-repeat measurement,
+For exact reuse of previous parameters, complete-cohort three-repeat measurement,
 six-panel plots and independent JSON publication, use
 [`posting_ablation.py`](posting_ablation.py) with
 [`examples/posting-ablation.ini`](examples/posting-ablation.ini).
@@ -177,13 +177,16 @@ Do not pool multiple MaxCheck configurations into a fixed-configuration curve.
 Separate resident processes can instead use `once_per_predicate`. Existing
 `once`, `per_point` and `once_per_predicate` behavior is unchanged.
 
-Register the three modes as distinct complete native INIs per scenario in one
+Reuse the original complete configurations and their exact nprobe sweeps;
+do not select R90-only controls, run a pilot, extend a grid or tune for a recall
+target. Multiple original configurations per scenario remain separate curves.
+Register the three modes as distinct complete native INIs per configuration in one
 experiment (same binary/index and one study/variant, with only the two mode
 switches differing). Give every INI all three repetitions. After `run` accepts
 the captures, `Rscript Tools/benchmarks/results/plot_posting_ablation.R /absolute/run`
 uses the existing ggplot2/jsonlite plotting environment to write six-panel
 PNG/PDF curves, an 80-100% zoom, repeat ranges and a CSV under a fresh `plots/`.
-It requires 1,000 queries, Recall@100 and identical non-mode controls; it
+It requires 1,000 queries, Recall@100 and identical non-mode parameter grids; it
 does not plot small-cohort pilots or substitute historical clients.
 
 ## Stable files and acceptance rules

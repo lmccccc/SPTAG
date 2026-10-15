@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Portable global/limited/full posting ablations on one immutable local index."""
 import argparse
+from collections import Counter
 import copy
 import fcntl
 import hashlib
@@ -11,8 +12,6 @@ import shutil
 import subprocess
 import sys
 
-import numpy as np
-
 import native_results as native
 import update_results as store
 from build_r90_timing import sources
@@ -22,6 +21,8 @@ from ssd_label_distribution import prospective
 require, read, save = native.require, native.read_json, native.save
 STUDY, VARIANT = "ablation-posting-path", "global-limited-full"
 MODES = ("global", "limited", "full")
+MODE_KEYS = {"globalpostingsearch", "enablepostingnavigation"}
+PARAMETER_POLICY = "exact-reference-grid"
 HERE = Path(__file__).resolve().parent
 PLOT = HERE / "plot_posting_ablation.R"
 PLOT_SELECTIVITY = dict(zip(SCENARIOS, ("49.829", "19.848", "10.053", "4.993", "1.001", "0.100")))
@@ -33,20 +34,16 @@ def status(root, state, **fields):
     print(json.dumps(value), flush=True)
 
 
-def probe_grid(text):
-    values = text.split(",")
-    require(all(v.strip().isdecimal() for v in values), "Use comma-separated integer nprobes")
-    result = [int(v) for v in values]
-    require(len(result) >= 2 and result == sorted(set(result)) and
-            100 <= result[0] <= result[-1] < 2**31, "Invalid top100 nprobe grid")
-    return result
+def controls(search):
+    excluded = MODE_KEYS | {"internalresultnum", "isexecute", "buildssdindex",
+                            "logphasetime", "logpathstats", "dumpheads"}
+    return {native.SEARCH_NAMES[key]: value for key, value in search.items() if key not in excluded}
 
 
 def load_config(config):
     config = native.absolute(str(config))
     values = native.read_config(config)
-    keys = {"directory", "datadirectory", "referenceexperiment", "pilotnprobe", "nprobegrid",
-            "pilottargetrecall", "minimummaxnprobe", "minimumavailablememorygib",
+    keys = {"directory", "datadirectory", "referenceexperiment", "minimumavailablememorygib",
             "minimumfreediskgib", "minimumaioevents"}
     require(set(values) == {"ablation"} and set(values["ablation"]) == keys,
             "Ablation must declare exactly: " + ", ".join(sorted(keys)))
@@ -61,7 +58,7 @@ def load_config(config):
             "Provide all six top100 scenarios with the complete 1000-query cohort")
     require(all(f"{100 * inputs['workload']['truth'][s]['selectivity']:.3f}" == PLOT_SELECTIVITY[s]
                 for s in SCENARIOS), "Truth selectivities do not match this SIFT1B plot template")
-    templates = {}
+    templates, seen_configs, seen_points = [], set(), set()
     for case in reference["cases"]:
         scenario, search = case["scenario"], case["profile"]["searchssdindex"]
         require(search["enablepostingnavigation"] == "true" and
@@ -69,15 +66,17 @@ def load_config(config):
                 "Reference profiles must describe the full hierarchical method")
         require({"postingnavigationwidth", "postingmatchratepercent", "postingmatchwindow"} <= search.keys(),
                 "Reference profiles must declare all native posting controls")
-        require(scenario not in templates or templates[scenario] == str(case["config"]),
-                "Select exactly one reference configuration per scenario; do not pool settings")
-        templates[scenario] = str(case["config"])
-    pilot, grid = probe_grid(policy["pilotnprobe"]), probe_grid(policy["nprobegrid"])
-    minimum = int(policy["minimummaxnprobe"])
-    target = float(policy["pilottargetrecall"])
-    require(set(pilot) <= set(grid) and pilot[0] == grid[0] and pilot[-1] == grid[-1] and
-            minimum in grid and minimum >= grid[1] and 0 < target <= 1,
-            "Pilot must span the declared grid; minimum cap must retain at least two points")
+        key = scenario, str(case["config"])
+        if key in seen_configs:
+            continue
+        seen_configs.add(key)
+        parameters = controls(search)
+        for probe in case["probes"]:
+            point = scenario, store.digest(parameters), probe
+            require(point not in seen_points, "Duplicate reference parameter point under different configs")
+            seen_points.add(point)
+        templates.append(dict(id=f"p{len(templates):03d}-{scenario}", scenario=scenario,
+            config=str(case["config"]), probes=list(case["probes"]), parameters=parameters))
     reserves = {key: int(policy[key]) for key in
                 ("minimumavailablememorygib", "minimumfreediskgib", "minimumaioevents")}
     require(all(value > 0 for value in reserves.values()), "Resource reserves must be positive")
@@ -88,88 +87,46 @@ def load_config(config):
         require(registry != other and registry not in other.parents and other not in registry.parents,
                 "Registry output overlaps the reference output or immutable index")
     protected = {config, reference_path, reference["batch"], reference["binary"],
-                 *map(Path, inputs["required"]), *map(Path, templates.values())}
+                 *map(Path, inputs["required"]), *(Path(t["config"]) for t in templates)}
     require(all(root != path and root not in path.parents for path in protected),
             "Campaign output overlaps a protected input")
     require(all(registry != path and registry not in path.parents for path in protected),
             "Registry output overlaps a protected input")
-    plan = dict(schema_version=1, root=str(root), registry=str(registry), reference=str(reference_path),
+    plan = dict(schema_version=2, parameter_policy=PARAMETER_POLICY,
+        root=str(root), registry=str(registry), reference=str(reference_path),
         index=str(reference["index"]), binary=str(reference["binary"]), templates=templates,
         workloads=str(reference["workloads"]), reference_policy=dict(reference["policy"]),
-        pilot_probes=pilot, grid=grid, minimum_max_nprobe=minimum, pilot_target_recall=target,
+        reference_points=len(seen_points), full_points=len(MODES) * len(seen_points),
         reserves=reserves, modes=list(MODES), scenarios=list(SCENARIOS))
     return plan, inputs, protected
 
 
-def prepare_pilot_truth(root, inputs):
-    folder = root / "pilot-truth"
-    folder.mkdir()
-    workload = copy.deepcopy(inputs["workload"])
-    workload.update(query_count=32, scenarios=list(SCENARIOS), protected={}, native_predicates={}, truth={},
-        subset_provenance=dict(kind="first32-of-accepted-input-cohort", new_exhaustive_scan=False))
-    queries = folder / "queries.npy"
-    np.save(queries, inputs["queries"][:32], allow_pickle=False)
-    workload["queries"] = str(queries)
-    workload["protected"][str(queries)] = store.file_sha(queries)
-    for scenario in SCENARIOS:
-        kind, payload = native.native_predicate(inputs["predicates"][scenario],
-                                               tuple(workload["column_types"]), 32)
-        predicate = folder / f"{scenario}-predicate.npy"
-        if kind != "empty":
-            np.save(predicate, payload, allow_pickle=False)
-            workload["protected"][str(predicate)] = store.file_sha(predicate)
-        workload["native_predicates"][scenario] = dict(kind=kind, file=str(predicate) if kind != "empty" else "")
-        truth = copy.deepcopy(inputs["workload"]["truth"][scenario])
-        for field in ("ids", "distances"):
-            path = folder / f"{scenario}-{field}.npy"
-            np.save(path, np.load(truth[field], allow_pickle=False)[:32], allow_pickle=False)
-            truth[field], truth[field + "_sha256"] = str(path), store.file_sha(path)
-        workload["truth"][scenario] = truth
-    save(folder / "workloads.json", workload)
-    save(folder / "completion.json", dict(state="complete",
-        workloads_sha256=store.file_sha(folder / "workloads.json"),
-        source_workload_sha256=store.digest(inputs["workload"]),
-        provenance=workload["subset_provenance"]))
-
-
-def write_experiment(plan, phase, grids):
-    require(phase in ("pilot", "measurement"), "Unknown campaign phase")
+def write_experiment(plan):
     root = Path(plan["root"])
-    count, repeats = (32, 1) if phase == "pilot" else (1000, 3)
-    workload_path = root / "pilot-truth/workloads.json" if phase == "pilot" else Path(plan["workloads"])
-    workload = read(workload_path)
-    configs = root / f"{phase}-configs"
+    configs = root / "measurement-configs"
     configs.mkdir()
-    paths = {}
-    for scenario in SCENARIOS:
+    profiles = []
+    for template in plan["templates"]:
         for mode in MODES:
-            profile = native.read_config(plan["templates"][scenario])
-            probes = grids[f"{scenario}/{mode}"]
-            profile["benchmark"].update(queries=workload["queries"], maxqueries=str(count), warmup=str(count),
-                predicate=workload["native_predicates"][scenario]["kind"],
-                predicatefile=workload["native_predicates"][scenario]["file"],
-                phasetiming="false", steptiming="false")
-            profile["searchssdindex"].update(internalresultnum=str(probes[0]),
-                globalpostingsearch=str(mode == "global").lower(),
+            profile = native.read_config(template["config"])
+            profile["searchssdindex"].update(globalpostingsearch=str(mode == "global").lower(),
                 enablepostingnavigation=str(mode == "full").lower())
-            profile["searchsweep"] = dict(nprobe=",".join(map(str, probes)))
-            path = configs / f"{scenario}-{mode}.ini"
+            name = f"{template['id']}-{mode}"
+            path = configs / f"{name}.ini"
             write_ini(path, profile)
-            paths[scenario, mode] = path
-    ordered = list(paths)
-    sequence = [(repeat, scenario, mode) for repeat in range(1, repeats + 1)
-                for scenario, mode in (ordered if repeat % 2 else list(reversed(ordered)))]
+            profiles.append(dict(name=name, path=path, scenario=template["scenario"]))
+    sequence = [(repeat, profile) for repeat in (1, 2, 3)
+                for profile in (profiles if repeat % 2 else list(reversed(profiles)))]
     batch = {"Batch": dict(CaseCount=str(len(sequence)), WarmupPolicy="once_per_mode_predicate")}
     policy = dict(plan["reference_policy"])
-    policy.update(directory=str(root / phase), batch=str(configs / "batch.ini"),
-        workloads=str(workload_path), study=STUDY if phase == "measurement" else STUDY + "-pilot",
-        variant=VARIANT, repeats=str(repeats))
+    policy.update(directory=str(root / "measurement"), batch=str(configs / "batch.ini"),
+                  study=STUDY, variant=VARIANT, repeats="3")
     experiment = {"Experiment": policy}
-    for ordinal, (repeat, scenario, mode) in enumerate(sequence, 1):
+    for ordinal, (repeat, profile) in enumerate(sequence, 1):
         name = f"Case{ordinal}"
-        batch[name] = dict(Config=str(paths[scenario, mode]),
-                          OutputDirectory=str(root / phase / f"{scenario}-{mode}-r{repeat}"))
-        experiment[name] = dict(Scenario=scenario, Repetition=str(repeat))
+        batch[name] = dict(Config=str(profile["path"]),
+            OutputDirectory=str(root / "measurement" / f"{profile['name']}-r{repeat}"))
+        experiment[name] = dict(Scenario=profile["scenario"], Repetition=str(repeat))
     write_ini(configs / "batch.ini", batch)
     config = configs / "experiment.ini"
     write_ini(config, experiment)
@@ -178,15 +135,13 @@ def write_experiment(plan, phase, grids):
 
 
 def prepare(config):
-    plan, inputs, protected = load_config(config)
+    plan, _, protected = load_config(config)
     root = Path(plan["root"])
     require(not os.path.lexists(root), "Use a fresh campaign directory")
     root.mkdir(parents=True)
     try:
         save(root / "plan.json", plan)
-        prepare_pilot_truth(root, inputs)
-        write_experiment(plan, "pilot",
-                         {f"{s}/{m}": plan["pilot_probes"] for s in SCENARIOS for m in MODES})
+        write_experiment(plan)
         protected.update(path for path in root.rglob("*") if path.is_file())
         protected.update(Path(module.__file__).resolve() for module in tuple(sys.modules.values())
                          if getattr(module, "__file__", None) and
@@ -201,7 +156,9 @@ def prepare(config):
             binary_sha256=store.file_sha(plan["binary"]),
             native_sources=sources(HERE.parents[2]),
             source_snapshot_policy="Preparation-time source/executable binding, not a compiler attestation"))
-        status(root, "prepared", scenarios=6, modes=3, pilot_queries=32, measurement_queries=1000, repeats=3)
+        verify(root)
+        status(root, "prepared", scenarios=6, modes=3, reference_points=plan["reference_points"],
+               points=plan["full_points"], measurement_queries=1000, repeats=3, parameter_policy=PARAMETER_POLICY)
     except Exception as error:
         save(root / "failure.json", dict(phase="prepare", error=str(error), failed_at=utc()))
         raise
@@ -209,12 +166,27 @@ def prepare(config):
 
 def verify(root):
     proof, plan = read(root / "registration.json"), read(root / "plan.json")
+    require(plan["schema_version"] == 2 and plan["parameter_policy"] == PARAMETER_POLICY,
+            "Use a fresh exact-reference-grid campaign; adaptive pilot campaigns are not compatible")
+    require(not (root / "abort.json").exists(), "Aborted campaigns cannot run or publish")
     native.verify_files(proof["files"])
     native.verify_files(proof["index_small"])
     require(store.file_sha(plan["binary"]) == proof["binary_sha256"], "Frozen native executable changed")
     require(all(store.file_sha(path) == digest for path, digest in proof["native_sources"].items()),
             "Frozen native sources changed")
     require(native.inventory(Path(plan["index"])) == proof["index"], "Immutable index changed")
+    for template in plan["templates"]:
+        expected = native.read_config(template["config"])
+        for mode in MODES:
+            path = root / "measurement-configs" / f"{template['id']}-{mode}.ini"
+            actual = native.read_config(path)
+            require(actual["searchssdindex"]["globalpostingsearch"] == str(mode == "global").lower() and
+                    actual["searchssdindex"]["enablepostingnavigation"] == str(mode == "full").lower(),
+                    "Incorrect ablation mode flags")
+            for key in MODE_KEYS:
+                actual["searchssdindex"].pop(key)
+                expected["searchssdindex"].pop(key, None)
+            require(actual == expected, "Only the two ablation mode flags may differ from the reference")
     return plan
 
 
@@ -234,26 +206,20 @@ def preflight(root, plan):
     return values
 
 
-def choose_grids(plan, events):
-    groups = {}
+def verify_reference_points(plan, events):
+    expected = Counter()
+    for template in plan["templates"]:
+        for mode in MODES:
+            parameters = dict(template["parameters"], GlobalPostingSearch=str(mode == "global").lower(),
+                EnablePostingNavigation=str(mode == "full").lower(), WarmupPolicy="once_per_mode_predicate")
+            for probe in template["probes"]:
+                expected[template["scenario"], store.digest(parameters), probe] += 1
+    actual = Counter()
     for event in events:
         point = event["point"]
-        search = json.loads(point["parameters"])
-        mode = "global" if search["GlobalPostingSearch"] == "true" else (
-            "full" if search["EnablePostingNavigation"] == "true" else "limited")
-        require(event["study"] == STUDY + "-pilot" and point["cohort_queries"] == 32 and
-                point["repeats"] == 1, "Only accepted 32-query pilot points may select the grid")
-        groups.setdefault(point["scenario"] + "/" + mode, []).append(point)
-    require(set(groups) == {f"{s}/{m}" for s in SCENARIOS for m in MODES}, "Incomplete pilot modes/scenarios")
-    grids, coverage = {}, {}
-    for key, points in groups.items():
-        require(sorted(p["search_value"] for p in points) == plan["pilot_probes"], "Incomplete pilot grid")
-        successful = [p["search_value"] for p in points if p["recall"] >= plan["pilot_target_recall"]]
-        cap = max(plan["minimum_max_nprobe"], min(successful)) if successful else plan["pilot_probes"][-1]
-        grids[key] = [probe for probe in plan["grid"] if probe <= cap]
-        coverage[key] = dict(cap=cap, pilot_target_reached=bool(successful),
-                             pilot_recall_max=max(p["recall"] for p in points))
-    return dict(grids=grids, coverage=coverage, full_points=sum(map(len, grids.values())))
+        actual[point["scenario"], store.digest(json.loads(point["parameters"])), point["search_value"]] += 1
+    require(actual == expected and len(events) == plan["full_points"],
+            "Measurements must reproduce every reference parameter point in all three modes, with no additions or omissions")
 
 
 def plot(root, events):
@@ -262,7 +228,7 @@ def plot(root, events):
     if not output.exists():
         subprocess.run(["Rscript", str(PLOT), str(measurement)], check=True)
     info = read(output / "metadata.json")
-    require(info["points"] == len(events) and info["input_md5"] ==
+    require(info["points"] == len(events) and info["matched_parameter_grids"] and info["input_md5"] ==
             hashlib.md5((measurement / "events.json").read_bytes()).hexdigest(), "Plots are incomplete or stale")
     require(all((output / (name + ext)).stat().st_size > 1000
                 for name in ("posting_ablation_recall_qps", "posting_ablation_recall_qps_80_100")
@@ -293,19 +259,13 @@ def publication_events(plan, before, records, events):
 
 def _publish(root):
     plan = verify(root)
-    native.verify_files(read(root / "measurement-registration.json")["files"])
     complete = root / "completion.json"
     if complete.exists():
         verify_seal(root, read(complete)["artifacts"],
                     {"publication-receipt.json", "measurement/plots/metadata.json",
                      "measurement/plots/recall_qps.csv"})
     events = native.accepted_events(root / "measurement-configs/experiment.ini")
-    grid = read(root / "grid-selection.json")
-    selected = choose_grids(plan, native.accepted_events(root / "pilot-configs/experiment.ini"))
-    require(all(grid[key] == value for key, value in selected.items()) and
-            grid["pilot_events_sha256"] == store.file_sha(root / "pilot/events.json"),
-            "Formal grid no longer matches the accepted pilot")
-    require(len(events) == grid["full_points"], "Formal grid is incomplete")
+    verify_reference_points(plan, events)
     plots = plot(root, events)
     registry = Path(plan["registry"])
     with store.locked(registry):
@@ -356,21 +316,10 @@ def run(root):
             "Fresh-only execution; preserve failed campaigns")
     save(root / "started.json", dict(started_at=utc(), pid=os.getpid(), **preflight(root, plan)))
     try:
-        status(root, "pilot_running", native_log=str(root / "pilot/native.log"), queries=32)
-        native.run(root / "pilot-configs/experiment.ini")
-        selection = choose_grids(plan, native.accepted_events(root / "pilot-configs/experiment.ini"))
-        save(root / "grid-selection.json", dict(**selection, selected_at=utc(),
-            pilot_events_sha256=store.file_sha(root / "pilot/events.json")))
-        config = write_experiment(plan, "measurement", selection["grids"])
-        paths = [root / "grid-selection.json", *sorted(config.parent.glob("*.ini"))]
-        save(root / "measurement-registration.json",
-             dict(files={str(path): native.frozen(path) for path in paths}))
-        verify(root)
-        preflight(root, plan)
         status(root, "measurement_running", native_log=str(root / "measurement/native.log"),
-               points=selection["full_points"], queries=1000, repetitions=3)
-        native.run(config)
-        status(root, "measurement_complete", points=selection["full_points"])
+               points=plan["full_points"], queries=1000, repetitions=3, parameter_policy=PARAMETER_POLICY)
+        native.run(root / "measurement-configs/experiment.ini")
+        status(root, "measurement_complete", points=plan["full_points"])
     except Exception as error:
         save(root / "failure.json", dict(error=str(error), failed_at=utc()))
         status(root, "failed", error=str(error))
