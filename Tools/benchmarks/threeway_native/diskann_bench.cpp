@@ -64,7 +64,8 @@ class DiskANNBackend final : public threeway::Backend
             threeway::require(fs::equivalent(options.resolve("DiskANN", "SourceDirectory"), THREEWAY_DISKANN_SOURCE),
                               "DiskANN.SourceDirectory differs from the original source used to compile this client");
             for (const auto &job : options.jobs)
-                threeway::require(options.scenarios[job.scenario_index].kind != threeway::ScenarioKind::mixed_dnf,
+                threeway::require(options.scenarios[job.scenario_index].kind == threeway::ScenarioKind::unfilter ||
+                                  options.scenarios[job.scenario_index].kind == threeway::ScenarioKind::categorical,
                                   "Original Filtered-DiskANN supports single categorical labels, not mixed_dnf; "
                                   "mark this point unsupported instead of substituting union/postfilter searches");
             beam_ = threeway::u32(options.ini.uint_value("DiskANN", "BeamWidth"), "DiskANN.BeamWidth");

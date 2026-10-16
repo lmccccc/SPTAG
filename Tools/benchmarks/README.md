@@ -43,6 +43,18 @@ OR handoff as the last field). Historical campaign readers may require their
 older pinned policy/schema: reproduce those with their recorded sources and
 binaries, not a newly built executable relabeled as the old client.
 
+## YFCC10M packed-H1 curves
+
+For the separate YFCC10M packed-H1 campaign, use
+[`run_yfcc_packed_curves.py`](run_yfcc_packed_curves.py) and the
+[GettingStart reproduction commands](../../docs/GettingStart.md#yfcc10m-packed-h1-reproduction).
+It requires only the matching Lion client/index and authenticated camera-OR
+workload. All324 single/4/8/16/32/48-thread points are freshly measured, with
+three repetitions and Linux process-RSS fields. GNU `time` launches the native
+child from a small parent so its peak does not inherit the Python controller's
+RSS high-water. The frozen54-pair grid is in
+[`configs/yfcc10m_packed_heads/selection.json`](configs/yfcc10m_packed_heads/selection.json).
+
 ## SIFT1B three-algorithm comparison
 
 `run_sift1b_threeway.py` adds the original C++ Filtered-DiskANN categorical

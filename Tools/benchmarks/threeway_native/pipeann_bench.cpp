@@ -40,7 +40,8 @@ void check_executable_copy(const fs::path &source)
             "Cannot completely read the PipeANN runtime executable copy");
 }
 
-void check_binding(const fs::path &path, const pipeann::Attribute &values, uint32_t queries, bool label)
+void check_binding(const fs::path &path, const pipeann::Attribute &values, uint32_t queries, bool label,
+                   uint32_t label_columns = 201)
 {
     const uint64_t nnz = static_cast<uint64_t>(queries) * values.size();
     require(fs::is_regular_file(path) && fs::file_size(path) == 24 + (uint64_t(queries) + 1) * 8 + nnz * 8,
@@ -48,7 +49,7 @@ void check_binding(const fs::path &path, const pipeann::Attribute &values, uint3
     std::ifstream input(path, std::ios::binary);
     int64_t header[3]{};
     input.read(reinterpret_cast<char *>(header), sizeof(header));
-    require(header[0] == queries && header[1] == (label ? 201 : int64_t(values.size())) &&
+    require(header[0] == queries && header[1] == (label ? label_columns : int64_t(values.size())) &&
                 header[2] == static_cast<int64_t>(nnz), "PipeANN binding header mismatch: " + path.string());
     for (uint64_t row = 0; row <= queries; ++row)
     {
@@ -91,7 +92,19 @@ void check_filter_config(const threeway::Options &options, const threeway::Scena
     picojson::array stores{store("tag", options.categorical_column, "label", "base.label.0")};
     picojson::object bindings;
     std::string expression;
-    if (scenario.kind == threeway::ScenarioKind::categorical)
+    if (scenario.kind == threeway::ScenarioKind::categorical_or)
+    {
+        require(options.attribute_columns == 4 && options.categorical_column == 2 &&
+                    !scenario.tags.empty() && scenario.tags.back() <= 66,
+                "Camera OR requires original column 2 and camera IDs 0..66");
+        const auto prefix = options.resolve("PipeANN", "IndexPrefix").string();
+        const auto binding = options.prepared_directory / ("camera.query." + scenario.name + ".spmat");
+        stores = {store("camera", 0, "label", (prefix + ".label.0").c_str())};
+        expression = "camera = $$camera";
+        bindings["camera"] = picojson::value(binding.string());
+        check_binding(binding, scenario.tags, options.query_count, true, 67);
+    }
+    else if (scenario.kind == threeway::ScenarioKind::categorical)
     {
         require(scenario.tag <= 200, "PipeANN categorical bindings must preserve original labels 0..200");
         expression = "tag = $$tag";
@@ -172,11 +185,15 @@ class PipeANNBackend final : public threeway::Backend
     std::string filter_scenario_;
     uint32_t width_ = 0, memory_l_ = 0, current_l_ = 0, max_threads_ = 0;
     bool filtered_ = false;
+    std::vector<std::vector<uint32_t>> result_ids_;
+    std::vector<std::vector<float>> result_distances_;
 
   public:
     PipeANNBackend(const threeway::Options &options, uint32_t max_threads)
         : options_(options), max_threads_(max_threads)
     {
+        result_ids_.assign(max_threads, std::vector<uint32_t>(options.top_k));
+        result_distances_.assign(max_threads, std::vector<float>(options.top_k));
         options.ini.only("PipeANN", {"indexprefix", "benchmarkbinary", "sourcedirectory", "lsweep", "pipelinewidth",
                                      "searchmode", "unfilteredmemoryl", "filteredmemoryl", "filtermode"});
         require(fs::equivalent(options.resolve("PipeANN", "SourceDirectory"), THREEWAY_PIPEANN_SOURCE),
@@ -189,7 +206,11 @@ class PipeANNBackend final : public threeway::Backend
                     memory_l_ == 10 && options.ini.uint_value("PipeANN", "FilteredMemoryL") == 0 &&
                     threeway::lower(options.ini.require("PipeANN", "FilterMode")) == "auto",
                 "PipeANN baseline requires pipeline_width=32, search_mode=2, unfilter mem_L=10, filtered auto/mem_L=0");
-        require(options.attribute_columns == 2 && options.categorical_column == 0 && options.numeric_column == 1,
+        const bool camera_or = std::all_of(options.scenarios.begin(), options.scenarios.end(), [](const auto &scenario) {
+            return scenario.kind == threeway::ScenarioKind::categorical_or;
+        });
+        require(camera_or || (options.attribute_columns == 2 && options.categorical_column == 0 &&
+                               options.numeric_column == 1),
                 "PipeANN index attributes must retain the original categorical/numeric columns 0,1");
         fs::current_path(options.prepared_directory);
         const std::string prefix = options.resolve("PipeANN", "IndexPrefix").string();
@@ -254,7 +275,8 @@ class PipeANNBackend final : public threeway::Backend
 
     void configure(const threeway::Job &job, const threeway::Scenario &scenario) override
     {
-        require(job.threads <= max_threads_ && job.L >= options_.top_k, "PipeANN job exceeds its resident plan");
+        require(job.threads <= max_threads_ && (job.L >= options_.top_k || options_.allow_search_below_topk),
+                "PipeANN job exceeds its resident plan");
         current_l_ = job.L;
         filtered_ = scenario.kind != threeway::ScenarioKind::unfilter;
         if (filtered_ && filter_scenario_ != scenario.name)
@@ -274,11 +296,21 @@ class PipeANNBackend final : public threeway::Backend
         require(worker_id < max_threads_ && query_index < options_.query_count && current_l_ != 0,
                 "PipeANN query outside the configured resident cohort");
         pipeann::QueryStats stats{};
+        auto *native_ids = options_.allow_short_results ? result_ids_[worker_id].data() : ids;
+        auto *native_distances = options_.allow_short_results ? result_distances_[worker_id].data() : distances;
         const size_t count = filtered_
             ? index_->spec_filter_search(query, options_.top_k, current_l_, filter_->selector.get(),
-                                         filter_->queries[query_index], ids, distances, width_, &stats,
+                                         filter_->queries[query_index], native_ids, native_distances, width_, &stats,
                                          nullptr, pipeann::N_FILTER_TYPES)
-            : index_->pipe_search(query, options_.top_k, memory_l_, current_l_, ids, distances, width_, &stats);
+            : index_->pipe_search(query, options_.top_k, memory_l_, current_l_, native_ids, native_distances, width_, &stats);
+        require(count <= options_.top_k, "PipeANN returned count exceeds K");
+        if (options_.allow_short_results)
+        {
+            // Native speculative filtering may leave rejected candidates after count.
+            // Only the valid prefix is part of the API result.
+            std::copy_n(native_ids, count, ids);
+            std::copy_n(native_distances, count, distances);
+        }
         return {count, static_cast<double>(stats.n_ios)};
     }
 };

@@ -25,24 +25,71 @@ int native_int(uint64_t value, const std::string &name)
 void validate_overlay(const threeway::Options &options)
 {
     const auto &ini = options.ini;
-    ini.only("SPANN", {"indexdirectory", "benchmarkbinary", "nprobe"});
-    ini.only("SearchSSDIndex", {
+    ini.only("SPANN", {"indexdirectory", "benchmarkbinary", "nprobe", "protocol"});
+    const bool explicit_ini = ini.has("SPANN", "Protocol");
+    const bool hierarchy_ablation = explicit_ini &&
+        ini.require("SPANN", "Protocol") == "hierarchy-ablation-v1";
+    const bool layout_ablation = explicit_ini &&
+        ini.require("SPANN", "Protocol") == "posting-layout-ablation-v1";
+#ifndef THREEWAY_SPANN_POSTING_LAYOUT_ABLATION
+    threeway::require(!layout_ablation, "Posting-layout ablation requires its matching isolated native core");
+#endif
+    if (explicit_ini)
+        threeway::require(ini.require("SPANN", "Protocol") == "explicit-ini-v1" ||
+                              hierarchy_ablation || layout_ablation,
+                          "Unknown SPANN.Protocol");
+    std::set<std::string> search_keys{
         "isexecute", "buildssdindex", "internalresultnum", "numberofthreads", "hashtableexponent",
         "resultnum", "maxcheck", "maxdistratio", "searchpostingpagelimit", "disablecrossedges",
         "logphasetime", "logpathstats", "dumpheads", "enablehybriddistance", "enablepostingnavigation",
-        "postinganchorcount", "postingadditionalmaxcheck"});
+        "postinganchorcount", "postingadditionalmaxcheck", "enablepackedheadlayout"};
+    if (ini.has("SearchSSDIndex", "EnablePackedHeadLayout"))
+    {
+        const bool packed = ini.bool_value("SearchSSDIndex", "EnablePackedHeadLayout");
+#ifdef THREEWAY_SPANN_PACKED_HEAD_LAYOUT
+        (void)packed;
+#else
+        threeway::require(!packed, "Packed layout requires a client linked to its matching packed-head core");
+#endif
+    }
+    if (explicit_ini)
+        search_keys.insert({"postingnavigationwidth", "postingmatchratepercent", "postingmatchwindow",
+                            "collectpostingcontributionstats"});
+    if (layout_ablation)
+        search_keys.insert("globalpostingnomemoryfilter");
+    ini.only("SearchSSDIndex", search_keys);
+    if (layout_ablation)
+    {
+        ini.bool_value("SearchSSDIndex", "GlobalPostingNoMemoryFilter");
+        threeway::require(!ini.bool_value("SearchSSDIndex", "EnablePostingNavigation"),
+                          "Both posting-layout variants must disable hierarchy");
+    }
     for (const auto &item : std::vector<std::pair<std::string, uint64_t>>{
              {"NumberOfThreads", 1}, {"HashTableExponent", 4}, {"ResultNum", options.top_k},
              {"MaxCheck", 2048}, {"SearchPostingPageLimit", 3}, {"DumpHeads", 0},
              {"PostingAnchorCount", 8}, {"PostingAdditionalMaxCheck", 2048}})
-        threeway::require(ini.uint_value("SearchSSDIndex", item.first) == item.second,
-                          "Frozen SPANN protocol differs at SearchSSDIndex." + item.first);
+        if (!explicit_ini || (item.first != "MaxCheck" && item.first != "PostingAnchorCount"))
+            threeway::require(ini.uint_value("SearchSSDIndex", item.first) == item.second,
+                              "SPANN protocol differs at SearchSSDIndex." + item.first);
+    if (explicit_ini)
+    {
+        native_int(ini.uint_value("SearchSSDIndex", "MaxCheck"), "SearchSSDIndex.MaxCheck");
+        threeway::require(ini.uint_value("SearchSSDIndex", "PostingAnchorCount") == 0 &&
+                          ini.uint_value("SearchSSDIndex", "PostingNavigationWidth") == 128 &&
+                          ini.double_value("SearchSSDIndex", "PostingMatchRatePercent") == 12.5 &&
+                          ini.uint_value("SearchSSDIndex", "PostingMatchWindow") == 1024,
+                          "Explicit protocol requires the approved local-match-union-v2 policy");
+    }
     for (const auto &item : std::vector<std::pair<std::string, bool>>{
              {"isExecute", true}, {"BuildSsdIndex", false}, {"DisableCrossEdges", true},
              {"LogPhaseTime", false}, {"LogPathStats", false}, {"EnableHybridDistance", false},
              {"EnablePostingNavigation", true}})
-        threeway::require(ini.bool_value("SearchSSDIndex", item.first) == item.second,
+    {
+        const bool value = ini.bool_value("SearchSSDIndex", item.first);
+        threeway::require(value == item.second ||
+                              ((hierarchy_ablation || layout_ablation) && item.first == "EnablePostingNavigation"),
                           "Frozen SPANN protocol differs at SearchSSDIndex." + item.first);
+    }
     threeway::require(ini.double_value("SearchSSDIndex", "MaxDistRatio") == 8,
                       "Frozen SPANN protocol requires SearchSSDIndex.MaxDistRatio=8");
     const auto initial = ini.uint_value("SearchSSDIndex", "InternalResultNum");
@@ -123,6 +170,13 @@ std::vector<uint32_t> encode_predicate(const threeway::Options &options, const t
     // DNF3 literals are (kind, ORIGINAL column, operation, uint32 value).
     if (scenario.kind == threeway::ScenarioKind::categorical)
         return {0x444e4633U, 1, 1, 0, options.categorical_column, SPTAG::Cache::DNF_EQ, scenario.tag};
+    if (scenario.kind == threeway::ScenarioKind::categorical_or)
+    {
+        std::vector<uint32_t> predicate{0x444e4633U, static_cast<uint32_t>(scenario.tags.size())};
+        for (const auto tag : scenario.tags)
+            predicate.insert(predicate.end(), {1, 0, options.categorical_column, SPTAG::Cache::DNF_EQ, tag});
+        return predicate;
+    }
     threeway::require(scenario.kind == threeway::ScenarioKind::mixed_dnf, "Unsupported SPANN predicate kind");
     return {0x444e4633U, 2,
             1, 0, options.categorical_column, SPTAG::Cache::DNF_EQ, scenario.rare_tag,
@@ -134,12 +188,15 @@ class SPANNBackend final : public threeway::Backend
 {
     const threeway::Options &options_;
     const uint32_t max_threads_;
+    const bool collect_posting_stats_;
     std::unique_ptr<TenantIndexManager> manager_;
     std::vector<uint32_t> predicate_;
 
   public:
     SPANNBackend(const threeway::Options &options, uint32_t max_threads)
-        : options_(options), max_threads_(max_threads)
+        : options_(options), max_threads_(max_threads),
+          collect_posting_stats_(options.ini.has("SearchSSDIndex", "CollectPostingContributionStats") &&
+                                options.ini.bool_value("SearchSSDIndex", "CollectPostingContributionStats"))
     {
         validate_overlay(options);
         native_int(options.top_k, "TopK");
@@ -159,11 +216,18 @@ class SPANNBackend final : public threeway::Backend
         manager_->SetHeadIndexCacheLimit(0);
         for (const auto &parameter : options.ini.section("SearchSSDIndex"))
         {
+            if (parameter.first == "enablepackedheadlayout") continue;
             const std::string value = parameter.first == "numberofthreads" ? std::to_string(max_threads) :
                                       parameter.first == "internalresultnum" ? std::to_string(options.jobs.front().L) :
                                                                              parameter.second;
             manager_->SetSearchParam(parameter.first.c_str(), value.c_str(), "SearchSSDIndex");
         }
+#ifdef THREEWAY_SPANN_PACKED_HEAD_LAYOUT
+        threeway::require(manager_->SetSearchParamChecked("EnablePackedHeadLayout",
+            options.ini.has("SearchSSDIndex", "EnablePackedHeadLayout") &&
+                options.ini.bool_value("SearchSSDIndex", "EnablePackedHeadLayout") ? "true" : "false",
+            "SearchSSDIndex"), "Cannot apply packed head layout");
+#endif
         threeway::require(manager_->LoadAll(directory.c_str()), "Cannot load immutable SPANN manager metadata");
         threeway::require(manager_->GetTenantCount() == 1 &&
                               manager_->GetTenantVectorCount(0) == static_cast<int>(options.vector_count),
@@ -181,6 +245,14 @@ class SPANNBackend final : public threeway::Backend
         configure(options.jobs.front(), options.scenarios[options.jobs.front().scenario_index]);
         search(first_query.data(), 0, 0, ids.data(), distances.data());
         std::cout << "THREEWAY_SPANN_INDEX {\"index_load_count\":1,\"max_threads\":" << max_threads
+                  << ",\"enable_posting_navigation\":"
+                  << (options.ini.bool_value("SearchSSDIndex", "EnablePostingNavigation") ? "true" : "false")
+                  << ",\"packed_head_layout\":"
+                  << (options.ini.has("SearchSSDIndex", "EnablePackedHeadLayout") &&
+                      options.ini.bool_value("SearchSSDIndex", "EnablePackedHeadLayout") ? "true" : "false")
+                  << ",\"global_posting_no_memory_filter\":"
+                  << (options.ini.has("SearchSSDIndex", "GlobalPostingNoMemoryFilter") &&
+                      options.ini.bool_value("SearchSSDIndex", "GlobalPostingNoMemoryFilter") ? "true" : "false")
                   << ",\"aio_contexts\":" << pool.NumContexts()
                   << ",\"aio_events_per_context\":" << native_aio_events_per_context
                   << ",\"core\":" << threeway::json_string(THREEWAY_SPANN_CORE)
@@ -191,6 +263,8 @@ class SPANNBackend final : public threeway::Backend
     {
         threeway::require(job.threads > 0 && job.threads <= max_threads_, "SPANN job exceeds its resident worker capacity");
         predicate_ = encode_predicate(options_, scenario);
+        if (job.maxcheck)
+            manager_->SetSearchParam("MaxCheck", std::to_string(job.maxcheck).c_str(), "SearchSSDIndex");
         manager_->SetSearchParam("InternalResultNum", std::to_string(job.L).c_str(), "SearchSSDIndex");
     }
 
@@ -214,8 +288,26 @@ class SPANNBackend final : public threeway::Backend
             distances[k] = entry->Dist;
             count += entry->VID >= 0;
         }
-        // Posting counters omit exact-rerank IO; do not label them total IOs.
-        return {count, std::nullopt};
+        const auto native = SPTAG::VectorIndex::GetThreadLocalPostingScanStats();
+        // Native read requests, not page counts or physical-device operations.
+        threeway::SearchStats stats{count, static_cast<double>(native.m_readPostings + native.m_rerankReadRequests), {}};
+        if (collect_posting_stats_)
+        {
+            stats.posting_counters = {
+                {"read_postings", native.m_readPostings},
+                {"matched_postings", native.m_matchedPostings},
+                {"unique_matched_postings", native.m_uniqueMatchedPostings},
+                {"scanned_vectors", native.m_scannedVectors},
+                {"matched_vectors", native.m_matchedVectors},
+                {"dedup_skipped_vectors", native.m_dedupSkippedVectors},
+                {"unique_matched_vectors", native.m_uniqueMatchedVectors},
+                {"posting_page_reads", native.m_postingPageReads},
+                {"posting_logical_bytes", native.m_postingLogicalBytes},
+                {"posting_physical_bytes", native.m_postingPhysicalBytes},
+                {"distance_computations", static_cast<uint64_t>((std::max)(result->GetScanned(), 0))}
+            };
+        }
+        return stats;
     }
 };
 } // namespace

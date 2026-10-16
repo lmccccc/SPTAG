@@ -103,6 +103,12 @@ class MockBackend final : public threeway::Backend
                 distances[0] = std::numeric_limits<float>::infinity();
             else if (mode_ == "underfill")
                 return {options_.top_k - 1, 7.0};
+            else if (mode_ == "short_prefix")
+            {
+                ids[options_.top_k - 1] = UINT32_MAX;
+                distances[options_.top_k - 1] = std::numeric_limits<float>::quiet_NaN();
+                return {options_.top_k - 1, 7.0};
+            }
         }
         return {options_.top_k, native_io_ ? std::optional<double>(7.0) : std::nullopt};
     }

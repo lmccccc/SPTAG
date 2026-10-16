@@ -5,6 +5,8 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -18,18 +20,21 @@
 #include <locale>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include <fcntl.h>
 #include <omp.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -46,6 +51,26 @@ inline void require(bool condition, const std::string &message)
 {
     if (!condition)
         throw std::runtime_error(message);
+}
+
+struct ProcessMemory
+{
+    uint64_t rss_bytes, peak_rss_bytes;
+};
+
+inline ProcessMemory process_memory()
+{
+    std::ifstream statm("/proc/self/statm");
+    uint64_t pages = 0, resident = 0;
+    const long page_size = ::sysconf(_SC_PAGESIZE);
+    require(static_cast<bool>(statm >> pages >> resident) && page_size > 0 &&
+                resident <= std::numeric_limits<uint64_t>::max() / static_cast<uint64_t>(page_size),
+            "Cannot read native process resident memory");
+    struct rusage usage{};
+    require(::getrusage(RUSAGE_SELF, &usage) == 0 && usage.ru_maxrss > 0 &&
+                static_cast<uint64_t>(usage.ru_maxrss) <= std::numeric_limits<uint64_t>::max() / 1024,
+            "Cannot read native process peak RSS");
+    return {resident * static_cast<uint64_t>(page_size), static_cast<uint64_t>(usage.ru_maxrss) * 1024};
 }
 
 inline std::string trim(const std::string &value)
@@ -264,6 +289,7 @@ enum class ScenarioKind
 {
     unfilter,
     categorical,
+    categorical_or,
     mixed_dnf
 };
 
@@ -273,12 +299,14 @@ struct Scenario
     ScenarioKind kind = ScenarioKind::unfilter;
     uint32_t tag = 0, rare_tag = 0, regular_tag = 0, upper_inclusive = 0;
     uint64_t candidate_count = 0;
+    std::vector<uint32_t> tags;
 };
 
 struct Job
 {
     size_t scenario_index = 0, control_index = 0, thread_index = 0;
     uint32_t L = 0, threads = 0, repeat = 0;
+    uint32_t maxcheck = 0;
 };
 
 struct Options
@@ -290,7 +318,12 @@ struct Options
     uint32_t dimension = 0, attribute_columns = 0, categorical_column = 0, numeric_column = 0;
     uint32_t query_count = 0, warmup_queries = 0, top_k = 0, single_repeats = 0, throughput_repeats = 0;
     double minimum_seconds = 0;
+    double minimum_qps = 0;
+    double maximum_seconds = 0;
+    std::string warmup_policy = "per_point";
     uint64_t aio_reserve = 0;
+    bool allow_short_results = false;
+    bool allow_search_below_topk = false;
     std::vector<uint32_t> controls, throughput_threads;
     std::vector<Scenario> scenarios;
     std::vector<Job> jobs;
@@ -307,7 +340,29 @@ struct Options
                              "categoricalcolumn", "numericcolumn", "querypayloadsha256"});
         ini.only("Run", {"outputdirectory", "prepareddirectory", "builddirectory", "buildcontrollerpid", "pollseconds",
                          "resourceintervalseconds", "minimumfreediskgib", "minimumfreememorygib", "maxchildrssgib", "rscript"});
-        ini.only("Benchmark", {"querycount", "warmupqueries", "topk", "singlerepeats", "scenarios"});
+        ini.only("Benchmark", {"querycount", "warmupqueries", "topk", "singlerepeats", "scenarios",
+                               "allowshortresults", "minimumqps", "warmuppolicy", "maximumseconds",
+                               "allowsearchbelowtopk"});
+        if (ini.has("Benchmark", "WarmupPolicy"))
+            warmup_policy = lower(ini.require("Benchmark", "WarmupPolicy"));
+        require(warmup_policy == "per_point" || warmup_policy == "once_per_scenario",
+                "Benchmark.WarmupPolicy must be per_point or once_per_scenario");
+        if (ini.has("Benchmark", "MaximumSeconds"))
+        {
+            maximum_seconds = ini.double_value("Benchmark", "MaximumSeconds");
+            require(maximum_seconds > 0, "Benchmark.MaximumSeconds must be positive");
+        }
+        if (ini.has("Benchmark", "AllowShortResults"))
+            allow_short_results = ini.bool_value("Benchmark", "AllowShortResults");
+        if (ini.has("Benchmark", "AllowSearchBelowTopK"))
+            allow_search_below_topk = ini.bool_value("Benchmark", "AllowSearchBelowTopK");
+        require(!allow_search_below_topk || (engine == "PipeANN" && allow_short_results),
+                "AllowSearchBelowTopK requires PipeANN native short-result handling");
+        if (ini.has("Benchmark", "MinimumQPS"))
+        {
+            minimum_qps = ini.double_value("Benchmark", "MinimumQPS");
+            require(minimum_qps >= 0, "Benchmark.MinimumQPS must be nonnegative");
+        }
         ini.only("Throughput", {"threads", "repeats", "minimumseconds", "recalltargets", "aioreserve", "cpunodes",
                                 "memorynodes", "resourcepolicy"});
         ini.only("Single", {"cpunodes", "memorynodes"});
@@ -360,7 +415,7 @@ struct Options
         single_repeats = u32(ini.uint_value("Benchmark", "SingleRepeats"), "Benchmark.SingleRepeats");
         throughput_repeats = u32(ini.uint_value("Throughput", "Repeats"), "Throughput.Repeats");
         minimum_seconds = ini.double_value("Throughput", "MinimumSeconds");
-        require(minimum_seconds > 0, "Throughput.MinimumSeconds must be positive");
+        require(minimum_seconds >= 0, "Throughput.MinimumSeconds must be nonnegative");
         aio_reserve = ini.uint_value("Throughput", "AIOReserve");
         throughput_threads = uint_list(ini, "Throughput", "Threads");
         for (uint32_t threads : throughput_threads)
@@ -381,7 +436,8 @@ struct Options
         controls = uint_list(ini, engine_section, engine == "SPTAG_adaptive" ? "NProbe" : "LSweep");
         if (engine != "SPTAG_adaptive")
             for (uint32_t value : controls)
-                require(value >= top_k, engine_section + ".LSweep entries must be >= TopK");
+                require(value >= top_k || allow_search_below_topk,
+                        engine_section + ".LSweep entries must be >= TopK unless explicitly allowed");
         std::set<std::string> names;
         for (const auto &name : split(ini.require("Benchmark", "Scenarios"), ','))
         {
@@ -400,6 +456,13 @@ struct Options
                 scenario.kind = ScenarioKind::categorical;
                 keys.insert({"tag", "filterconfig"});
                 scenario.tag = u32(ini.uint_value(section, "Tag"), section + ".Tag", true);
+            }
+            else if (kind == "categorical_or")
+            {
+                scenario.kind = ScenarioKind::categorical_or;
+                keys.insert({"tags", "filterconfig"});
+                scenario.tags = uint_list(ini, section, "Tags", true);
+                std::sort(scenario.tags.begin(), scenario.tags.end());
             }
             else if (kind == "mixed_dnf")
             {
@@ -452,8 +515,14 @@ struct Options
         require(static_cast<bool>(std::getline(input, line)), "Empty plan: " + path.string());
         if (!line.empty() && line.back() == '\r')
             line.pop_back();
-        require(line == "scenario\tcontrol_index\tthread_index\trepeat", "Invalid plan TSV header");
-        std::set<std::tuple<size_t, uint32_t, uint32_t, uint32_t>> distinct;
+        const bool has_maxcheck = line == "scenario\tcontrol_index\tthread_index\trepeat\tmaxcheck";
+        require(line == "scenario\tcontrol_index\tthread_index\trepeat" || has_maxcheck, "Invalid plan TSV header");
+        require(!has_maxcheck || (engine == "SPTAG_adaptive" && ini.has("SPANN", "Protocol") &&
+                                  (ini.require("SPANN", "Protocol") == "explicit-ini-v1" ||
+                                   ini.require("SPANN", "Protocol") == "hierarchy-ablation-v1" ||
+                                   ini.require("SPANN", "Protocol") == "posting-layout-ablation-v1")),
+                "Per-job MaxCheck requires the explicit SPANN protocol");
+        std::set<std::tuple<size_t, uint32_t, uint32_t, uint32_t, uint32_t>> distinct;
         size_t number = 1;
         while (std::getline(input, line))
         {
@@ -462,7 +531,7 @@ struct Options
                 line.pop_back();
             const std::string context = path.string() + ":" + std::to_string(number);
             const auto fields = split(line, '\t');
-            require(fields.size() == 4, context + ": expected exactly four TSV fields");
+            require(fields.size() == (has_maxcheck ? 5 : 4), context + ": unexpected TSV field count");
             Job job;
             auto scenario = std::find_if(scenarios.begin(), scenarios.end(),
                                          [&](const Scenario &item) { return item.name == fields[0]; });
@@ -479,8 +548,14 @@ struct Options
             require(job.repeat <= (phase == "single" ? single_repeats : throughput_repeats),
                     context + ": repeat out of range");
             job.L = controls[job.control_index];
+            if (has_maxcheck)
+            {
+                job.maxcheck = u32(parse_uint(fields[4], context), context);
+                require(job.maxcheck <= static_cast<uint32_t>(std::numeric_limits<int>::max()),
+                        context + ": MaxCheck exceeds native int range");
+            }
             job.threads = phase == "single" ? 1 : throughput_threads[job.thread_index];
-            require(distinct.emplace(job.scenario_index, job.L, job.threads, job.repeat).second,
+            require(distinct.emplace(job.scenario_index, job.L, job.threads, job.repeat, job.maxcheck).second,
                     context + ": duplicate job");
             jobs.push_back(job);
         }
@@ -492,6 +567,7 @@ struct SearchStats
 {
     size_t count = 0;
     std::optional<double> ios;
+    std::map<std::string, uint64_t> posting_counters;
 };
 
 class Backend
@@ -600,6 +676,8 @@ class Attributes
         const uint32_t tag = row[options_.categorical_column];
         if (scenario.kind == ScenarioKind::categorical)
             return tag == scenario.tag;
+        if (scenario.kind == ScenarioKind::categorical_or)
+            return std::binary_search(scenario.tags.begin(), scenario.tags.end(), tag);
         return tag == scenario.rare_tag ||
                (tag == scenario.regular_tag && row[options_.numeric_column] <= scenario.upper_inclusive);
     }
@@ -822,6 +900,8 @@ struct Totals
     uint64_t queries = 0, hits = 0, invalid_queries = 0, invalid_ids = 0, duplicate_ids = 0;
     uint64_t nonmatching_ids = 0, nonfinite_distances = 0, underfilled_queries = 0, query_exceptions = 0;
     uint64_t io_observations = 0;
+    uint64_t posting_observations = 0;
+    std::map<std::string, uint64_t> posting_counters;
     long double latency_us = 0, ios = 0;
     LatencyHistogram histogram;
 
@@ -840,6 +920,24 @@ struct Totals
                 ++queries;
                 latency_us += call.latency_us;
                 histogram.add(call.latency_us);
+                if (!call.stats.posting_counters.empty())
+                {
+                    if (posting_observations)
+                    {
+                        require(posting_counters.size() == call.stats.posting_counters.size(),
+                                "Posting diagnostic counter schema changed within a cohort");
+                        for (const auto &counter : call.stats.posting_counters)
+                            require(posting_counters.count(counter.first) == 1,
+                                    "Posting diagnostic counter name changed within a cohort");
+                    }
+                    ++posting_observations;
+                    for (const auto &counter : call.stats.posting_counters)
+                    {
+                        auto &sum = posting_counters[counter.first];
+                        require(sum <= UINT64_MAX - counter.second, "Posting diagnostic counter overflow");
+                        sum += counter.second;
+                    }
+                }
                 if (call.stats.ios)
                 {
                     if (!std::isfinite(*call.stats.ios) || *call.stats.ios < 0)
@@ -853,7 +951,7 @@ struct Totals
                 if (call.stats.count != options.top_k)
                 {
                     ++underfilled_queries;
-                    invalid = true;
+                    invalid = !options.allow_short_results || call.stats.count > options.top_k || invalid;
                 }
             }
             uint64_t query_hits = 0;
@@ -861,6 +959,13 @@ struct Totals
             for (uint32_t k = 0; k < options.top_k; ++k)
             {
                 const uint32_t id = cohort.ids[offset + k];
+                if (options.allow_short_results && k >= call.stats.count)
+                {
+                    const bool bad_suffix = id != UINT32_MAX;
+                    invalid_ids += bad_suffix;
+                    invalid = invalid || bad_suffix;
+                    continue;
+                }
                 const bool bad_id = id >= options.vector_count;
                 const bool duplicate = std::find(cohort.ids.begin() + offset, cohort.ids.begin() + offset + k, id) !=
                                        cohort.ids.begin() + offset + k;
@@ -885,7 +990,8 @@ struct Totals
 
 inline std::string stem(const Options &options, const Job &job)
 {
-    return options.scenarios[job.scenario_index].name + ".L" + std::to_string(job.L) + ".T" +
+    return options.scenarios[job.scenario_index].name +
+           (job.maxcheck ? ".MC" + std::to_string(job.maxcheck) : "") + ".L" + std::to_string(job.L) + ".T" +
            std::to_string(job.threads) + ".r" + std::to_string(job.repeat);
 }
 
@@ -930,16 +1036,67 @@ inline void reject_output_symlinks(const fs::path &path)
     }
 }
 
-inline void run_job(Backend &backend, const Options &options, const Inputs &inputs, const Job &job,
-                    const fs::path &directory)
+class CohortDeadline
+{
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool finished_ = false;
+    std::thread thread_;
+
+  public:
+    CohortDeadline(const Options &options, const Job &job, const fs::path &directory, const char *stage)
+    {
+        if (options.maximum_seconds == 0)
+            return;
+        const std::string record = "{\"state\":\"timeout\",\"scenario\":" +
+            json_string(options.scenarios[job.scenario_index].name) + ",\"L\":" + std::to_string(job.L) +
+            ",\"maxcheck\":" + std::to_string(job.maxcheck) + ",\"threads\":" + std::to_string(job.threads) +
+            ",\"repeat\":" + std::to_string(job.repeat) + ",\"stage\":" + json_string(stage) +
+            ",\"limit_seconds\":" + std::to_string(options.maximum_seconds) +
+            ",\"reason\":\"incomplete_cohort_no_valid_qps\"}";
+        const auto deadline = Clock::now() + std::chrono::duration<double>(options.maximum_seconds);
+        thread_ = std::thread([this, deadline, directory, record] {
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (condition_.wait_until(lock, deadline, [this] { return finished_; }))
+                return;
+            try
+            {
+                write_text(directory / "timeout.json", record + "\n");
+                std::cerr << "THREEWAY_TIMEOUT " << record << std::endl;
+            }
+            catch (const std::exception &error)
+            {
+                std::cerr << "Cannot persist native timeout: " << error.what() << std::endl;
+            }
+            std::_Exit(124);
+        });
+    }
+
+    ~CohortDeadline()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            finished_ = true;
+        }
+        condition_.notify_one();
+        if (thread_.joinable())
+            thread_.join();
+    }
+};
+
+inline double run_job(Backend &backend, const Options &options, const Inputs &inputs, const Job &job,
+                    const fs::path &directory, bool do_warmup = true)
 {
     omp_set_num_threads(static_cast<int>(job.threads));
     check_team(job.threads);
     backend.configure(job, options.scenarios[job.scenario_index]);
     Cohort current(options.query_count, options.top_k), first(options.query_count, options.top_k);
     uint32_t warmed = 0;
-    while (warmed < options.warmup_queries)
+    if (do_warmup)
     {
+      CohortDeadline deadline(options, job, directory, "warmup");
+      while (warmed < options.warmup_queries)
+      {
         const uint32_t count = std::min(options.query_count, options.warmup_queries - warmed);
         batch(backend, options, inputs, job, count, current);
         Totals warmup;
@@ -953,12 +1110,16 @@ inline void run_job(Backend &backend, const Options &options, const Inputs &inpu
             throw std::runtime_error("Native warmup produced invalid/underfilled results for " + stem(options, job));
         }
         warmed += count;
+      }
     }
 
+    const auto memory_before = process_memory();
     Totals total;
     uint64_t passes = 0;
     double elapsed = 0;
     double first_recall = 0, last_recall = 0, recall_min_batch = 1;
+    {
+    CohortDeadline deadline(options, job, directory, "measurement");
     const auto start = Clock::now();
     do
     {
@@ -979,7 +1140,9 @@ inline void run_job(Backend &backend, const Options &options, const Inputs &inpu
         if (options.phase == "throughput")
             elapsed = std::chrono::duration<double>(Clock::now() - start).count();
     } while (!total.invalid_queries && options.phase == "throughput" && elapsed < options.minimum_seconds);
+    }
     require(elapsed > 0, "Nonpositive timed interval");
+    const auto memory_after = process_memory();
 
     const std::string name = stem(options, job);
     save_pair(directory, name + ".first", first, options.query_count, options.top_k);
@@ -991,9 +1154,14 @@ inline void run_job(Backend &backend, const Options &options, const Inputs &inpu
            << ",\"phase\":" << json_string(options.phase)
            << ",\"scenario\":" << json_string(options.scenarios[job.scenario_index].name)
            << ",\"L\":" << job.L << ",\"threads\":" << job.threads << ",\"repeat\":" << job.repeat
+           << (job.maxcheck ? ",\"maxcheck\":" + std::to_string(job.maxcheck) : "")
            << ",\"queries\":" << total.queries << ",\"cohort_queries\":" << options.query_count
            << ",\"passes\":" << passes << ",\"warmup_queries\":" << warmed
            << ",\"elapsed_seconds\":" << elapsed << ",\"qps\":" << total.queries / elapsed
+           << ",\"rss_before_queries_bytes\":" << memory_before.rss_bytes
+           << ",\"rss_after_queries_bytes\":" << memory_after.rss_bytes
+           << ",\"peak_rss_bytes\":" << memory_after.peak_rss_bytes
+           << ",\"peak_rss_scope\":\"native_process_lifetime_including_load_warmup_validation\""
            << ",\"recall\":" << (total.queries ? static_cast<double>(total.hits) / total.queries / options.top_k : 0)
            << ",\"first_recall\":" << first_recall << ",\"last_recall\":" << last_recall
            << ",\"recall_min_batch\":" << recall_min_batch
@@ -1005,6 +1173,19 @@ inline void run_job(Backend &backend, const Options &options, const Inputs &inpu
         result << static_cast<double>(total.ios / total.queries);
     else
         result << "null";
+    if (total.posting_observations)
+    {
+        require(total.posting_observations == total.queries, "Incomplete posting diagnostic observations");
+        result << ",\"posting_counters\":{";
+        bool first_counter = true;
+        for (const auto &counter : total.posting_counters)
+        {
+            if (!first_counter) result << ",";
+            first_counter = false;
+            result << json_string(counter.first) << ":" << counter.second;
+        }
+        result << "},\"posting_stats_queries\":" << total.posting_observations;
+    }
     result << ",\"invalid_queries\":" << total.invalid_queries
            << ",\"invalid_ids\":" << total.invalid_ids << ",\"duplicate_ids\":" << total.duplicate_ids
            << ",\"nonmatching_ids\":" << total.nonmatching_ids << ",\"nonfinite_distances\":" << total.nonfinite_distances
@@ -1022,6 +1203,7 @@ inline void run_job(Backend &backend, const Options &options, const Inputs &inpu
         throw std::runtime_error("Native measured output invalid/underfilled for " + name +
                                  "; saved first/last evidence, no result repair");
     }
+    return total.queries / elapsed;
 }
 
 inline int run_main(int argc, char **argv, const std::string &engine, const BackendFactory &factory)
@@ -1047,18 +1229,47 @@ inline int run_main(int argc, char **argv, const std::string &engine, const Back
         const auto load_start = Clock::now();
         std::unique_ptr<Backend> backend = factory(options, options.max_threads());
         require(static_cast<bool>(backend), "Backend factory returned null");
+        const double load_seconds = std::chrono::duration<double>(Clock::now() - load_start).count();
+        const auto memory = process_memory();
         std::ostringstream ready;
         ready << std::setprecision(17) << "{\"schema_version\":1,\"engine\":" << json_string(engine)
               << ",\"phase\":" << json_string(options.phase) << ",\"job_count\":" << options.jobs.size()
               << ",\"max_threads\":" << options.max_threads() << ",\"pid\":" << ::getpid()
-              << ",\"load_seconds\":" << std::chrono::duration<double>(Clock::now() - load_start).count() << "}";
+              << ",\"load_seconds\":" << load_seconds
+              << ",\"rss_after_load_bytes\":" << memory.rss_bytes
+              << ",\"peak_rss_bytes\":" << memory.peak_rss_bytes
+              << ",\"peak_rss_scope\":\"native_process_lifetime_including_load_warmup_validation\"}";
         write_text(directory / "ready.json", ready.str() + "\n");
         std::cout << "THREEWAY_READY " << ready.str() << std::endl;
+        std::map<std::tuple<size_t, uint32_t, uint32_t>, uint32_t> slow_controls;
+        std::set<std::pair<size_t, uint32_t>> warmed_scenarios;
+        size_t completed_jobs = 0, skipped_jobs = 0;
         for (const Job &job : options.jobs)
-            run_job(*backend, options, inputs, job, directory);
+        {
+            const auto key = std::make_tuple(job.scenario_index, job.threads, job.maxcheck);
+            const auto slow = slow_controls.find(key);
+            if (options.minimum_qps > 0 && slow != slow_controls.end() && job.L > slow->second)
+            {
+                std::cout << "THREEWAY_SKIP {\"scenario\":"
+                          << json_string(options.scenarios[job.scenario_index].name)
+                          << ",\"L\":" << job.L << ",\"threads\":" << job.threads
+                          << ",\"repeat\":" << job.repeat << ",\"slow_L\":" << slow->second
+                          << (job.maxcheck ? ",\"maxcheck\":" + std::to_string(job.maxcheck) : "")
+                          << ",\"reason\":\"larger_budget_after_measured_qps_below_floor\"}" << std::endl;
+                ++skipped_jobs;
+                continue;
+            }
+            const bool first = warmed_scenarios.emplace(job.scenario_index, job.threads).second;
+            const double qps = run_job(*backend, options, inputs, job, directory,
+                                      options.warmup_policy == "per_point" || first);
+            ++completed_jobs;
+            if (qps < options.minimum_qps)
+                slow_controls[key] = job.L;
+        }
         const std::string completion = "{\"schema_version\":1,\"engine\":" + json_string(engine) +
             ",\"phase\":" + json_string(options.phase) + ",\"status\":\"completed\",\"job_count\":" +
-            std::to_string(options.jobs.size()) + ",\"completed_jobs\":" + std::to_string(options.jobs.size()) + "}";
+            std::to_string(options.jobs.size()) + ",\"completed_jobs\":" + std::to_string(completed_jobs) +
+            (options.minimum_qps > 0 ? ",\"skipped_jobs\":" + std::to_string(skipped_jobs) : "") + "}";
         write_text(directory / "completion.json", completion + "\n");
         std::cout << "THREEWAY_COMPLETE " << completion << std::endl;
         return 0;

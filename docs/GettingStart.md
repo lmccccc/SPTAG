@@ -356,6 +356,7 @@ PostingMatchWindow=1024
 | `SearchPostingPageLimit` | 3 | 3 | Physical-page cap on each selected H/O posting region. Zero means uncapped, not "no reads". |
 | `MaxDistRatio` | 10000 | 8 | Native distance-ratio cutoff for selected posting candidates; not a filter-selectivity controller. |
 | `NumberOfThreads` | 2 | 1 | Aliases native `SearchThreadNum`; separate from client concurrency and build threads (whose SSD thread default is 16). |
+| `EnablePackedHeadLayout` | false | false | Opt-in, read-only metadata-first H1 arena; enable explicitly in the YFCC packed-layout recipe below, before the first query. |
 
 `DisableCrossEdges=true` keeps the current single-H1 query profile explicit.
 Phase/path logging, head dumps, hybrid distance and quantization are not
@@ -412,6 +413,98 @@ Tune nprobe first on a fixed index, then examine graph work, supplementary work
 and SSD page limits separately. Do not rewrite construction settings or expand
 parameters by predicate selectivity in the client. Preserve sparse/empty results
 in recall accounting instead of silently dropping those queries.
+
+#### **YFCC10M packed-H1 reproduction**
+
+The YFCC workload is **10 million UInt8/192D vectors, squared L2, Top100**,
+with the original schema `numeric,numeric,categorical,categorical`; camera
+is original column 2. `sel_01pct` means **0.1%**, not 1%.
+Use the completed, immutable `lion_v5_h_only_a37ddfe` index and its authenticated
+1,000-query camera-OR groundtruth. Rebuilding an index with nominally equal
+parameters does not reproduce its frozen geometry or guarantee equal results.
+Do not substitute the SIFT1B `MaxCheck=16324` recommendation for this workload.
+
+Set `SearchSSDIndex.EnablePackedHeadLayout=true` **last**, after the other
+search parameters and before the first query. This preserves the saved disk
+formats, but materializes one shared, 64-byte-aligned H1 arena:
+metadata/signatures/support, then vector, then adjacency. It requires STATIC
+storage, one raw/unquantized BKT H1, compact metadata, fixed support with no
+overflow, `DisableCrossEdges=true` and `EnableHybridDistance=false`.
+Packed geometry/metadata are read-only; disabling it or first enabling it after
+queries have started requires a fresh load. All query workers share the arena.
+Leave the default false for indexes that do not satisfy these requirements.
+
+The repository-owned
+[runner](../Tools/benchmarks/run_yfcc_packed_curves.py) needs **only Lion**,
+not PipeANN or DiskANN. Its
+[fixed parameter table](../Tools/benchmarks/configs/yfcc10m_packed_heads/selection.json)
+contains nine `[nprobe, MaxCheck]` pairs per scenario. It reruns all six
+selectivities at **1, 4, 8, 16, 32 and 48 workers**, with three repetitions:
+324 fresh points / 972 repetitions, without reusing older single-thread timings.
+The table is an offline experimental grid, not runtime selectivity-based tuning.
+
+The generated native INIs keep three SSD pages, anchor0, extra2048,
+navigation width128, match rate12.5/window1024, distance ratio8, hash exponent4,
+posting navigation on and hybrid distance off. `MaxCheck` is 1024 or4096 as
+specified by each table entry. The adapter sets native worker capacity from the
+actual batch thread count. Each resident scenario/thread batch warms up once
+for1,000 queries; every repetition measures exactly one1,000-query cohort.
+The10-QPS floor and100-second cohort guard remain enabled, with no overall
+campaign timeout. Failed or incomplete runs are not published as complete.
+
+From the source repository root, with the usual native dependencies plus Linux
+GNU `time`, `numactl`, NumPy and Matplotlib:
+
+```bash
+WORKSPACE=/path/to/workspace
+GT=/path/to/yfcc10m_camera_recall100_groundtruth_1000
+INDEX=/path/to/lion_v5_h_only_a37ddfe
+CORE="$PWD/build-packed"
+CLIENT="$WORKSPACE/toolchains/yfcc-packed-client"
+RUN="$WORKSPACE/runs/yfcc-packed-curves"
+
+cmake -S . -B "$CORE" -DCMAKE_BUILD_TYPE=Release -DSPDK=OFF -DROCKSDB=OFF \
+  -DSPTAG_QUERY_WORK_DIAGNOSTICS=OFF -DSPTAG_QUERY_STEP_TIMING=OFF -DUSE_ASAN=OFF
+cmake --build "$CORE" --target nativeBench -j8
+python3 Tools/benchmarks/threeway_native/build_camera_clients.py \
+  --workspace "$WORKSPACE" --lion-build "$CORE" \
+  --output-directory "$CLIENT" --engines lion --packed-head-layout
+python3 Tools/benchmarks/run_yfcc_packed_curves.py \
+  --groundtruth-directory "$GT" --index "$INDEX" \
+  --client-build "$CLIENT/lion.build.json" --output-directory "$RUN" \
+  --cpu-nodes 0 1 2 3 --memory-nodes 0 1 2 3 \
+  --library-path "$LD_LIBRARY_PATH"
+```
+
+Use fresh client/run directories. Headers, wrapper objects and native libraries
+must come from the **same source/build**; never link packed headers to a frozen
+older core. `--lion-build` reuses an existing ordinary CMake build and compiles
+only the adapter. Supply the host's actual runtime library path to both build
+and run; set CPU/memory node lists only to available NUMA nodes and retain the
+published0-3 placement for a protocol-matched comparison. The workload manifest
+and its completion/verification seals must resolve to the original input files.
+No source index bytes, global cache settings or host AIO limits are changed.
+
+The output includes `final.json`, CSV, per-thread plots, native profiles/plans,
+capture files, registration and checksums. `targets[].by_threads` selects the
+fastest **observed** configuration meeting a recall target in all three repeats;
+`paired` instead compares identical parameters across thread counts.
+Single-thread validation is outside its timer; throughput includes dispatch and
+native validation/recall reduction. Exact Python capture validation, RSS
+snapshots and file writes are outside the native query clock.
+
+**Memory fields use bytes.** Raw repetitions contain
+`rss_before_queries_bytes`, `rss_after_queries_bytes` and `peak_rss_bytes`;
+points additionally retain `rss_after_load_bytes` and
+`process_exit_peak_rss_bytes`. `peak_rss_bytes` is a cumulative native-process
+high-water through that repetition, including earlier configurations, load,
+packing, warmup and native validation; it is not an isolated per-query peak.
+The final process peak comes from GNU `time` waiting on its native child. This
+small intermediate parent avoids inheriting the memory-heavy Python controller's
+pre-exec RSS high-water. `memory.by_threads` takes maxima across processes,
+never sums repeated samples or multiplies shared index memory by worker count.
+These are process RSS measurements, not index-only bytes; load-time packing can
+temporarily hold old and new storage together.
 
 <a id="sift1b-measured-configuration-and-tuning-range"></a>
 
@@ -510,11 +603,19 @@ if (!parameterCheck)
     throw std::runtime_error("Unsupported vector type");
 TenantIndexManager manager(dimension, "SPANN", valueType.c_str());
 for (const auto& item : config.GetParameters("SearchSSDIndex")) {
+    if (item.first == "enablepackedheadlayout")
+        continue;
     if (parameterCheck->SetParameter(item.first.c_str(), item.second.c_str(), "SearchSSDIndex")
         != SPTAG::ErrorCode::Success)
         throw std::runtime_error("Invalid SearchSSDIndex parameter: " + item.first);
-    manager.SetSearchParam(item.first.c_str(), item.second.c_str(), "SearchSSDIndex");
+    if (!manager.SetSearchParamChecked(item.first.c_str(), item.second.c_str(), "SearchSSDIndex"))
+        throw std::runtime_error("Cannot apply SearchSSDIndex parameter: " + item.first);
 }
+const auto packed = config.GetParameter<std::string>("SearchSSDIndex", "EnablePackedHeadLayout", "false");
+if (parameterCheck->SetParameter("EnablePackedHeadLayout", packed.c_str(), "SearchSSDIndex")
+        != SPTAG::ErrorCode::Success ||
+    !manager.SetSearchParamChecked("EnablePackedHeadLayout", packed.c_str(), "SearchSSDIndex"))
+    throw std::runtime_error("Cannot apply packed H1 layout");
 if (!manager.LoadAll(root.c_str()))
     throw std::runtime_error("Cannot load index");
 
@@ -523,8 +624,13 @@ if (!results)
     throw std::runtime_error("Filtered search failed; inspect native diagnostics");
 ```
 
-The native `VectorIndex::SetParameter` validation is intentional:
-`TenantIndexManager::SetSearchParam` returns `void`, not an acceptance status.
+Use `SetSearchParamChecked`, which returns `bool`; the legacy
+`SetSearchParam` remains a void compatibility API. Native
+`VectorIndex::SetParameter` preflight is still intentional: before any tenant
+is resident, ordinary manager parameters are staged for later application.
+Check loading and the first query as well. `IniReader` lowercases parameter
+names; apply the packed-layout flag last. Write native INIs as `key=value`,
+without whitespace after `=` or inline comments.
 Keep `[Base]`, construction sections and application-only orchestration out of
 that search-parameter loop. For unfiltered requests, call
 `manager.SearchWithPredicate(queryBytes, 0, topK, ByteArray(), 0)`.
@@ -544,8 +650,8 @@ do not substitute a legacy flat tag list for numeric/DNF predicates.
 For evaluation, truth must use the same base-row IDs, metric, query cohort
 and **exact per-query predicate**; unfiltered truth is not filtered truth.
 The specialized `native_postfilter/nativeBench` campaign client restricts its
-workload to Float/UInt8 and 128 dimensions, but these are **client restrictions,
-not native-library dataset limits**. Its `[Validation]`, `[CounterProbe]` and
+workload to Float/UInt8 and validates the actual dataset dimension against the
+saved index; it is no longer hardcoded to128D. Its `[Validation]`, `[CounterProbe]` and
 `[Runtime.*]` sections are orchestration, not SPANN parameters. The preserved
 [controlled-ascent benchmark profile](../Tools/benchmarks/configs/posting_frontier_repair/sift1b_controlled_ascent.ini)
 explicitly pins additional diagnostic/default values for reproducibility;
