@@ -89,6 +89,18 @@ int main(int argc,char** argv) {
         auto* typed=dynamic_cast<BKT::Index<float>*>(restored.get());
         CHECK(typed);
         auto& loaded=*typed;
+        PackedHeadPrefetch packedPrefetch;
+        if(argc>2 && std::string(argv[2])=="--packed") {
+            const auto schema=TagSchema::Parse("categorical");
+            loaded.InitializeCompactHeadNodeMeta(loaded.GetNumSamples(),schema,{},true);
+            const auto layout=PackedHeadLayout::Create(loaded.GetHeadMetadataLayout(),0,2,
+                loaded.GetFeatureDim()*sizeof(float),loaded.GetNeighborhoodSize());
+            auto storage=std::make_shared<PackedHeadStorage>(layout,loaded.GetNumSamples());
+            CHECK(loaded.PackHeadRows(storage)==ErrorCode::Success);
+            packedPrefetch=PackedHeadPrefetch(loaded.GetPackedHeadStorage());
+            packedPrefetch.Add(0,64);
+        }
+        const auto* prefetch=packedPrefetch?&packedPrefetch:nullptr;
         const auto predicate=[&](int id){return id==1 || (id>=200 && id<232 && id!=representative);};
         COMMON::QueryResultSet<float> baseline(data.data(),4), result(data.data(),4);
         CHECK(loaded.SearchIndexWithResultFilter(baseline,predicate,2)==ErrorCode::Success);
@@ -98,7 +110,8 @@ int main(int argc,char** argv) {
         COMMON::GraphAccessStats aliasStats;
         {
             COMMON::ScopedGraphAccessStats scope(&aliasStats);
-            CHECK(loaded.SearchIndexWithPostingNavigation(result,predicate,&posting,2,false,8,1)==ErrorCode::Success);
+            CHECK(loaded.SearchIndexWithPostingNavigation(result,predicate,&posting,2,false,8,1,
+                0,1024,true,prefetch)==ErrorCode::Success);
         }
         CHECK(posting.calls==1 && posting.row.degree==2 && posting.row.newCandidates==0 && posting.row.targetFilled);
         CHECK(posting.distances==1 && !posting.row.canContinue);
@@ -119,7 +132,7 @@ int main(int argc,char** argv) {
             AliasRow online; online.representative=representative;
             COMMON::QueryResultSet<float> refined(data.data(),4);
             CHECK(loaded.SearchIndexWithPostingNavigation(refined,predicate,&online,
-                2,false,8,8,100,2)==ErrorCode::Success);
+                2,false,8,8,100,2,true,prefetch)==ErrorCode::Success);
             CHECK(online.calls==1 && online.row.targetFilled);
             for(int i=0;i<4;++i) CHECK(refined.GetResult(i)->VID>=0 &&
                 refined.GetResult(i)->VID!=201 && predicate(refined.GetResult(i)->VID));
@@ -133,7 +146,7 @@ int main(int argc,char** argv) {
                 COMMON::ScopedGraphAccessStats scope(&stats);
                 CHECK(loaded.SearchIndexWithPostingNavigation(empty,[&](int id) {
                     ++calls[id];return deletedOnly && id==201;
-                },&rejected,2,false,8,1)==ErrorCode::Success);
+                },&rejected,2,false,8,1,0,1024,true,prefetch)==ErrorCode::Success);
             }
             CHECK(rejected.calls==1 && rejected.row.degree==2 && rejected.row.newCandidates==0);
             CHECK(!rejected.row.targetFilled && rejected.row.canContinue && rejected.distances==0);
@@ -152,7 +165,7 @@ int main(int argc,char** argv) {
             COMMON::ScopedGraphAccessStats scope(&sparseStats);
             CHECK(loaded.SearchIndexWithPostingNavigation(sparseResult,[&](int id) {
                 ++calls[id];return id==230;
-            },&sparse,2,false,8,1)==ErrorCode::Success);
+            },&sparse,2,false,8,1,0,1024,true,prefetch)==ErrorCode::Success);
         }
         CHECK(sparse.rows.size()==2 && sparse.distances==std::vector<std::uint64_t>({0,1}));
         CHECK(sparse.rows[0].degree==5 && sparse.rows[0].eligible==0 && sparse.rows[0].canContinue);
@@ -183,7 +196,7 @@ int main(int argc,char** argv) {
                 COMMON::ScopedGraphAccessStats scope(&stats);
                 CHECK(loaded.SearchIndexWithPostingNavigation(refined,[&](int id) {
                     ++checked[id];return refinementPredicate(id);
-                },&hierarchy,2,false,8,extra)==ErrorCode::Success);
+                },&hierarchy,2,false,8,extra,0,1024,true,prefetch)==ErrorCode::Success);
             }
             CHECK(refined.GetResult(0)->VID==refinementBase.GetResult(0)->VID &&
                   refined.GetResult(0)->Dist==refinementBase.GetResult(0)->Dist);

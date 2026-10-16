@@ -777,8 +777,23 @@ break;
                         static_cast<std::uint64_t>(m_iNeighborhoodSize);
             }
 
+            void InstallSharedRows(Dataset<SizeType>& rows)
+            {
+                if (!rows.SharedStorage() || rows.R() != m_iGraphSize ||
+                    rows.C() != m_iNeighborhoodSize || m_iRuntimeEdgeSuffixSize != 0 ||
+                    m_pNeighborhoodGraph.HasIncrementalRows())
+                    throw std::invalid_argument("Shared graph rows do not match immutable geometry");
+                m_pNeighborhoodGraph.Swap(rows);
+            }
+
+            bool HasIncrementalRows() const { return m_pNeighborhoodGraph.HasIncrementalRows(); }
+
             ErrorCode SetRuntimeEdgeSuffixSize(DimensionType p_suffixSize)
             {
+                if (m_pNeighborhoodGraph.SharedStorage() && p_suffixSize != 0) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Packed graph rows cannot acquire cross-edge suffixes.\n");
+                    return ErrorCode::Fail;
+                }
                 if (p_suffixSize < 0 ||
                     p_suffixSize > (std::numeric_limits<DimensionType>::max)() - m_iNeighborhoodSize) {
                     return ErrorCode::Fail;

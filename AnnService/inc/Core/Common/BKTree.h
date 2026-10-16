@@ -966,6 +966,7 @@ break;
             void InitSearchTrees(const Dataset<T>& data, std::function<float(const T*, const T*, DimensionType)> fComputeDistance, COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_space) const
             {
                 const auto distanceToSample = [&](SizeType id) {
+                    if (p_space.packedHeadPrefetch) p_space.packedHeadPrefetch->Prefetch(id);
                     return fComputeDistance(p_query.GetQuantizedTarget(), data[id], data.C());
                 };
                 for (char i = 0; i < m_iTreeNumber; i++) {
@@ -1051,6 +1052,7 @@ break;
                 COMMON::WorkSpace &p_space, const int p_limits) const
             {
                 const auto distanceToSample = [&](SizeType id) {
+                    if (p_space.packedHeadPrefetch) p_space.packedHeadPrefetch->Prefetch(id);
                     return fComputeDistance(p_query.GetQuantizedTarget(), data[id], data.C());
                 };
                 while (!p_space.m_SPTQueue.empty())

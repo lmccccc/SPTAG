@@ -20,6 +20,33 @@ class RoutingPredicate
     std::vector<Clause> m_clauses;
 
 public:
+    PackedHeadPrefetch HeadPrefetch(const PackedHeadStorage* storage, bool pure, bool support) const
+    {
+        PackedHeadPrefetch prefetch(storage);
+        if (!storage) return prefetch;
+        const auto& layout = storage->Layout();
+        if (support) {
+            prefetch.Add(layout.metadata.own + layout.keyColumn * sizeof(std::uint32_t), sizeof(std::uint32_t));
+            prefetch.Add(layout.ownSupportPresent, 1);
+            prefetch.Add(layout.additionalSupport, (layout.supportSlots - 1) * sizeof(std::uint32_t));
+        }
+        for (const auto& clause : m_clauses) {
+            if (clause.impossible) continue;
+            for (const auto& category : clause.categories) {
+                if (!pure) prefetch.Add(layout.metadata.tail, sizeof(Cache::PostingBitmask));
+                else if (category.first >= 0 && category.first < Cache::HIER_LEVELS &&
+                         layout.metadata.categorical[category.first] != HeadMetadataLayout::Absent)
+                    prefetch.Add(layout.metadata.categorical[category.first],
+                                 layout.metadata.widths.bits[category.first] / 8);
+            }
+            for (const auto& range : clause.ranges)
+                prefetch.Add((pure ? layout.metadata.numeric : layout.metadata.tailNumeric) +
+                             range.lane * Cache::NUM_QUANT_WORDS * sizeof(std::uint64_t),
+                             Cache::NUM_QUANT_WORDS * sizeof(std::uint64_t));
+        }
+        return prefetch;
+    }
+
     RoutingPredicate(const Cache::DNFPredicate* dnf, const std::uint32_t* tags,
                      int count, const std::vector<int>& numericColumns,
                      const std::vector<Cache::NumQuantParam>& params)

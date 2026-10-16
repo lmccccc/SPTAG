@@ -211,6 +211,27 @@ inline bool LoadHeadNodeMetadataV8(
     return true;
 }
 
+template <typename Consumer>
+inline void ForEachHeadNodeMetadataChunk(const VectorIndex& index, Consumer&& consume)
+{
+    if (!index.GetPackedHeadStorage()) {
+        const auto& blob = index.GetHeadNodeMetaBlob();
+        consume(blob.data(), blob.size());
+        return;
+    }
+    const auto stride = index.GetHeadNodeMetaStride();
+    const auto rows = (std::max)(std::size_t{1}, std::size_t{65536} / stride);
+    std::vector<std::uint8_t> buffer(rows * stride);
+    const auto count = static_cast<std::size_t>(index.GetHeadNodeMetaSampleCount());
+    for (std::size_t begin = 0; begin < count; begin += rows) {
+        const auto chunk = (std::min)(rows, count - begin);
+        for (std::size_t row = 0; row < chunk; ++row)
+            index.CopyHeadNodeMetadataRow(static_cast<SizeType>(begin + row),
+                                          buffer.data() + row * stride, stride);
+        consume(buffer.data(), chunk * stride);
+    }
+}
+
 inline bool SaveHeadNodeMetadata(
     const std::string& path, const std::shared_ptr<VectorIndex>& index,
     std::uint64_t generation)
@@ -224,10 +245,14 @@ inline bool SaveHeadNodeMetadata(
     header.numSamples = index->GetHeadNodeMetaSampleCount();
     header.numQuantCols = layout.numericColumns;
     header.stride = static_cast<std::int32_t>(layout.stride);
-    if (header.numSamples <= 0 || (layout.hasTail && generation == 0)) return false;
-    const auto& blob = static_cast<const VectorIndex&>(*index).GetHeadNodeMetaBlob();
+    if (header.numSamples <= 0 || (layout.hasTail && generation == 0) || layout.stride == 0 ||
+        layout.stride > static_cast<std::size_t>((std::numeric_limits<std::int32_t>::max)()) ||
+        static_cast<std::size_t>(header.numSamples) >
+            (std::numeric_limits<std::size_t>::max)() / layout.stride) return false;
     const auto domain = index->GetHeadNodeNumericDomainFingerprint();
-    if (blob.size() != static_cast<std::size_t>(header.numSamples) * layout.stride ||
+    if ((!index->GetPackedHeadStorage() &&
+         static_cast<const VectorIndex&>(*index).GetHeadNodeMetaBlob().size() !=
+             static_cast<std::size_t>(header.numSamples) * layout.stride) ||
         (layout.numericColumns && domain == 0)) return false;
     for (SizeType head = 0; generation && head < header.numSamples; ++head)
         if (index->GetHeadNodeGlobalVID(head) < 0 ||
@@ -241,7 +266,9 @@ inline bool SaveHeadNodeMetadata(
     const auto& schema = layout.schema.text;
     const std::uint32_t length = static_cast<std::uint32_t>(schema.size());
     auto content = HeadMetadataHashSeed(header, bits.data(), flags, domain, generation, schema);
-    AppendHeadMetadataHash(content, blob.data(), blob.size());
+    ForEachHeadNodeMetadataChunk(*index, [&](const std::uint8_t* data, std::size_t bytes) {
+        AppendHeadMetadataHash(content, data, bytes);
+    });
     const auto staged = path + ".tmp";
     std::ofstream output(staged, std::ios::binary | std::ios::trunc);
     output.write(reinterpret_cast<const char*>(&header), sizeof(header));
@@ -252,7 +279,9 @@ inline bool SaveHeadNodeMetadata(
     output.write(reinterpret_cast<const char*>(&content), sizeof(content));
     output.write(reinterpret_cast<const char*>(&length), sizeof(length));
     output.write(schema.data(), schema.size());
-    output.write(reinterpret_cast<const char*>(blob.data()), blob.size());
+    ForEachHeadNodeMetadataChunk(*index, [&](const std::uint8_t* data, std::size_t bytes) {
+        output.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(bytes));
+    });
     output.close();
     if (!output || !Helper::AtomicReplaceFile(staged, path)) {
         std::remove(staged.c_str());
@@ -410,11 +439,12 @@ inline bool CollectHierarchyHeadSignatures(
     {
         const auto* pure = index.GetHeadNodePS(head);
         const auto* attributes = support.HeadAttributes(head);
-        const auto* tags = support.HeadTagData(head);
-        if (pure == nullptr || attributes == nullptr || tags == nullptr) return false;
+        if (pure == nullptr || attributes == nullptr) return false;
         Cache::PostingBitmask supported;
-        for (int slot = 0; slot < support.SlotsPerHead(); ++slot)
-            if (tags[slot] != LimitedTagSupport::EmptyTag) supported.Insert(tags[slot]);
+        for (int slot = 0; slot < support.SlotsPerHead(); ++slot) {
+            const auto tag = support.TagAt(head, slot);
+            if (tag != LimitedTagSupport::EmptyTag) supported.Insert(tag);
+        }
         const auto* extraTags = support.ExtraTagData(head);
         const auto extraCount = support.ExtraTagCount(head);
         for (std::size_t slot = 0; slot < extraCount; ++slot)

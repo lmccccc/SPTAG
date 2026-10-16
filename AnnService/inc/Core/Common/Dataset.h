@@ -5,6 +5,7 @@
 #define _SPTAG_COMMON_DATASET_H_
 
 #include "inc/Core/VectorIndex.h"
+#include "inc/Core/Common/SharedAlignedBuffer.h"
 
 namespace SPTAG
 {
@@ -246,6 +247,7 @@ namespace SPTAG
 
             DimensionType colStart = 0;
             DimensionType mycols = 0;
+            std::shared_ptr<SharedAlignedBuffer> m_sharedStorage;
 
         public:
             Dataset() {}
@@ -268,9 +270,14 @@ namespace SPTAG
 
             void Initialize(SizeType rows_, DimensionType cols_, SizeType rowsInBlock_, SizeType capacity_, const void* data_ = nullptr, bool shareOwnership_ = true, std::shared_ptr<std::vector<char*>> incBlocks_ = nullptr, int colStart_ = 0, int rowEnd_ = -1)
             {
+                if (m_sharedStorage) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Cannot reinitialize a read-only shared Dataset.\n");
+                    throw std::logic_error("Cannot reinitialize a read-only shared Dataset");
+                }
                 if (data != nullptr) {
                     if (ownData) ALIGN_FREE(data);
                 }
+                ownData = false;
                 rows = rows_;
 
                 if (incBlocks != nullptr)
@@ -309,6 +316,10 @@ namespace SPTAG
 
             void SetR(SizeType R_)
             {
+                if (m_sharedStorage && R_ != rows) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Cannot resize a read-only shared Dataset.\n");
+                    throw std::logic_error("Cannot resize a read-only shared Dataset");
+                }
                 if (R_ >= rows)
                     incRows = R_ - rows;
                 else
@@ -322,8 +333,65 @@ namespace SPTAG
             inline const DimensionType& C() const { return mycols; }
             inline std::uint64_t BufferSize() const { return sizeof(SizeType) + sizeof(DimensionType) + sizeof(T) * R() * C(); }
 
+            ErrorCode AttachSharedRows(const std::shared_ptr<SharedAlignedBuffer>& storage,
+                SizeType rowCount, DimensionType columns, std::size_t rowStride, std::size_t offset)
+            {
+                if (!storage || m_sharedStorage || incRows != 0 || rowCount <= 0 || columns <= 0 ||
+                    rowStride == 0 || rowStride > static_cast<std::size_t>((std::numeric_limits<DimensionType>::max)()) ||
+                    offset > rowStride || offset % alignof(T) != 0 || rowStride % alignof(T) != 0 ||
+                    static_cast<std::size_t>(columns) > (rowStride - offset) / sizeof(T) ||
+                    static_cast<std::size_t>(rowCount) > storage->Size() / rowStride) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid shared Dataset row layout.\n");
+                    return ErrorCode::FailedParseValue;
+                }
+                auto emptyBlocks = std::make_shared<std::vector<char*>>();
+                if (ownData) ALIGN_FREE(data);
+                if (incBlocks) {
+                    for (char* pointer : *incBlocks) ALIGN_FREE(pointer);
+                    incBlocks->clear();
+                }
+                m_sharedStorage = storage;
+                data = reinterpret_cast<char*>(storage->Data());
+                ownData = false;
+                rows = rowCount;
+                maxRows = rowCount;
+                incRows = 0;
+                mycols = columns;
+                cols = static_cast<DimensionType>(rowStride);
+                colStart = static_cast<DimensionType>(offset);
+                incBlocks = std::move(emptyBlocks);
+                return ErrorCode::Success;
+            }
+
+            const std::shared_ptr<SharedAlignedBuffer>& SharedStorage() const { return m_sharedStorage; }
+            std::size_t RowStride() const { return static_cast<std::size_t>(cols); }
+            std::size_t RowOffset() const { return static_cast<std::size_t>(colStart); }
+            bool HasIncrementalRows() const { return incRows != 0; }
+
+            void Swap(Dataset& other) noexcept
+            {
+                using std::swap;
+                swap(name, other.name);
+                swap(rows, other.rows);
+                swap(cols, other.cols);
+                swap(data, other.data);
+                swap(ownData, other.ownData);
+                swap(incRows, other.incRows);
+                swap(maxRows, other.maxRows);
+                swap(rowsInBlock, other.rowsInBlock);
+                swap(rowsInBlockEx, other.rowsInBlockEx);
+                swap(incBlocks, other.incBlocks);
+                swap(colStart, other.colStart);
+                swap(mycols, other.mycols);
+                swap(m_sharedStorage, other.m_sharedStorage);
+            }
+
             ErrorCode RepackColumns(DimensionType p_cols)
             {
+                if (m_sharedStorage) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Cannot repack a read-only shared Dataset.\n");
+                    return ErrorCode::Fail;
+                }
                 if (p_cols <= 0 || colStart != 0 || incRows != 0 || data == nullptr) {
                     return ErrorCode::Fail;
                 }
@@ -391,6 +459,10 @@ namespace SPTAG
 
             ErrorCode AddBatch(SizeType num, const T* pData = nullptr)
             {
+                if (m_sharedStorage) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Cannot append to a read-only shared Dataset.\n");
+                    return ErrorCode::Fail;
+                }
                 if (colStart != 0) return ErrorCode::Success;
                 if (R() > maxRows - num) return ErrorCode::MemoryOverFlow;
 
@@ -451,6 +523,10 @@ namespace SPTAG
                 IOBINARY(pInput, ReadBinary, sizeof(SizeType), (char*)&(r));
                 IOBINARY(pInput, ReadBinary, sizeof(DimensionType), (char*)(&c));
 
+                if (m_sharedStorage) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Cannot reload a read-only shared Dataset.\n");
+                    return ErrorCode::Fail;
+                }
                 if (data == nullptr || r != rows + incRows || c != mycols) {
                     Initialize(r, c, blockSize, capacity);
                 }
@@ -473,6 +549,10 @@ namespace SPTAG
             // Functions for loading models from memory mapped files
             ErrorCode Load(char* pDataPointsMemFile, SizeType blockSize, SizeType capacity)
             {
+                if (m_sharedStorage) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Cannot reload a read-only shared Dataset.\n");
+                    return ErrorCode::Fail;
+                }
                 SizeType R;
                 DimensionType C;
                 R = *((SizeType*)pDataPointsMemFile);

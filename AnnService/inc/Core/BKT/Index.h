@@ -76,6 +76,13 @@ namespace SPTAG
             };
 
         private:
+            bool RequireMutableRows() const
+            {
+                if (!GetPackedHeadStorage()) return true;
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Packed BKT head rows are read-only.\n");
+                return false;
+            }
+
             // data points
             COMMON::Dataset<T> m_pSamples;
         
@@ -182,7 +189,13 @@ namespace SPTAG
 
             // Raw graph access for cross-subgraph orchestration above the BKT layer.
             inline const COMMON::RelativeNeighborhoodGraph& GetGraph() const { return m_pGraph; }
-            inline COMMON::RelativeNeighborhoodGraph& GetMutableGraph() { return m_pGraph; }
+            inline COMMON::RelativeNeighborhoodGraph& GetMutableGraph()
+            {
+                if (GetPackedHeadStorage()) throw std::logic_error("Packed head geometry is read-only");
+                return m_pGraph;
+            }
+            ErrorCode PackHeadRows(const std::shared_ptr<PackedHeadStorage>& storage,
+                                  const std::function<void()>& attachSupport = {});
             inline DimensionType GetNeighborhoodSize() const { return m_pGraph.m_iNeighborhoodSize; }
             inline bool NeedRefine() const { return m_deletedID.Count() > (size_t)(GetNumSamples() * m_fDeletePercentageForRefine); }
             std::shared_ptr<std::vector<std::uint64_t>> BufferSize() const
@@ -236,7 +249,7 @@ namespace SPTAG
                 int maxCheck = 0, bool searchDeleted = false,
                 int anchorCount = 0, int additionalMaxCheck = 0,
                 double matchRatePercent = 0, int matchWindow = 1024,
-                bool allowEarlyHandoff = true) const;
+                bool allowEarlyHandoff = true, const PackedHeadPrefetch* prefetch = nullptr) const;
 
             ErrorCode SearchIndexWithResultFilter(
                 QueryResult& p_query,

@@ -38,6 +38,8 @@ public:
 
     void SetSearchParam(const char* p_name, const char* p_value, const char* p_section);
 
+    bool SetSearchParamChecked(const char* p_name, const char* p_value, const char* p_section);
+
     bool LoadQuantizer(const char* p_quantizerFile);
 
     void SetQuantizerADC(bool p_adc);
@@ -250,6 +252,7 @@ public:
     // during the subsequent build.
     void SetBuildParam(const char* p_name, const char* p_value, const char* p_section);
     void SetSearchParam(const char* p_name, const char* p_value, const char* p_section);
+    bool SetSearchParamChecked(const char* p_name, const char* p_value, const char* p_section);
 
     // Set HeadIndex LRU cache size limit (in bytes). 0 = unlimited.
     void SetHeadIndexCacheLimit(uint64_t p_bytesLimit);

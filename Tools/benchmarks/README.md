@@ -1346,6 +1346,19 @@ Release/spannaclbench ... \
   --search-ini Tools/benchmarks/search_turbopuffer_sift1m_tenant0_n20.ini
 ```
 
+For metadata-first H1 experiments, set native
+`[SearchSSDIndex] EnablePackedHeadLayout=true` (default `false`), with
+`DisableCrossEdges=true` and `EnableHybridDistance=false`.
+See the [layout and read-only constraints](../../README.md#metadata-first-h1-memory-layout-opt-in).
+Use separate index loads for layout-off/on comparisons: `nativeBench` rejects
+mixed-layout batches, applies the layout setting after other search settings
+and reports `packed_head_layout` in each point. It takes vector dimension from
+the query matrix and checks the saved tenant manifest rather than assuming
+128 dimensions, so the same client supports UInt8/192D YFCC inputs.
+Keep all other settings, query order and warmup policy matched; compare captured
+IDs/distances before interpreting throughput. Do not modify the source index
+configuration or historical result files for an overlay experiment.
+
 ## Hybrid Build Metadata
 
 `build_spann_attr_sift1m_global_static_hybrid_distance.ini` is the hybrid-on

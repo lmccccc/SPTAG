@@ -18,7 +18,8 @@ int main()
                                 const char* anchors="8", const char* maxCheck="2048",
                                 const char* topk="10", const char* probe="96", const char* sweep=nullptr,
                                 const char* rate=nullptr, const char* window=nullptr,
-                                const char* global=nullptr, const char* navigation="true") {
+                                const char* global=nullptr, const char* navigation="true",
+                                const char* packed=nullptr) {
             std::ofstream file(directory / name);
             file << "[SearchSSDIndex]\nisExecute=true\nBuildSsdIndex=false\nInternalResultNum=" << probe <<
                 "\nNumberOfThreads=1\nHashTableExponent=4\nResultNum=" << topk << "\nMaxCheck=" << maxCheck << "\nMaxDistRatio=8\n"
@@ -30,6 +31,7 @@ int main()
             if (rate) file << "PostingMatchRatePercent=" << rate << '\n';
             if (window) file << "PostingMatchWindow=" << window << '\n';
             if (global) file << "GlobalPostingSearch=" << global << '\n';
+            if (packed) file << "EnablePackedHeadLayout=" << packed << '\n';
             if (sweep) file << "[SearchSweep]\nNProbe=" << sweep << '\n';
             file << "[Benchmark]\nIndex=" << (directory / "index").string() << "\nQueries="
                 << (directory / "queries.npy").string()
@@ -49,6 +51,8 @@ int main()
         config("global.ini", "0", false, "0", "2048", "10", "96", nullptr, "0", "1024", "true", "false");
         config("global-conflict.ini", "0", false, "0", "2048", "10", "96", nullptr, "0", "1024", "true");
         config("global-invalid.ini", "0", false, "0", "2048", "10", "96", nullptr, "0", "1024", "yes", "false");
+        config("packed.ini", "0", false, "0", "2048", "10", "96", nullptr, "0", "1024", "false", "true", "true");
+        config("packed-invalid.ini", "0", false, "0", "2048", "10", "96", nullptr, "0", "1024", "false", "true", "yes");
         for (const char* name : {"steps.ini", "bad-steps.ini", "mixed-timers.ini"}) {
             config(name, "8", false);
             std::ofstream file(directory / name, std::ios::app);
@@ -80,6 +84,11 @@ int main()
             return ReadBatch(path.c_str(), reader);
         };
         const auto cases = batch({"on.ini", "off.ini", "on.ini"});
+        Require(batch({"packed.ini","packed.ini"})[0]->cfg.packedHeadLayout &&
+            !cases[0]->cfg.packedHeadLayout, "Packed layout opt-in/default changed");
+        bool mixedPacked = false;
+        try { batch({"packed.ini","off.ini"}); } catch (const std::runtime_error&) { mixedPacked = true; }
+        Require(mixedPacked, "Batch mixed layouts without reloading");
         Require(cases.size()==3 && cases[0]->cfg.navigationWidth==8 &&
             cases[1]->cfg.navigationWidth==0 && cases[2]->cfg.navigationWidth==8,
             "Optional native cutoff or per-case default changed");
@@ -126,6 +135,13 @@ int main()
         AnnIndex wrapped("SPANN","Float",128);
         wrapped.SetBuildParam("PostingAnchorCount","8","BuildSSDIndex");
         Require(wrapped.GetInternalIndex()!=nullptr, "Cannot initialize wrapper fixture");
+        Require(!wrapped.SetSearchParamChecked("EnablePackedHeadLayout","invalid","SearchSSDIndex"),
+            "Checked wrapper accepted an invalid layout flag");
+        TenantIndexManager staged(128,"SPANN","Float");
+        Require(!staged.SetSearchParamChecked("EnablePackedHeadLayout","invalid","SearchSSDIndex") &&
+            !staged.SetSearchParamChecked("EnablePackedHeadLayout","true","BuildHead") &&
+            staged.SetSearchParamChecked("EnablePackedHeadLayout","true","SearchSSDIndex"),
+            "Checked manager did not validate the staged layout flag");
         for (const char* section : {"BuildSSDIndex","SearchSSDIndex"}) {
             wrapped.SetSearchParam("PostingAnchorCount","8",section);
             Require(wrapped.GetInternalIndex()->GetParameter("PostingAnchorCount",section)=="8",
@@ -149,7 +165,7 @@ int main()
                                 "zero-budget.ini", "negative-budget.ini", "malformed-budget.ini", "overflow-budget.ini",
                                 "short-probe.ini", "short-sweep.ini", "invalid-topk0.ini", "invalid-topk-1.ini",
                                 "invalid-topk100x.ini", "invalid-topk2147483648.ini", "bad-steps.ini", "mixed-timers.ini",
-                                "global-conflict.ini", "global-invalid.ini"}) {
+                                "global-conflict.ini", "global-invalid.ini", "packed-invalid.ini"}) {
             bool rejected=false;
             try { batch({name}); }
             catch (const std::runtime_error&) { rejected=true; }

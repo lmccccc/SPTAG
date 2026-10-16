@@ -141,6 +141,7 @@ namespace SPTAG
             // build-time-only; the highest slot retains the persisted graph.
             std::unique_ptr<PostingOwners> m_postingOwners;
             RoutingSignatures m_routingSignatures;
+            mutable std::atomic<bool> m_searchStarted{false};
             mutable std::atomic<bool> m_routingStaleWarning{false};
             std::vector<std::shared_ptr<VectorSet>> m_secondLevelCatalogs;
             std::vector<SecondLevelHeadPostings> m_secondLevelPostings;
@@ -781,9 +782,18 @@ namespace SPTAG
 
             bool IsLimitedTagMutationReadOnly() const
             {
-                return m_sparseHierarchy != nullptr || IsRecoveredLimitedTagReadOnly() ||
+                return m_limitedTagSupport.PackedStorage() != nullptr ||
+                    m_sparseHierarchy != nullptr || IsRecoveredLimitedTagReadOnly() ||
                     m_limitedTagSupport.HasExpansion();
             }
+
+            void MarkSearchStarted() const
+            {
+                if (!m_searchStarted.load(std::memory_order_relaxed))
+                    m_searchStarted.store(true, std::memory_order_relaxed);
+            }
+
+            ErrorCode MaterializePackedHeadLayout();
 
             bool CheckHeadIndexType();
             void SelectHeadAdjustOptions(Options& p_options, int p_vectorCount);

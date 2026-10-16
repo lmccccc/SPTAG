@@ -106,6 +106,47 @@ documented completion-first behavior. See
 [search-budget semantics](docs/SearchBudgetBoundaries.md) for the distinction
 between online soft stopping and offline construction bounds.
 
+### Metadata-first H1 memory layout (opt-in)
+
+`[SearchSSDIndex] EnablePackedHeadLayout=true` materializes a read-only H1
+arena after loading and authenticating the existing index. Each 64-byte-aligned
+record stores routing signatures, original attributes and support before its
+vector and adjacency. These are shared, strided views of one allocation, not
+additional copies. Support slot zero reuses the original key attribute plus an
+active-support flag; H/O summaries retain their distinct meanings. The old
+per-head support, attribute, metadata, vector and graph buffers are released.
+BKT trees, deletion state and query-private workspaces remain separate.
+
+For UInt8/192D, degree 32, two support slots and the
+`numeric,numeric,categorical,categorical` schema with 256-bit categorical
+signatures, the layout is:
+
+| Byte range | Contents |
+| --- | --- |
+| 0-63 | Key-column H signature, original attributes, additional support, identity/flags |
+| 64-319 | Remaining H/O signatures and numeric summaries, alignment padding |
+| 320-511 | Vector |
+| 512-639 | Original adjacency, including its collapsed-alias slot |
+
+The default is **off**. Enable it in the load configuration or through the
+native API before the first query, after setting `DisableCrossEdges=true` and
+`EnableHybridDistance=false`. Configuration must not race query threads.
+Wrapper callers can use `SetSearchParamChecked` for a boolean status; the
+existing void setter remains available and logs native errors.
+Disabling an installed layout requires a fresh load. The initial implementation
+requires a STATIC, unquantized, single BKT H1, explicit compact H/O metadata and
+fixed-slot support without overflow supports. Unsupported layouts and mutations
+fail explicitly.
+
+Posting-navigation queries prefetch only the metadata cache lines selected by
+their predicate, four candidates ahead. Fresh ordinary H1 candidates prefetch
+vectors while admission runs; negatives still navigate. Terminal vectors remain
+lazy, including the matching-collapsed-alias exception. No candidate ordering,
+match-rate windows or budgets change. Disk formats and SSD/H2-H5 contents stay
+unchanged; metadata/support export uses canonical logical rows. Packing briefly
+requires both old buffers and the new arena, and payload alignment costs are
+not an RSS or performance guarantee.
+
 ## Build
 
 The native Linux path requires a C++17 compiler with OpenMP, CMake,

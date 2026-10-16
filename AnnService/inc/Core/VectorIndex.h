@@ -15,6 +15,7 @@
 #include "inc/Core/Common/IQuantizer.h"
 #include "inc/Core/Cache/PostingSignature.h"
 #include "inc/Core/HeadMetadataLayout.h"
+#include "inc/Core/PackedHeadStorage.h"
 
 class ResultIterator;
 
@@ -307,7 +308,7 @@ public:
             bool p_includeTailPS,
             size_t& p_stride);
 
-        bool HasHeadNodeMeta() const { return m_headLayout.stride > 0 && !m_headNodeMeta.empty(); }
+        bool HasHeadNodeMeta() const { return m_headLayout.stride > 0 && (m_packedHeadStorage || !m_headNodeMeta.empty()); }
 
         SizeType GetHeadNodeMetaSampleCount() const;
 
@@ -315,10 +316,28 @@ public:
 
         Cache::HierWidthTable GetHeadNodeHierWidths() const;
 
-        const std::vector<std::uint8_t>& GetHeadNodeMetaBlob() const { return m_headNodeMeta; }
+        const std::vector<std::uint8_t>& GetHeadNodeMetaBlob() const
+        {
+            if (m_packedHeadStorage) throw std::logic_error("Packed metadata requires logical row export");
+            return m_headNodeMeta;
+        }
 
-        std::vector<std::uint8_t>& GetHeadNodeMetaBlob() { ++m_headNodeMetaRevision; return m_headNodeMeta; }
+        std::vector<std::uint8_t>& GetHeadNodeMetaBlob()
+        {
+            if (m_packedHeadStorage) throw std::logic_error("Packed metadata has no mutable contiguous blob");
+            ++m_headNodeMetaRevision;
+            return m_headNodeMeta;
+        }
         std::uint64_t GetHeadNodeMetaRevision() const { return m_headNodeMetaRevision; }
+        const PackedHeadStorage* GetPackedHeadStorage() const { return m_packedHeadStorage.get(); }
+        const HeadMetadataLayout& RuntimeHeadMetadataLayout() const
+        {
+            return m_packedHeadStorage ? m_packedHeadStorage->Layout().metadata : m_headLayout;
+        }
+        std::uint8_t* HeadNodeMetadataData(SizeType head);
+        const std::uint8_t* HeadNodeMetadataData(SizeType head) const;
+        void CopyHeadNodeMetadataRow(SizeType head, std::uint8_t* output, std::size_t bytes) const;
+        void AttachPackedHeadMetadata(const std::shared_ptr<PackedHeadStorage>& storage);
 
         void SetHeadNodeGlobalVID(SizeType p_sampleId, SizeType p_globalVID);
 
@@ -353,6 +372,7 @@ public:
 
         void SetHeadNodeOwnTagsAvailable(bool p_available)
         {
+            RequireMutableHeadMetadata();
             ++m_headNodeMetaRevision;
             m_headNodeOwnTagsAvailable = p_available;
         }
@@ -374,6 +394,7 @@ public:
 
         void SetHeadNodePostingHierMasksAvailable(bool p_available)
         {
+            RequireMutableHeadMetadata();
             ++m_headNodeMetaRevision;
             m_headNodePostingHierMasksAvailable = p_available;
         }
@@ -386,6 +407,7 @@ public:
         void SetHeadNodeNumericDomainFingerprint(
             std::uint64_t p_fingerprint)
         {
+            RequireMutableHeadMetadata();
             ++m_headNodeMetaRevision;
             m_headNodeNumericDomainFingerprint =
                 p_fingerprint;
@@ -555,6 +577,12 @@ public:
     ErrorCode LoadIndexConfig(Helper::IniReader& p_reader);
 
   private:
+    void RequireMutableHeadMetadata() const
+    {
+        if (m_packedHeadStorage)
+            throw std::logic_error("Packed head metadata is read-only");
+    }
+
     ErrorCode SaveIndexConfig(std::shared_ptr<Helper::DiskIO> p_configOut);
 
     bool InitializeHeadNodeMetaLayout(
@@ -584,6 +612,9 @@ public:
     bool m_headNodeOwnTagsAvailable = false;
     bool m_headNodePostingHierMasksAvailable = false;
     std::vector<std::uint8_t> m_headNodeMeta;
+
+protected:
+    std::shared_ptr<PackedHeadStorage> m_packedHeadStorage;
 
 public:
     int m_iDataBlockSize = 1024 * 1024;

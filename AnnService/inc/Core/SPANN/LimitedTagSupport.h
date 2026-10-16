@@ -5,6 +5,7 @@
 #define _SPTAG_SPANN_LIMITEDTAGSUPPORT_H_
 
 #include "inc/Core/Common.h"
+#include "inc/Core/PackedHeadStorage.h"
 #include "inc/Helper/AtomicFile.h"
 
 #include <algorithm>
@@ -123,6 +124,7 @@ public:
 
     void Reset()
     {
+        RequireOwnedStorage();
         m_header = Header();
         m_tags.clear();
         m_headAttributes.clear();
@@ -193,6 +195,7 @@ public:
         const std::unordered_map<
             std::uint32_t, std::uint64_t>& p_counts)
     {
+        RequireOwnedStorage();
         if (HasExpansion()) return false;
         m_header.m_vectorCount = 0;
         m_tagVectorCounts.clear();
@@ -245,6 +248,7 @@ public:
             std::uint32_t, std::uint32_t>& p_requiredCounts,
         std::string* p_error = nullptr)
     {
+        RequireOwnedStorage();
         if (p_error != nullptr) p_error->clear();
         auto fail = [&](const char* p_message) {
             if (p_error != nullptr) *p_error = p_message;
@@ -315,6 +319,7 @@ public:
         const std::uint32_t* p_attributes,
         int p_attributeCount)
     {
+        RequireOwnedStorage();
         if (HasExpansion() ||
             p_head < 0 || p_attributes == nullptr ||
             p_attributeCount !=
@@ -338,6 +343,7 @@ public:
         SizeType p_head,
         const std::vector<std::uint32_t>& p_tags)
     {
+        RequireOwnedStorage();
         if (HasExpansion() || p_head < 0 ||
             static_cast<std::uint32_t>(p_head) >=
                 m_header.m_headCount ||
@@ -380,6 +386,7 @@ public:
         const std::uint32_t* p_attributes,
         int p_attributeCount)
     {
+        RequireOwnedStorage();
         if (HasExpansion() || p_tags.empty() ||
             p_tags.size() > m_header.m_slotsPerHead ||
             p_attributes == nullptr ||
@@ -427,6 +434,7 @@ public:
 
     bool AppendTombstoneHead()
     {
+        RequireOwnedStorage();
         if (HasExpansion() ||
             m_header.m_headCount ==
                 (std::numeric_limits<std::uint32_t>::max)() ||
@@ -451,6 +459,7 @@ public:
 
     bool TombstoneHead(SizeType p_head)
     {
+        RequireOwnedStorage();
         if (HasExpansion() || p_head < 0 ||
             static_cast<std::uint32_t>(p_head) >=
                 m_header.m_headCount)
@@ -476,6 +485,7 @@ public:
         const std::uint32_t* p_attributes,
         int p_attributeCount)
     {
+        RequireOwnedStorage();
         if (HasExpansion() ||
             p_tags.empty() || p_attributes == nullptr ||
             p_attributeCount !=
@@ -497,6 +507,7 @@ public:
         const std::uint32_t* p_attributes,
         int p_attributeCount)
     {
+        RequireOwnedStorage();
         if (HasExpansion() ||
             !ValidActiveRow(
                 p_tags, p_attributes,
@@ -555,6 +566,7 @@ public:
         const std::uint32_t* p_attributes,
         int p_attributeCount)
     {
+        RequireOwnedStorage();
         if (HasExpansion() ||
             !ValidActiveRow(
                 p_tags, p_attributes,
@@ -608,6 +620,7 @@ public:
 
     bool PrepareRuntimeTombstoneHead()
     {
+        RequireOwnedStorage();
         if (HasExpansion() ||
             m_header.m_headCount ==
             (std::numeric_limits<std::uint32_t>::max)())
@@ -643,6 +656,7 @@ public:
 
     bool AppendPreparedRuntimeTombstoneHead()
     {
+        RequireOwnedStorage();
         if (HasExpansion() ||
             m_header.m_headCount ==
                 (std::numeric_limits<std::uint32_t>::max)() ||
@@ -669,6 +683,7 @@ public:
 
     bool TombstoneRuntimeHead(SizeType p_head)
     {
+        RequireOwnedStorage();
         if (HasExpansion() || !IsActiveHead(p_head))
             return false;
         const size_t offset =
@@ -713,6 +728,7 @@ public:
         int p_attributeCount,
         SizeType p_loser)
     {
+        RequireOwnedStorage();
         if (HasExpansion() || p_survivor == p_loser ||
             !IsActiveHead(p_survivor) ||
             !IsActiveHead(p_loser) ||
@@ -829,6 +845,7 @@ public:
         int p_attributeCount,
         SizeType p_loser)
     {
+        RequireOwnedStorage();
         if (HasExpansion() || p_survivor == p_loser ||
             !IsActiveHead(p_survivor) ||
             !IsActiveHead(p_loser) ||
@@ -944,6 +961,11 @@ public:
         {
             return false;
         }
+        if (m_packedStorage) {
+            for (int slot = 0; slot < SlotsPerHead(); ++slot)
+                if (m_packedStorage->Support(p_head, slot) == p_tag) return true;
+            return false;
+        }
         const size_t offset = static_cast<size_t>(p_head) * m_header.m_slotsPerHead;
         for (std::uint32_t slot = 0;
              slot < m_header.m_slotsPerHead; ++slot)
@@ -970,7 +992,8 @@ public:
         {
             return EmptyTag;
         }
-        return HeadTagData(p_head)[p_slot];
+        return m_packedStorage ? m_packedStorage->Support(p_head, p_slot)
+                               : HeadTagData(p_head)[p_slot];
     }
 
     std::uint32_t OwnTag(SizeType p_head) const
@@ -981,6 +1004,8 @@ public:
     const std::uint32_t* HeadTagData(
         SizeType p_head) const
     {
+        if (m_packedStorage)
+            throw std::logic_error("Packed support slots are not contiguous; use TagAt or HeadTags");
         if (p_head < 0 ||
             static_cast<std::uint32_t>(p_head) >=
                 m_header.m_headCount)
@@ -994,17 +1019,22 @@ public:
 
     const std::uint32_t* HeadLookupData(SizeType p_head) const
     {
+        if (m_packedStorage)
+            return p_head < 0 || p_head >= HeadCount() ? nullptr :
+                reinterpret_cast<const std::uint32_t*>(m_packedStorage->Row(p_head));
         const auto* tags = HeadTagData(p_head);
         return tags == nullptr || !m_inlineExtraTag ? tags : tags - 2;
     }
 
     size_t HeadLookupStride() const
     {
+        if (m_packedStorage) return m_packedStorage->Layout().stride / sizeof(std::uint32_t);
         return m_inlineExtraTag ? InlineTagStride() : m_header.m_slotsPerHead;
     }
 
     size_t HeadAttributeStride() const
     {
+        if (m_packedStorage) return m_packedStorage->Layout().stride / sizeof(std::uint32_t);
         return m_inlineExtraTag ? InlineTagStride() : m_header.m_attributeCount;
     }
 
@@ -1100,6 +1130,7 @@ public:
         {
             return nullptr;
         }
+        if (m_packedStorage) return m_packedStorage->Attributes(p_head);
         return m_inlineExtraTag
             ? HeadTagData(p_head) + m_header.m_slotsPerHead
             : m_headAttributes.data() +
@@ -1116,11 +1147,10 @@ public:
             return tags;
         }
 
-        const auto* base = HeadTagData(p_head);
         for (std::uint32_t slot = 0;
              slot < m_header.m_slotsPerHead; ++slot)
         {
-            const std::uint32_t tag = base[slot];
+            const std::uint32_t tag = TagAt(p_head, static_cast<int>(slot));
             if (tag != EmptyTag) tags.push_back(tag);
         }
         const std::uint32_t* extra = ExtraTagData(p_head);
@@ -1138,6 +1168,7 @@ public:
 
     bool Finalize(std::string* p_error = nullptr)
     {
+        RequireOwnedStorage();
         std::unordered_set<std::uint32_t> tags;
         ForEachBaseTagChunk([&](const std::uint32_t* values, size_t count) {
             for (size_t i = 0; i < count; ++i)
@@ -1163,7 +1194,13 @@ public:
 
     bool Save(const std::string& p_path, std::string* p_error = nullptr)
     {
-        if (!Finalize(p_error)) return false;
+        if (m_packedStorage) {
+            if (!Validate(p_error)) return false;
+            if (CurrentBodyFingerprint() != m_header.m_bodyFingerprint) {
+                if (p_error) *p_error = "packed limited-tag support fingerprint mismatch";
+                return false;
+            }
+        } else if (!Finalize(p_error)) return false;
 
         const std::string temporary = p_path + ".tmp";
         std::ofstream output(
@@ -1639,7 +1676,53 @@ public:
         return m_headsByTag;
     }
 
+    const PackedHeadStorage* PackedStorage() const { return m_packedStorage.get(); }
+
+    size_t OwnedHeadPayloadBytes() const
+    {
+        return (m_tags.capacity() + m_headAttributes.capacity() + m_extraTags.capacity()) *
+                sizeof(std::uint32_t) +
+            (m_extraTagOffsets.capacity() + m_headsWithExtraTags.capacity()) * sizeof(std::uint64_t);
+    }
+
+    void AttachPackedStorage(const std::shared_ptr<PackedHeadStorage>& storage)
+    {
+        RequireOwnedStorage();
+        if (!storage || storage->Count() != HeadCount() ||
+            storage->Layout().keyColumn != KeyColumn() ||
+            storage->Layout().supportSlots != SlotsPerHead() ||
+            storage->Layout().metadata.ownColumns != AttributeCount() ||
+            !m_extraTags.empty() || m_inlineExtraTag || ContentFingerprint() == 0)
+            throw std::invalid_argument("Packed support requires finalized fixed-slot rows without extra supports");
+        std::string error;
+        if (!Validate(&error)) throw std::invalid_argument(error);
+        for (SizeType head = 0; head < HeadCount(); ++head)
+            if (std::memcmp(HeadAttributes(head), storage->Attributes(head),
+                            AttributeCount() * sizeof(std::uint32_t)) != 0)
+                throw std::invalid_argument("Packed support and metadata original attributes differ");
+        const auto& layout = storage->Layout();
+        for (SizeType head = 0; head < HeadCount(); ++head) {
+            auto* row = storage->Row(head);
+            row[layout.ownSupportPresent] = OwnTag(head) != EmptyTag;
+            auto* additional = reinterpret_cast<std::uint32_t*>(row + layout.additionalSupport);
+            for (int slot = 1; slot < SlotsPerHead(); ++slot)
+                additional[slot - 1] = TagAt(head, slot);
+        }
+        m_packedStorage = storage;
+        std::vector<std::uint32_t>().swap(m_tags);
+        std::vector<std::uint32_t>().swap(m_headAttributes);
+        std::vector<std::uint32_t>().swap(m_extraTags);
+        std::vector<std::uint64_t>().swap(m_extraTagOffsets);
+        std::vector<std::uint64_t>().swap(m_headsWithExtraTags);
+    }
+
 private:
+    void RequireOwnedStorage() const
+    {
+        if (m_packedStorage)
+            throw std::logic_error("Packed limited-tag support is read-only");
+    }
+
     // Keep layout-specific register pressure out of the sparse lookup hot path.
 #if defined(_MSC_VER)
     __declspec(noinline)
@@ -1679,6 +1762,7 @@ private:
         const size_t inlineStride = static_cast<size_t>(p_header.m_slotsPerHead) +
             p_header.m_attributeCount + 2;
         const auto offsetAt = [&](size_t index) {
+            if (m_packedStorage) return std::uint64_t{0};
             return p_inlineExtraTag
                 ? static_cast<std::uint64_t>(m_tags[index * inlineStride]) : p_offsets[index];
         };
@@ -1707,9 +1791,9 @@ private:
         const std::uint64_t tagElements = p_inlineExtraTag
             ? static_cast<std::uint64_t>(p_header.m_headCount) * inlineStride + 2
             : baseTagCount;
-        if (m_tags.size() != tagElements)
+        if (!m_packedStorage && m_tags.size() != tagElements)
             return fail("limited-tag support body size mismatch");
-        if (m_headAttributes.size() != (p_inlineExtraTag ? 0 :
+        if (!m_packedStorage && m_headAttributes.size() != (p_inlineExtraTag ? 0 :
             static_cast<std::uint64_t>(p_header.m_headCount) * p_header.m_attributeCount))
         {
             return fail("limited-tag head attribute size mismatch");
@@ -1724,7 +1808,7 @@ private:
             if ((p_header.m_version == 4 &&
                  (p_maxExtraSupports == 0 || p_extraTags.size() > p_maxExtraSupports)) ||
                 (p_header.m_version == 5 && p_extraTags.size() != p_maxExtraSupports) ||
-                (p_inlineExtraTag ? !p_offsets.empty()
+                (p_inlineExtraTag || m_packedStorage ? !p_offsets.empty()
                     : p_offsets.size() != static_cast<std::uint64_t>(p_header.m_headCount) + 1) ||
                 offsetAt(0) != 0 || offsetAt(p_header.m_headCount) != p_extraTags.size())
             {
@@ -1761,14 +1845,16 @@ private:
                 : static_cast<size_t>(head) * p_header.m_slotsPerHead;
             for (std::uint32_t slot = 0; slot < p_header.m_slotsPerHead; ++slot)
             {
-                const std::uint32_t tag = m_tags[offset + slot];
+                const std::uint32_t tag = m_packedStorage
+                    ? m_packedStorage->Support(head, slot) : m_tags[offset + slot];
                 if (tag == EmptyTag) continue;
                 active = true;
                 if (!unique.insert(tag).second)
                     return fail("duplicate tag in limited-tag head support");
                 ++coverage[tag];
             }
-            const std::uint32_t ownTag = m_tags[offset];
+            const std::uint32_t ownTag = m_packedStorage
+                ? m_packedStorage->Support(head, 0) : m_tags[offset];
             if (expanded)
             {
                 const size_t begin = static_cast<size_t>(offsetAt(head));
@@ -1792,7 +1878,7 @@ private:
                 }
             }
             if (!active) continue;
-            const std::uint32_t* attributes = p_inlineExtraTag
+            const std::uint32_t* attributes = m_packedStorage ? m_packedStorage->Attributes(head) : p_inlineExtraTag
                 ? m_tags.data() + offset + p_header.m_slotsPerHead
                 : m_headAttributes.data() + static_cast<size_t>(head) * p_header.m_attributeCount;
             if (ownTag == EmptyTag || attributes[p_header.m_keyColumn] != ownTag)
@@ -1861,7 +1947,9 @@ private:
         for (size_t head = 0; head < p_header.m_headCount; ++head)
             for (size_t slot = 0; slot < p_header.m_slotsPerHead; ++slot)
             {
-                const auto tag = m_tags[head * stride + (p_inline ? 2 : 0) + slot];
+                const auto tag = m_packedStorage
+                    ? m_packedStorage->Support(static_cast<SizeType>(head), static_cast<int>(slot))
+                    : m_tags[head * stride + (p_inline ? 2 : 0) + slot];
                 if (tag != EmptyTag) ++baseCoverage[tag];
             }
         std::uint64_t total = 0;
@@ -1933,12 +2021,11 @@ private:
         for (std::uint32_t head = 0;
              head < m_header.m_headCount; ++head)
         {
-            const auto* base = HeadTagData(static_cast<SizeType>(head));
             for (std::uint32_t slot = 0;
                  slot < m_header.m_slotsPerHead;
                  ++slot)
             {
-                const std::uint32_t tag = base[slot];
+                const std::uint32_t tag = TagAt(static_cast<SizeType>(head), static_cast<int>(slot));
                 if (tag != EmptyTag)
                 {
                     m_headsByTag[tag].push_back(
@@ -2070,6 +2157,7 @@ private:
 
     std::uint64_t ExtraOffsetAt(size_t p_head) const
     {
+        if (m_packedStorage) return 0;
         return m_inlineExtraTag ? m_tags[p_head * InlineTagStride()] : m_extraTagOffsets[p_head];
     }
 
@@ -2108,6 +2196,10 @@ private:
     template <typename Consumer>
     void ForEachBaseTagChunk(Consumer&& p_consumer) const
     {
+        if (m_packedStorage) {
+            ForEachPackedField(false, p_consumer);
+            return;
+        }
         if (!m_inlineExtraTag)
         {
             p_consumer(m_tags.data(), m_tags.size());
@@ -2119,6 +2211,10 @@ private:
     template <typename Consumer>
     void ForEachHeadAttributeChunk(Consumer&& p_consumer) const
     {
+        if (m_packedStorage) {
+            ForEachPackedField(true, p_consumer);
+            return;
+        }
         if (!m_inlineExtraTag)
         {
             p_consumer(m_headAttributes.data(), m_headAttributes.size());
@@ -2126,6 +2222,23 @@ private:
         }
         ForEachInlineHeadField(static_cast<size_t>(m_header.m_slotsPerHead) + 2,
             m_header.m_attributeCount, p_consumer);
+    }
+
+    template <typename Consumer>
+    void ForEachPackedField(bool attributes, Consumer&& consumer) const
+    {
+        std::array<std::uint32_t, 1024> values;
+        size_t filled = 0;
+        const int width = attributes ? AttributeCount() : SlotsPerHead();
+        for (SizeType head = 0; head < HeadCount(); ++head)
+            for (int column = 0; column < width; ++column) {
+                values[filled++] = attributes ? HeadAttributes(head)[column] : TagAt(head, column);
+                if (filled == values.size()) {
+                    consumer(values.data(), filled);
+                    filled = 0;
+                }
+            }
+        if (filled) consumer(values.data(), filled);
     }
 
     template <typename Consumer>
@@ -2157,7 +2270,7 @@ private:
     template <typename Consumer>
     void ForEachExtraOffsetChunk(Consumer&& p_consumer) const
     {
-        if (!m_inlineExtraTag)
+        if (!m_inlineExtraTag && !m_packedStorage)
         {
             p_consumer(m_extraTagOffsets.data(), m_extraTagOffsets.size());
             return;
@@ -2198,6 +2311,7 @@ private:
         std::vector<SizeType>> m_headsByTag;
     bool m_legacyWithoutTagVectorCounts = false;
     bool m_inlineExtraTag = false;
+    std::shared_ptr<PackedHeadStorage> m_packedStorage;
 };
 
 } // namespace SPANN

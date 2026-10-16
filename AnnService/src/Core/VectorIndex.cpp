@@ -52,18 +52,12 @@ bool TryAlignUp(size_t value, size_t alignment, size_t& output)
 
 std::uint8_t* HeadNodeMetaBase(VectorIndex* index, SizeType sampleId)
 {
-    if (index == nullptr || sampleId < 0 || !index->HasHeadNodeMeta()) return nullptr;
-    const size_t sid = static_cast<size_t>(sampleId);
-    if (sid >= static_cast<size_t>(index->GetHeadNodeMetaSampleCount())) return nullptr;
-    return index->GetHeadNodeMetaBlob().data() + sid * index->GetHeadNodeMetaStride();
+    return index == nullptr ? nullptr : index->HeadNodeMetadataData(sampleId);
 }
 
 const std::uint8_t* HeadNodeMetaBase(const VectorIndex* index, SizeType sampleId)
 {
-    if (index == nullptr || sampleId < 0 || !index->HasHeadNodeMeta()) return nullptr;
-    const size_t sid = static_cast<size_t>(sampleId);
-    if (sid >= static_cast<size_t>(index->GetHeadNodeMetaSampleCount())) return nullptr;
-    return index->GetHeadNodeMetaBlob().data() + sid * index->GetHeadNodeMetaStride();
+    return index == nullptr ? nullptr : index->HeadNodeMetadataData(sampleId);
 }
 
 } // namespace
@@ -286,6 +280,8 @@ VectorIndex::~VectorIndex()
 
 void VectorIndex::ClearHeadNodeMeta()
 {
+    if (m_packedHeadStorage)
+        throw std::logic_error("Cannot clear metadata of a read-only packed head index");
     ++m_headNodeMetaRevision;
     m_headLayout.stride = 0;
     m_headLayout.pure = 0;
@@ -303,6 +299,40 @@ void VectorIndex::ClearHeadNodeMeta()
     m_headNodeOwnTagsAvailable = false;
     m_headNodePostingHierMasksAvailable = false;
     m_headLayout = HeadMetadataLayout{};
+    std::vector<std::uint8_t>().swap(m_headNodeMeta);
+}
+
+std::uint8_t* VectorIndex::HeadNodeMetadataData(SizeType head)
+{
+    RequireMutableHeadMetadata();
+    if (head < 0 || !HasHeadNodeMeta() || head >= GetHeadNodeMetaSampleCount()) return nullptr;
+    ++m_headNodeMetaRevision;
+    return m_headNodeMeta.data() + static_cast<std::size_t>(head) * m_headLayout.stride;
+}
+
+const std::uint8_t* VectorIndex::HeadNodeMetadataData(SizeType head) const
+{
+    if (head < 0 || !HasHeadNodeMeta() || head >= GetHeadNodeMetaSampleCount()) return nullptr;
+    return m_packedHeadStorage ? m_packedHeadStorage->Row(head) :
+        m_headNodeMeta.data() + static_cast<std::size_t>(head) * m_headLayout.stride;
+}
+
+void VectorIndex::CopyHeadNodeMetadataRow(SizeType head, std::uint8_t* output, std::size_t bytes) const
+{
+    if (!output || bytes != m_headLayout.stride || head < 0 || head >= GetHeadNodeMetaSampleCount())
+        throw std::invalid_argument("Invalid logical head metadata row export");
+    if (m_packedHeadStorage) m_packedHeadStorage->ExportMetadata(head, output);
+    else std::memcpy(output, HeadNodeMetadataData(head), bytes);
+}
+
+void VectorIndex::AttachPackedHeadMetadata(const std::shared_ptr<PackedHeadStorage>& storage)
+{
+    if (!storage || m_packedHeadStorage || storage->Count() != GetHeadNodeMetaSampleCount() ||
+        !storage->Layout().MatchesMetadata(m_headLayout))
+        throw std::invalid_argument("Packed metadata does not match the loaded head index");
+    m_packedHeadStorage = storage;
+    // Routing owners resolve rows through this index; relocation changes no
+    // logical metadata and preserves their authenticated content revision.
     std::vector<std::uint8_t>().swap(m_headNodeMeta);
 }
 
@@ -596,6 +626,7 @@ bool VectorIndex::InitializeHeadNodeMetaLayout(
 
 std::uint64_t* VectorIndex::GetHeadNodeNumQuantMutable(SizeType p_sampleId)
 {
+    RequireMutableHeadMetadata();
     ++m_headNodeMetaRevision;
     if (p_sampleId < 0 || p_sampleId >= m_headLayout.count) return nullptr;
     if (m_headLayout.numericColumns <= 0 || m_headLayout.stride == 0) return nullptr;
@@ -609,6 +640,9 @@ const std::uint64_t* VectorIndex::GetHeadNodeNumQuant(SizeType p_sampleId) const
 {
     if (p_sampleId < 0 || p_sampleId >= m_headLayout.count) return nullptr;
     if (m_headLayout.numericColumns <= 0 || m_headLayout.stride == 0) return nullptr;
+    if (m_packedHeadStorage)
+        return reinterpret_cast<const std::uint64_t*>(m_packedHeadStorage->Row(p_sampleId) +
+            RuntimeHeadMetadataLayout().numeric);
     size_t base = static_cast<size_t>(p_sampleId) * m_headLayout.stride + m_headLayout.numeric;
     size_t bytes = (size_t)m_headLayout.numericColumns * Cache::NUM_QUANT_WORDS * sizeof(std::uint64_t);
     if (base + bytes > m_headNodeMeta.size()) return nullptr;
@@ -619,6 +653,7 @@ std::uint64_t*
 VectorIndex::GetHeadNodeTailNumQuantMutable(
     SizeType p_sampleId)
 {
+    RequireMutableHeadMetadata();
     ++m_headNodeMetaRevision;
     if (p_sampleId < 0 || p_sampleId >= m_headLayout.count) return nullptr;
     if (!m_headLayout.hasTail ||
@@ -653,6 +688,9 @@ VectorIndex::GetHeadNodeTailNumQuant(
         m_headLayout.stride == 0) {
         return nullptr;
     }
+    if (m_packedHeadStorage)
+        return reinterpret_cast<const std::uint64_t*>(m_packedHeadStorage->Row(p_sampleId) +
+            RuntimeHeadMetadataLayout().tailNumeric);
     const size_t base =
         static_cast<size_t>(p_sampleId) *
             m_headLayout.stride +
@@ -673,6 +711,7 @@ VectorIndex::GetHeadNodeTailNumQuant(
 
 SizeType VectorIndex::GetHeadNodeMetaSampleCount() const
 {
+    if (m_packedHeadStorage) return m_packedHeadStorage->Count();
     if (m_headLayout.stride == 0) return 0;
     return static_cast<SizeType>(m_headNodeMeta.size() / m_headLayout.stride);
 }
@@ -681,7 +720,7 @@ void VectorIndex::SetHeadNodeGlobalVID(SizeType p_sampleId, SizeType p_globalVID
 {
     auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return;
-    std::memcpy(base + m_headLayout.vid, &p_globalVID, sizeof(SizeType));
+    std::memcpy(base + RuntimeHeadMetadataLayout().vid, &p_globalVID, sizeof(SizeType));
 }
 
 SizeType VectorIndex::GetHeadNodeGlobalVID(SizeType p_sampleId) const
@@ -689,12 +728,13 @@ SizeType VectorIndex::GetHeadNodeGlobalVID(SizeType p_sampleId) const
     const auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return MaxSize;
     SizeType globalVID = MaxSize;
-    std::memcpy(&globalVID, base + m_headLayout.vid, sizeof(SizeType));
+    std::memcpy(&globalVID, base + RuntimeHeadMetadataLayout().vid, sizeof(SizeType));
     return globalVID;
 }
 
 void VectorIndex::SetHeadNodePS(SizeType p_sampleId, const Cache::PostingBitmask& p_ps)
 {
+    RequireMutableHeadMetadata();
     ++m_headNodeMetaRevision;
     auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return;
@@ -702,7 +742,7 @@ void VectorIndex::SetHeadNodePS(SizeType p_sampleId, const Cache::PostingBitmask
         if (p_ps.Popcount() != 0) throw std::invalid_argument("Categorical signature in a numeric-only layout");
         return;
     }
-    std::memcpy(base + m_headLayout.pure, &p_ps, sizeof(Cache::PostingBitmask));
+    std::memcpy(base + RuntimeHeadMetadataLayout().pure, &p_ps, sizeof(Cache::PostingBitmask));
 }
 
 const Cache::PostingBitmask* VectorIndex::GetHeadNodePS(SizeType p_sampleId) const
@@ -711,7 +751,7 @@ const Cache::PostingBitmask* VectorIndex::GetHeadNodePS(SizeType p_sampleId) con
     if (base == nullptr) return nullptr;
     static const Cache::PostingBitmask empty;
     if (m_headLayout.pure == HeadMetadataLayout::Absent) return &empty;
-    return reinterpret_cast<const Cache::PostingBitmask*>(base + m_headLayout.pure);
+    return reinterpret_cast<const Cache::PostingBitmask*>(base + RuntimeHeadMetadataLayout().pure);
 }
 
 bool VectorIndex::HeadNodePSMayIntersect(SizeType p_sampleId, const Cache::PostingBitmask& p_queryMask) const
@@ -724,6 +764,7 @@ void VectorIndex::SetHeadNodeTailPS(
     SizeType p_sampleId,
     const Cache::PostingBitmask& p_ps)
 {
+    RequireMutableHeadMetadata();
     ++m_headNodeMetaRevision;
     if (!m_headLayout.hasTail) return;
     auto* base = HeadNodeMetaBase(this, p_sampleId);
@@ -733,7 +774,7 @@ void VectorIndex::SetHeadNodeTailPS(
         return;
     }
     std::memcpy(
-        base + m_headLayout.tail,
+        base + RuntimeHeadMetadataLayout().tail,
         &p_ps, sizeof(Cache::PostingBitmask));
 }
 
@@ -749,7 +790,7 @@ VectorIndex::GetHeadNodeTailPS(
     if (m_headLayout.tail == HeadMetadataLayout::Absent) return &empty;
     return reinterpret_cast<
         const Cache::PostingBitmask*>(
-            base + m_headLayout.tail);
+            base + RuntimeHeadMetadataLayout().tail);
 }
 
 bool VectorIndex::HeadNodeTailPSMayIntersect(
@@ -766,21 +807,23 @@ void VectorIndex::SetHeadNodeHeadOnly(SizeType p_sampleId, bool p_isHeadOnly)
 {
     auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return;
-    base[m_headLayout.flags] = p_isHeadOnly ? 1 : 0;
+    base[RuntimeHeadMetadataLayout().flags] = p_isHeadOnly ? 1 : 0;
 }
 
 bool VectorIndex::IsHeadNodeHeadOnly(SizeType p_sampleId) const
 {
     const auto* base = HeadNodeMetaBase(this, p_sampleId);
-    return base != nullptr && base[m_headLayout.flags] != 0;
+    return base != nullptr && base[RuntimeHeadMetadataLayout().flags] != 0;
 }
 
 void VectorIndex::SetHeadNodeHierMask(SizeType p_sampleId, const Cache::HierarchicalOwnTags& p_mask)
 {
+    if (m_packedHeadStorage)
+        throw std::logic_error("Cannot change shared attributes of a read-only packed head index");
     ++m_headNodeMetaRevision;
     auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return;
-    std::memcpy(base + m_headLayout.own, p_mask.tag,
+    std::memcpy(base + RuntimeHeadMetadataLayout().own, p_mask.tag,
         m_headLayout.ownColumns * sizeof(std::uint32_t));
     m_headNodeOwnTagsAvailable = true;
 }
@@ -790,17 +833,18 @@ HeadOwnTagsView VectorIndex::GetHeadNodeHierMask(SizeType p_sampleId) const
     if (!m_headNodeOwnTagsAvailable) return {};
     const auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return {};
-    return {reinterpret_cast<const std::uint32_t*>(base + m_headLayout.own),
+    return {reinterpret_cast<const std::uint32_t*>(base + RuntimeHeadMetadataLayout().own),
         m_headLayout.ownColumns};
 }
 
 void VectorIndex::SetHeadNodePostingHierMask(SizeType p_sampleId, const Cache::HierarchicalPostingMask& p_mask)
 {
+    RequireMutableHeadMetadata();
     ++m_headNodeMetaRevision;
     auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return;
     for (int column = 0; column < Cache::HIER_LEVELS; ++column) {
-        const auto offset = m_headLayout.categorical[column];
+        const auto offset = RuntimeHeadMetadataLayout().categorical[column];
         const auto* words = p_mask.mask + m_headLayout.widths.wordOff[column];
         const auto bytes = m_headLayout.widths.bits[column] / 8;
         if (offset != HeadMetadataLayout::Absent)
@@ -817,14 +861,14 @@ HeadPostingMaskView VectorIndex::GetHeadNodePostingHierMask(SizeType p_sampleId)
 {
     if (!m_headNodePostingHierMasksAvailable) return {};
     const auto* base = HeadNodeMetaBase(this, p_sampleId);
-    return {base, &m_headLayout};
+    return {base, &RuntimeHeadMetadataLayout()};
 }
 
 void VectorIndex::SetHeadNodeBundleNodeId(SizeType p_sampleId, int16_t p_bundleNodeId)
 {
     auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return;
-    std::memcpy(base + m_headLayout.bundle, &p_bundleNodeId, sizeof(int16_t));
+    std::memcpy(base + RuntimeHeadMetadataLayout().bundle, &p_bundleNodeId, sizeof(int16_t));
 }
 
 int16_t VectorIndex::GetHeadNodeBundleNodeId(SizeType p_sampleId) const
@@ -832,7 +876,7 @@ int16_t VectorIndex::GetHeadNodeBundleNodeId(SizeType p_sampleId) const
     const auto* base = HeadNodeMetaBase(this, p_sampleId);
     if (base == nullptr) return -1;
     int16_t bundleNodeId = -1;
-    std::memcpy(&bundleNodeId, base + m_headLayout.bundle, sizeof(int16_t));
+    std::memcpy(&bundleNodeId, base + RuntimeHeadMetadataLayout().bundle, sizeof(int16_t));
     return bundleNodeId;
 }
 

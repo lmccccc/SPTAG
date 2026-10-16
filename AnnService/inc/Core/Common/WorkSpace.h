@@ -5,6 +5,7 @@
 #define _SPTAG_COMMON_WORKSPACE_H_
 
 #include "inc/Core/SearchResult.h"
+#include "inc/Core/PackedHeadStorage.h"
 #include "CommonUtils.h"
 #include "GraphAccessStats.h"
 #include "Heap.h"
@@ -410,6 +411,7 @@ namespace SPTAG
             static void Reset() {}
 
             const std::function<bool(SizeType)>* matchPredicate = nullptr;
+            const PackedHeadPrefetch* packedHeadPrefetch = nullptr;
             PostingNavigation* postingNavigation = nullptr;
             const std::function<void(SizeType, float, bool)>* scoredCandidate = nullptr;
             bool lastNavigationMatch = false;

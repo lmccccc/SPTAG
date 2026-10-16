@@ -2836,6 +2836,11 @@ ErrorCode Index<T>::RefreshRoutingSignatures()
 {
     std::unique_lock<std::shared_timed_mutex> lock(m_headTopologyLock);
     if (!m_index) return ErrorCode::EmptyIndex;
+    if (m_index->GetPackedHeadStorage()) {
+        if (m_routingSignatures.Current(m_index.get())) return ErrorCode::Success;
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Cannot rebuild changed routing metadata in a packed read-only index.\n");
+        return ErrorCode::Fail;
+    }
     const auto& schema = m_options.Schema();
     NumericMetaDiskData domain;
     std::vector<Cache::NumQuantParam> params;
@@ -2873,6 +2878,58 @@ ErrorCode Index<T>::RefreshRoutingSignatures()
         m_routingSignatures.params.size(), m_routingSignatures.SharedBytes(),
         m_routingSignatures.SharedCapacityBytes());
     return ErrorCode::Success;
+}
+
+template <typename T>
+ErrorCode Index<T>::MaterializePackedHeadLayout()
+{
+    std::unique_lock<std::shared_timed_mutex> lock(m_headTopologyLock);
+    if (m_index && m_index->GetPackedHeadStorage()) return ErrorCode::Success;
+    if (m_searchStarted.load(std::memory_order_relaxed)) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "EnablePackedHeadLayout must be set before the first query.\n");
+        return ErrorCode::FailedParseValue;
+    }
+    auto* bkt = dynamic_cast<BKT::Index<T>*>(m_index.get());
+    if (!bkt || m_options.m_storage != Storage::STATIC || !m_options.m_enableLimitedTagPosting ||
+        m_pQuantizer || m_options.m_enableHybridDistance || !m_options.m_disableCrossEdges ||
+        !m_options.m_buildH1Graph || m_metadataOnlyHeadStore ||
+        !Helper::StrUtils::StrEqualIgnoreCase(m_options.m_postingQuantizer.c_str(), "None") ||
+        m_headBundleNodes.size() != 1 ||
+        m_headBundleNodes[0].headIndexRelativePath != m_options.m_headIndexFolder ||
+        m_headBundleNodes[0].headCount != bkt->GetNumSamples() ||
+        !m_routingSignatures.Current(bkt) || !bkt->HasHeadNodeOwnTags() ||
+        !bkt->HasHeadNodePostingHierMasks() || m_limitedTagSupport.ExtraSupportCount() != 0) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+            "Packed heads require an immutable STATIC, unquantized, single BKT H1 with "
+            "authenticated H/O metadata, fixed-slot support, DisableCrossEdges=true and EnableHybridDistance=false.\n");
+        return ErrorCode::FailedParseValue;
+    }
+    try {
+        const auto layout = PackedHeadLayout::Create(bkt->GetHeadMetadataLayout(),
+            m_limitedTagSupport.KeyColumn(), m_limitedTagSupport.SlotsPerHead(),
+            static_cast<std::size_t>(bkt->GetFeatureDim()) * sizeof(T), bkt->GetNeighborhoodSize());
+        auto storage = std::make_shared<PackedHeadStorage>(layout, bkt->GetNumSamples());
+        const auto status = bkt->PackHeadRows(storage, [&] {
+            m_limitedTagSupport.AttachPackedStorage(storage);
+        });
+        if (status != ErrorCode::Success) return status;
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+            "Packed H1: heads=%d, alignment=64, stride=%zu, vector_offset=%zu, edge_offset=%zu, "
+            "logical_metadata_stride=%zu, arena_bytes=%zu, owned_support_bytes=%zu, owned_metadata_bytes=%zu.\n",
+            bkt->GetNumSamples(), layout.stride, layout.vector, layout.edges, layout.serialized.stride,
+            storage->Buffer()->Size(), m_limitedTagSupport.OwnedHeadPayloadBytes(),
+            bkt->m_headNodeMeta.capacity());
+        return ErrorCode::Success;
+    } catch (const std::bad_alloc&) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Cannot allocate packed H1 storage.\n");
+        return ErrorCode::MemoryOverFlow;
+    } catch (const std::logic_error& error) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid packed H1 layout: %s.\n", error.what());
+        return ErrorCode::FailedParseValue;
+    } catch (const std::overflow_error& error) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Packed H1 size overflow: %s.\n", error.what());
+        return ErrorCode::MemoryOverFlow;
+    }
 }
 
 template <typename T>
@@ -5116,6 +5173,8 @@ template <typename T> bool Index<T>::CheckHeadIndexType()
 
 template <typename T> void Index<T>::SetQuantizer(std::shared_ptr<SPTAG::COMMON::IQuantizer> quantizer)
 {
+    if (m_limitedTagSupport.PackedStorage() && quantizer)
+        throw std::logic_error("Packed H1 does not support quantization");
     m_pQuantizer = quantizer;
     if (m_pQuantizer)
     {
@@ -5139,6 +5198,10 @@ template <typename T> void Index<T>::SetQuantizer(std::shared_ptr<SPTAG::COMMON:
 
 template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader)
 {
+    if (m_limitedTagSupport.PackedStorage()) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Cannot reload a packed read-only index.\n");
+        return ErrorCode::Fail;
+    }
     const auto legacyArtifactParameter = [this](const std::string& name, const std::string& value, bool& handled) {
         handled = false;
         if (Helper::StrUtils::StrEqualIgnoreCase(name.c_str(), "BuildH1Graph")) {
@@ -5327,6 +5390,10 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
 
 template <typename T> ErrorCode Index<T>::LoadIndexDataFromMemory(const std::vector<ByteArray> &p_indexBlobs)
 {
+    if (m_options.m_enablePackedHeadLayout || m_limitedTagSupport.PackedStorage()) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Packed H1 requires a fresh directory load with authenticated sidecars.\n");
+        return ErrorCode::FailedParseValue;
+    }
     if (!m_options.ValidateTagSchema(true)) return ErrorCode::FailedParseValue;
     LatchMutableLimitedTagLayout();
     m_recoveredLimitedTagReadOnly =
@@ -5395,6 +5462,10 @@ template <typename T> ErrorCode Index<T>::LoadIndexDataFromMemory(const std::vec
 template <typename T>
 ErrorCode Index<T>::LoadIndexData(const std::vector<std::shared_ptr<Helper::DiskIO>> &p_indexStreams)
 {
+    if (m_limitedTagSupport.PackedStorage()) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Cannot reload a packed read-only index.\n");
+        return ErrorCode::Fail;
+    }
     if (!m_options.ValidateTagSchema(true)) return ErrorCode::FailedParseValue;
     LatchMutableLimitedTagLayout();
     m_recoveredLimitedTagReadOnly =
@@ -5540,7 +5611,7 @@ ErrorCode Index<T>::LoadIndexData(const std::vector<std::shared_ptr<Helper::Disk
         return ErrorCode::Fail;
     if (!m_options.m_buildH1Graph) {
         // There is no H1 graph or bundle-local graph to augment in catalog mode.
-        return ErrorCode::Success;
+        return m_options.m_enablePackedHeadLayout ? MaterializePackedHeadLayout() : ErrorCode::Success;
     }
 
     // Inline the unchanged cross-edge sidecar before the index is published to
@@ -5587,7 +5658,7 @@ ErrorCode Index<T>::LoadIndexData(const std::vector<std::shared_ptr<Helper::Disk
         m_headCrossEdgesLoaded.store(true, std::memory_order_release);
     }
 
-    return ErrorCode::Success;
+    return m_options.m_enablePackedHeadLayout ? MaterializePackedHeadLayout() : ErrorCode::Success;
 }
 
 template <typename T> ErrorCode Index<T>::SaveConfig(std::shared_ptr<Helper::DiskIO> p_configOut)
@@ -5701,6 +5772,7 @@ ErrorCode Index<T>::SaveIndexData(const std::vector<std::shared_ptr<Helper::Disk
 
 template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool p_searchDeleted) const
 {
+    MarkSearchStarted();
     SPTAG_STEP_SCOPE(HeadPrepare);
     if (!m_bReady)
         return ErrorCode::EmptyIndex;
@@ -6006,6 +6078,8 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                         "Posting navigation requires unchanged H1 BKT geometry and loaded hierarchy CSR; disable EnablePostingNavigation for unsupported layouts.\n");
                     return ErrorCode::FailedParseValue;
                 }
+                const auto headPrefetch = routingPredicate.HeadPrefetch(
+                    m_index->GetPackedHeadStorage(), useLimitedTagMembership, useLimitedTagMembership);
                 if (m_sparseHierarchy) {
                     if (!routingReady) {
                         SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Sparse hierarchy routing metadata is stale.\n");
@@ -6028,7 +6102,8 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                     };
                     const auto prefetch = [&](std::size_t level, std::uint32_t id) {
                         if (level == 0) {
-                            if (id < static_cast<std::uint32_t>(m_index->GetNumSamples()))
+                            if (!m_index->GetPackedHeadStorage() &&
+                                id < static_cast<std::uint32_t>(m_index->GetNumSamples()))
                                 _mm_prefetch(reinterpret_cast<const char*>(m_limitedTagSupport.HeadLookupData(id)), _MM_HINT_T0);
                         } else if (id < static_cast<std::uint32_t>(hierarchy.Count())) hierarchy.Prefetch(id);
                     };
@@ -6042,7 +6117,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                         m_options.m_maxCheck, false, m_options.m_postingAnchorCount, m_options.m_postingAdditionalMaxCheck,
                         m_options.m_postingMatchRatePercent, m_options.m_postingMatchWindow,
                         // A posting-only phase cannot replace H1 for an absent OR label.
-                        sparseLabels.size() == limitedTagQueryValues.size());
+                        sparseLabels.size() == limitedTagQueryValues.size(), &headPrefetch);
                 } else {
                 Cache::PostingBitmask signature; signature.Clear();
                 bool signatureReady=false;
@@ -6063,7 +6138,8 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                 };
                 const auto prefetch=[&](std::size_t level,std::uint32_t head) {
                     if (level == 0) {
-                        if (useLimitedTagMembership && head < static_cast<std::uint32_t>(m_index->GetNumSamples()))
+                        if (!m_index->GetPackedHeadStorage() && useLimitedTagMembership &&
+                            head < static_cast<std::uint32_t>(m_index->GetNumSamples()))
                             _mm_prefetch(reinterpret_cast<const char*>(
                                 m_limitedTagSupport.HeadLookupData(static_cast<SizeType>(head))), _MM_HINT_T0);
                     } else if (head < static_cast<std::uint32_t>(m_postingOwners->Count(level - 1))) {
@@ -6080,7 +6156,7 @@ template <typename T> ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool
                         m_options.m_postingNavigationWidth);
                 ret=bkt->SearchIndexWithPostingNavigation(*p_queryResults,headAdmission,&posting,m_options.m_maxCheck,
                     false,m_options.m_postingAnchorCount,m_options.m_postingAdditionalMaxCheck,
-                    m_options.m_postingMatchRatePercent,m_options.m_postingMatchWindow);
+                    m_options.m_postingMatchRatePercent,m_options.m_postingMatchWindow,true,&headPrefetch);
                 }
             }
             if (ret != ErrorCode::Success) return ret;
@@ -6555,6 +6631,7 @@ ErrorCode Index<T>::SearchIndexIterative(QueryResult &p_headQuery, QueryResult &
                                          COMMON::WorkSpace *p_indexWorkspace, ExtraWorkSpace *p_extraWorkspace,
                                          int p_batch, int &resultCount, bool first) const
 {
+    MarkSearchStarted();
     if (!m_bReady)
         return ErrorCode::EmptyIndex;
     if (m_metadataOnlyHeadStore) {
@@ -6612,6 +6689,7 @@ ErrorCode Index<T>::SearchIndexIterative(QueryResult &p_headQuery, QueryResult &
 template <typename T>
 std::shared_ptr<ResultIterator> Index<T>::GetIterator(const void *p_target, bool p_searchDeleted, std::function<bool(const ByteArray&)> p_filterFunc, int p_maxCheck) const
 {
+    MarkSearchStarted();
     if (!m_bReady)
         return nullptr;
     auto extraWorkspace = m_workSpaceFactory->GetWorkSpace();
@@ -6673,6 +6751,7 @@ template <typename T>
 ErrorCode Index<T>::SearchIndexWithFilter(QueryResult &p_query, std::function<bool(const ByteArray &)> filterFunc,
                                           int maxCheck, bool p_searchDeleted) const
 {
+    MarkSearchStarted();
     if (nullptr == m_extraSearcher)
         return ErrorCode::EmptyIndex;
 
@@ -6796,6 +6875,7 @@ ErrorCode Index<T>::SearchIndexWithFilter(QueryResult &p_query, std::function<bo
 
 template <typename T> ErrorCode Index<T>::SearchDiskIndex(QueryResult &p_query, SearchStats *p_stats) const
 {
+    MarkSearchStarted();
     if (nullptr == m_extraSearcher)
         return ErrorCode::EmptyIndex;
 
@@ -6872,6 +6952,7 @@ template <typename T>
 ErrorCode Index<T>::SearchDiskIndexIterative(QueryResult &p_headQuery, QueryResult &p_query,
                                         ExtraWorkSpace *extraWorkspace) const
 {
+    MarkSearchStarted();
     if (extraWorkspace->m_loadPosting)
     {
         COMMON::QueryResultSet<T> *p__headQueryResults = (COMMON::QueryResultSet<T> *)&p_headQuery;
@@ -7886,6 +7967,10 @@ bool Index<T>::SelectHeadInternal(std::shared_ptr<Helper::VectorSetReader> &p_re
 
 template <typename T> ErrorCode Index<T>::BuildIndexInternal(std::shared_ptr<Helper::VectorSetReader> &p_reader)
 {
+    if (m_options.m_enablePackedHeadLayout || m_limitedTagSupport.PackedStorage()) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "EnablePackedHeadLayout is a read-only load option, not a construction option.\n");
+        return ErrorCode::FailedParseValue;
+    }
     if (m_options.HasSparseHierarchy()) {
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
             "Sparse label admission is an upper-only reconstruction setting; "
@@ -9115,6 +9200,40 @@ template <typename T> ErrorCode Index<T>::SetParameter(const char *p_param, cons
         p_parameters.emplace_back(p_name, p_newValue);
     };
 
+    if (Helper::StrUtils::StrEqualIgnoreCase(p_param, "EnablePackedHeadLayout")) {
+        bool enabled = false;
+        if (!Helper::Convert::ConvertStringTo<bool>(p_value, enabled) ||
+            (!Helper::StrUtils::StrEqualIgnoreCase(p_section, "SearchSSDIndex") &&
+             !Helper::StrUtils::StrEqualIgnoreCase(p_section, "BuildSSDIndex"))) {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid native EnablePackedHeadLayout setting.\n");
+            return ErrorCode::FailedParseValue;
+        }
+        if (!enabled && m_limitedTagSupport.PackedStorage()) {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Packed H1 cannot be disabled in place; reload with the option off.\n");
+            return ErrorCode::FailedParseValue;
+        }
+        if (enabled && m_bReady) {
+            const auto status = MaterializePackedHeadLayout();
+            if (status != ErrorCode::Success) return status;
+        }
+        m_options.m_enablePackedHeadLayout = enabled;
+        storeParameter(Helper::StrUtils::StrEqualIgnoreCase(p_section, "SearchSSDIndex")
+            ? m_searchSSDParameters : m_buildSSDParameters, p_param, p_value);
+        return ErrorCode::Success;
+    }
+    if (m_limitedTagSupport.PackedStorage()) {
+        for (const char* name : {"EnableLimitedTagPosting", "EnableHybridDistance", "DisableCrossEdges",
+                "Storage", "IndexAlgoType", "ValueType", "DistCalcMethod", "PostingQuantizer", "Recovery",
+                "LimitedTagSlotsPerHead", "LimitedTagMinHeadCount", "LimitedTagSupportFile",
+                "LimitedTagGenerationFingerprint", "HeadIndexFolder", "IndexDirectory"}) {
+            if (Helper::StrUtils::StrEqualIgnoreCase(p_param, name) &&
+                GetParameter(p_param, p_section) != p_value) {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Cannot change %s on packed read-only H1.\n", p_param);
+                return ErrorCode::FailedParseValue;
+            }
+        }
+    }
+
     if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_section, "SearchSSDIndex"))
     {
 
@@ -9437,6 +9556,10 @@ ErrorCode Index<T>::AddTaggedHeadToBundle(int p_bundleSlot, const T* p_center,
                                           SizeType p_anchorVID, SizeType p_templateHeadID,
                                           SizeType& p_headID)
 {
+    if (m_limitedTagSupport.PackedStorage()) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Cannot append a head to packed read-only H1.\n");
+        return ErrorCode::Fail;
+    }
     p_headID = -1;
     if (p_center == nullptr || p_anchorVID < 0 || m_extraSearcher == nullptr ||
         m_index == nullptr) {

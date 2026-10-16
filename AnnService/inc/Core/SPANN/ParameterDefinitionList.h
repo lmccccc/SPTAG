@@ -89,6 +89,7 @@ DefineBuildHeadParameter(m_buildHead, bool, false, "isExecute")
 
 #ifdef DefineSSDParameter
 DefineSSDParameter(m_enablePostingNavigation, bool, false, "EnablePostingNavigation")
+DefineSSDParameter(m_enablePackedHeadLayout, bool, false, "EnablePackedHeadLayout")
 DefineSSDParameter(m_globalPostingSearch, bool, false, "GlobalPostingSearch")
 DefineSSDParameter(m_postingAnchorCount, int, 0, "PostingAnchorCount")
 DefineSSDParameter(m_postingAdditionalMaxCheck, int, 0, "PostingAdditionalMaxCheck")

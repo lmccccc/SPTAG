@@ -18,8 +18,49 @@ template <typename T> thread_local std::unique_ptr<T> COMMON::ThreadLocalWorkSpa
 namespace BKT
 {
 
+template <typename T>
+ErrorCode Index<T>::PackHeadRows(const std::shared_ptr<PackedHeadStorage>& storage,
+                                const std::function<void()>& attachSupport)
+{
+    if (!storage || GetPackedHeadStorage() || m_pQuantizer ||
+        storage->Count() != GetNumSamples() || GetHeadNodeMetaSampleCount() != GetNumSamples() ||
+        !storage->Layout().MatchesMetadata(GetHeadMetadataLayout()) ||
+        storage->Layout().vectorBytes != static_cast<std::size_t>(GetFeatureDim()) * sizeof(T) ||
+        storage->Layout().degree != m_pGraph.m_iNeighborhoodSize ||
+        m_pGraph.R() != GetNumSamples() || m_pGraph.GetRuntimeEdgeSuffixSize() != 0 ||
+        m_threadPool.jobsize() != 0 ||
+        m_pSamples.HasIncrementalRows() || m_pGraph.HasIncrementalRows()) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Packed heads require unchanged, unquantized BKT rows.\n");
+        return ErrorCode::FailedParseValue;
+    }
+    const auto& layout = storage->Layout();
+    COMMON::Dataset<T> samples;
+    COMMON::Dataset<SizeType> edges;
+    samples.SetName(m_pSamples.Name());
+    edges.SetName("RNG");
+    if (samples.AttachSharedRows(storage->Buffer(), GetNumSamples(), GetFeatureDim(),
+            layout.stride, layout.vector) != ErrorCode::Success ||
+        edges.AttachSharedRows(storage->Buffer(), GetNumSamples(), layout.degree,
+            layout.stride, layout.edges) != ErrorCode::Success)
+        return ErrorCode::FailedParseValue;
+    const VectorIndex& metadata = *this;
+    for (SizeType head = 0; head < GetNumSamples(); ++head) {
+        auto* row = storage->Row(head);
+        std::memcpy(row + layout.vector, m_pSamples[head], layout.vectorBytes);
+        std::memcpy(row + layout.edges, m_pGraph[head], layout.degree * sizeof(SizeType));
+        storage->ImportMetadata(head, metadata.HeadNodeMetadataData(head));
+    }
+    // All allocation and support validation precede publication of the views.
+    if (attachSupport) attachSupport();
+    AttachPackedHeadMetadata(storage);
+    m_pSamples.Swap(samples);
+    m_pGraph.InstallSharedRows(edges);
+    return ErrorCode::Success;
+}
+
 template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader)
 {
+    if (!RequireMutableRows()) return ErrorCode::Fail;
     for (const char* name : {"BKTSeed", "TPTSeed"}) {
         if (!p_reader.DoesParameterExist("Index", name)) continue;
         int legacySeed;
@@ -40,6 +81,8 @@ template <typename T> ErrorCode Index<T>::LoadConfig(Helper::IniReader &p_reader
 
 template <> void Index<std::uint8_t>::SetQuantizer(std::shared_ptr<SPTAG::COMMON::IQuantizer> quantizer)
 {
+    if (GetPackedHeadStorage() && quantizer)
+        throw std::logic_error("Packed head rows do not support quantization");
     m_pQuantizer = quantizer;
     m_pTrees.m_pQuantizer = quantizer;
     if (m_pQuantizer)
@@ -59,6 +102,8 @@ template <> void Index<std::uint8_t>::SetQuantizer(std::shared_ptr<SPTAG::COMMON
 
 template <typename T> void Index<T>::SetQuantizer(std::shared_ptr<SPTAG::COMMON::IQuantizer> quantizer)
 {
+    if (GetPackedHeadStorage() && quantizer)
+        throw std::logic_error("Packed head rows do not support quantization");
     m_pQuantizer = quantizer;
     m_pTrees.m_pQuantizer = quantizer;
     if (quantizer)
@@ -70,6 +115,7 @@ template <typename T> void Index<T>::SetQuantizer(std::shared_ptr<SPTAG::COMMON:
 
 template <typename T> ErrorCode Index<T>::LoadIndexDataFromMemory(const std::vector<ByteArray> &p_indexBlobs)
 {
+    if (!RequireMutableRows()) return ErrorCode::Fail;
     if (p_indexBlobs.size() < 3)
         return ErrorCode::LackOfInputs;
 
@@ -102,6 +148,7 @@ template <typename T> ErrorCode Index<T>::LoadIndexDataFromMemory(const std::vec
 template <typename T>
 ErrorCode Index<T>::LoadIndexData(const std::vector<std::shared_ptr<Helper::DiskIO>> &p_indexStreams)
 {
+    if (!RequireMutableRows()) return ErrorCode::Fail;
     if (p_indexStreams.size() < 4)
         return ErrorCode::LackOfInputs;
 
@@ -850,9 +897,15 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                     };
                     for (int i = 0; i < (std::min)(count, aliasPrefetchDistance); ++i)
                         prefetchAlias(i);
+                    if (p_space.packedHeadPrefetch)
+                        for (int i = 0; i < (std::min)(count, PackedHeadPrefetch::Lookahead); ++i)
+                            p_space.packedHeadPrefetch->Prefetch(static_cast<SizeType>(members[i]));
                     for (int i = 0; i < count; ++i) {
                         if (count - i > aliasPrefetchDistance)
                             prefetchAlias(i + aliasPrefetchDistance);
+                        if (p_space.packedHeadPrefetch && count - i > PackedHeadPrefetch::Lookahead)
+                            p_space.packedHeadPrefetch->Prefetch(
+                                static_cast<SizeType>(members[i + PackedHeadPrefetch::Lookahead]));
                         const SizeType id = static_cast<SizeType>(members[i]);
                         if (id < 0 || id >= GetNumSamples()) throw std::out_of_range("Invalid postgraph H1 member");
                         if (COMMON::g_graphAccessStats) ++COMMON::g_graphAccessStats->m_visitedChecks;
@@ -989,13 +1042,16 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
 
         if constexpr (!EnableCrossEdges)
         {
-            COMMON::PrefetchGraphNeighbors(
-                node, localEdgeCount,
-                [this](SizeType neighbor) -> const void* {
-                    return neighbor >= 0 && neighbor < m_pSamples.R()
-                        ? m_pSamples[neighbor]
-                        : nullptr;
-                });
+            if (p_space.packedHeadPrefetch)
+                _mm_prefetch(reinterpret_cast<const char*>(node + checkPos), _MM_HINT_T0);
+            else
+                COMMON::PrefetchGraphNeighbors(
+                    node, localEdgeCount,
+                    [this](SizeType neighbor) -> const void* {
+                        return neighbor >= 0 && neighbor < m_pSamples.R()
+                            ? m_pSamples[neighbor]
+                            : nullptr;
+                    });
         }
 
         SizeType checkNode = node[checkPos];
@@ -1052,10 +1108,24 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                 bool p_crossEncoded, unsigned* degree = nullptr, unsigned* eligible = nullptr,
                 bool auxiliary = false, unsigned* newCandidates = nullptr)
         {
+            if constexpr (!EnableCrossEdges) {
+                if (p_space.packedHeadPrefetch) {
+                    _mm_prefetch(reinterpret_cast<const char*>(p_edges + p_begin), _MM_HINT_T0);
+                    for (DimensionType i = p_begin;
+                         i < p_end && i - p_begin < PackedHeadPrefetch::Lookahead; ++i) {
+                        if (p_edges[i] < 0) break;
+                        p_space.packedHeadPrefetch->Prefetch(p_edges[i]);
+                    }
+                }
+            }
             for (DimensionType edge = p_begin;
                  edge < p_end; ++edge)
             {
                 if (p_space.ConstructionBudgetExhausted()) return false;
+                if constexpr (!EnableCrossEdges) {
+                    if (p_space.packedHeadPrefetch && p_end - edge > PackedHeadPrefetch::Lookahead)
+                        p_space.packedHeadPrefetch->Prefetch(p_edges[edge + PackedHeadPrefetch::Lookahead]);
+                }
                 const bool isCross =
                     EnableCrossEdges && p_crossEncoded;
                 if constexpr (EnableCrossEdges)
@@ -1154,20 +1224,20 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                 if (p_space.matchPredicate) {
                     if (COMMON::g_graphAccessStats != nullptr) ++COMMON::g_graphAccessStats->m_visitedChecks;
                     match = p_space.nodeCheckStatus.Match(targetKey, [&](SizeType id) {
-                        if (auxiliary) {
+                        if (auxiliary || targetIndex->GetPackedHeadStorage()) {
                             // Only a visited miss reaches this callback, before attribute work.
                             const auto* bytes = reinterpret_cast<const char*>(targetIndex->m_pSamples[targetLocal]);
                             const std::size_t length = std::size_t(targetIndex->m_pSamples.C()) * sizeof(T);
                             if (length) {
                                 _mm_prefetch(bytes, _MM_HINT_T0);
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
-                                if (COMMON::g_graphAccessStats) ++COMMON::g_graphAccessStats->m_auxiliaryPrefetchLines;
+                                if (auxiliary && COMMON::g_graphAccessStats) ++COMMON::g_graphAccessStats->m_auxiliaryPrefetchLines;
 #endif
                                 const std::size_t nextLine = 64 - (reinterpret_cast<std::uintptr_t>(bytes) & 63);
                                 for (std::size_t offset = nextLine; offset < length; offset += 64) {
                                     _mm_prefetch(bytes + offset, _MM_HINT_T0);
 #ifdef SPTAG_QUERY_WORK_DIAGNOSTICS
-                                    if (COMMON::g_graphAccessStats) ++COMMON::g_graphAccessStats->m_auxiliaryPrefetchLines;
+                                    if (auxiliary && COMMON::g_graphAccessStats) ++COMMON::g_graphAccessStats->m_auxiliaryPrefetchLines;
 #endif
                                 }
                             }
@@ -1717,7 +1787,7 @@ ErrorCode Index<T>::SearchIndexWithPostingNavigation(QueryResult& query,
     const std::function<bool(SizeType)>& predicate,
     COMMON::PostingNavigation* postingNavigation, int maxCheck, bool searchDeleted,
     int anchorCount, int additionalMaxCheck, double matchRatePercent, int matchWindow,
-    bool allowEarlyHandoff) const
+    bool allowEarlyHandoff, const PackedHeadPrefetch* prefetch) const
 {
     const int anchorLimit = anchorCount == 0 ? query.GetResultNum() : anchorCount;
     if (anchorLimit <= 0 || additionalMaxCheck < 0 || !std::isfinite(matchRatePercent) || matchRatePercent < 0 ||
@@ -1732,6 +1802,7 @@ ErrorCode Index<T>::SearchIndexWithPostingNavigation(QueryResult& query,
     if (!m_bReady) return ErrorCode::EmptyIndex;
     auto workspace = RentWorkSpace(query.GetResultNum(), nullptr, maxCheck > 0 ? maxCheck : m_iMaxCheck);
     workspace->matchPredicate = &predicate;
+    workspace->packedHeadPrefetch = prefetch && *prefetch ? prefetch : nullptr;
     workspace->postingNavigation = postingNavigation;
     workspace->postingAnchorCount = anchorLimit;
     workspace->postingAdditionalMaxCheck = additionalMaxCheck;
@@ -1742,6 +1813,7 @@ ErrorCode Index<T>::SearchIndexWithPostingNavigation(QueryResult& query,
         COMMON::WorkSpace& workspace;
         ~Clear() {
             workspace.matchPredicate = nullptr;
+            workspace.packedHeadPrefetch = nullptr;
             workspace.postingNavigation = nullptr;
             workspace.scoredCandidate = nullptr;
             workspace.postingAdditionalMaxCheck = 0;
@@ -1936,6 +2008,7 @@ template <typename T>
 ErrorCode Index<T>::BuildIndex(const void *p_data, SizeType p_vectorNum, DimensionType p_dimension, bool p_normalized,
                                bool p_shareOwnership)
 {
+    if (!RequireMutableRows()) return ErrorCode::Fail;
     if (p_data == nullptr || p_vectorNum == 0 || p_dimension == 0)
         return ErrorCode::EmptyData;
 
@@ -1972,6 +2045,7 @@ ErrorCode Index<T>::BuildIndex(const void *p_data, SizeType p_vectorNum, Dimensi
 
 template <typename T> ErrorCode Index<T>::RefineIndex(std::shared_ptr<VectorIndex> &p_newIndex)
 {
+    if (!RequireMutableRows()) return ErrorCode::Fail;
     p_newIndex.reset(new Index<T>());
     Index<T> *ptr = (Index<T> *)p_newIndex.get();
 
@@ -2035,6 +2109,7 @@ template <typename T>
 ErrorCode Index<T>::RefineIndex(const std::vector<std::shared_ptr<Helper::DiskIO>> &p_indexStreams,
                                 IAbortOperation *p_abort, std::vector<SizeType> *p_mapping)
 {
+    if (!RequireMutableRows()) return ErrorCode::Fail;
     std::lock_guard<std::mutex> lock(m_dataAddLock);
     std::unique_lock<std::shared_timed_mutex> uniquelock(m_dataDeleteLock);
 
@@ -2124,6 +2199,7 @@ ErrorCode Index<T>::RefineIndex(const std::vector<std::shared_ptr<Helper::DiskIO
 
 template <typename T> ErrorCode Index<T>::DeleteIndex(const void *p_vectors, SizeType p_vectorNum)
 {
+    if (!RequireMutableRows()) return ErrorCode::Fail;
     const T *ptr_v = (const T *)p_vectors;
     std::vector<std::thread> mythreads;
     mythreads.reserve(m_iNumberOfThreads);
@@ -2165,6 +2241,7 @@ template <typename T> ErrorCode Index<T>::DeleteIndex(const void *p_vectors, Siz
 
 template <typename T> ErrorCode Index<T>::DeleteIndex(const SizeType &p_id)
 {
+    if (!RequireMutableRows()) return ErrorCode::Fail;
     if (!m_bReady)
         return ErrorCode::EmptyIndex;
 
@@ -2178,6 +2255,7 @@ template <typename T>
 ErrorCode Index<T>::AddIndex(const void *p_data, SizeType p_vectorNum, DimensionType p_dimension,
                              std::shared_ptr<MetadataSet> p_metadataSet, bool p_withMetaIndex, bool p_normalized)
 {
+    if (!RequireMutableRows()) return ErrorCode::Fail;
     if (p_data == nullptr || p_vectorNum == 0 || p_dimension == 0)
         return ErrorCode::EmptyData;
 
@@ -2265,6 +2343,7 @@ template <typename T>
 ErrorCode Index<T>::AddIndexId(const void *p_data, SizeType p_vectorNum, DimensionType p_dimension, int &beginHead,
                                int &endHead)
 {
+    if (!RequireMutableRows()) return ErrorCode::Fail;
     if (p_data == nullptr || p_vectorNum == 0 || p_dimension == 0)
         return ErrorCode::EmptyData;
 
@@ -2302,6 +2381,7 @@ ErrorCode Index<T>::AddIndexId(const void *p_data, SizeType p_vectorNum, Dimensi
 
 template <typename T> ErrorCode Index<T>::AddIndexIdx(SizeType begin, SizeType end)
 {
+    if (!RequireMutableRows()) return ErrorCode::Fail;
     if (end - m_pTrees.sizePerTree() >= m_addCountForRebuild && m_threadPool.jobsize() == 0) {
         m_threadPool.add(new RebuildJob(&m_pSamples, &m_pTrees, &m_pGraph, m_iDistCalcMethod));
     }
@@ -2315,6 +2395,7 @@ template <typename T> ErrorCode Index<T>::AddIndexIdx(SizeType begin, SizeType e
 
 template <typename T> ErrorCode Index<T>::AddIndexIdxNoBackEdge(SizeType begin, SizeType end)
 {
+    if (!RequireMutableRows()) return ErrorCode::Fail;
     for (SizeType node = begin; node < end; node++)
     {
         m_pGraph.RefineNode<T>(this, node, false, true, m_pGraph.m_iAddCEF);
@@ -2372,6 +2453,18 @@ template <typename T> ErrorCode Index<T>::SetParameter(const char *p_param, cons
 {
     if (nullptr == p_param || nullptr == p_value)
         return ErrorCode::Fail;
+    if (GetPackedHeadStorage()) {
+        if (GetParameter(p_param) == p_value) return ErrorCode::Success;
+        bool searchParameter = false;
+        for (const char* name : {"MaxCheck", "NumberOfThreads", "HashTableExponent",
+                "ThresholdOfNumberOfContinuousNoBetterPropagation",
+                "NumberOfInitialDynamicPivots", "NumberOfOtherDynamicPivots"})
+            searchParameter |= Helper::StrUtils::StrEqualIgnoreCase(p_param, name);
+        if (!searchParameter) {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Cannot change %s on packed read-only BKT rows.\n", p_param);
+            return ErrorCode::FailedParseValue;
+        }
+    }
     if (Helper::StrUtils::StrEqualIgnoreCase(p_param, "BKTSeed") ||
         Helper::StrUtils::StrEqualIgnoreCase(p_param, "TPTSeed")) {
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "%s was removed; construction uses upstream RNG behavior.\n", p_param);

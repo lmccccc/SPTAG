@@ -1714,9 +1714,21 @@ void AnnIndex::SetBuildParam(const char *p_name, const char *p_value, const char
 
 void AnnIndex::SetSearchParam(const char *p_name, const char *p_value, const char *p_section)
 {
-    if (!ValidatePostingParameters(p_name, p_value)) return;
-    if (nullptr != m_index)
-        m_index->SetParameter(p_name, p_value, p_section);
+    SetSearchParamChecked(p_name, p_value, p_section);
+}
+
+bool AnnIndex::SetSearchParamChecked(const char *p_name, const char *p_value, const char *p_section)
+{
+    if (!p_name || !p_value || !p_section) {
+        fprintf(stderr, "[ERROR] Search parameters require a name, value and section.\n");
+        return false;
+    }
+    if (!ValidatePostingParameters(p_name, p_value)) return false;
+    if (nullptr == m_index) {
+        fprintf(stderr, "[ERROR] Cannot set search parameters without an index.\n");
+        return false;
+    }
+    return m_index->SetParameter(p_name, p_value, p_section) == SPTAG::ErrorCode::Success;
 }
 
 std::shared_ptr<ResultIterator> AnnIndex::GetIterator(ByteArray p_target)
@@ -2903,7 +2915,9 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
                 const std::string& name = std::get<0>(pendingParam);
                 const std::string& value = std::get<1>(pendingParam);
                 const std::string& section = std::get<2>(pendingParam);
-                tenantIndex->SetSearchParam(name.c_str(), value.c_str(), section.c_str());
+                const bool applied = tenantIndex->SetSearchParamChecked(name.c_str(), value.c_str(), section.c_str());
+                if (!applied && SPTAG::Helper::StrUtils::StrEqualIgnoreCase(name.c_str(), "EnablePackedHeadLayout"))
+                    return false;
                 fprintf(stderr, "[INFO] Tenant %d: native [%s] %s = %s\n",
                         tenantId, section.c_str(), name.c_str(), value.c_str());
             }
@@ -3851,15 +3865,32 @@ void TenantIndexManager::SetBuildParam(const char* p_name, const char* p_value, 
 
 void TenantIndexManager::SetSearchParam(const char* p_name, const char* p_value, const char* p_section)
 {
+    SetSearchParamChecked(p_name, p_value, p_section);
+}
+
+bool TenantIndexManager::SetSearchParamChecked(const char* p_name, const char* p_value, const char* p_section)
+{
     if (p_name == nullptr || p_value == nullptr || p_section == nullptr) {
-        return;
+        fprintf(stderr, "[ERROR] Search parameters require a name, value and section.\n");
+        return false;
     }
     p_name = SPTAG::SPANN::Options::CanonicalParameter(p_section, p_name);
 
-    if (!ValidatePostingParameters(p_name, p_value)) return;
+    if (!ValidatePostingParameters(p_name, p_value)) return false;
+    if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_name, "EnablePackedHeadLayout")) {
+        bool enabled;
+        if (!SPTAG::Helper::Convert::ConvertStringTo<bool>(p_value, enabled) ||
+            (!SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_section, "SearchSSDIndex") &&
+             !SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_section, "BuildSSDIndex"))) {
+            fprintf(stderr, "[ERROR] Invalid native EnablePackedHeadLayout setting.\n");
+            return false;
+        }
+    }
     std::unique_lock<std::shared_mutex> wlock(m_tenantIndicesMutex);
     if (!ValidateStagedPostingBudget(p_name, p_value, p_section,
-        m_extraSSDBuildParams, m_pendingBuildParams, m_pendingSearchParams)) return;
+        m_extraSSDBuildParams, m_pendingBuildParams, m_pendingSearchParams)) return false;
+    for (auto& tenantEntry : m_tenantIndices)
+        if (!tenantEntry.second->SetSearchParamChecked(p_name, p_value, p_section)) return false;
     bool updated = false;
     for (auto& pendingParam : m_pendingSearchParams)
     {
@@ -3876,10 +3907,7 @@ void TenantIndexManager::SetSearchParam(const char* p_name, const char* p_value,
         m_pendingSearchParams.emplace_back(p_name, p_value, p_section);
     }
 
-    for (auto& tenantEntry : m_tenantIndices)
-    {
-        tenantEntry.second->SetSearchParam(p_name, p_value, p_section);
-    }
+    return true;
 }
 
 bool TenantIndexManager::EnsureTenantLoaded(int p_tenantId)
@@ -4032,9 +4060,11 @@ bool TenantIndexManager::EnsureTenantLoaded(int p_tenantId)
 
     for (const auto& pendingParam : m_pendingSearchParams)
     {
-        indexPtr->SetSearchParam(std::get<0>(pendingParam).c_str(),
-                                 std::get<1>(pendingParam).c_str(),
-                                 std::get<2>(pendingParam).c_str());
+        const auto* name = std::get<0>(pendingParam).c_str();
+        const bool applied = indexPtr->SetSearchParamChecked(name,
+            std::get<1>(pendingParam).c_str(), std::get<2>(pendingParam).c_str());
+        if (!applied && SPTAG::Helper::StrUtils::StrEqualIgnoreCase(name, "EnablePackedHeadLayout"))
+            return false;
     }
     m_tenantIndices[p_tenantId] = indexPtr;
     m_loadedHeadIndexBytes += estimatedBytes;

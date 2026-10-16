@@ -111,6 +111,7 @@ namespace SPTAG {
 
             // Section 4: for build ssd and search ssd
             bool m_enablePostingNavigation;
+            bool m_enablePackedHeadLayout;
             bool m_globalPostingSearch;
             int m_postingAnchorCount;
             int m_postingAdditionalMaxCheck;

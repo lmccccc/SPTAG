@@ -109,6 +109,7 @@ struct Config {
     bool phaseTiming=false;
     bool stepTiming=false;
     bool globalPostingSearch=false;
+    bool packedHeadLayout=false;
     int count,warmup,topk,maxCheck,anchorCount,additionalMaxCheck,postingPageLimit,navigationWidth;
     double matchRatePercent;
     int matchWindow;
@@ -138,6 +139,9 @@ struct Config {
         const auto global=ini.GetParameter<std::string>("SearchSSDIndex","GlobalPostingSearch","false");
         Require(global=="true" || global=="false","GlobalPostingSearch must be true or false");
         globalPostingSearch=global=="true";
+        const auto packed=ini.GetParameter<std::string>("SearchSSDIndex","EnablePackedHeadLayout","false");
+        Require(packed=="true" || packed=="false","EnablePackedHeadLayout must be true or false");
+        packedHeadLayout=packed=="true";
         Require(!globalPostingSearch || mode=="graph",
             "GlobalPostingSearch requires EnablePostingNavigation=false");
         if(globalPostingSearch) mode="global";
@@ -207,7 +211,7 @@ struct Config {
             "maxdistratio","searchpostingpagelimit","disablecrossedges",
             "logphasetime","logpathstats","dumpheads","enablehybriddistance","enablepostingnavigation",
             "postinganchorcount","postingadditionalmaxcheck","postingnavigationwidth",
-            "postingmatchratepercent","postingmatchwindow","globalpostingsearch"};
+            "postingmatchratepercent","postingmatchwindow","globalpostingsearch","enablepackedheadlayout"};
         for(const auto& p:ini.GetParameters("SearchSSDIndex"))
             Require(keys.count(p.first),"Unsupported search parameter "+p.first);
         for(char** entry=environ;*entry;++entry) {
@@ -226,12 +230,15 @@ struct Config {
             manager.SetSearchParam("PostingAdditionalMaxCheck",
                 std::to_string(additionalMaxCheck).c_str(),"SearchSSDIndex");
         for(const auto& p:ini.GetParameters("SearchSSDIndex"))
-            manager.SetSearchParam(p.first.c_str(),p.second.c_str(),"SearchSSDIndex");
+            if(p.first!="enablepackedheadlayout")
+                manager.SetSearchParam(p.first.c_str(),p.second.c_str(),"SearchSSDIndex");
         manager.SetSearchParam("PostingNavigationWidth",std::to_string(navigationWidth).c_str(),"SearchSSDIndex");
         manager.SetSearchParam("PostingMatchRatePercent",
             ini.GetParameter<std::string>("SearchSSDIndex","PostingMatchRatePercent","0").c_str(),"SearchSSDIndex");
         manager.SetSearchParam("PostingMatchWindow",std::to_string(matchWindow).c_str(),"SearchSSDIndex");
         manager.SetSearchParam("GlobalPostingSearch",globalPostingSearch?"true":"false","SearchSSDIndex");
+        Require(manager.SetSearchParamChecked("EnablePackedHeadLayout",packedHeadLayout?"true":"false","SearchSSDIndex"),
+            "Cannot apply native packed head layout");
     }
 };
 using Work=std::array<std::uint64_t,8>;
@@ -267,7 +274,9 @@ template<class T> Matrix<std::uint32_t> PrepareCase(Config& cfg,const Matrix<T>&
         if(cfg.count==0) cfg.count=cfg.warmup=static_cast<int>(queries.rows);
         Matrix<std::uint32_t> predicates;
         if(cfg.predicate!="empty") predicates=ReadNpy<std::uint32_t>(cfg.predicateFile,"<u4");
-        Require(queries.rank==2 && queries.cols==128 && queries.rows>=static_cast<std::size_t>(cfg.count) &&
+        Require(queries.rank==2 && queries.cols>0 &&
+            queries.cols<=static_cast<std::size_t>((std::numeric_limits<DimensionType>::max)()) &&
+            queries.rows>=static_cast<std::size_t>(cfg.count) &&
             (cfg.predicate=="empty" || predicates.rows==queries.rows),"Query/predicate shape mismatch");
         if(cfg.predicate=="dnf")
             for(int i=0;i<cfg.count;++i)
@@ -393,6 +402,7 @@ template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_
                  <<",\"search_posting_page_limit\":"<<cfg.postingPageLimit
                  <<",\"nprobe\":"<<probe
                  <<",\"global_posting_search\":"<<(cfg.globalPostingSearch?"true":"false")
+                 <<",\"packed_head_layout\":"<<(cfg.packedHeadLayout?"true":"false")
                  <<",\"max_check\":"<<cfg.maxCheck
                  <<",\"posting_anchor_count\":"<<cfg.anchorCount
                  <<",\"posting_anchor_limit\":"<<(cfg.anchorCount ? cfg.anchorCount : probe)
@@ -428,7 +438,7 @@ template<class T> int RunCase(Config& cfg,Matrix<T>& queries,Matrix<std::uint32_
 template<class T> int RunBenchmark(Config& cfg,const std::string& dtype) {
     auto queries=ReadNpy<T>(cfg.queries,dtype);
     auto predicates=PrepareCase(cfg,queries);
-    TenantIndexManager manager(128,"SPANN",cfg.valueType.c_str());
+    TenantIndexManager manager(static_cast<DimensionType>(queries.cols),"SPANN",cfg.valueType.c_str());
     cfg.Apply(manager);
     Require(manager.LoadAll(cfg.index.c_str()),"Cannot load immutable native index");
     return RunCase(cfg,queries,predicates,manager);
@@ -507,7 +517,7 @@ std::vector<std::unique_ptr<BatchCase>> ReadBatch(const char* path,Helper::IniRe
         const auto& search=cfg.ini.GetParameters("SearchSSDIndex");
         Require(search.size()==completeKeys.size()+search.count("postingnavigationwidth")+
             search.count("postingmatchratepercent")+search.count("postingmatchwindow")+
-            search.count("globalpostingsearch"),
+            search.count("globalpostingsearch")+search.count("enablepackedheadlayout"),
             "Batch cases require complete SearchSSDIndex settings");
         auto validated=VectorIndex::CreateInstance(IndexAlgoType::SPANN,
             cfg.valueType=="UInt8"?VectorValueType::UInt8:VectorValueType::Float);
@@ -529,6 +539,7 @@ std::vector<std::unique_ptr<BatchCase>> ReadBatch(const char* path,Helper::IniRe
         if(!cases.empty()) {
             const auto& first=cases.front()->cfg;
             Require(cfg.phaseTiming==first.phaseTiming,"Mixed batch PhaseTiming modes");
+            Require(cfg.packedHeadLayout==first.packedHeadLayout,"Mixed batch packed head layouts require separate loads");
             Require(cfg.index==first.index && cfg.valueType==first.valueType && cfg.queries==first.queries &&
                 cfg.count==first.count && cfg.warmup==first.warmup,"Mixed batch index, value type or query cohort");
             // Workspace sizing and graph connectivity are not mutable batch dimensions.
@@ -555,7 +566,7 @@ template<class T> int RunBatch(std::vector<std::unique_ptr<BatchCase>>& cases,co
         <<",\"value_type\":"<<JsonString(first.valueType)<<",\"index\":"<<JsonString(first.index)
         <<",\"queries\":"<<JsonString(first.queries)<<"}\n";
     FlushProgress();
-    TenantIndexManager manager(128,"SPANN",first.valueType.c_str());
+    TenantIndexManager manager(static_cast<DimensionType>(queries.cols),"SPANN",first.valueType.c_str());
     first.Apply(manager);
     Require(manager.LoadAll(first.index.c_str()),"Cannot load immutable native index");
     std::cout<<"{\"event\":\"batch_loaded\",\"index_load_count\":1,\"query_corpus_load_count\":1}\n";
