@@ -6,6 +6,8 @@
 #include <iostream>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <map>
 
 using namespace SPTAG;
 #define CHECK(x) do { if (!(x)) throw std::runtime_error("Search budget test line " + std::to_string(__LINE__)); } while (false)
@@ -271,6 +273,86 @@ void ConstructionCandidates()
     std::cout << "PASS 4096-node underfill capped at 32, BFS, tiny support direct path, exact fallback and missing-support failure\n";
 }
 
+void TemporaryConstructionEagerAdmission()
+{
+    BKT::Index<float> source;
+    for (auto parameter : std::vector<std::pair<const char*, const char*>>{
+        {"DistCalcMethod", "L2"}, {"NumberOfThreads", "1"}, {"BKTKmeansK", "8"},
+        {"BKTLeafSize", "1"}, {"NeighborhoodSize", "32"}, {"TPTNumber", "1"},
+        {"RefineIterations", "1"}, {"NumberOfInitialDynamicPivots", "1"},
+        {"NumberOfOtherDynamicPivots", "0"}})
+        CHECK(source.SetParameter(parameter.first, parameter.second) == ErrorCode::Success);
+    std::vector<float> data(256 * 128);
+    for (int id = 0; id < 256; ++id)
+        std::fill_n(data.data() + id * 128, 128, float(id >= 200 && id <= 202 ? 200 : id));
+    CHECK(source.BuildIndex(data.data(), 256, 128) == ErrorCode::Success);
+    for (int id = 0; id < 256; ++id)
+        std::fill_n(source.GetMutableGraph()[id], 32, -1);
+    auto* edges = source.GetMutableGraph()[0];
+    edges[0] = 1;
+    edges[1] = 200;
+    edges[2] = 200;
+    edges[3] = 203;
+    CHECK(source.DeleteIndex(201) == ErrorCode::Success);
+    const auto folder = std::filesystem::current_path() / ("construction_eager_" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    CHECK(!std::filesystem::exists(folder));
+    CHECK(source.SaveIndex(folder.string()) == ErrorCode::Success);
+    {
+        COMMON::BKTNode nodes[] = {COMMON::BKTNode(0), COMMON::BKTNode(200),
+            COMMON::BKTNode(201), COMMON::BKTNode(202), COMMON::BKTNode(-1)};
+        nodes[1].childStart = -2;
+        nodes[1].childEnd = 4;
+        const std::int32_t header[] = {1, 0, 5};
+        std::ofstream tree(folder / "tree.bin", std::ios::binary);
+        tree.write(reinterpret_cast<const char*>(header), sizeof(header));
+        tree.write(reinterpret_cast<const char*>(nodes), sizeof(nodes));
+        CHECK(bool(tree));
+    }
+    std::shared_ptr<VectorIndex> restored;
+    CHECK(VectorIndex::LoadIndex(folder.string(), restored) == ErrorCode::Success);
+    auto* index = dynamic_cast<BKT::Index<float>*>(restored.get());
+    CHECK(index);
+    // The close negative fills the one-slot navigation pool before head 200 is scored.
+    for (bool aliases : {false, true}) {
+        index->GetMutableGraph()[200][31] = aliases ? -3 : -1;
+        for (int selected : {200, 201, 202, 203, -1}) {
+            const bool available = selected == 200 || (aliases && selected == 202);
+            for (int budget : {2, 3, 4}) {
+                COMMON::QueryResultSet<float> query(data.data(), 1);
+                COMMON::GraphAccessStats stats;
+                std::map<int, int> calls;
+                {
+                    COMMON::ScopedGraphAccessStats scope(&stats);
+                    CHECK(index->SearchIndexForConstruction(query, [&](int id) {
+                        ++calls[id]; return id == selected;
+                    }, budget) == ErrorCode::Success);
+                }
+                CHECK(query.GetScanned() == budget && stats.m_distanceCalls == std::uint64_t(budget));
+                const bool admitted = (budget >= 3 && available) || (budget == 4 && selected == 203);
+                if (query.GetResult(0)->VID != (admitted ? selected : -1))
+                    throw std::runtime_error("Temporary eager admission: aliases=" + std::to_string(aliases) +
+                        " selected=" + std::to_string(selected) + " budget=" + std::to_string(budget) +
+                        " actual=" + std::to_string(query.GetResult(0)->VID));
+                CHECK(query.GetResult(0)->Dist == (admitted ?
+                    index->ComputeDistance(data.data(), index->GetSample(selected)) : MaxDist));
+                CHECK(calls[200] == (budget >= 3 ? 1 : 0));
+                CHECK(calls[203] == (budget == 4 ? 1 : 0));
+                for (const auto& call : calls) CHECK(call.second <= 1);
+                COMMON::QueryResultSet<float> online(data.data(), 1), ordinary(data.data(), 1);
+                CHECK(index->SearchIndexWithResultFilter(online,
+                    [selected](int id) { return id == selected; }, budget) == ErrorCode::Success);
+                CHECK(online.GetResult(0)->VID == -1 && online.GetScanned() == 4);
+                CHECK(index->SearchIndexWithMaxCheck(ordinary, budget) == ErrorCode::Success);
+                CHECK(ordinary.GetResult(0)->VID == 0 && ordinary.GetResult(0)->Dist == 0);
+                CHECK(ordinary.GetScanned() == 4);
+            }
+        }
+    }
+    std::filesystem::remove_all(folder);
+    std::cout << "PASS temporary construction-only eager admission: pool-rejected neighbors, aliases/deletion, exact cap, distance reuse, dedup and online isolation\n";
+}
+
 int main()
 {
     try {
@@ -278,6 +360,7 @@ int main()
         UpstreamBoundaries<float>();
         UpstreamBoundaries<std::uint8_t>();
         ConstructionCandidates();
+        TemporaryConstructionEagerAdmission();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

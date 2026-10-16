@@ -18,6 +18,33 @@ candidate request are scored directly. Other labels use bounded ANN, with the
 existing exact-support fallback only on an empty result. RNG/no-replica-fill
 rules remain unchanged. Build progress reports checked and exact work separately.
 
+### Temporary performance experiment: eager construction candidates (2026-10-16)
+
+This revision temporarily restores **only** eager matching-neighbor admission
+inside filtered `SearchIndexForConstruction`. After scoring a fresh graph
+neighbor, it offers that neighbor (including live matching collapsed aliases)
+to the bounded result heap **before** the navigation distance pool can reject
+it. Distances and the existing result deduplication/liveness helpers are reused.
+Tree candidates retain their current admission path.
+
+This is active for filtered BKT construction calls in this revision, including
+SSD H placement and upper H reconstruction using that entrypoint; it adds no
+INI/environment override. It is a temporary performance/recall comparison,
+not a permanent policy decision or a full restoration of `c0dd656`.
+The matching result boundary, navigation-pool width, hard construction MaxCheck,
+tree accounting, pending-candidate drain, exact fallback and RNG/no-fill policy
+are unchanged. Earlier result admission can change that matching boundary and
+therefore subsequent convergence; identical checked work is not guaranteed.
+Online filtered/unfiltered/posting queries and graph refinement never enable
+the construction flag and keep queue-pop admission.
+
+Existing index bytes are unaffected. Compare newly constructed outputs in new
+directories with the same source geometry, labels and native INIs, and record
+the source commit. Revert this experiment commit to restore queue-pop-only
+construction admission; do not rewrite historical controls.
+`NativePosting.SearchBudgets` covers pool-rejected matching neighbors, aliases,
+deletion, exact-cap admission, distance reuse and unchanged online behavior.
+
 ## Online query semantics
 
 The project engine is not an unmodified Microsoft/SPTAG binary. Both filtered

@@ -293,6 +293,11 @@ more expansion. Tree routing distances and RNG/exact-support distances are
 separate work, not hidden inside that counter. Construction has a separate
 workspace cache and discards grown tables before reuse. None of these rules
 change online soft stopping, posting handoff or graph refinement.
+Temporary performance experiment (2026-10-16): filtered BKT construction alone
+admits freshly scored graph neighbors before navigation-pool rejection, reusing
+native alias/liveness/dedup helpers. Matching boundaries and the construction cap
+remain; online admission is unchanged. This is not a full historical rollback.
+See `docs/SearchBudgetBoundaries.md` for scope and rollback.
 On source reload, retain validated BuildHead parameters independently of the
 loaded H1's runtime overrides. Temporary construction indexes must inherit
 that native recipe, not defaults or current query settings. Load-only legacy

@@ -1201,6 +1201,21 @@ void Index<T>::Search(COMMON::QueryResultSet<T> &p_query, COMMON::WorkSpace &p_s
                           distance)
                     : distance;
                 ++p_space.m_iNumberOfCheckedLeaves;
+                if constexpr (!EnableCrossEdges) {
+                    if (p_space.m_bConstructionSearch && hasResultFilter) {
+                        // TEMPORARY performance experiment: admit scored construction
+                        // neighbors even when the navigation distance pool rejects them.
+                        const auto scoredDistance = [&]() { return routeDistance; };
+                        if (targetIndex->m_pGraph[targetLocal][
+                                targetIndex->m_pGraph.m_iNeighborhoodSize - 1] < -1) {
+                            admitCollapsedResults(targetNode, targetIndex, nullptr,
+                                targetLocal, scoredDistance, false);
+                        } else {
+                            admitFilteredResult(targetKey, targetIndex, targetLocal,
+                                targetLocal, scoredDistance);
+                        }
+                    }
+                }
                 if (p_space.scoredCandidate)
                     (*p_space.scoredCandidate)(targetLocal, routeDistance, match.second);
                 if (newCandidates && match.second) ++*newCandidates;
