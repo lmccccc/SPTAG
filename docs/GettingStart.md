@@ -443,6 +443,30 @@ selectivities at **1, 4, 8, 16, 32 and 48 workers**, with three repetitions:
 324 fresh points / 972 repetitions, without reusing older single-thread timings.
 The table is an offline experimental grid, not runtime selectivity-based tuning.
 
+**Measured starting points for at least95% Recall@100.** The completed
+2026-10-16 packed run has324 fresh points and972 repetitions. For each predicate
+below, the same nprobe/MaxCheck pair was fastest among qualifying observations
+at every tested worker count. Recall is required to meet the target in **all
+three repetitions**; QPS is the median. These recommendations apply to this
+frozen index and workload, not to arbitrary filters or rebuilt indexes.
+
+| Selectivity | nprobe | MaxCheck | Recall@100 | 1-worker QPS | Best measured workers | QPS at that worker count |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 50% | 384 | 1024 | 95.409% | 213.414 | 8 | 1241.683 |
+| 20% | 256 | 4096 | 95.170% | 232.326 | 16 | 1862.711 |
+| 10% | 768 | 1024 | 96.235% | 59.200 | 16 | 585.470 |
+| 5% | 512 | 4096 | 95.119% | 110.772 | 16 | 938.915 |
+| 1% | 512 | 4096 | 95.168% | 119.789 | 16 | 924.693 |
+| 0.1% | 256 | 1024 | 95.277% | 368.427 | 8 | 2447.437 |
+
+Set `InternalResultNum` to nprobe. Keep the other search settings below fixed
+and select the desired worker count in the native client's batch profile.
+More workers were not always faster on this shared host:48 is a measured
+comparison mode, not the universal recommendation. All1/4/8/16/32/48-worker
+results, individual repetitions, memory values and higher-recall targets are in
+the [published JSON](https://github.com/lmccccc/lion_results/blob/main/yfcc10m-camera-recall100/20261016-new-h/six-scenarios/final.json).
+No interpolation or online selectivity lookup is used.
+
 The generated native INIs keep three SSD pages, anchor0, extra2048,
 navigation width128, match rate12.5/window1024, distance ratio8, hash exponent4,
 posting navigation on and hybrid distance off. `MaxCheck` is 1024 or4096 as
@@ -504,7 +528,13 @@ small intermediate parent avoids inheriting the memory-heavy Python controller's
 pre-exec RSS high-water. `memory.by_threads` takes maxima across processes,
 never sums repeated samples or multiplies shared index memory by worker count.
 These are process RSS measurements, not index-only bytes; load-time packing can
-temporarily hold old and new storage together.
+temporarily hold old and new storage together. Per-worker query buffers can
+still grow with nprobe and concurrency. In this run the maximum kernel-reported
+process peak was1.786 GiB at one worker and3.580 GiB at48 workers.
+Resident snapshots use `/proc/self/statm`; peaks use `getrusage`/`wait4`.
+These counters differed slightly in this run, including some resident snapshots
+above the separately reported peak. Original measured values are retained
+without clamping.
 
 <a id="sift1b-measured-configuration-and-tuning-range"></a>
 
