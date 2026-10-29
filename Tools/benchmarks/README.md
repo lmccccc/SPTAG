@@ -408,6 +408,57 @@ SPANN retains its frozen core's four shared 1,024-event AIO contexts, with nativ
 modulo selection and per-context locking. It checks room for 4,096 events plus
 the reserve; its query workers do not each require a separate AIO context.
 DiskANN's per-worker AIO cap must not be applied to SPANN.
+
+### Ordinary-query AIO isolation (new builds only)
+
+The frozen four-context results above remain unchanged. New native clients can
+select independent reader-owned channels before loading or materializing an index:
+
+```ini
+[SearchSSDIndex]
+UseSharedAIOPool=false
+AIOContextCount=48
+NumberOfThreads=48
+```
+
+`AIOContextCount=0` uses `SearchSSDIndex.NumberOfThreads` at load time.
+For an ordinary one-worker run use capacity 1; for 48 workers use capacity 48.
+These are load-time resource settings, not changes to recall budgets or index
+bytes. Changing ownership/capacity on a loaded index is rejected; reload to
+change them. Later `NumberOfThreads` changes do not resize existing channels.
+The manager applies staged AIO settings before opening posting files, including
+lazy reload after eviction. The native `VectorIndex::LoadIndex` pre-data callback
+can apply the same settings without editing a saved `indexloader.ini`.
+
+Core readers default to private ownership and never join a pool merely because
+another manager initialized one. `TenantIndexManager` honors saved explicit AIO
+settings and retains its shared-mode default for legacy multi-tenant snapshots
+without that setting. Staged native build/search overrides take precedence;
+ordinary-query adapters should explicitly set `UseSharedAIOPool=false` using
+`SetSearchParamChecked` before loading.
+Shared mode still uses its original protected completion queues. Private mode
+leases each participating reader's channel until the entire batch and its
+callbacks finish; workspace IDs do not select private channels. Excess batches
+wait for a free channel rather than collide through modulo arithmetic. Multiple
+readers are acquired in a consistent order. Posting filtering/scanning remains
+in the same callback and the query algorithm is unchanged.
+
+The native posting client's INI parser accepts both settings and rejects mixed
+AIO modes/capacities in a resident batch. Missing settings retain its historical
+shared-mode default. Build a new client/core and use fresh output directories;
+do not reuse the old three-way adapter that requires four shared contexts.
+Private AIO reservations scale with the number of opened posting files, channel
+capacity and native queue depth; use current host headroom, not the old fixed
+4,096-event estimate. PipePQ rerank and dynamic FILEIO have additional readers.
+The ordinary `nativeBench` retains its single-query-worker protocol. The new
+`spannAioBench` CMake target supports the three-way header's concurrent worker
+jobs with explicit private capacity, raw STATIC postings, native MaxCheck and
+unlimited query pages (`SearchPostingPageLimit=0`). It requires capacity at least
+the maximum planned workers and checks posting-file/channel/event reservations
+plus the manager's retained pool against live host headroom. Its load marker
+distinguishes private per-file channels from the unused manager pool. Neither
+the historical adapter mode nor its frozen build helper is switched implicitly.
+
 Published peaks are **maximum observed feasible throughput**, not a proof of an
 unconstrained algorithm maximum. Boundary maxima remain censored. Likewise,
 PipeANN's historical medium-label grid reaches roughly 90% recall, not 95%;

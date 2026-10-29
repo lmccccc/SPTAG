@@ -2282,6 +2282,7 @@ std::shared_ptr<AnnIndex> TenantIndexManager::LoadSpannWithSharedDB(const std::s
     if (vecIndex == nullptr) return nullptr;
 
     if (vecIndex->LoadIndexConfig(iniReader) != ErrorCode::Success) return nullptr;
+    if (ConfigureIndexAIO(*vecIndex, &iniReader) != ErrorCode::Success) return nullptr;
 
     if (algoType == IndexAlgoType::SPANN)
     {
@@ -2878,6 +2879,7 @@ bool TenantIndexManager::BuildFromData(ByteArray p_vectors, ByteArray p_metadata
             // Bulk SPANN saves/releases this index before tenantVectors dies.
             // A mutable normalization copy can therefore also be borrowed by core.
             tenantIndex->SetShareBuildOwnership(borrowedVectors || singleTenantBulk);
+            if (ConfigureIndexAIO(*tenantIndex->GetInternalIndex()) != SPTAG::ErrorCode::Success) return false;
             buildOk = tenantIndex->Build(tenantVectors, tenantVecCount, p_normalized);
             m_tenantSpannWorkDirs[tenantId] = spannWorkDir;
             fprintf(stderr, "[INFO] Tenant %d: SPANN build (%d vectors)\n", tenantId, tenantVecCount);
@@ -3876,6 +3878,16 @@ bool TenantIndexManager::SetSearchParamChecked(const char* p_name, const char* p
     }
     p_name = SPTAG::SPANN::Options::CanonicalParameter(p_section, p_name);
 
+    if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_name, "UseSharedAIOPool") ||
+        SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_name, "AIOContextCount")) {
+        SPTAG::SPANN::Options proposed;
+        if ((!SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_section, "SearchSSDIndex") &&
+             !SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_section, "BuildSSDIndex")) ||
+            proposed.SetParameter("BuildSSDIndex", p_name, p_value) != SPTAG::ErrorCode::Success) {
+            fprintf(stderr, "[ERROR] Invalid load-time AIO setting.\n");
+            return false;
+        }
+    }
     if (!ValidatePostingParameters(p_name, p_value)) return false;
     if (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(p_name, "EnablePackedHeadLayout")) {
         bool enabled;
@@ -3908,6 +3920,53 @@ bool TenantIndexManager::SetSearchParamChecked(const char* p_name, const char* p
     }
 
     return true;
+}
+
+SPTAG::ErrorCode TenantIndexManager::ConfigureIndexAIO(SPTAG::VectorIndex& p_index,
+    const SPTAG::Helper::IniReader* p_saved) const
+{
+    using namespace SPTAG;
+    if (p_index.GetIndexAlgoType() != IndexAlgoType::SPANN) return ErrorCode::Success;
+#if !defined(_MSC_VER) && !defined(URING) && !defined(SPDK)
+    const char* sharedDefault = "true";
+#else
+    const char* sharedDefault = "false";
+#endif
+    auto status = ErrorCode::Success;
+    if (!p_saved || (!p_saved->DoesParameterExist("BuildSSDIndex", "UseSharedAIOPool") &&
+                     !p_saved->DoesParameterExist("SearchSSDIndex", "UseSharedAIOPool"))) {
+        status = p_index.SetParameter("UseSharedAIOPool", sharedDefault, "SearchSSDIndex");
+        if (status != ErrorCode::Success) return status;
+    }
+    const auto apply = [&](const char* name, const char* value, const char* section) {
+        if (Helper::StrUtils::StrEqualIgnoreCase(name, "UseSharedAIOPool") ||
+            Helper::StrUtils::StrEqualIgnoreCase(name, "AIOContextCount") ||
+            (Helper::StrUtils::StrEqualIgnoreCase(section, "SearchSSDIndex") &&
+             Helper::StrUtils::StrEqualIgnoreCase(name, "NumberOfThreads")))
+            return p_index.SetParameter(name, value, section);
+        return ErrorCode::Success;
+    };
+    for (const auto& parameter : m_extraSSDBuildParams) {
+        status = apply(parameter.first.c_str(), parameter.second.c_str(), "BuildSSDIndex");
+        if (status != ErrorCode::Success) return status;
+    }
+    for (const auto* parameters : {&m_pendingBuildParams, &m_pendingSearchParams}) {
+        for (const auto& parameter : *parameters) {
+            status = apply(std::get<0>(parameter).c_str(), std::get<1>(parameter).c_str(),
+                std::get<2>(parameter).c_str());
+            if (status != ErrorCode::Success) return status;
+        }
+    }
+    if (p_index.GetParameter("UseSharedAIOPool", "SearchSSDIndex") == "false") {
+        for (const auto& parameter : m_pendingSearchParams) {
+            if (Helper::StrUtils::StrEqualIgnoreCase(std::get<2>(parameter).c_str(), "SearchSSDIndex") &&
+                Helper::StrUtils::StrEqualIgnoreCase(std::get<0>(parameter).c_str(), "InternalResultNum")) {
+                status = p_index.SetParameter("InternalResultNum", std::get<1>(parameter).c_str(), "SearchSSDIndex");
+                if (status != ErrorCode::Success) return status;
+            }
+        }
+    }
+    return ErrorCode::Success;
 }
 
 bool TenantIndexManager::EnsureTenantLoaded(int p_tenantId)
@@ -4036,13 +4095,16 @@ bool TenantIndexManager::EnsureTenantLoaded(int p_tenantId)
     }
     else
     {
-        AnnIndex tmp = AnnIndex::Load(loadPath.c_str());
-        if (!tmp.ReadyToServe())
+        std::shared_ptr<SPTAG::VectorIndex> native;
+        if (SPTAG::VectorIndex::LoadIndex(loadPath, native,
+                [this](SPTAG::VectorIndex& index, const SPTAG::Helper::IniReader& saved) {
+                    return ConfigureIndexAIO(index, &saved);
+                }) != SPTAG::ErrorCode::Success)
         {
             fprintf(stderr, "[ERROR] Failed to load tenant %d from %s\n", p_tenantId, loadPath.c_str());
             return false;
         }
-        indexPtr = std::make_shared<AnnIndex>(tmp);
+        indexPtr = std::make_shared<AnnIndex>(native);
     }
     if (m_rssHighWaterMarkBytes > 0)
     {
@@ -4063,7 +4125,9 @@ bool TenantIndexManager::EnsureTenantLoaded(int p_tenantId)
         const auto* name = std::get<0>(pendingParam).c_str();
         const bool applied = indexPtr->SetSearchParamChecked(name,
             std::get<1>(pendingParam).c_str(), std::get<2>(pendingParam).c_str());
-        if (!applied && SPTAG::Helper::StrUtils::StrEqualIgnoreCase(name, "EnablePackedHeadLayout"))
+        if (!applied && (SPTAG::Helper::StrUtils::StrEqualIgnoreCase(name, "EnablePackedHeadLayout") ||
+                        SPTAG::Helper::StrUtils::StrEqualIgnoreCase(name, "UseSharedAIOPool") ||
+                        SPTAG::Helper::StrUtils::StrEqualIgnoreCase(name, "AIOContextCount")))
             return false;
     }
     m_tenantIndices[p_tenantId] = indexPtr;

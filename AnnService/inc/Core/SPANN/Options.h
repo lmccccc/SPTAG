@@ -121,6 +121,13 @@ namespace SPTAG {
             bool m_enableSSD;
             bool m_buildSsdIndex;
             int m_iSSDNumberOfThreads;
+            bool m_useSharedAIOPool;
+            int m_aioContextCount;
+
+            int QueryAIOContextCount() const
+            {
+                return m_aioContextCount > 0 ? m_aioContextCount : m_searchThreadNum;
+            }
             bool m_enableDeltaEncoding;
             bool m_enablePostingListRearrange;
             bool m_enableOrderedPageStart;
@@ -541,6 +548,11 @@ namespace SPTAG {
                         "Unknown or invalid native parameter [%s] %s=%s.\n", p_section, p_param, p_value);
                     return ErrorCode::FailedParseValue;
                 };
+                if (Helper::StrUtils::StrEqualIgnoreCase(p_param, "AIOContextCount")) {
+                    int count = 0;
+                    if (!ParsePostingInteger(p_value, 0, count) || count > 65535)
+                        return invalid();
+                }
                 if (Helper::StrUtils::StrEqualIgnoreCase(p_param, "HierarchyTargetPostingSize") ||
                     Helper::StrUtils::StrEqualIgnoreCase(p_param, "HierarchySizingSampleHeads")) {
                     int value = -1;

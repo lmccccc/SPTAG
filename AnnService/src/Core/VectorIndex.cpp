@@ -1931,7 +1931,8 @@ std::shared_ptr<VectorIndex> VectorIndex::CreateInstance(IndexAlgoType p_algo, V
     return nullptr;
 }
 
-ErrorCode VectorIndex::LoadIndex(const std::string &p_loaderFilePath, std::shared_ptr<VectorIndex> &p_vectorIndex)
+ErrorCode VectorIndex::LoadIndex(const std::string &p_loaderFilePath, std::shared_ptr<VectorIndex> &p_vectorIndex,
+    const std::function<ErrorCode(VectorIndex&, const Helper::IniReader&)>& p_beforeLoadData)
 {
     std::string folderPath(p_loaderFilePath);
     if (!folderPath.empty() && *(folderPath.rbegin()) != FolderSep)
@@ -1958,6 +1959,9 @@ ErrorCode VectorIndex::LoadIndex(const std::string &p_loaderFilePath, std::share
 
     ErrorCode ret = ErrorCode::Success;
     if ((ret = p_vectorIndex->LoadIndexConfig(iniReader)) != ErrorCode::Success)
+        return ret;
+
+    if (p_beforeLoadData && (ret = p_beforeLoadData(*p_vectorIndex, iniReader)) != ErrorCode::Success)
         return ret;
 
     std::shared_ptr<std::vector<std::string>> indexfiles = p_vectorIndex->GetIndexFiles();

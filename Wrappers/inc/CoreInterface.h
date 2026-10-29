@@ -396,6 +396,8 @@ private:
 
     // Search params to apply to both currently loaded and future lazy-loaded tenants.
     std::vector<std::tuple<std::string, std::string, std::string>> m_pendingSearchParams;
+    SPTAG::ErrorCode ConfigureIndexAIO(SPTAG::VectorIndex& p_index,
+        const SPTAG::Helper::IniReader* p_saved = nullptr) const;
 
     // Build params to apply after TenantIndexManager's automatic defaults. This
     // gives explicit native INI values precedence over tenant-size heuristics.

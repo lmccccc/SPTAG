@@ -99,6 +99,8 @@ DefineSSDParameter(m_postingNavigationWidth, int, 0, "PostingNavigationWidth")
 DefineSSDParameter(m_enableSSD, bool, false, "isExecute")
 DefineSSDParameter(m_buildSsdIndex, bool, false, "BuildSsdIndex")
 DefineSSDParameter(m_iSSDNumberOfThreads, int, 16, "NumberOfThreads") // Mutable
+DefineSSDParameter(m_useSharedAIOPool, bool, false, "UseSharedAIOPool") // Load-time ownership
+DefineSSDParameter(m_aioContextCount, int, 0, "AIOContextCount") // 0: use SearchThreadNum at load time
 DefineSSDParameter(m_enableDeltaEncoding, bool, false, "EnableDeltaEncoding")
 DefineSSDParameter(m_enablePostingListRearrange, bool, false, "EnablePostingListRearrange")
 DefineSSDParameter(m_enableOrderedPageStart, bool, false, "EnableOrderedPageStart")

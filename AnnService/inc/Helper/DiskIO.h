@@ -132,6 +132,8 @@ namespace SPTAG
 
             virtual ~DiskIO() {}
 
+            virtual bool SetUseSharedAIOPool(bool enabled) { return !enabled; }
+
             virtual bool Initialize(const char* filePath, int openMode,
                 // Max read/write buffer size.
                 std::uint64_t maxIOSize = (1 << 20),

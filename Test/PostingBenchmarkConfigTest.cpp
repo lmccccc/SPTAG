@@ -19,7 +19,7 @@ int main()
                                 const char* topk="10", const char* probe="96", const char* sweep=nullptr,
                                 const char* rate=nullptr, const char* window=nullptr,
                                 const char* global=nullptr, const char* navigation="true",
-                                const char* packed=nullptr) {
+                                const char* packed=nullptr, const char* aio=nullptr) {
             std::ofstream file(directory / name);
             file << "[SearchSSDIndex]\nisExecute=true\nBuildSsdIndex=false\nInternalResultNum=" << probe <<
                 "\nNumberOfThreads=1\nHashTableExponent=4\nResultNum=" << topk << "\nMaxCheck=" << maxCheck << "\nMaxDistRatio=8\n"
@@ -32,6 +32,7 @@ int main()
             if (window) file << "PostingMatchWindow=" << window << '\n';
             if (global) file << "GlobalPostingSearch=" << global << '\n';
             if (packed) file << "EnablePackedHeadLayout=" << packed << '\n';
+            if (aio) file << "UseSharedAIOPool=false\nAIOContextCount=" << aio << '\n';
             if (sweep) file << "[SearchSweep]\nNProbe=" << sweep << '\n';
             file << "[Benchmark]\nIndex=" << (directory / "index").string() << "\nQueries="
                 << (directory / "queries.npy").string()
@@ -84,6 +85,20 @@ int main()
             return ReadBatch(path.c_str(), reader);
         };
         const auto cases = batch({"on.ini", "off.ini", "on.ini"});
+        for (const char* name : {"private-aio.ini", "invalid-aio.ini"}) {
+            config(name, "8", false, "8", "2048", "10", "96", nullptr, nullptr,
+                nullptr, nullptr, "true", nullptr,
+                std::string(name) == "private-aio.ini" ? "48" : "-1");
+        }
+        const auto aioCases = batch({"private-aio.ini", "private-aio.ini"});
+        Require(!aioCases[0]->cfg.sharedAIO && aioCases[0]->cfg.aioContextCount==48 &&
+            cases[0]->cfg.sharedAIO, "Explicit private AIO or historical default changed");
+        for (const auto& names : std::vector<std::vector<std::string>>{
+                {"private-aio.ini","on.ini"}, {"invalid-aio.ini"}}) {
+            bool rejected=false;
+            try { batch(names); } catch (const std::runtime_error&) { rejected=true; }
+            Require(rejected, "Invalid or mixed AIO ownership accepted");
+        }
         Require(batch({"packed.ini","packed.ini"})[0]->cfg.packedHeadLayout &&
             !cases[0]->cfg.packedHeadLayout, "Packed layout opt-in/default changed");
         bool mixedPacked = false;

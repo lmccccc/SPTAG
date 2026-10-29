@@ -110,6 +110,8 @@ struct Config {
     bool stepTiming=false;
     bool globalPostingSearch=false;
     bool packedHeadLayout=false;
+    bool sharedAIO=true;
+    int aioContextCount=0;
     int count,warmup,topk,maxCheck,anchorCount,additionalMaxCheck,postingPageLimit,navigationWidth;
     double matchRatePercent;
     int matchWindow;
@@ -149,6 +151,13 @@ struct Config {
             !ini.DoesParameterExist("BuildSSDIndex","PostingMinCandidates"),
             "PostingMinCandidates was removed even when OFF; migrate to PostingAnchorCount and PostingAdditionalMaxCheck");
         SPANN::Options checked;
+        const auto aio=ini.GetParameter<std::string>("SearchSSDIndex","UseSharedAIOPool","true");
+        Require(aio=="true" || aio=="false","UseSharedAIOPool must be true or false");
+        sharedAIO=aio=="true";
+        Require(checked.SetParameter("BuildSSDIndex","AIOContextCount",
+            ini.GetParameter<std::string>("SearchSSDIndex","AIOContextCount","0").c_str())==ErrorCode::Success,
+            "Invalid AIOContextCount");
+        aioContextCount=checked.m_aioContextCount;
         for (const char* key : {"MaxCheck", "PostingAnchorCount", "PostingAdditionalMaxCheck"})
             Require(checked.SetParameter("BuildSSDIndex",key,Get("SearchSSDIndex",key).c_str())==ErrorCode::Success,
                 std::string("Invalid post-graph budget parameter ")+key);
@@ -211,7 +220,8 @@ struct Config {
             "maxdistratio","searchpostingpagelimit","disablecrossedges",
             "logphasetime","logpathstats","dumpheads","enablehybriddistance","enablepostingnavigation",
             "postinganchorcount","postingadditionalmaxcheck","postingnavigationwidth",
-            "postingmatchratepercent","postingmatchwindow","globalpostingsearch","enablepackedheadlayout"};
+            "postingmatchratepercent","postingmatchwindow","globalpostingsearch","enablepackedheadlayout",
+            "usesharedaiopool","aiocontextcount"};
         for(const auto& p:ini.GetParameters("SearchSSDIndex"))
             Require(keys.count(p.first),"Unsupported search parameter "+p.first);
         for(char** entry=environ;*entry;++entry) {
@@ -225,6 +235,9 @@ struct Config {
         return ini.GetParameter<std::string>(section.c_str(),key.c_str(),"");
     }
     void Apply(TenantIndexManager& manager,const Config* previous=nullptr) {
+        Require(manager.SetSearchParamChecked("UseSharedAIOPool",sharedAIO?"true":"false","SearchSSDIndex") &&
+            manager.SetSearchParamChecked("AIOContextCount",std::to_string(aioContextCount).c_str(),"SearchSSDIndex"),
+            "Cannot apply load-time AIO ownership/capacity");
         // Lower the declared extra first when a higher base would transiently overflow.
         if(previous && maxCheck>previous->maxCheck && additionalMaxCheck<previous->additionalMaxCheck)
             manager.SetSearchParam("PostingAdditionalMaxCheck",
@@ -517,7 +530,8 @@ std::vector<std::unique_ptr<BatchCase>> ReadBatch(const char* path,Helper::IniRe
         const auto& search=cfg.ini.GetParameters("SearchSSDIndex");
         Require(search.size()==completeKeys.size()+search.count("postingnavigationwidth")+
             search.count("postingmatchratepercent")+search.count("postingmatchwindow")+
-            search.count("globalpostingsearch")+search.count("enablepackedheadlayout"),
+            search.count("globalpostingsearch")+search.count("enablepackedheadlayout")+
+            search.count("usesharedaiopool")+search.count("aiocontextcount"),
             "Batch cases require complete SearchSSDIndex settings");
         auto validated=VectorIndex::CreateInstance(IndexAlgoType::SPANN,
             cfg.valueType=="UInt8"?VectorValueType::UInt8:VectorValueType::Float);
@@ -540,6 +554,8 @@ std::vector<std::unique_ptr<BatchCase>> ReadBatch(const char* path,Helper::IniRe
             const auto& first=cases.front()->cfg;
             Require(cfg.phaseTiming==first.phaseTiming,"Mixed batch PhaseTiming modes");
             Require(cfg.packedHeadLayout==first.packedHeadLayout,"Mixed batch packed head layouts require separate loads");
+            Require(cfg.sharedAIO==first.sharedAIO && cfg.aioContextCount==first.aioContextCount,
+                "Mixed batch AIO ownership/capacities require separate loads");
             Require(cfg.index==first.index && cfg.valueType==first.valueType && cfg.queries==first.queries &&
                 cfg.count==first.count && cfg.warmup==first.warmup,"Mixed batch index, value type or query cohort");
             // Workspace sizing and graph connectivity are not mutable batch dimensions.

@@ -30,13 +30,34 @@ void validate_overlay(const threeway::Options &options)
         "isexecute", "buildssdindex", "internalresultnum", "numberofthreads", "hashtableexponent",
         "resultnum", "maxcheck", "maxdistratio", "searchpostingpagelimit", "disablecrossedges",
         "logphasetime", "logpathstats", "dumpheads", "enablehybriddistance", "enablepostingnavigation",
-        "postinganchorcount", "postingadditionalmaxcheck"});
+        "postinganchorcount", "postingadditionalmaxcheck"
+#ifdef THREEWAY_SPANN_AIO_ISOLATION
+        , "usesharedaiopool", "aiocontextcount", "enablepackedheadlayout"
+#endif
+        });
     for (const auto &item : std::vector<std::pair<std::string, uint64_t>>{
-             {"NumberOfThreads", 1}, {"HashTableExponent", 4}, {"ResultNum", options.top_k},
-             {"MaxCheck", 2048}, {"SearchPostingPageLimit", 3}, {"DumpHeads", 0},
-             {"PostingAnchorCount", 8}, {"PostingAdditionalMaxCheck", 2048}})
+             {"HashTableExponent", 4}, {"ResultNum", options.top_k},
+             {"DumpHeads", 0},
+#ifndef THREEWAY_SPANN_AIO_ISOLATION
+             {"NumberOfThreads", 1}, {"MaxCheck", 2048}, {"SearchPostingPageLimit", 3}, {"PostingAnchorCount", 8},
+#endif
+             {"PostingAdditionalMaxCheck", 2048}})
         threeway::require(ini.uint_value("SearchSSDIndex", item.first) == item.second,
                           "Frozen SPANN protocol differs at SearchSSDIndex." + item.first);
+#ifdef THREEWAY_SPANN_AIO_ISOLATION
+    threeway::require(!ini.bool_value("SearchSSDIndex", "UseSharedAIOPool"),
+                      "The isolated client requires explicit private AIO");
+    native_int(ini.uint_value("SearchSSDIndex", "MaxCheck"), "MaxCheck");
+    threeway::require(ini.uint_value("SearchSSDIndex", "SearchPostingPageLimit") <= INT_MAX,
+                      "Invalid SearchPostingPageLimit");
+    threeway::require(ini.uint_value("SearchSSDIndex", "PostingAnchorCount") <= INT_MAX,
+                      "Invalid PostingAnchorCount");
+    const auto capacity = ini.uint_value("SearchSSDIndex", "AIOContextCount");
+    threeway::require(capacity >= options.max_threads() && capacity <= 65535,
+                      "Private AIO capacity must cover the planned worker concurrency");
+    threeway::require(ini.uint_value("SearchSSDIndex", "NumberOfThreads") == options.max_threads(),
+                      "NumberOfThreads must match the isolated client's planned maximum workers");
+#endif
     for (const auto &item : std::vector<std::pair<std::string, bool>>{
              {"isExecute", true}, {"BuildSsdIndex", false}, {"DisableCrossEdges", true},
              {"LogPhaseTime", false}, {"LogPathStats", false}, {"EnableHybridDistance", false},
@@ -100,11 +121,33 @@ uint64_t aio_counter(const char *path)
     return threeway::parse_uint(text, path);
 }
 
+uint64_t private_aio_reservation(const threeway::Options& options)
+{
+#ifdef THREEWAY_SPANN_AIO_ISOLATION
+    SPTAG::Helper::IniReader saved;
+    const auto directory = options.resolve("SPANN", "IndexDirectory") / "tenant_0";
+    threeway::require(saved.LoadIniFile((directory / "indexloader.ini").string()) == SPTAG::ErrorCode::Success,
+                      "Cannot read AIO file layout");
+    threeway::require(saved.GetParameter<std::string>("BuildSSDIndex", "PostingQuantizer", "None") == "None",
+                      "The isolated client currently supports raw STATIC postings only");
+    const auto base = directory / saved.GetParameter<std::string>("Base", "SSDIndex", "SPTAGFullList.bin");
+    threeway::require(threeway::fs::is_regular_file(base), "Missing native posting file");
+    uint64_t files = 1;
+    while (threeway::fs::is_regular_file(base.string() + "_" + std::to_string(files))) ++files;
+    const auto contexts = options.ini.uint_value("SearchSSDIndex", "AIOContextCount");
+    threeway::require(contexts > 0 && contexts <= 65535 && files <= 32767,
+                      "Invalid private AIO capacity or file count");
+    return files * contexts * options.jobs.front().L;
+#else
+    return 0;
+#endif
+}
+
 void check_aio(const threeway::Options &options)
 {
     const uint64_t maximum = aio_counter("/proc/sys/fs/aio-max-nr");
     const uint64_t used = aio_counter("/proc/sys/fs/aio-nr");
-    const uint64_t requested = native_aio_contexts * native_aio_events_per_context;
+    const uint64_t requested = native_aio_contexts * native_aio_events_per_context + private_aio_reservation(options);
     threeway::require(used <= maximum && options.aio_reserve <= maximum - used &&
                           requested <= maximum - used - options.aio_reserve,
                       "Insufficient CURRENT HOST SPANN AIO headroom: used=" + std::to_string(used) +
@@ -113,7 +156,13 @@ void check_aio(const threeway::Options &options)
                           "; re-plan explicitly, no hidden thread reduction or sysctl change");
     std::cout << "THREEWAY_AIO {\"used\":" << used << ",\"maximum\":" << maximum
               << ",\"requested\":" << requested << ",\"reserve\":" << options.aio_reserve
-              << ",\"policy\":\"native-shared-pool\"}" << std::endl;
+              << ",\"policy\":\""
+#ifdef THREEWAY_SPANN_AIO_ISOLATION
+              << "private-readers-plus-manager-pool"
+#else
+              << "native-shared-pool"
+#endif
+              << "\"}" << std::endl;
 }
 
 std::vector<uint32_t> encode_predicate(const threeway::Options &options, const threeway::Scenario &scenario)
@@ -147,22 +196,36 @@ class SPANNBackend final : public threeway::Backend
         const auto directory = options.resolve("SPANN", "IndexDirectory");
         validate_saved_index(options, directory);
         check_aio(options);
+#ifndef THREEWAY_SPANN_AIO_ISOLATION
         threeway::require(!SPTAG::Helper::SharedAIOPool::Instance().IsInitialized(),
                           "SPANN requires its original manager-owned AIO pool");
+#endif
         manager_ = std::make_unique<TenantIndexManager>(native_int(options.dimension, "Dimension"), "SPANN", "UInt8");
         // Keep the measured client's native four-context pool. The batch reader
         // leases workspace_id % 4 under a per-context lock through completion;
         // query workspaces remain thread-local, not one index per IO channel.
         const auto &pool = SPTAG::Helper::SharedAIOPool::Instance();
+#ifdef THREEWAY_SPANN_AIO_ISOLATION
+        const auto capacity = options.ini.uint_value("SearchSSDIndex", "AIOContextCount");
+        threeway::require(manager_->SetSearchParamChecked("UseSharedAIOPool", "false", "SearchSSDIndex") &&
+                              manager_->SetSearchParamChecked("AIOContextCount", std::to_string(capacity).c_str(), "SearchSSDIndex"),
+                          "Cannot configure private query AIO");
+#else
         threeway::require(pool.IsUsable() && pool.NumContexts() == native_aio_contexts,
                           "Original SPANN shared AIO pool initialization failed");
+#endif
         manager_->SetHeadIndexCacheLimit(0);
         for (const auto &parameter : options.ini.section("SearchSSDIndex"))
         {
             const std::string value = parameter.first == "numberofthreads" ? std::to_string(max_threads) :
                                       parameter.first == "internalresultnum" ? std::to_string(options.jobs.front().L) :
                                                                              parameter.second;
+#ifdef THREEWAY_SPANN_AIO_ISOLATION
+            threeway::require(manager_->SetSearchParamChecked(parameter.first.c_str(), value.c_str(), "SearchSSDIndex"),
+                              "Cannot apply native search parameter " + parameter.first);
+#else
             manager_->SetSearchParam(parameter.first.c_str(), value.c_str(), "SearchSSDIndex");
+#endif
         }
         threeway::require(manager_->LoadAll(directory.c_str()), "Cannot load immutable SPANN manager metadata");
         threeway::require(manager_->GetTenantCount() == 1 &&
@@ -181,8 +244,14 @@ class SPANNBackend final : public threeway::Backend
         configure(options.jobs.front(), options.scenarios[options.jobs.front().scenario_index]);
         search(first_query.data(), 0, 0, ids.data(), distances.data());
         std::cout << "THREEWAY_SPANN_INDEX {\"index_load_count\":1,\"max_threads\":" << max_threads
+#ifdef THREEWAY_SPANN_AIO_ISOLATION
+                  << ",\"aio_policy\":\"private\",\"aio_contexts_per_file\":" << capacity
+                  << ",\"aio_events_per_context\":" << options.jobs.front().L
+                  << ",\"unused_manager_pool_contexts\":" << pool.NumContexts()
+#else
                   << ",\"aio_contexts\":" << pool.NumContexts()
                   << ",\"aio_events_per_context\":" << native_aio_events_per_context
+#endif
                   << ",\"core\":" << threeway::json_string(THREEWAY_SPANN_CORE)
                   << ",\"index\":" << threeway::json_string(directory.string()) << "}" << std::endl;
     }

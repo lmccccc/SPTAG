@@ -9149,6 +9149,20 @@ template <typename T> ErrorCode Index<T>::SetParameter(const char *p_param, cons
         Options::IsRemovedSectionAlias(p_section, p_param))
         return m_options.SetParameter(p_section, p_param, p_value);
     p_param = Options::CanonicalParameter(p_section, p_param);
+    if (Helper::StrUtils::StrEqualIgnoreCase(p_param, "UseSharedAIOPool") ||
+        Helper::StrUtils::StrEqualIgnoreCase(p_param, "AIOContextCount")) {
+        Options proposed = m_options;
+        if ((!Helper::StrUtils::StrEqualIgnoreCase(p_section, "BuildSSDIndex") &&
+             !Helper::StrUtils::StrEqualIgnoreCase(p_section, "SearchSSDIndex")) ||
+            proposed.SetParameter("BuildSSDIndex", p_param, p_value) != ErrorCode::Success)
+            return ErrorCode::FailedParseValue;
+        if (m_bReady && (proposed.m_useSharedAIOPool != m_options.m_useSharedAIOPool ||
+                        proposed.m_aioContextCount != m_options.m_aioContextCount)) {
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Error,
+                "AIO ownership and capacity must be configured before loading; reload to change them.\n");
+            return ErrorCode::FailedParseValue;
+        }
+    }
     if (Helper::StrUtils::StrEqualIgnoreCase(p_param, "HierarchyLocalTarget") ||
         Helper::StrUtils::StrEqualIgnoreCase(p_param, "HierarchyLocalWindow") ||
         Helper::StrUtils::StrEqualIgnoreCase(p_param, "HierarchyTargetPostingSize") ||

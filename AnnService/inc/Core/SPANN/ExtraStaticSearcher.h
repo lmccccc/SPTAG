@@ -2294,7 +2294,7 @@ namespace SPTAG
                     int wid = 0;
                     if (m_freeWorkSpaceIds == nullptr || !m_freeWorkSpaceIds->try_pop(wid))
                     {
-                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "FreeWorkSpaceIds is not initalized or the workspace number is not enough! Please increase iothread number.\n");
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Allocating an additional workspace ID; AIO batches retain exclusive context ownership.\n");
                         wid = m_workspaceCount.fetch_add(1);
                     }
                     p_exWorkSpace->SetAsyncContextID(wid);
@@ -6363,10 +6363,14 @@ namespace SPTAG
                 }
 
                 m_staticRerankFile = f_createAsyncIO();
-                const int rerankContexts = max(
-                    max(1, p_opt.m_ioThreads),
-                    max(p_opt.m_searchThreadNum, p_opt.m_iSSDNumberOfThreads));
+                const int rerankContexts = p_opt.m_aioContextCount > 0 ? p_opt.m_aioContextCount :
+                    max(max(1, p_opt.m_ioThreads), max(p_opt.m_searchThreadNum, p_opt.m_iSSDNumberOfThreads));
+                if (rerankContexts <= 0 || rerankContexts > 65535) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid PipePQ rerank AIO context count.\n");
+                    return false;
+                }
                 if (m_staticRerankFile == nullptr ||
+                    !m_staticRerankFile->SetUseSharedAIOPool(p_opt.m_useSharedAIOPool) ||
                     !m_staticRerankFile->Initialize(fullPath.c_str(), O_RDONLY | O_DIRECT,
                                                      std::max(64, p_opt.m_rerankL), 2, 2,
                                                      static_cast<std::uint16_t>(rerankContexts))) {
@@ -7982,15 +7986,22 @@ namespace SPTAG
                                      const Options& p_opt,
                                      std::shared_ptr<Helper::DiskIO>& p_indexFile) const
             {
+                const int contextCount = p_opt.QueryAIOContextCount();
+                if (contextCount <= 0 || contextCount > 65535) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Query AIO context count must be in [1,65535].\n");
+                    return false;
+                }
                 p_indexFile = f_createAsyncIO();
 #ifndef _MSC_VER
                 const int staticOpenMode = O_RDONLY |
                     (p_opt.m_useDirectIO ? O_DIRECT : O_NOATIME);
 #endif
-                if (p_indexFile == nullptr || !p_indexFile->Initialize(p_file.c_str(),
+                if (p_indexFile == nullptr ||
+                    !p_indexFile->SetUseSharedAIOPool(p_opt.m_useSharedAIOPool) ||
+                    !p_indexFile->Initialize(p_file.c_str(),
 #ifndef _MSC_VER
 #ifdef BATCH_READ
-                    staticOpenMode, p_opt.m_searchInternalResultNum, 2, 2, p_opt.m_iSSDNumberOfThreads
+                    staticOpenMode, p_opt.m_searchInternalResultNum, 2, 2, static_cast<std::uint16_t>(contextCount)
 #else
                     staticOpenMode, p_opt.m_searchInternalResultNum * p_opt.m_iSSDNumberOfThreads / p_opt.m_ioThreads + 1, 2, 2, p_opt.m_ioThreads
 #endif

@@ -12,6 +12,10 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
+#include <limits>
+#include <algorithm>
+#include <atomic>
 #include <string>
 #include <vector>
 #include <thread>
@@ -612,12 +616,19 @@ namespace SPTAG
             bool IsInitialized() const { return m_initialized; }
             bool IsUsable() const
             {
-                return m_initialized && !m_contexts.empty() &&
+                return m_initialized && !m_failed.load() && !m_contexts.empty() &&
                        m_contexts.size() == m_contextLocks.size();
             }
             aio_context_t GetContext(int i) const { return m_contexts[i % m_contexts.size()]; }
             std::mutex& GetContextMutex(int i) { return *m_contextLocks[i % m_contextLocks.size()]; }
             int NumContexts() const { return (int)m_contexts.size(); }
+            void InvalidateContext(int i)
+            {
+                m_failed.store(true);
+                auto& context = m_contexts[i % m_contexts.size()];
+                if (context) syscall(__NR_io_destroy, context);
+                context = 0;
+            }
 
             ~SharedAIOPool() {
                 for (auto& ctx : m_contexts) {
@@ -633,6 +644,7 @@ namespace SPTAG
             std::vector<std::unique_ptr<std::mutex>> m_contextLocks;
             std::mutex m_initializeMutex;
             bool m_initialized = false;
+            std::atomic<bool> m_failed{false};
         };
 
         class AsyncFileIO : public DiskIO
@@ -647,7 +659,81 @@ namespace SPTAG
 
             virtual bool Available()
             {
-                return !m_shutdown;
+                return !m_shutdown && !m_contextFailed.load() &&
+                    (!m_useSharedPool || SharedAIOPool::Instance().IsUsable());
+            }
+
+            bool SetUseSharedAIOPool(bool enabled) override
+            {
+                if (!m_shutdown) {
+                    SPTAGLIB_LOG(LogLevel::LL_Error, "AIO ownership must be selected before opening the file.\n");
+                    return false;
+                }
+#ifdef URING
+                if (enabled) {
+                    SPTAGLIB_LOG(LogLevel::LL_Error, "Shared libaio contexts are not supported by io_uring.\n");
+                    return false;
+                }
+#endif
+                m_useSharedPool = enabled;
+                return true;
+            }
+
+            class ContextLease
+            {
+            public:
+                ContextLease() = default;
+                ContextLease(AsyncFileIO* owner, int context) : m_owner(owner), m_context(context) {}
+                ContextLease(const ContextLease&) = delete;
+                ContextLease& operator=(const ContextLease&) = delete;
+                ContextLease(ContextLease&& other) noexcept
+                    : m_owner(other.m_owner), m_context(other.m_context) { other.m_owner = nullptr; }
+                ~ContextLease()
+                {
+                    if (m_owner) {
+                        {
+                            std::lock_guard<std::mutex> lock(m_owner->m_contextMutex);
+                            if (!m_owner->m_contextFailed.load())
+                                m_owner->m_freeContexts.push_back(m_context);
+                        }
+                        m_owner->m_contextAvailable.notify_one();
+                    }
+                }
+                int Context() const { return m_context; }
+            private:
+                AsyncFileIO* m_owner = nullptr;
+                int m_context = -1;
+            };
+
+            ContextLease AcquirePrivateContext()
+            {
+                if (m_useSharedPool) return {};
+                std::unique_lock<std::mutex> lock(m_contextMutex);
+                m_contextAvailable.wait(lock, [&] {
+                    return m_shutdown || m_contextFailed.load() || !m_freeContexts.empty();
+                });
+                if (m_shutdown || m_contextFailed.load()) {
+                    SPTAGLIB_LOG(LogLevel::LL_Error, "Cannot acquire a context from a closed or failed AIO reader.\n");
+                    return {};
+                }
+                const int context = m_freeContexts.back();
+                m_freeContexts.pop_back();
+                return ContextLease(this, context);
+            }
+
+            void InvalidateContext(int context)
+            {
+                if (m_useSharedPool) {
+                    SharedAIOPool::Instance().InvalidateContext(context);
+                } else {
+                    {
+                        std::lock_guard<std::mutex> lock(m_contextMutex);
+                        m_contextFailed.store(true);
+                    }
+                    if (m_iocps[context]) syscall(__NR_io_destroy, m_iocps[context]);
+                    m_iocps[context] = 0;
+                    m_contextAvailable.notify_all();
+                }
             }
 
             virtual bool NewFile(const char* filePath, uint64_t maxFileSize) {
@@ -689,6 +775,15 @@ namespace SPTAG
                 std::uint16_t threadPoolSize = 4,
                 std::uint64_t maxFileSize = (300ULL << 30))
             {
+                if (!m_shutdown || threadPoolSize == 0 || maxNumBlocks == 0 ||
+                    maxNumBlocks > static_cast<std::uint64_t>((std::numeric_limits<int>::max)())) {
+                    SPTAGLIB_LOG(LogLevel::LL_Error, "Invalid AIO initialization or reader already open.\n");
+                    return false;
+                }
+                if (m_useSharedPool && !SharedAIOPool::Instance().IsUsable()) {
+                    SPTAGLIB_LOG(LogLevel::LL_Error, "Explicit shared AIO pool is not initialized.\n");
+                    return false;
+                }
                 const bool readOnly = (openMode & O_ACCMODE) == O_RDONLY;
                 if (!fileexists(filePath)) {
                     if (readOnly) {
@@ -713,6 +808,8 @@ namespace SPTAG
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "AsyncFileIO::Open failed: %s\n", err_str);
                     return false;
                 }
+                m_shutdown = false;
+                m_contextFailed.store(false);
                 SPTAGLIB_LOG(
                     Helper::LogLevel::LL_Info,
                     "AsyncFileIO::InitializeFileIo: file %s opened, fd=%d mode=%s threads=%d maxNumBlocks=%d\n",
@@ -722,15 +819,8 @@ namespace SPTAG
                     threadPoolSize,
                     maxNumBlocks);
 
-                // Use shared AIO pool if available, otherwise create own contexts.
-                // NOTE: the SharedAIOPool only holds libaio contexts; it does NOT carry
-                // io_uring rings. Under URING the read path submits via m_uring[iocp]
-                // (BatchReadFile), so taking the shared-pool branch would leave m_uring
-                // unsized -> out-of-bounds segfault. Bypass the shared pool entirely when
-                // built with io_uring so both m_iocps and m_uring are initialized together.
 #ifndef URING
-                if (SharedAIOPool::Instance().IsUsable()) {
-                    m_useSharedPool = true;
+                if (m_useSharedPool) {
                     int poolSize = SharedAIOPool::Instance().NumContexts();
                     m_iocps.resize(poolSize);
                     for (int i = 0; i < poolSize; i++) {
@@ -740,7 +830,6 @@ namespace SPTAG
                 } else
 #endif
                 {
-                    m_useSharedPool = false;
                     m_iocps.resize(threadPoolSize);
 #ifdef URING
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "AsyncFileIO::InitializeFileIo: using io uring for read!\n");
@@ -753,6 +842,10 @@ namespace SPTAG
                         auto ret = syscall(__NR_io_setup, (int)maxNumBlocks, &(m_iocps[i]));
                         if (ret < 0) {
                             SPTAGLIB_LOG(LogLevel::LL_Error, "Cannot setup aio: %s\n", strerror(errno));
+#ifdef URING
+                            m_uring.resize(i);
+#endif
+                            ShutDown();
                             return false;
                         }
 #ifdef URING
@@ -761,13 +854,15 @@ namespace SPTAG
                         if (ret < 0)
                         {
                             SPTAGLIB_LOG(LogLevel::LL_Error, "Cannot setup io_uring: %s\n", strerror(-ret));
-                            for (int j = 0; j < i; ++j) io_uring_queue_exit(&m_uring[j]);
-                            m_uring.clear();
+                            m_uring.resize(i);
+                            ShutDown();
                             m_uringLocks.clear();
                             return false;
                         }
 #endif
                     }
+                    for (int i = threadPoolSize; i > 0; --i) m_freeContexts.push_back(i - 1);
+                    SPTAGLIB_LOG(LogLevel::LL_Info, "AsyncFileIO: using private AIO channels (%d contexts)\n", threadPoolSize);
                 } // end if/else shared pool
                 m_shutdown = false;
 
@@ -813,11 +908,14 @@ namespace SPTAG
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "The iocp number is not enough! Please increase iothread number.\n");
                     return 0;
                 }
-                int iocp = readRequests[0].m_status % m_iocps.size();
+                auto privateContext = AcquirePrivateContext();
+                if (!m_useSharedPool && privateContext.Context() < 0) return 0;
+                int iocp = m_useSharedPool ? readRequests[0].m_status % m_iocps.size() : privateContext.Context();
                 std::unique_lock<std::mutex> sharedContextLock;
                 if (m_useSharedPool) {
                     sharedContextLock = std::unique_lock<std::mutex>(
                         SharedAIOPool::Instance().GetContextMutex(iocp));
+                    if (!SharedAIOPool::Instance().IsUsable()) return 0;
                 }
 #ifdef URING
                 if (iocp < 0 || static_cast<size_t>(iocp) >= m_uringLocks.size() ||
@@ -914,8 +1012,12 @@ namespace SPTAG
                             if (s > 0) {
                                 totalSubmitted += s;
                             } else {
-                                SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "AsyncFileReader::ReadBlocks: io_submit failed\n");
-                                return batchTotalDone;
+                                if (s < 0 && errno == EINTR) continue;
+                                if (!(s < 0 && errno == EAGAIN && totalSubmitted > totalDone)) {
+                                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "AsyncFileReader::ReadBlocks: io_submit failed: %s\n", strerror(errno));
+                                    if (totalSubmitted > totalDone) InvalidateContext(iocp);
+                                    return batchTotalDone;
+                                }
 			                } 
                         }
                         int wait = totalSubmitted - totalDone;
@@ -925,7 +1027,9 @@ namespace SPTAG
                         }
                         else
                         {
-                            SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "AsyncFileReader::ReadBlocks: io_getevents failed\n");
+                            if (errno == EINTR) continue;
+                            SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "AsyncFileReader::ReadBlocks: io_getevents failed: %s\n", strerror(errno));
+                            InvalidateContext(iocp);
                             return batchTotalDone;
                         }
                     }
@@ -957,11 +1061,14 @@ namespace SPTAG
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "The iocp number is not enough! Please increase iothread number.\n");
                     return 0;
                 }
-                int iocp = readRequests[0].m_status % m_iocps.size();
+                auto privateContext = AcquirePrivateContext();
+                if (!m_useSharedPool && privateContext.Context() < 0) return 0;
+                int iocp = m_useSharedPool ? readRequests[0].m_status % m_iocps.size() : privateContext.Context();
                 std::unique_lock<std::mutex> sharedContextLock;
                 if (m_useSharedPool) {
                     sharedContextLock = std::unique_lock<std::mutex>(
                         SharedAIOPool::Instance().GetContextMutex(iocp));
+                    if (!SharedAIOPool::Instance().IsUsable()) return 0;
                 }
 	         	//struct timespec timeout_ts {0, 0};
 		        //while (syscall(__NR_io_getevents, m_iocps[iocp], batchSize, batchSize, events.data(), &timeout_ts) > 0);
@@ -997,8 +1104,12 @@ namespace SPTAG
                             if (s > 0) {
                                 totalSubmitted += s;
                             } else {
-                                SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "AsyncFileReader::WriteBlocks: io_submit failed\n");
-                                return batchTotalDone;
+                                if (s < 0 && errno == EINTR) continue;
+                                if (!(s < 0 && errno == EAGAIN && totalSubmitted > totalDone)) {
+                                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "AsyncFileReader::WriteBlocks: io_submit failed: %s\n", strerror(errno));
+                                    if (totalSubmitted > totalDone) InvalidateContext(iocp);
+                                    return batchTotalDone;
+                                }
 			                }
                         }
                         int wait = totalSubmitted - totalDone;
@@ -1008,7 +1119,9 @@ namespace SPTAG
                         }
                         else
                         {
-                            SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "AsyncFileReader::WriteBlocks: io_getevents failed\n");
+                            if (errno == EINTR) continue;
+                            SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "AsyncFileReader::WriteBlocks: io_getevents failed: %s\n", strerror(errno));
+                            InvalidateContext(iocp);
                             return batchTotalDone;
                         }
                     }
@@ -1055,15 +1168,21 @@ namespace SPTAG
                 m_shutdown = true;
                 if (!m_useSharedPool) {
                     // Only destroy AIO contexts if we own them
-                    for (int i = 0; i < m_iocps.size(); i++) syscall(__NR_io_destroy, m_iocps[i]);
+                    for (int i = 0; i < m_iocps.size(); i++)
+                        if (m_iocps[i]) syscall(__NR_io_destroy, m_iocps[i]);
 #ifdef URING
                     for (int i = 0; i < m_uring.size(); i++) io_uring_queue_exit(&m_uring[i]);
+                    m_uring.clear();
                     m_uringLocks.clear();
 #endif
                 }
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "AsyncFileReader: Destroying fd=%d!%s\n",
                              m_fileHandle, m_useSharedPool ? " (shared pool, skip io_destroy)" : "");
                 close(m_fileHandle);
+                m_fileHandle = -1;
+                m_iocps.clear();
+                m_freeContexts.clear();
+                m_contextAvailable.notify_all();
 #ifndef BATCH_READ
                 for (auto& th : m_fileIocpThreads)
                 {
@@ -1077,6 +1196,7 @@ namespace SPTAG
 
             aio_context_t& GetIOCP(int i) { return m_iocps[i % m_iocps.size()]; }
             bool UsesSharedAIOPool() const { return m_useSharedPool; }
+            int NumContexts() const { return static_cast<int>(m_iocps.size()); }
 
             int GetFileHandler() { return m_fileHandle; }
 
@@ -1104,8 +1224,12 @@ namespace SPTAG
             bool m_shutdown = true;
 
             bool m_useSharedPool = false;
+            std::atomic<bool> m_contextFailed{false};
 
-            int m_fileHandle;
+            std::mutex m_contextMutex;
+            std::condition_variable m_contextAvailable;
+            std::vector<int> m_freeContexts;
+            int m_fileHandle = -1;
 
             uint64_t m_currSize;
 

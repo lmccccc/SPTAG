@@ -3,6 +3,8 @@
 
 #include "inc/Helper/AsyncFileReader.h"
 #include "inc/Core/Common/QueryStepTiming.h"
+#include <exception>
+#include <set>
 
 namespace SPTAG
 {
@@ -68,6 +70,11 @@ struct timespec AIOTimeout
 bool BatchReadFileAsync(std::vector<std::shared_ptr<Helper::DiskIO>> &handlers, AsyncReadRequest *readRequests, int num)
 {
     SPTAG_STEP_SCOPE(AIOPrepare);
+    if (num == 0) return true;
+    if (num < 0 || readRequests == nullptr || handlers.empty()) {
+        SPTAGLIB_LOG(LogLevel::LL_Error, "Invalid asynchronous posting batch.\n");
+        return false;
+    }
     std::vector<struct iocb> myiocbs(num);
     std::vector<std::vector<struct iocb *>> iocbs(handlers.size());
     std::vector<int> submitted(handlers.size(), 0);
@@ -78,9 +85,15 @@ bool BatchReadFileAsync(std::vector<std::shared_ptr<Helper::DiskIO>> &handlers, 
     for (int i = 0; i < num; i++)
     {
         AsyncReadRequest *readRequest = &(readRequests[i]);
+        readRequest->m_success = false;
 
         iocp = readRequest->m_status & 0xffff;
         int fileid = (readRequest->m_status >> 16);
+        if (fileid < 0 || static_cast<size_t>(fileid) >= handlers.size() ||
+            !handlers[fileid] || !handlers[fileid]->Available()) {
+            SPTAGLIB_LOG(LogLevel::LL_Error, "Invalid or closed AIO batch file %d.\n", fileid);
+            return false;
+        }
 
         struct iocb *myiocb = &(myiocbs[totalToSubmit++]);
         myiocb->aio_data = reinterpret_cast<uintptr_t>(readRequest);
@@ -96,6 +109,8 @@ bool BatchReadFileAsync(std::vector<std::shared_ptr<Helper::DiskIO>> &handlers, 
     std::vector<struct io_event> events(totalToSubmit);
     int totalDone = 0, totalSubmitted = 0, totalQueued = 0;
     bool allSucceeded = true;
+    bool submitFailed = false;
+    std::exception_ptr callbackError;
     auto dispatchCompletions = [&](int p_begin, int p_end) {
         for (int i = p_begin; i < p_end; ++i)
         {
@@ -106,24 +121,53 @@ bool BatchReadFileAsync(std::vector<std::shared_ptr<Helper::DiskIO>> &handlers, 
                 events[i].res == static_cast<decltype(events[i].res)>(req->m_readSize);
             req->m_success = success;
             allSucceeded = allSucceeded && success;
-            if (req->m_callback) req->m_callback(success);
+            if (req->m_callback) {
+                try {
+                    req->m_callback(success);
+                } catch (...) {
+                    // Finish owning/reaping the batch before unwinding caller buffers.
+                    if (!callbackError) callbackError = std::current_exception();
+                }
+            }
         }
     };
     std::unique_lock<std::mutex> sharedContextLock;
-    for (const auto& diskHandler : handlers)
+    for (size_t file = 0; file < handlers.size(); ++file)
     {
-        auto* handler = static_cast<AsyncFileIO*>(diskHandler.get());
+        if (iocbs[file].empty()) continue;
+        auto* handler = static_cast<AsyncFileIO*>(handlers[file].get());
         if (handler->UsesSharedAIOPool())
         {
             SPTAG_STEP_SCOPE(AIOLock);
             sharedContextLock = std::unique_lock<std::mutex>(
                 SharedAIOPool::Instance().GetContextMutex(iocp));
+            if (!SharedAIOPool::Instance().IsUsable()) return false;
             break;
         }
     }
+    // All callers acquire participating readers in one order. A lease lasts
+    // through the final callback, irrespective of workspace IDs or file order.
+    std::vector<AsyncFileIO*> privateReaders;
+    for (size_t i = 0; i < handlers.size(); ++i) {
+        if (!iocbs[i].empty()) {
+            auto* reader = static_cast<AsyncFileIO*>(handlers[i].get());
+            if (!reader->UsesSharedAIOPool()) privateReaders.push_back(reader);
+        }
+    }
+    std::sort(privateReaders.begin(), privateReaders.end(), std::less<AsyncFileIO*>());
+    privateReaders.erase(std::unique(privateReaders.begin(), privateReaders.end()), privateReaders.end());
+    std::vector<AsyncFileIO::ContextLease> privateLeases;
+    privateLeases.reserve(privateReaders.size());
+    std::vector<int> channels(handlers.size(), iocp);
+    for (auto* reader : privateReaders) {
+        privateLeases.emplace_back(SPTAG_STEP_CALL(AIOLock, reader->AcquirePrivateContext()));
+        if (privateLeases.back().Context() < 0) return false;
+        for (size_t i = 0; i < handlers.size(); ++i)
+            if (handlers[i].get() == reader) channels[i] = privateLeases.back().Context();
+    }
     while (totalDone < totalToSubmit)
     {
-        if (totalSubmitted < totalToSubmit)
+        if (!submitFailed && totalSubmitted < totalToSubmit)
         {
             for (int i = 0; i < handlers.size(); i++)
             {
@@ -131,7 +175,7 @@ bool BatchReadFileAsync(std::vector<std::shared_ptr<Helper::DiskIO>> &handlers, 
                 {
                     AsyncFileIO *handler = (AsyncFileIO *)(handlers[i].get());
                     int s = SPTAG_STEP_CALL(AIOSubmit,
-                        syscall(__NR_io_submit, handler->GetIOCP(iocp), iocbs[i].size() - submitted[i],
+                        syscall(__NR_io_submit, handler->GetIOCP(channels[i]), iocbs[i].size() - submitted[i],
                                 iocbs[i].data() + submitted[i]));
                     if (s > 0)
                     {
@@ -140,9 +184,14 @@ bool BatchReadFileAsync(std::vector<std::shared_ptr<Helper::DiskIO>> &handlers, 
                     }
                     else
                     {
+                        if (s < 0 && errno == EINTR) continue;
+                        if (s < 0 && errno == EAGAIN && totalSubmitted > totalDone) break;
                         SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "fid:%d channel %d, to submit:%d, submitted:%s\n", i,
-                                     iocp, iocbs[i].size() - submitted[i], strerror(-s));
-                        return false;
+                                     channels[i], static_cast<int>(iocbs[i].size()) - submitted[i], strerror(errno));
+                        allSucceeded = false;
+                        submitFailed = true;
+                        totalToSubmit = totalSubmitted;
+                        break;
                     }
                 }
             }
@@ -158,18 +207,33 @@ bool BatchReadFileAsync(std::vector<std::shared_ptr<Helper::DiskIO>> &handlers, 
                 int wait = submitted[i] - done[i];
                 AsyncFileIO *handler = (AsyncFileIO *)(handlers[i].get());
                 auto d = SPTAG_STEP_CALL(AIOWait,
-                    syscall(__NR_io_getevents, handler->GetIOCP(iocp), wait, wait, events.data() + totalDone,
+                    syscall(__NR_io_getevents, handler->GetIOCP(channels[i]), wait, wait, events.data() + totalDone,
                             &AIOTimeout));
                 if (d > 0)
                 {
                     done[i] += d;
                     totalDone += d;
                 }
+                else if (d < 0 && errno != EINTR) {
+                    SPTAGLIB_LOG(LogLevel::LL_Error, "AIO completion failure: %s; invalidating outstanding contexts.\n",
+                        strerror(errno));
+                    std::set<aio_context_t> cancelled;
+                    for (size_t j = 0; j < handlers.size(); ++j) {
+                        if (done[j] < submitted[j]) {
+                            auto* pending = static_cast<AsyncFileIO*>(handlers[j].get());
+                            if (cancelled.insert(pending->GetIOCP(channels[j])).second)
+                                pending->InvalidateContext(channels[j]);
+                        }
+                    }
+                    if (callbackError) std::rethrow_exception(callbackError);
+                    return false;
+                }
             }
         }
     }
 
     dispatchCompletions(totalQueued, totalDone);
+    if (callbackError) std::rethrow_exception(callbackError);
     return allSucceeded;
 }
 #else

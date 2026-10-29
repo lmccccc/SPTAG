@@ -23,16 +23,24 @@ bool FileIO::BlockController::Initialize(SPANN::Options &p_opt)
     m_startTime = std::chrono::high_resolution_clock::now();
 
     int numblocks = m_batchSize;
+    const std::int64_t contextCount = p_opt.m_aioContextCount > 0 ? p_opt.m_aioContextCount :
+        (std::max<std::int64_t>)(p_opt.m_ioThreads,
+            2LL * max(p_opt.m_searchThreadNum, p_opt.m_iSSDNumberOfThreads) +
+            p_opt.m_insertThreadNum + p_opt.m_reassignThreadNum + p_opt.m_appendThreadNum);
+    if (contextCount <= 0 || contextCount > 65535) {
+        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Invalid FILEIO AIO context count.\n");
+        return false;
+    }
     m_fileHandle = f_createAsyncIO();
     if (m_fileHandle == nullptr ||
+        !m_fileHandle->SetUseSharedAIOPool(p_opt.m_useSharedAIOPool) ||
         !m_fileHandle->Initialize(
             m_filePath,
 #ifndef _MSC_VER
             (m_readOnly ? O_RDONLY : O_RDWR) |
                 O_DIRECT,
             numblocks, 2, 2,
-            max(p_opt.m_ioThreads, (2 * max(p_opt.m_searchThreadNum, p_opt.m_iSSDNumberOfThreads) +
-                                    p_opt.m_insertThreadNum + p_opt.m_reassignThreadNum + p_opt.m_appendThreadNum)),
+            static_cast<std::uint16_t>(contextCount),
             ((std::uint64_t)p_opt.m_startFileSize) << 30
 #else
             m_readOnly
