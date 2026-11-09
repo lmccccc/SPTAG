@@ -213,6 +213,7 @@ workload; historical measurements do not establish performance for a new index.
 | [Posting hierarchy recipe](docs/LocalLabelHierarchy.ini) | Upper-only reconstruction without rebuilding H1/SSD. |
 | [Benchmark guide](Tools/benchmarks/README.md) | Native benchmark clients, predicate inputs and experiment provenance. |
 | [Search-budget boundaries](docs/SearchBudgetBoundaries.md) | Online stopping, supplementary work and bounded construction semantics. |
+| [SIFT1B hierarchy cost study (2026-11-09)](docs/reports/2026-11-09-sift1b-hierarchy-crossover.md) | R90 measurements, budget diagnosis and a conditional crossover estimate; not a calibrated trigger recommendation. |
 
 ## References
 
